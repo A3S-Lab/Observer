@@ -51,7 +51,9 @@ The **policy lives outside the core** — two ways to implement it, both first-c
    the observer's existing event stream (NDJSON / OTel) and pushes verdicts through a
    **control API** (CLI / unix-socket / gRPC that updates the policy maps). The policy engine
    (OPA/Rego, a service, your own code in any language) lives entirely outside the binary; the
-   core only enforces what the maps say. **This is the "外部实现" path.**
+   core only enforces what the maps say. **This is the "外部实现" path** — see
+   [`scripts/example-controller.py`](../scripts/example-controller.py) for a worked example
+   (NDJSON event stream → provider allow-list policy → enforcer deny-file).
 
 Default policy = `AllowAll` (fail-open — never break an agent unless a rule opts in).
 
