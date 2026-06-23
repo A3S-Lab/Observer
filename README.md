@@ -1,158 +1,103 @@
 # a3s-observer
 
-General-purpose, language-agnostic **eBPF** observability for AI agents. Turns
-kernel-level events into semantic agent telemetry — which agent made which LLM call,
-ran which tools, touched which files, reached which endpoints — **with zero changes to
-the agent, across languages**.
+Kernel-level **eBPF** observability — and optional intervention — for AI agents. It turns
+syscalls and network events into agent-semantic telemetry (which agent ran which tool, made
+which LLM call, touched which files, reached which endpoint) with **zero changes to the agent
+and no per-language instrumentation**. The same kernel vantage point can also **intervene** —
+deny an agent's egress or file access from an external policy.
 
-> **Status: production-ready collector.** Probes — `exec`, TLS-`SNI`, `connect`, `dns`
-> (incl. `sendmsg`/`sendmmsg`), `file` (writes), and per-socket LLM metrics — stream to ring
-> buffers, enriched in userspace with identity (k8s cgroup→pod, `/proc`, or in-kernel
-> `comm`) and a `(pid,fd)→peer` correlation, then exported as NDJSON (or human log). A
-> single event captures **who** (process / pod), **what** (tool, file, or LLM provider +
-> req/resp bytes + latency + TTFT), and **where** (peer). Built + validated on Linux
-> (kernel 6.8, bpf-linker 0.10, nightly `build-std`). OpenTelemetry via the Collector
-> ([config](deploy/otel-collector.yaml)). Roadmap: opt-in SSL-payload (prompt/response
-> content); in-guest probes for a3s-box.
+Built and validated on Linux 6.8 (Aya, no uprobes). Observe-only by default; intervention is
+opt-in and never affects the observe path.
 
-## Why eBPF (not an SDK)
+## What it captures
 
-- **Zero-instrumentation, language-agnostic** — observe any agent (Python/Node/Go/Rust)
-  without touching its code.
-- **Sees what the app won't tell you** — real subprocess execs, file I/O, network egress,
-  including the agent's tool subprocesses.
-- **Security angle** — detect unexpected egress / file access / spawned shells.
+One event answers **who / what / where**: who (process or k8s pod), what (tool, file, or LLM
+provider + bytes/latency/TTFT), where (peer IP / hostname).
 
-## Design decisions
-
-- **Language-agnostic kernel hooks only — no per-language uprobes in v1.** Works on any
-  runtime, nothing to maintain per language.
-  - Trade-off: **no** LLM prompt / model name / exact token / completion content. Those
-    need an opt-in TLS-payload extension (per TLS library) — deliberately **not** in the
-    universal core.
-- **LLM calls identified via TLS SNI + DNS** (the ClientHello `server_name` is plaintext)
-  → provider + endpoint, language-agnostically. Plus per-call metrics accumulated in-kernel:
-  req/resp bytes (wire bytes, incl. TLS framing), latency, and a TTFT proxy (first response
-  byte).
-  - Risk: Encrypted ClientHello (ECH) will eventually hide SNI → fall back to IP/DNS.
-- **Full scope:** tool exec + file I/O + network egress + LLM flows.
-- **All environments:** Kubernetes, bare host, a3s-box MicroVM — via a pluggable
-  `IdentityResolver`.
-
-## Architecture (minimal core + extensions)
-
-Core: eBPF probes → Aya loader → ring buffer → `IdentityResolver` → correlation/spans →
-`Exporter`. Everything else is a swappable trait.
-
-Probes (all language-agnostic kernel hooks):
-
-| probe | hook | gives |
+| probe | kernel hook | signal |
 |---|---|---|
-| `exec` | `sys_enter_execve` | tool / subprocess (argv, comm, uid) |
-| `file` | `sys_enter_openat` (write opens) | files the agent writes — **opt-in** (`A3S_OBSERVER_FILES=1`; high-volume on busy nodes) |
+| `exec` | `sys_enter_execve` | tools / subprocesses (argv, comm, uid) |
 | `connect` | `sys_enter_connect` | peer IP:port |
-| `sni`  | TLS ClientHello on `write` / `sendto` | LLM provider |
-| `dns`  | `sendto` / `sendmsg` / `sendmmsg` to :53 | resolved hostnames |
-| LLM metrics | `read` / `recv` + `close`, per socket | req/resp bytes, latency, TTFT |
+| `sni` | TLS ClientHello (plaintext `server_name`) | LLM provider + endpoint |
+| `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | resolved hostnames |
+| LLM metrics | per-socket `read` / `recv` + `close` | req/resp wire bytes, latency, TTFT |
+| `file` | `sys_enter_openat` (write opens) | files written — **opt-in** (`A3S_OBSERVER_FILES=1`; high-volume) |
 
-Extensions (trait, swappable, degrade gracefully):
-- `IdentityResolver` — k8s (cgroup→pod) / bare host (`/proc` comm+ppid), with an in-kernel
-  `comm` fallback so short-lived processes are still attributed
-- `ServiceClassifier` — SNI → `Provider` (14 LLM providers)
-- `Exporter` — NDJSON / human log → OpenTelemetry Collector (see below)
-- *(opt-in)* `Policy` — **intervention**: deny egress (`cgroup/connect4`) by an external
-  policy, implemented in-process or by an out-of-process controller; the observe-only core is
-  never affected. See [enforcement](docs/enforcement.md)
-- *(deferred, opt-in)* TLS-payload provider — for model/tokens/prompt, per TLS library
+Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+ppid, or an
+in-kernel `comm` fallback for short-lived processes) and a `(pid,fd)→peer` **correlation**,
+then exports **NDJSON** (or a human-readable log).
 
-## a3s-box note
+## Intervene (opt-in)
 
-Each box is a separate guest kernel, so **host-side eBPF can't see guest syscalls**
-(exec/file). The **network layer** works host-side (box egress flows through the host
-net path → SNI/flow). **file/exec inside a box need in-guest eBPF** (guest kernel built
-with BPF + collector in-guest) — phase 2.
+The same vantage point can enforce an **external** policy: the policy lives outside the binary
+(a plain file any controller can write), and the kernel asks a guard allow/deny per action.
+The observe-only core is untouched.
 
-## Status
+| guard | mechanism | denies |
+|---|---|---|
+| `a3s-observer-enforce` | `cgroup/connect4` eBPF | egress to policy IPs/hosts — **cgroup-scoped**, fail-open |
+| `a3s-observer-fileguard` | fanotify `FAN_OPEN_PERM` | `open()` of policy-listed files |
 
-Implemented + validated on Linux 6.8 (language-agnostic kernel hooks, no uprobes):
+Both KVM-validated: a denied connect / file-open returns `EPERM`, everything else is
+untouched. Drive it in-process (the `Policy` trait) or out-of-process — `scripts/example-controller.py`
+turns observed events into a deny-list. See [`docs/enforcement.md`](docs/enforcement.md).
 
-- **Probes:** `exec`, `file` (writes), `connect`, TLS-`SNI`, `dns`
-  (`sendto`/`sendmsg`/`sendmmsg`), and per-socket LLM metrics (req/resp bytes, latency, TTFT).
-- **Identity:** k8s cgroup→pod, `/proc` comm+ppid, in-kernel `comm` fallback.
-- **Correlation:** `(pid,fd)→peer`. **Export:** NDJSON / log → OTel Collector.
-- **Enforcement (opt-in intervention):** `Policy` contract + `cgroup/connect4` egress guard +
-  `a3s-observer-enforce` (applies an external policy file) + a worked external controller
-  (`scripts/example-controller.py`). Interface implemented + demonstrated end-to-end in
-  userspace; **live kernel-block validation pending a non-prod box** (never the shared prod
-  node). See [`docs/enforcement.md`](docs/enforcement.md).
+## Why eBPF, and the boundary
 
-Roadmap: validate enforcement (egress + LSM file-deny) on a non-prod box, then tag v0.3.0;
-opt-in SSL-payload extension (prompt/response *content*, per TLS library — needs uprobes, so
-not language-agnostic); in-guest probes for a3s-box MicroVMs (phase 2).
-
-Stack: Rust + [Aya](https://aya-rs.dev). Probes in `a3s-observer-ebpf`; shared kernel/user
-types in `a3s-observer-common`.
+- **Zero-instrumentation, language-agnostic** — observe or guard any agent
+  (Python/Node/Go/Rust) without touching its code, including its tool subprocesses.
+- **Sees what the app won't report** — real execs, file I/O, network egress.
+- **Kernel hooks only, no uprobes.** The deliberate trade-off: **no LLM prompt / model name /
+  token / completion content** — that needs an opt-in per-TLS-library uprobe extension, kept
+  out of the universal core. (ECH will eventually hide SNI → fall back to IP/DNS.)
+- **a3s-box:** a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
+  flows through the host net path) but not in-guest exec/file — those need an in-guest
+  collector (phase 2).
 
 ## Build & run
 
-The eBPF crate needs nightly + `rust-src` + [`bpf-linker`](https://github.com/aya-rs/bpf-linker)
-(which borrows rustc's bundled LLVM — **no system LLVM required**):
+eBPF needs nightly + `rust-src` + [`bpf-linker`](https://github.com/aya-rs/bpf-linker)
+(it borrows rustc's bundled LLVM — no system LLVM required):
 
 ```bash
 rustup toolchain install nightly --component rust-src
 cargo install bpf-linker
+cargo build --release -p a3s-observer-collector    # build.rs compiles + links the eBPF
 
-# build.rs compiles the eBPF crate to BPF bytecode and links it into the collector
-cargo build --release -p a3s-observer-collector
-
-# run it (Linux only; needs root / CAP_BPF + CAP_PERFMON)
 sudo ./target/release/a3s-observer-collector                          # human-readable log
-A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON (pipe to vector/Loki/jq)
-
-# file-write capture is off by default (openat is high-volume on busy nodes); opt in with:
-A3S_OBSERVER_FILES=1 A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector
+A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON
+A3S_OBSERVER_FILES=1 A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector  # + file writes
 ```
 
-Each event names the agent (process / k8s pod), the tool or LLM provider, and the peer.
+Linux only; needs root (CAP_BPF + CAP_PERFMON).
 
-Workspace:
+## Deploy
+
+a3s-observer captures and emits NDJSON; shipping it (batch / retry / route to a backend) is
+the OpenTelemetry Collector's job, so in-process OTLP is intentionally **not** built:
+
+```
+a3s-observer  →  NDJSON  →  OTel Collector (filelog → OTLP)  →  your backend
+```
+
+- Collector config: [`deploy/otel-collector.yaml`](deploy/otel-collector.yaml). Every event
+  is one valid-JSON line, so it also drops into vector / Loki / `jq`.
+- **Kubernetes:** CI publishes `ghcr.io/a3s-lab/observer:<tag>` on each tag
+  ([`image.yml`](.github/workflows/image.yml) from [`deploy/Dockerfile`](deploy/Dockerfile));
+  deploy [`deploy/daemonset.yaml`](deploy/daemonset.yaml) (NDJSON to stdout, pod identity from
+  `/proc/<pid>/cgroup` — no k8s API/RBAC). Mirror the image to a cluster-local registry for
+  nodes that can't reach ghcr.io.
+
+## Workspace
 
 | crate | role |
 |---|---|
-| `a3s-observer` | contracts + data model (`IdentityResolver` / `ServiceClassifier` / `Exporter`) — host-buildable |
-| `a3s-observer-common` | `no_std` types shared with eBPF |
-| `a3s-observer-ebpf` | the probes, compiled to BPF bytecode |
-| `a3s-observer-collector` | loader + correlation + export |
+| `a3s-observer` | contracts + data model (`IdentityResolver` / `ServiceClassifier` / `Exporter` / `Policy`) — host-buildable |
+| `a3s-observer-common` | `no_std` types shared with the eBPF probes |
+| `a3s-observer-ebpf` | the probes + egress guard, compiled to BPF bytecode |
+| `a3s-observer-collector` | loader, correlation, export; plus the `enforce` and `fileguard` binaries |
 
-## Export to OpenTelemetry
-
-a3s-observer stays lean: it captures and emits NDJSON. Shipping telemetry — batching,
-retry, routing to a backend — is the OpenTelemetry Collector's job, not a privileged
-kernel-tracing tool's. So the production pipeline is:
-
-```
-capture (a3s-observer)  →  NDJSON  →  OTel Collector (filelog → OTLP)  →  your backend
-```
-
-A ready Collector config is in [`deploy/otel-collector.yaml`](deploy/otel-collector.yaml):
-
-```bash
-A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector >> /var/log/a3s-observer.ndjson
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otlp-backend:4317 \
-    otelcol-contrib --config deploy/otel-collector.yaml
-```
-
-Every event is one valid-JSON line (verified: the `filelog` receiver's `json_parser`
-ingests them directly), so a3s-observer also drops straight into vector / Loki / `jq`.
-
-**Kubernetes:** CI publishes the image to **`ghcr.io/a3s-lab/observer:<ver>`** on each tag
-([`.github/workflows/image.yml`](.github/workflows/image.yml), built from
-[`deploy/Dockerfile`](deploy/Dockerfile)); mirror/promote it to a cluster-local registry for
-nodes that can't reach `ghcr.io`. Then deploy [`deploy/daemonset.yaml`](deploy/daemonset.yaml)
-(NDJSON to stdout); a node-level OTel Collector DaemonSet tails the container log. No k8s
-API/RBAC needed — pod identity comes from `/proc/<pid>/cgroup`. This keeps the always-on probe binary minimal and
-decoupled from backend availability; in-process OTLP push is intentionally **not** built —
-that's the Collector's job.
+Rust + [Aya](https://aya-rs.dev).
 
 ## License
 
