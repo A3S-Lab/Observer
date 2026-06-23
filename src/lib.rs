@@ -9,9 +9,9 @@
 //! any agent runtime. Trade-off: no LLM prompt / model / exact-token visibility — that
 //! needs an opt-in TLS-payload extension. See the README for the full design.
 //!
-//! This crate currently defines the stable contracts ([`IdentityResolver`],
-//! [`ServiceClassifier`], [`Exporter`]) and the data [`model`]. The eBPF probe set (Aya)
-//! is the next milestone.
+//! This crate defines the stable contracts ([`IdentityResolver`], [`ServiceClassifier`],
+//! [`Exporter`]) and the data [`model`]; the eBPF probes live in `a3s-observer-ebpf` and
+//! the collector that loads them in `a3s-observer-collector`.
 
 pub mod model;
 pub mod traits;

@@ -70,3 +70,17 @@ pub struct FileEvent {
     pub flags: u32,
     pub path: [u8; PATH_SNAP_LEN],
 }
+
+/// Metrics for one LLM call, emitted when its TLS socket closes. Bytes/timing are
+/// accumulated in-kernel per `(pid,fd)`; userspace joins this with the SNI/provider/peer it
+/// recorded at ClientHello time to build the full `LlmCall`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LlmEvent {
+    pub pid: u32,
+    pub fd: u32,
+    pub req_bytes: u64,  // bytes written after ClientHello (approx request size)
+    pub resp_bytes: u64, // bytes read back (approx response size)
+    pub latency_ns: u64, // ClientHello → close
+    pub ttft_ns: u64,    // ClientHello → first response byte; 0 = no response seen
+}

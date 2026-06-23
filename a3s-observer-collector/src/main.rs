@@ -8,13 +8,14 @@
 
 use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
-    LogExporter, ServiceClassifier, SniClassifier,
+    LogExporter, Provider, ServiceClassifier, SniClassifier,
 };
-use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, TlsEvent};
+use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +33,11 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
     attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
+    attach(&mut ebpf, "read_enter", "syscalls", "sys_enter_read")?;
+    attach(&mut ebpf, "recv_enter", "syscalls", "sys_enter_recvfrom")?;
+    attach(&mut ebpf, "read_exit", "syscalls", "sys_exit_read")?;
+    attach(&mut ebpf, "recv_exit", "syscalls", "sys_exit_recvfrom")?;
+    attach(&mut ebpf, "sock_close", "syscalls", "sys_enter_close")?;
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
@@ -43,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
     let resolver = KubeResolver; // cgroup→pod in k8s; falls back to comm on bare hosts
                                  // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
     let mut peers: HashMap<u64, IpAddr> = HashMap::new();
+    // (pid,fd) -> (sni, provider, peer): recorded at ClientHello, read when the socket
+    // closes (the in-kernel LlmEvent) to build the metric-bearing LlmCall.
+    let mut llm_meta: HashMap<u64, (Option<String>, Option<Provider>, IpAddr)> = HashMap::new();
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
     let mut tls_ring = RingBuf::try_from(
         ebpf.take_map("TLS_EVENTS")
@@ -60,9 +69,13 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("FILE_EVENTS")
             .context("`FILE_EVENTS` missing")?,
     )?;
+    let mut llm_ring = RingBuf::try_from(
+        ebpf.take_map("LLM_EVENTS")
+            .context("`LLM_EVENTS` missing")?,
+    )?;
 
     tracing::info!(
-        "a3s-observer-collector: exec + TLS-SNI + connect + dns + file probes attached; streaming (Ctrl-C to stop)"
+        "a3s-observer-collector: exec + TLS-SNI + connect + dns + file + LLM-metrics probes attached; streaming (Ctrl-C to stop)"
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -116,6 +129,12 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap_or(UNKNOWN_PEER);
                         let provider =
                             sni.as_deref().and_then(|h| classifier.classify(Some(h), peer));
+                        // Remember the call so the close event can build a metric-bearing
+                        // LlmCall. Bounded; entries are normally removed on close.
+                        if llm_meta.len() > 16384 {
+                            llm_meta.clear(); // ponytail: crude cap; LRU if it ever matters
+                        }
+                        llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         exporter.export(&EnrichedEvent {
                             identity: resolver.resolve(ev.pid, 0, 0),
                             provider,
@@ -153,6 +172,32 @@ async fn main() -> anyhow::Result<()> {
                                     write: ev.flags & 0x3 != 0,
                                 },
                             });
+                        }
+                    }
+                }
+                while let Some(item) = llm_ring.next() {
+                    if let Some(ev) = read_pod::<LlmEvent>(&item) {
+                        // Join the kernel's byte/timing metrics with the SNI/provider/peer
+                        // recorded at ClientHello. Only provider-identified calls → LlmCall.
+                        if let Some((sni, provider, peer)) =
+                            llm_meta.remove(&sock_key(ev.pid, ev.fd))
+                        {
+                            if provider.is_some() {
+                                exporter.export(&EnrichedEvent {
+                                    identity: resolver.resolve(ev.pid, 0, 0),
+                                    provider,
+                                    event: AgentEvent::LlmCall {
+                                        pid: ev.pid,
+                                        sni,
+                                        peer,
+                                        req_bytes: ev.req_bytes,
+                                        resp_bytes: ev.resp_bytes,
+                                        latency: Duration::from_nanos(ev.latency_ns),
+                                        ttft: (ev.ttft_ns > 0)
+                                            .then(|| Duration::from_nanos(ev.ttft_ns)),
+                                    },
+                                });
+                            }
                         }
                     }
                 }
