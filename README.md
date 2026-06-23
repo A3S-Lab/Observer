@@ -60,6 +60,9 @@ Extensions (trait, swappable, degrade gracefully):
   `comm` fallback so short-lived processes are still attributed
 - `ServiceClassifier` — SNI → `Provider` (14 LLM providers)
 - `Exporter` — NDJSON / human log → OpenTelemetry Collector (see below)
+- *(opt-in)* `Policy` — **intervention**: deny egress (`cgroup/connect4`) by an external
+  policy, implemented in-process or by an out-of-process controller; the observe-only core is
+  never affected. See [enforcement](docs/enforcement.md)
 - *(deferred, opt-in)* TLS-payload provider — for model/tokens/prompt, per TLS library
 
 ## a3s-box note
@@ -77,9 +80,15 @@ Implemented + validated on Linux 6.8 (language-agnostic kernel hooks, no uprobes
   (`sendto`/`sendmsg`/`sendmmsg`), and per-socket LLM metrics (req/resp bytes, latency, TTFT).
 - **Identity:** k8s cgroup→pod, `/proc` comm+ppid, in-kernel `comm` fallback.
 - **Correlation:** `(pid,fd)→peer`. **Export:** NDJSON / log → OTel Collector.
+- **Enforcement (opt-in intervention):** `Policy` contract + `cgroup/connect4` egress guard +
+  `a3s-observer-enforce` (applies an external policy file) + a worked external controller
+  (`scripts/example-controller.py`). Interface implemented + demonstrated end-to-end in
+  userspace; **live kernel-block validation pending a non-prod box** (never the shared prod
+  node). See [`docs/enforcement.md`](docs/enforcement.md).
 
-Roadmap: opt-in SSL-payload extension (prompt/response *content*, per TLS library — needs
-uprobes, so not language-agnostic); in-guest probes for a3s-box MicroVMs (phase 2).
+Roadmap: validate enforcement (egress + LSM file-deny) on a non-prod box, then tag v0.3.0;
+opt-in SSL-payload extension (prompt/response *content*, per TLS library — needs uprobes, so
+not language-agnostic); in-guest probes for a3s-box MicroVMs (phase 2).
 
 Stack: Rust + [Aya](https://aya-rs.dev). Probes in `a3s-observer-ebpf`; shared kernel/user
 types in `a3s-observer-common`.
