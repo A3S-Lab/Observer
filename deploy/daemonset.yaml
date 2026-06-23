@@ -21,10 +21,11 @@ spec:
       hostPID: true # resolve /proc/<pid> for host processes (identity)
       containers:
         - name: a3s-observer
-          image: <registry>/a3s-observer:0.2.0 # built from deploy/Dockerfile
+          image: 10.12.111.133:49164/a3s/observer:0.2.4 # A3S OCI Registry (built from deploy/Dockerfile)
           securityContext:
-            # eBPF load + tracepoint attach. On kernels ≥5.8 you can drop `privileged` and
-            # use capabilities: [BPF, PERFMON, SYS_RESOURCE] instead.
+            # eBPF load + tracepoint attach requires privileged. (Verified: a non-root
+            # process with only CAP_BPF+CAP_PERFMON fails to attach — the tracefs tracepoint
+            # ids are root-gated. Root + those caps may suffice in a tuned environment.)
             privileged: true
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
