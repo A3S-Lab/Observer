@@ -2,6 +2,14 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.2.4] — clean shutdown (k8s lifecycle)
+
+### Changed
+
+- Handle **SIGTERM** (not just SIGINT) so a Kubernetes DaemonSet pod shuts down cleanly on
+  termination instead of being SIGKILLed after the grace period; flush a final throughput
+  report on exit. Validated on KVM: SIGTERM → exit 0 + final-window log.
+
 ## [0.2.3] — data-loss visibility
 
 ### Added

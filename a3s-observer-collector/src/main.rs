@@ -113,12 +113,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut stats = Stats::default();
     let mut report = tokio::time::interval(Duration::from_secs(60));
     report.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
+            _ = sigterm.recv() => break, // k8s sends SIGTERM on pod termination
             _ = report.tick() => {
                 let dropped: u64 = drops
                     .get(&0, 0)
@@ -259,7 +261,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    tracing::info!("a3s-observer-collector: stopped");
+    tracing::info!(
+        exec = stats.exec,
+        egress = stats.egress,
+        dns = stats.dns,
+        file = stats.file,
+        llm = stats.llm,
+        "a3s-observer-collector: stopped (final window)"
+    );
     Ok(())
 }
 
