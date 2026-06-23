@@ -9,7 +9,39 @@ deny an agent's egress or file access from an external policy.
 Built and validated on Linux 6.8 (Aya, no uprobes). Observe-only by default; intervention is
 opt-in and never affects the observe path.
 
-## What it captures
+## Architecture
+
+A **minimal core** — probes → loader → identity → correlation → export — with everything else a
+swappable trait. Two paths share one kernel vantage point: **observe** is always-on and passive;
+**intervene** is opt-in and isolated, so a policy mistake can never break observability.
+
+```
+  AI agent + its tool subprocesses                       unmodified · any language
+              │
+              │  execve · connect · TLS ClientHello · DNS · openat · read / recv
+  ════════════╪══════════════════════════════════════════════  KERNEL · eBPF (no uprobes)
+              ▼
+    OBSERVE  (passive, always on)               INTERVENE  (opt-in)
+      exec   connect   sni   dns                  connect4 egress guard  (cgroup-scoped)
+      llm-metrics      file                       fanotify  file guard
+              │                                            ▲
+              │  ring buffers                              │  allow / DENY → EPERM
+  ════════════╪═════════════════════════════════════════════╪═══════════  USERSPACE
+              ▼                                              │
+    a3s-observer-collector  (Aya)                 a3s-observer-enforce · fileguard
+      · identity    k8s pod / proc / comm                   ▲
+      · correlate   (pid,fd) → peer                         │  reads
+      · export      NDJSON / human log             external policy file
+              │                                    (your controller · OPA · a script)
+              ▼
+    OTel Collector  →  your backend
+```
+
+The four core pieces — **probes** (language-agnostic kernel hooks), **identity** (attribute an
+event to an agent), **correlation** (fuse provider + endpoint), **export** (NDJSON) — plus the
+opt-in **guards**, are detailed below.
+
+## Observe — who / what / where
 
 One event answers **who / what / where**: who (process or k8s pod), what (tool, file, or LLM
 provider + bytes/latency/TTFT), where (peer IP / hostname).
