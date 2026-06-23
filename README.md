@@ -5,10 +5,13 @@ kernel-level events into semantic agent telemetry — which agent made which LLM
 ran which tools, touched which files, reached which endpoints — **with zero changes to
 the agent, across languages**.
 
-> **Status: first probe working end-to-end.** Stable contracts + data model + a bpftrace
-> PoC, and the first Aya probe: `execve` → eBPF → ring buffer → `Exporter` builds and runs
-> on Linux (kernel 6.8, bpf-linker 0.10, nightly `build-std`). SNI / flow / DNS probes +
-> correlation are next — see [v1 plan](#v1-plan).
+> **Status: working collector.** Three eBPF probes — `exec` + TLS-`SNI` + `connect` —
+> stream to ring buffers, enriched in userspace with identity (`/proc`) and a
+> `(pid,fd)→peer` correlation, then exported as NDJSON (or human log). A single event
+> captures **who** (process), **what** (LLM provider), and **where** (peer) for a call.
+> Built + validated on Linux (kernel 6.8, bpf-linker 0.10, nightly `build-std`). Additive
+> next: OTLP export, k8s identity, DNS, byte/latency metrics, opt-in SSL-payload — see
+> [v1 plan](#v1-plan).
 
 ## Why eBPF (not an SDK / OTel)
 
