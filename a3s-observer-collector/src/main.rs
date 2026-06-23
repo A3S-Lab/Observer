@@ -1,50 +1,49 @@
-//! a3s-observer collector — loads the eBPF probes, pumps the ring buffer, and emits
-//! enriched events through the [`Exporter`] contract. This is the exec-probe vertical
-//! slice: it proves the Aya toolchain + loader + ring buffer end to end.
+//! a3s-observer collector — loads the eBPF probes, pumps the ring buffers, and emits
+//! enriched events through the [`Exporter`] contract.
+//!
+//! Probes wired so far: `exec` (tools/subprocesses) and `tls_*` (TLS ClientHello → SNI →
+//! provider). Identity resolution + OTel export are the next milestones.
 
-use a3s_observer::{AgentEvent, EnrichedEvent, Exporter, Identity, LogExporter};
-use a3s_observer_common::ExecEvent;
+use a3s_observer::{
+    AgentEvent, EnrichedEvent, Exporter, Identity, LogExporter, ServiceClassifier, SniClassifier,
+};
+use a3s_observer_common::{ExecEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
+use std::net::{IpAddr, Ipv4Addr};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // The eBPF object is built by build.rs (aya-build) into OUT_DIR.
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/probes"
     )))
     .context("load eBPF object")?;
 
-    let prog: &mut TracePoint = ebpf
-        .program_mut("exec")
-        .context("`exec` program not found in object")?
-        .try_into()?;
-    prog.load()?;
-    prog.attach("syscalls", "sys_enter_execve")
-        .context("attach sys_enter_execve")?;
+    attach(&mut ebpf, "exec", "syscalls", "sys_enter_execve")?;
+    attach(&mut ebpf, "tls_write", "syscalls", "sys_enter_write")?;
+    attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
 
-    // ponytail: LogExporter + default identity for the slice; OtelExporter +
-    // pid-tree/k8s IdentityResolver land in task #6.
     let exporter = LogExporter;
-    let mut ring =
-        RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` map not found")?)?;
+    let classifier = SniClassifier;
+    let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
+    let mut tls_ring =
+        RingBuf::try_from(ebpf.take_map("TLS_EVENTS").context("`TLS_EVENTS` missing")?)?;
 
-    tracing::info!("a3s-observer-collector: exec probe attached; streaming (Ctrl-C to stop)");
+    tracing::info!(
+        "a3s-observer-collector: exec + TLS-SNI probes attached; streaming (Ctrl-C to stop)"
+    );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
-            // ponytail: poll loop; a production collector uses AsyncFd on the ring fd.
+            // ponytail: poll loop; AsyncFd on the ring fds is the production form.
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                while let Some(item) = ring.next() {
-                    let bytes: &[u8] = &item;
-                    if bytes.len() >= core::mem::size_of::<ExecEvent>() {
-                        let ev: ExecEvent =
-                            unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const ExecEvent) };
+                while let Some(item) = exec_ring.next() {
+                    if let Some(ev) = read_pod::<ExecEvent>(&item) {
                         exporter.export(&EnrichedEvent {
                             identity: Identity::default(),
                             provider: None,
@@ -57,15 +56,111 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                 }
+                while let Some(item) = tls_ring.next() {
+                    if let Some(ev) = read_pod::<TlsEvent>(&item) {
+                        let len = (ev.len as usize).min(ev.data.len());
+                        let sni = parse_sni(&ev.data[..len]);
+                        let provider = sni
+                            .as_deref()
+                            .and_then(|h| classifier.classify(Some(h), UNKNOWN_PEER));
+                        exporter.export(&EnrichedEvent {
+                            identity: Identity::default(),
+                            provider,
+                            event: AgentEvent::Egress {
+                                pid: ev.pid,
+                                sni,
+                                peer: UNKNOWN_PEER,
+                                bytes: ev.len as u64,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
-
     tracing::info!("a3s-observer-collector: stopped");
     Ok(())
+}
+
+// ponytail: peer IP arrives with the flow probe (#5); SNI alone identifies the provider.
+const UNKNOWN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+fn attach(ebpf: &mut Ebpf, prog: &str, category: &str, name: &str) -> anyhow::Result<()> {
+    let p: &mut TracePoint = ebpf
+        .program_mut(prog)
+        .with_context(|| format!("`{prog}` program not found"))?
+        .try_into()?;
+    p.load()?;
+    p.attach(category, name)
+        .with_context(|| format!("attach {category}:{name}"))?;
+    Ok(())
+}
+
+fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
+    (item.len() >= core::mem::size_of::<T>())
+        .then(|| unsafe { core::ptr::read_unaligned(item.as_ptr() as *const T) })
 }
 
 fn argv_of(filename: &[u8; 128]) -> Vec<String> {
     let end = filename.iter().position(|&b| b == 0).unwrap_or(filename.len());
     vec![String::from_utf8_lossy(&filename[..end]).into_owned()]
+}
+
+/// Extract the SNI `server_name` from a TLS ClientHello record. Fully bounds-checked
+/// (any malformed/truncated input returns `None`).
+fn parse_sni(buf: &[u8]) -> Option<String> {
+    // record(5) + handshake(4) + client_version(2) + random(32) = 43
+    let mut p = 43usize;
+    p += 1 + *buf.get(p)? as usize; // session_id: len(1) + id
+    p += 2 + be16(buf, p)? as usize; // cipher_suites: len(2) + suites
+    p += 1 + *buf.get(p)? as usize; // compression: len(1) + methods
+    p += 2; // extensions: total len(2)
+    while p + 4 <= buf.len() {
+        let ext_type = be16(buf, p)?;
+        let ext_len = be16(buf, p + 2)? as usize;
+        p += 4;
+        if ext_type == 0x0000 {
+            // server_name: list_len(2) + name_type(1) + name_len(2) + name
+            let name_len = be16(buf, p + 3)? as usize;
+            let start = p + 5;
+            let name = buf.get(start..start.checked_add(name_len)?)?;
+            return core::str::from_utf8(name).ok().map(str::to_owned);
+        }
+        p = p.checked_add(ext_len)?;
+    }
+    None
+}
+
+fn be16(buf: &[u8], i: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sni;
+
+    #[test]
+    fn parses_sni_from_minimal_clienthello() {
+        let mut b = vec![0x16, 0x03, 0x01, 0x00, 0x00]; // record header
+        b.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // handshake header
+        b.extend_from_slice(&[0x03, 0x03]); // client_version
+        b.extend_from_slice(&[0u8; 32]); // random
+        b.push(0x00); // session_id len 0
+        b.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: len 2 + 1 suite
+        b.extend_from_slice(&[0x01, 0x00]); // compression: len 1 + null
+        b.extend_from_slice(&[0x00, 0x11]); // extensions total len 17
+        b.extend_from_slice(&[0x00, 0x00]); // ext type: server_name
+        b.extend_from_slice(&[0x00, 0x0d]); // ext len 13
+        b.extend_from_slice(&[0x00, 0x0b]); // server_name_list len 11
+        b.push(0x00); // name_type host_name
+        b.extend_from_slice(&[0x00, 0x08]); // name len 8
+        b.extend_from_slice(b"test.com");
+        assert_eq!(parse_sni(&b).as_deref(), Some("test.com"));
+    }
+
+    #[test]
+    fn rejects_truncated_or_garbage() {
+        assert_eq!(parse_sni(&[0u8; 8]), None);
+        assert_eq!(parse_sni(&[]), None);
+    }
 }

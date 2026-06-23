@@ -17,3 +17,19 @@ pub struct ExecEvent {
     pub comm: [u8; 16],
     pub filename: [u8; 128],
 }
+
+/// The leading bytes of an outbound TLS ClientHello, captured at the send syscall.
+///
+/// The eBPF side only detects + copies (verifier-friendly); userspace parses the SNI
+/// `server_name` out of `data[..len]` — language-agnostic LLM-provider identification
+/// with no per-language uprobe.
+pub const TLS_SNAP_LEN: usize = 512;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsEvent {
+    pub pid: u32,
+    pub len: u16,
+    pub _pad: u16,
+    pub data: [u8; TLS_SNAP_LEN],
+}
