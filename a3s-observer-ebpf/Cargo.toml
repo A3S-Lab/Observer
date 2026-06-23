@@ -1,0 +1,16 @@
+[package]
+name = "a3s-observer-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+a3s-observer-common = { path = "../a3s-observer-common" }
+
+# Bin name differs from the package name so aya-build's target-dir
+# (OUT_DIR/<package>) and copy destination (OUT_DIR/<bin>) don't collide.
+[[bin]]
+name = "probes"
+path = "src/main.rs"

@@ -1,0 +1,19 @@
+//! Compiles the sibling `a3s-observer-ebpf` crate to BPF bytecode (via bpf-linker, on
+//! the nightly toolchain) and places the object in OUT_DIR for the loader to
+//! `include_bytes_aligned!`.
+use aya_build::{Package, Toolchain};
+
+fn main() -> anyhow::Result<()> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let ebpf_dir = format!("{manifest_dir}/../a3s-observer-ebpf");
+    aya_build::build_ebpf(
+        [Package {
+            name: "a3s-observer-ebpf",
+            root_dir: &ebpf_dir,
+            no_default_features: false,
+            features: &[],
+        }],
+        Toolchain::default(), // Nightly
+    )?;
+    Ok(())
+}

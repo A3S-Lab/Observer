@@ -1,0 +1,23 @@
+[package]
+name = "a3s-observer-collector"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "a3s-observer collector: loads the eBPF probes and exports enriched events."
+
+[dependencies]
+a3s-observer = { path = ".." }
+a3s-observer-common = { path = "../a3s-observer-common" }
+aya = "0.13"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+aya-build = "0.1"
+anyhow = "1"
+
+[[bin]]
+name = "a3s-observer-collector"
+path = "src/main.rs"

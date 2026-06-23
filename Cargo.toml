@@ -6,5 +6,14 @@ license = "MIT"
 description = "General-purpose, language-agnostic eBPF observability for AI agents (LLM calls, tools, files, network egress)."
 repository = "https://github.com/A3S-Lab/Observer"
 
+# Root crate = the light, language-agnostic contracts/model (builds anywhere).
+# The eBPF/aya code lives in the collector + ebpf member crates (Linux-only).
+[workspace]
+members = ["a3s-observer-common", "a3s-observer-collector", "a3s-observer-ebpf"]
+# ebpf is a member so aya-build's `cargo build --package a3s-observer-ebpf` resolves,
+# but it's kept out of default-members so a host `cargo build` never tries to compile
+# the bpf-only crate for the host target.
+default-members = ["a3s-observer-common", "a3s-observer-collector"]
+
 [dependencies]
 tracing = "0.1"

@@ -1,0 +1,9 @@
+[package]
+name = "a3s-observer-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared no_std types crossing the eBPF <-> userspace boundary for a3s-observer."
+
+[dependencies]
+# none — pure no_std plain-old-data shared with the eBPF programs.
