@@ -54,6 +54,7 @@ provider + bytes/latency/TTFT), where (peer IP / hostname).
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | resolved hostnames |
 | LLM metrics | per-socket `read` / `recv` + `close` | req/resp wire bytes, latency, TTFT |
 | `file` | `sys_enter_openat` (write opens) | files written — **opt-in** (`A3S_OBSERVER_FILES=1`; high-volume) |
+| `ssl` content | uprobes on OpenSSL `SSL_write` / `SSL_read` | request/response **plaintext** (prompt/completion) — **opt-in** (`A3S_OBSERVER_SSL=1`; OpenSSL-only, not language-agnostic) |
 
 Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+ppid, or an
 in-kernel `comm` fallback for short-lived processes) and a `(pid,fd)→peer` **correlation**,
@@ -79,9 +80,11 @@ turns observed events into a deny-list. See [`docs/enforcement.md`](docs/enforce
 - **Zero-instrumentation, language-agnostic** — observe or guard any agent
   (Python/Node/Go/Rust) without touching its code, including its tool subprocesses.
 - **Sees what the app won't report** — real execs, file I/O, network egress.
-- **Kernel hooks only, no uprobes.** The deliberate trade-off: **no LLM prompt / model name /
-  token / completion content** — that needs an opt-in per-TLS-library uprobe extension, kept
-  out of the universal core. (ECH will eventually hide SNI → fall back to IP/DNS.)
+- **Kernel hooks only in the always-on core, no uprobes.** The deliberate trade-off: the core
+  gives **no LLM prompt / completion content**. That content *is* available via an **opt-in**
+  OpenSSL uprobe extension (`A3S_OBSERVER_SSL=1`) that captures `SSL_write`/`SSL_read`
+  plaintext — kept out of the core because a uprobe binds to a library symbol, so it's OpenSSL
+  only, not language-agnostic. (ECH will eventually hide SNI → fall back to IP/DNS.)
 - **a3s-box:** a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
   flows through the host net path) but not in-guest exec/file — those need an in-guest
   collector (phase 2).
