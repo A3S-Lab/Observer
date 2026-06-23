@@ -1,0 +1,18 @@
+#!/usr/bin/env bpftrace
+/*
+ * a3s-observer PoC: language-agnostic tool / subprocess capture.
+ *
+ * Every execve is a tool the agent (or one of its tools) ran — captured at the
+ * syscall layer, so it works for ANY runtime (Python/Node/Go/Rust) with zero
+ * per-language instrumentation. This is the `exec` probe from the design.
+ *
+ *   sudo bpftrace poc/exec.bt
+ *
+ * On a shared/noisy host, scope it, e.g.  /comm == "node"/  or by uid, or (as in
+ * the PoC validation) a filename allowlist so you don't dump unrelated processes.
+ */
+tracepoint:syscalls:sys_enter_execve
+{
+    printf("EXEC pid=%-7d ppid=%-7d comm=%-16s | ", pid, curtask->real_parent->tgid, comm);
+    join(args->argv);
+}

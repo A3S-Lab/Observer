@@ -1,0 +1,44 @@
+#!/usr/bin/env bpftrace
+/*
+ * a3s-observer PoC: language-agnostic LLM-provider identification via TLS SNI.
+ *
+ * Detects the TLS ClientHello on the outbound write/sendto syscall (record type
+ * 0x16 "handshake", TLS major 0x03, handshake type 0x01 "ClientHello") and dumps
+ * the leading bytes. The SNI `server_name` is plaintext ASCII inside the
+ * ClientHello (e.g. "api.openai.com"), so it is recoverable with NO per-language
+ * uprobe — works for any runtime. The robust in-kernel SNI parse is the Aya
+ * implementation's job; this PoC proves the bytes are there at the syscall layer.
+ *
+ *   BPFTRACE_MAX_STRLEN=200 sudo -E bpftrace poc/sni.bt
+ *
+ * NOTE: bpftrace stores strings/buf on the 512-byte BPF stack, so buf() caps at
+ * ~200 bytes. SNI usually lands within that window, but a large ClientHello can
+ * push it past 200B. This is a *bpftrace* limit, not an eBPF one: the real Aya
+ * probe stages the full record in a per-CPU array / ring buffer (no stack cap)
+ * and parses SNI in-kernel. The PoC's point is only to prove the ClientHello is
+ * visible + parseable at the syscall layer, language-agnostically.
+ *
+ * The /comm == "curl"/ filter scopes capture to the PoC's own test traffic so it
+ * does not dump unrelated TLS on a shared host. Remove/adjust for real use.
+ */
+tracepoint:syscalls:sys_enter_write
+/comm == "curl"/
+{
+    $b = uptr((uint8 *)args->buf);
+    if (args->count > 43 &&
+        *$b == 0x16 && *($b + 1) == 0x03 && *($b + 5) == 0x01) {
+        printf("CLIENTHELLO write  pid=%d comm=%s len=%d\n%r\n\n",
+               pid, comm, args->count, buf($b, 200));
+    }
+}
+
+tracepoint:syscalls:sys_enter_sendto
+/comm == "curl"/
+{
+    $b = uptr((uint8 *)args->buff);
+    if (args->len > 43 &&
+        *$b == 0x16 && *($b + 1) == 0x03 && *($b + 5) == 0x01) {
+        printf("CLIENTHELLO sendto pid=%d comm=%s len=%d\n%r\n\n",
+               pid, comm, args->len, buf($b, 200));
+    }
+}
