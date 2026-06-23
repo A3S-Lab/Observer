@@ -7,10 +7,10 @@
 use a3s_observer::{
     AgentEvent, EnrichedEvent, Exporter, Identity, LogExporter, ServiceClassifier, SniClassifier,
 };
-use a3s_observer_common::{ExecEvent, TlsEvent};
+use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,15 +25,18 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "exec", "syscalls", "sys_enter_execve")?;
     attach(&mut ebpf, "tls_write", "syscalls", "sys_enter_write")?;
     attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
+    attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
 
     let exporter = LogExporter;
     let classifier = SniClassifier;
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
     let mut tls_ring =
         RingBuf::try_from(ebpf.take_map("TLS_EVENTS").context("`TLS_EVENTS` missing")?)?;
+    let mut connect_ring =
+        RingBuf::try_from(ebpf.take_map("CONNECT_EVENTS").context("`CONNECT_EVENTS` missing")?)?;
 
     tracing::info!(
-        "a3s-observer-collector: exec + TLS-SNI probes attached; streaming (Ctrl-C to stop)"
+        "a3s-observer-collector: exec + TLS-SNI + connect probes attached; streaming (Ctrl-C to stop)"
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -75,6 +78,20 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                 }
+                while let Some(item) = connect_ring.next() {
+                    if let Some(ev) = read_pod::<ConnectEvent>(&item) {
+                        exporter.export(&EnrichedEvent {
+                            identity: Identity::default(),
+                            provider: None,
+                            event: AgentEvent::Egress {
+                                pid: ev.pid,
+                                sni: None,
+                                peer: peer_ip(&ev),
+                                bytes: 0,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
@@ -104,6 +121,14 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
 fn argv_of(filename: &[u8; 128]) -> Vec<String> {
     let end = filename.iter().position(|&b| b == 0).unwrap_or(filename.len());
     vec![String::from_utf8_lossy(&filename[..end]).into_owned()]
+}
+
+fn peer_ip(ev: &ConnectEvent) -> IpAddr {
+    if ev.family == 2 {
+        IpAddr::V4(Ipv4Addr::new(ev.addr[0], ev.addr[1], ev.addr[2], ev.addr[3]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(ev.addr))
+    }
 }
 
 /// Extract the SNI `server_name` from a TLS ClientHello record. Fully bounds-checked

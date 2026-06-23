@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use a3s_observer_common::{ExecEvent, TlsEvent, TLS_SNAP_LEN};
+use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent, TLS_SNAP_LEN};
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
     helpers::{
@@ -18,6 +18,9 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+#[map]
+static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // ---- tool / subprocess exec (sys_enter_execve) ----
 
@@ -97,6 +100,51 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
             n,
             buf as *const core::ffi::c_void,
         );
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- outbound connection peer (sys_enter_connect) ----
+
+#[tracepoint]
+pub fn connect(ctx: TracePointContext) -> u32 {
+    try_connect(&ctx).unwrap_or(0)
+}
+
+fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_connect: int fd @16, struct sockaddr *uservaddr @24, int addrlen @32.
+    let addr_ptr: *const u8 = unsafe { ctx.read_at(24)? };
+    let addrlen: u64 = unsafe { ctx.read_at(32)? };
+    if addrlen < 8 {
+        return Ok(0);
+    }
+    let mut fam = [0u8; 2];
+    if unsafe { bpf_probe_read_user_buf(addr_ptr, &mut fam) }.is_err() {
+        return Ok(0);
+    }
+    let family = u16::from_ne_bytes(fam); // sa_family is host-endian
+    if family != 2 && family != 10 {
+        return Ok(0); // only AF_INET / AF_INET6
+    }
+    let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).family = family;
+        let mut port = [0u8; 2];
+        let _ = bpf_probe_read_user_buf(addr_ptr.add(2), &mut port); // sin_port (network order)
+        (*ev).port = u16::from_be_bytes(port);
+        // Read into a local first to avoid an autoref through the raw event pointer.
+        let mut a = [0u8; 16];
+        if family == 2 {
+            let _ = bpf_probe_read_user_buf(addr_ptr.add(4), &mut a[..4]); // sin_addr
+        } else {
+            let _ = bpf_probe_read_user_buf(addr_ptr.add(8), &mut a); // sin6_addr
+        }
+        (*ev).addr = a;
     }
     entry.submit(0);
     Ok(0)

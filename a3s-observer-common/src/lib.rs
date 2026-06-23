@@ -33,3 +33,13 @@ pub struct TlsEvent {
     pub _pad: u16,
     pub data: [u8; TLS_SNAP_LEN],
 }
+
+/// An outbound connection attempt (`sys_enter_connect`): which peer a process dialed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConnectEvent {
+    pub pid: u32,
+    pub family: u16, // AF_INET = 2, AF_INET6 = 10
+    pub port: u16,   // host byte order
+    pub addr: [u8; 16], // IPv4 in [0..4], IPv6 uses all 16
+}
