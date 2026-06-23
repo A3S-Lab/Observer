@@ -12,7 +12,27 @@
 //! syscall. Default is fail-open ([`AllowAll`]): never block unless a policy opts in.
 
 use crate::traits::Identity;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
+
+/// Parse an egress-policy file body — the external interface's input contract. One entry per
+/// line (`#` comments + blank lines ignored); each is either a literal IPv4 or a hostname.
+/// Returns `(literal_ips, hostnames)`; the enforcer resolves the hostnames and denies every
+/// resulting dest IP. Pure + testable (no kernel, no DNS), so the file format is CI-covered.
+pub fn parse_egress_policy(body: &str) -> (Vec<Ipv4Addr>, Vec<String>) {
+    let mut ips = Vec::new();
+    let mut hosts = Vec::new();
+    for line in body.lines() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        match s.parse::<Ipv4Addr>() {
+            Ok(ip) => ips.push(ip),
+            Err(_) => hosts.push(s.to_owned()),
+        }
+    }
+    (ips, hosts)
+}
 
 /// A decision for an action before it happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,5 +94,16 @@ mod tests {
         assert_eq!(p.egress(&id, Some("evil.example.com"), ip), Verdict::Deny);
         // non-egress actions still default to allow
         assert_eq!(p.file_write(&id, "/tmp/x"), Verdict::Allow);
+    }
+
+    #[test]
+    fn parses_egress_policy_file() {
+        let (ips, hosts) =
+            parse_egress_policy("# deny list\n1.1.1.1\n\n  evil.example.com \n8.8.8.8\n");
+        assert_eq!(
+            ips,
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
+        );
+        assert_eq!(hosts, vec!["evil.example.com".to_string()]);
     }
 }

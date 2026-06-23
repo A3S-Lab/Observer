@@ -69,15 +69,11 @@ async fn main() -> anyhow::Result<()> {
 /// IPv4 or a hostname (resolved to its IPv4s) to deny egress to. Replaces the map each time.
 fn apply_policy(deny: &mut BpfHashMap<MapData, u32, u8>, path: &str) -> anyhow::Result<()> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read policy {path}"))?;
-    let mut want: Vec<u32> = Vec::new();
-    for line in body.lines() {
-        let s = line.trim();
-        if s.is_empty() || s.starts_with('#') {
-            continue;
-        }
-        if let Ok(IpAddr::V4(v4)) = s.parse::<IpAddr>() {
-            want.push(u32::from(v4));
-        } else if let Ok(addrs) = (s, 0u16).to_socket_addrs() {
+    // Parsing is the lib's CI-tested contract; the binary only resolves hostnames + DNS.
+    let (ips, hosts) = a3s_observer::parse_egress_policy(&body);
+    let mut want: Vec<u32> = ips.iter().map(|ip| u32::from(*ip)).collect();
+    for h in &hosts {
+        if let Ok(addrs) = (h.as_str(), 0u16).to_socket_addrs() {
             for a in addrs {
                 if let IpAddr::V4(v4) = a.ip() {
                     want.push(u32::from(v4));
