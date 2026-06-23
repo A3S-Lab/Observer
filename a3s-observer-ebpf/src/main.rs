@@ -69,6 +69,7 @@ pub fn tls_sendto(ctx: TracePointContext) -> u32 {
 fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let buf: *const u8 = unsafe { ctx.read_at(24)? };
     let count: u64 = unsafe { ctx.read_at(32)? };
+    let fd: u64 = unsafe { ctx.read_at(16)? };
     if count < 6 {
         return Ok(0);
     }
@@ -86,6 +87,7 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let ev = entry.as_mut_ptr();
     unsafe {
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).fd = fd as u32;
         (*ev)._pad = 0;
         // n <= TLS_SNAP_LEN (= data capacity) and n <= count (= source length).
         let n: u32 = if count > TLS_SNAP_LEN as u64 {
@@ -116,6 +118,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     // sys_enter_connect: int fd @16, struct sockaddr *uservaddr @24, int addrlen @32.
     let addr_ptr: *const u8 = unsafe { ctx.read_at(24)? };
     let addrlen: u64 = unsafe { ctx.read_at(32)? };
+    let fd: u64 = unsafe { ctx.read_at(16)? };
     if addrlen < 8 {
         return Ok(0);
     }
@@ -133,6 +136,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     let ev = entry.as_mut_ptr();
     unsafe {
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).fd = fd as u32;
         (*ev).family = family;
         let mut port = [0u8; 2];
         let _ = bpf_probe_read_user_buf(addr_ptr.add(2), &mut port); // sin_port (network order)

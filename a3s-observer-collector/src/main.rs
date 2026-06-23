@@ -11,6 +11,7 @@ use a3s_observer::{
 use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[tokio::main]
@@ -31,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let exporter = LogExporter;
     let classifier = SniClassifier;
     let resolver = ProcResolver;
+    // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
+    let mut peers: HashMap<u64, IpAddr> = HashMap::new();
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
     let mut tls_ring =
         RingBuf::try_from(ebpf.take_map("TLS_EVENTS").context("`TLS_EVENTS` missing")?)?;
@@ -61,35 +64,45 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                 }
-                while let Some(item) = tls_ring.next() {
-                    if let Some(ev) = read_pod::<TlsEvent>(&item) {
-                        let len = (ev.len as usize).min(ev.data.len());
-                        let sni = parse_sni(&ev.data[..len]);
-                        let provider = sni
-                            .as_deref()
-                            .and_then(|h| classifier.classify(Some(h), UNKNOWN_PEER));
-                        exporter.export(&EnrichedEvent {
-                            identity: resolver.resolve(ev.pid, 0, 0),
-                            provider,
-                            event: AgentEvent::Egress {
-                                pid: ev.pid,
-                                sni,
-                                peer: UNKNOWN_PEER,
-                                bytes: ev.len as u64,
-                            },
-                        });
-                    }
-                }
+                // Drain connect BEFORE tls so a same-poll ClientHello finds its peer.
                 while let Some(item) = connect_ring.next() {
                     if let Some(ev) = read_pod::<ConnectEvent>(&item) {
+                        let peer = peer_ip(&ev);
+                        if peers.len() > 8192 {
+                            peers.clear(); // ponytail: crude cap; LRU if it ever matters
+                        }
+                        peers.insert(sock_key(ev.pid, ev.fd), peer);
                         exporter.export(&EnrichedEvent {
                             identity: resolver.resolve(ev.pid, 0, 0),
                             provider: None,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
                                 sni: None,
-                                peer: peer_ip(&ev),
+                                peer,
                                 bytes: 0,
+                            },
+                        });
+                    }
+                }
+                while let Some(item) = tls_ring.next() {
+                    if let Some(ev) = read_pod::<TlsEvent>(&item) {
+                        let len = (ev.len as usize).min(ev.data.len());
+                        let sni = parse_sni(&ev.data[..len]);
+                        // Correlated peer for this socket (the LLM endpoint).
+                        let peer = peers
+                            .get(&sock_key(ev.pid, ev.fd))
+                            .copied()
+                            .unwrap_or(UNKNOWN_PEER);
+                        let provider =
+                            sni.as_deref().and_then(|h| classifier.classify(Some(h), peer));
+                        exporter.export(&EnrichedEvent {
+                            identity: resolver.resolve(ev.pid, 0, 0),
+                            provider,
+                            event: AgentEvent::Egress {
+                                pid: ev.pid,
+                                sni,
+                                peer,
+                                bytes: ev.len as u64,
                             },
                         });
                     }
@@ -131,6 +144,10 @@ fn peer_ip(ev: &ConnectEvent) -> IpAddr {
     } else {
         IpAddr::V6(Ipv6Addr::from(ev.addr))
     }
+}
+
+fn sock_key(pid: u32, fd: u32) -> u64 {
+    ((pid as u64) << 32) | fd as u64
 }
 
 /// Extract the SNI `server_name` from a TLS ClientHello record. Fully bounds-checked

@@ -29,6 +29,7 @@ pub const TLS_SNAP_LEN: usize = 512;
 #[derive(Clone, Copy)]
 pub struct TlsEvent {
     pub pid: u32,
+    pub fd: u32, // socket fd, for (pid,fd) correlation with ConnectEvent
     pub len: u16,
     pub _pad: u16,
     pub data: [u8; TLS_SNAP_LEN],
@@ -39,6 +40,7 @@ pub struct TlsEvent {
 #[derive(Clone, Copy)]
 pub struct ConnectEvent {
     pub pid: u32,
+    pub fd: u32,     // socket fd, keys the userspace (pid,fd)->peer join
     pub family: u16, // AF_INET = 2, AF_INET6 = 10
     pub port: u16,   // host byte order
     pub addr: [u8; 16], // IPv4 in [0..4], IPv6 uses all 16
