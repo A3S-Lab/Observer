@@ -7,8 +7,8 @@
 //! exports (NDJSON or log). OTLP is a drop-in via the `Exporter` trait.
 
 use a3s_observer::{
-    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
-    LogExporter, Provider, ServiceClassifier, SniClassifier,
+    read_ppid, AgentEvent, EnrichedEvent, Exporter, Identity, IdentityResolver, JsonExporter,
+    KubeResolver, LogExporter, Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, TlsEvent};
 use anyhow::Context as _;
@@ -84,12 +84,14 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
-            // ponytail: poll loop; AsyncFd on the ring fds is the production form.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+            // Drain all rings every 20ms. Adequate for production at moderate volume; the
+            // rings (64-256 KiB) absorb bursts between ticks. For sustained extreme volume,
+            // switch to AsyncFd (epoll) on the ring fds and/or enlarge the rings.
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
                 while let Some(item) = exec_ring.next() {
                     if let Some(ev) = read_pod::<ExecEvent>(&item) {
                         exporter.export(&EnrichedEvent {
-                            identity: resolver.resolve(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider: None,
                             event: AgentEvent::ToolExec {
                                 pid: ev.pid,
@@ -109,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         peers.insert(sock_key(ev.pid, ev.fd), peer);
                         exporter.export(&EnrichedEvent {
-                            identity: resolver.resolve(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider: None,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -138,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         exporter.export(&EnrichedEvent {
-                            identity: resolver.resolve(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -154,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                         let len = (ev.len as usize).min(ev.data.len());
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
                             exporter.export(&EnrichedEvent {
-                                identity: resolver.resolve(ev.pid, 0, 0),
+                                identity: identity_for(&resolver, ev.pid, &ev.comm),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
                             });
@@ -166,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                         let path = cstr(&ev.path);
                         if !path.is_empty() {
                             exporter.export(&EnrichedEvent {
-                                identity: resolver.resolve(ev.pid, 0, 0),
+                                identity: identity_for(&resolver, ev.pid, &ev.comm),
                                 provider: None,
                                 event: AgentEvent::FileAccess {
                                     pid: ev.pid,
@@ -186,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
                         {
                             if provider.is_some() {
                                 exporter.export(&EnrichedEvent {
-                                    identity: resolver.resolve(ev.pid, 0, 0),
+                                    identity: identity_for(&resolver, ev.pid, &ev.comm),
                                     provider,
                                     event: AgentEvent::LlmCall {
                                         pid: ev.pid,
@@ -237,6 +239,19 @@ fn argv_of(filename: &[u8; 128]) -> Vec<String> {
 fn cstr(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Resolve identity, falling back to the in-kernel `comm` when the /proc lookup fails (a
+/// short-lived process that exited before we read it) — so no event is left unattributed.
+fn identity_for(r: &impl IdentityResolver, pid: u32, comm: &[u8; 16]) -> Identity {
+    let mut id = r.resolve(pid, 0, 0);
+    if id.agent.is_none() {
+        let c = cstr(comm);
+        if !c.is_empty() {
+            id.agent = Some(c);
+        }
+    }
+    id
 }
 
 fn peer_ip(ev: &ConnectEvent) -> IpAddr {

@@ -154,6 +154,7 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
         (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev)._pad = 0;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         // n <= TLS_SNAP_LEN (= data capacity) and n <= count (= source length).
         let n: u32 = if count > TLS_SNAP_LEN as u64 {
             TLS_SNAP_LEN as u32
@@ -203,6 +204,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).fd = fd as u32;
         (*ev).family = family;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let mut port = [0u8; 2];
         let _ = bpf_probe_read_user_buf(addr_ptr.add(2), &mut port); // sin_port (network order)
         (*ev).port = u16::from_be_bytes(port);
@@ -254,6 +256,7 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
     unsafe {
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev)._pad = 0;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if count > DNS_SNAP_LEN as u64 {
             DNS_SNAP_LEN as u32
         } else {
@@ -329,6 +332,7 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
     unsafe {
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev)._pad = 0;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if iov_len > DNS_SNAP_LEN as u64 {
             DNS_SNAP_LEN as u32
         } else {
@@ -465,6 +469,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
             } else {
                 0
             };
+            (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         }
         entry.submit(0);
     }

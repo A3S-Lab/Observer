@@ -32,6 +32,7 @@ pub struct TlsEvent {
     pub fd: u32, // socket fd, for (pid,fd) correlation with ConnectEvent
     pub len: u16,
     pub _pad: u16,
+    pub comm: [u8; 16], // in-kernel process name — reliable identity even if the proc exits
     pub data: [u8; TLS_SNAP_LEN],
 }
 
@@ -44,6 +45,7 @@ pub struct ConnectEvent {
     pub family: u16,    // AF_INET = 2, AF_INET6 = 10
     pub port: u16,      // host byte order
     pub addr: [u8; 16], // IPv4 in [0..4], IPv6 uses all 16
+    pub comm: [u8; 16],
 }
 
 /// The leading bytes of an outbound DNS query (sendto to :53). Userspace parses the
@@ -56,6 +58,7 @@ pub struct DnsEvent {
     pub pid: u32,
     pub len: u16,
     pub _pad: u16,
+    pub comm: [u8; 16],
     pub data: [u8; DNS_SNAP_LEN],
 }
 
@@ -68,6 +71,7 @@ pub const PATH_SNAP_LEN: usize = 256;
 pub struct FileEvent {
     pub pid: u32,
     pub flags: u32,
+    pub comm: [u8; 16],
     pub path: [u8; PATH_SNAP_LEN],
 }
 
@@ -83,4 +87,5 @@ pub struct LlmEvent {
     pub resp_bytes: u64, // bytes read back (approx response size)
     pub latency_ns: u64, // ClientHello → close
     pub ttft_ns: u64,    // ClientHello → first response byte; 0 = no response seen
+    pub comm: [u8; 16],
 }
