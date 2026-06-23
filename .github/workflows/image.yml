@@ -1,8 +1,8 @@
 name: image
 
 # Canonical release: on a version tag, build the collector clean-room (the eBPF crate +
-# userspace binary) and push the runtime image to GHCR. The internal A3S registry (what the
-# egress-constrained cluster pulls) is fed by promoting/mirroring this image.
+# userspace binary), push the runtime image to GHCR, scan it for CVEs, and keyless-sign it.
+# The internal A3S registry (what the egress-constrained cluster pulls) is fed by mirroring.
 on:
   push:
     tags: ['v*']
@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write # keyless cosign signing via GitHub OIDC
 
 jobs:
   image:
@@ -30,17 +31,33 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT" # ghcr needs lowercase
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }} # -> ghcr.io/a3s-lab/observer (lowercased)
+          images: ${{ steps.img.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=ref,event=tag
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: dist
           file: deploy/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: true # SLSA build provenance attestation
+          sbom: true # SBOM attestation
+      # Supply chain: scan for fixable CRITICAL CVEs, then keyless-sign the pushed digest.
+      - name: Trivy image scan (report fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0' # report-only; set to '1' to block releases once the base is confirmed clean
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless, GitHub OIDC)
+        run: cosign sign --yes ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}

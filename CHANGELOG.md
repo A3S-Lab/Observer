@@ -2,6 +2,20 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.5.1] — production hardening
+
+### Changed
+
+- **Liveness heartbeat**: the collector refreshes `/run/a3s-observer.alive`
+  (`A3S_OBSERVER_HEARTBEAT`) at startup and every 60s report tick, so a k8s `livenessProbe`
+  restarts a collector that has wedged (stopped pumping events).
+- **DaemonSet** is production-grade: `system-node-critical` priority, `RollingUpdate`
+  (maxUnavailable 1), a 30s graceful-shutdown window for the SIGTERM flush, and the heartbeat
+  liveness probe.
+- **Release supply chain**: the image workflow scans the pushed image for CVEs (Trivy,
+  report-only for now), keyless-signs it (cosign / GitHub OIDC), and attaches SLSA build
+  provenance + an SBOM.
+
 ## [0.5.0] — SSL/TLS content capture (opt-in)
 
 ### Added

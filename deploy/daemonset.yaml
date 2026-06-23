@@ -1,7 +1,6 @@
 # Run a3s-observer on every node. It writes NDJSON to stdout; a node-level OpenTelemetry
 # Collector then tails the container log and ships OTLP (see deploy/otel-collector.yaml).
 #
-#   docker build -f deploy/Dockerfile -t <registry>/a3s-observer:0.2.0 . && docker push ...
 #   kubectl apply -f deploy/daemonset.yaml
 #
 # No k8s API access / RBAC is needed: pod-UID + container-id come from /proc/<pid>/cgroup.
@@ -14,14 +13,19 @@ metadata:
 spec:
   selector:
     matchLabels: { app: a3s-observer }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 } # controlled node-by-node rollout
   template:
     metadata:
       labels: { app: a3s-observer }
     spec:
       hostPID: true # resolve /proc/<pid> for host processes (identity)
+      priorityClassName: system-node-critical # observability shouldn't be evicted under pressure
+      terminationGracePeriodSeconds: 30 # the collector flushes a final report on SIGTERM
       containers:
         - name: a3s-observer
-          image: 10.12.111.133:49164/a3s/observer:0.2.4 # A3S OCI Registry (built from deploy/Dockerfile)
+          image: 10.12.111.133:49164/a3s/observer:0.5.1 # mirror of ghcr.io/a3s-lab/observer:0.5.1
           securityContext:
             # eBPF load + tracepoint attach requires privileged. (Verified: a non-root
             # process with only CAP_BPF+CAP_PERFMON fails to attach — the tracefs tracepoint
@@ -30,12 +34,23 @@ spec:
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
             # - { name: A3S_OBSERVER_FILES, value: "1" }   # opt in to file-write capture
+            # - { name: A3S_OBSERVER_SSL, value: "1" }     # opt in to OpenSSL content (uprobe)
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
           resources:
+            # No CPU limit on purpose: a tracing agent should not be CPU-throttled into
+            # dropping events. Memory is bounded; the rings are fixed-size.
             requests: { cpu: 50m, memory: 64Mi }
             limits: { memory: 256Mi }
+          livenessProbe:
+            # Restart a wedged collector: it refreshes /run/a3s-observer.alive at startup and
+            # every 60s report tick, so a stale (>180s) heartbeat means it stopped pumping.
+            exec:
+              command:
+                ["sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/a3s-observer.alive) )) -lt 180"]
+            initialDelaySeconds: 20
+            periodSeconds: 60
       volumes:
         - { name: sys, hostPath: { path: /sys } }
       tolerations:
-        - operator: Exists # run on every node, including control-plane
+        - operator: Exists # run on every node, including control-plane / tainted nodes

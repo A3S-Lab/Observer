@@ -166,6 +166,12 @@ async fn main() -> anyhow::Result<()> {
          streaming (Ctrl-C to stop)"
     );
 
+    // Liveness heartbeat: refresh a file at startup and on every report tick, so a k8s
+    // livenessProbe can detect a wedged collector (file goes stale → restart the pod).
+    let heartbeat = std::env::var("A3S_OBSERVER_HEARTBEAT")
+        .unwrap_or_else(|_| "/run/a3s-observer.alive".into());
+    let _ = std::fs::write(&heartbeat, b"ok");
+
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut stats = Stats::default();
@@ -176,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break, // k8s sends SIGTERM on pod termination
             _ = report.tick() => {
+                let _ = std::fs::write(&heartbeat, b"ok"); // refresh liveness heartbeat
                 let dropped: u64 = drops
                     .get(&0, 0)
                     .map(|v| v.iter().copied().sum())
