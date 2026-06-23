@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a3s-observer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-observer-collector"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "a3s-observer",
  "a3s-observer-common",
@@ -27,11 +27,11 @@ dependencies = [
 
 [[package]]
 name = "a3s-observer-common"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "a3s-observer-ebpf"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "a3s-observer-common",
  "aya-ebpf",

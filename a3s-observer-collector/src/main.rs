@@ -23,6 +23,23 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("a3s-observer-collector {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "a3s-observer-collector {} — language-agnostic eBPF observability for AI agents\n\n\
+                 Run as root / CAP_BPF+CAP_PERFMON (Linux). Configure via env:\n  \
+                 A3S_OBSERVER_JSON=1    emit NDJSON (default: human-readable log)\n  \
+                 A3S_OBSERVER_FILES=1   also capture file writes (high-volume; off by default)",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
     tracing_subscriber::fmt::init();
 
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(

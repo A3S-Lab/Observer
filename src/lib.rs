@@ -14,9 +14,11 @@
 //! the collector that loads them in `a3s-observer-collector`.
 
 pub mod model;
+pub mod policy;
 pub mod traits;
 
 pub use model::{AgentEvent, EnrichedEvent};
+pub use policy::{AllowAll, Policy, Verdict};
 pub use traits::{
     read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LogExporter,
     ProcResolver, Provider, ServiceClassifier, SniClassifier,

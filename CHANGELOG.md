@@ -2,6 +2,21 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.2.5] — operator polish + enforcement design
+
+### Added
+
+- `--version` / `--help` flags on the collector.
+- `scripts/smoke.sh` — committed end-to-end smoke test (builds, unit-tests, loads the probes,
+  drives an LLM call, asserts an event flowed) so the manual validation is reproducible.
+- **Enforcement extension — design + contract** (opt-in *intervention*, kept separate from
+  the observe-only core): `docs/enforcement.md` (architecture) + a `Policy`/`Verdict` seam
+  (`src/policy.rs`) that an **external** policy implements — in-process (`impl Policy`) or
+  out-of-process (a controller driving in-kernel policy maps via a control API). Default
+  `AllowAll` (fail-open). The eBPF mechanism (LSM `file_open`/`bprm` deny, TC egress drop) is
+  phase 2 and must be validated on a non-prod box. Note: encrypted TLS payload can be
+  dropped/RST/redirected but not modified.
+
 ## [0.2.4] — clean shutdown (k8s lifecycle)
 
 ### Changed
