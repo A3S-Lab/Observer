@@ -1,8 +1,10 @@
 //! a3s-observer collector — loads the eBPF probes, pumps the ring buffers, and emits
 //! enriched events through the [`Exporter`] contract.
 //!
-//! Probes wired so far: `exec` (tools/subprocesses) and `tls_*` (TLS ClientHello → SNI →
-//! provider). Identity resolution + OTel export are the next milestones.
+//! Probes: `exec` (tools/subprocesses), `tls_*` (TLS ClientHello → SNI → provider), and
+//! `connect` (peer IP). Userspace enriches with identity (`/proc` comm+ppid, k8s
+//! cgroup→pod) and a `(pid,fd)→peer` correlation, then exports (NDJSON or log). OTLP is a
+//! drop-in via the `Exporter` trait.
 
 use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
@@ -37,13 +39,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let classifier = SniClassifier;
     let resolver = KubeResolver; // cgroup→pod in k8s; falls back to comm on bare hosts
-    // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
+                                 // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
     let mut peers: HashMap<u64, IpAddr> = HashMap::new();
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
-    let mut tls_ring =
-        RingBuf::try_from(ebpf.take_map("TLS_EVENTS").context("`TLS_EVENTS` missing")?)?;
-    let mut connect_ring =
-        RingBuf::try_from(ebpf.take_map("CONNECT_EVENTS").context("`CONNECT_EVENTS` missing")?)?;
+    let mut tls_ring = RingBuf::try_from(
+        ebpf.take_map("TLS_EVENTS")
+            .context("`TLS_EVENTS` missing")?,
+    )?;
+    let mut connect_ring = RingBuf::try_from(
+        ebpf.take_map("CONNECT_EVENTS")
+            .context("`CONNECT_EVENTS` missing")?,
+    )?;
 
     tracing::info!(
         "a3s-observer-collector: exec + TLS-SNI + connect probes attached; streaming (Ctrl-C to stop)"
@@ -139,13 +145,18 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
 }
 
 fn argv_of(filename: &[u8; 128]) -> Vec<String> {
-    let end = filename.iter().position(|&b| b == 0).unwrap_or(filename.len());
+    let end = filename
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(filename.len());
     vec![String::from_utf8_lossy(&filename[..end]).into_owned()]
 }
 
 fn peer_ip(ev: &ConnectEvent) -> IpAddr {
     if ev.family == 2 {
-        IpAddr::V4(Ipv4Addr::new(ev.addr[0], ev.addr[1], ev.addr[2], ev.addr[3]))
+        IpAddr::V4(Ipv4Addr::new(
+            ev.addr[0], ev.addr[1], ev.addr[2], ev.addr[3],
+        ))
     } else {
         IpAddr::V6(Ipv6Addr::from(ev.addr))
     }

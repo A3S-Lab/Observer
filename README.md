@@ -76,6 +76,34 @@ Stack: Rust + [Aya](https://aya-rs.dev) (CO-RE for portability). The eBPF progra
 live in a sibling `a3s-observer-ebpf` crate (added with the probes); shared kernel/user
 types in `a3s-observer-common`.
 
+## Build & run
+
+The eBPF crate needs nightly + `rust-src` + [`bpf-linker`](https://github.com/aya-rs/bpf-linker)
+(which borrows rustc's bundled LLVM — **no system LLVM required**):
+
+```bash
+rustup toolchain install nightly --component rust-src
+cargo install bpf-linker
+
+# build.rs compiles the eBPF crate to BPF bytecode and links it into the collector
+cargo build --release -p a3s-observer-collector
+
+# run it (Linux only; needs root / CAP_BPF + CAP_PERFMON)
+sudo ./target/release/a3s-observer-collector                          # human-readable log
+A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON (pipe to vector/Loki/jq)
+```
+
+Each event names the agent (process / k8s pod), the tool or LLM provider, and the peer.
+
+Workspace:
+
+| crate | role |
+|---|---|
+| `a3s-observer` | contracts + data model (`IdentityResolver` / `ServiceClassifier` / `Exporter`) — host-buildable |
+| `a3s-observer-common` | `no_std` types shared with eBPF |
+| `a3s-observer-ebpf` | the probes, compiled to BPF bytecode |
+| `a3s-observer-collector` | loader + correlation + export |
+
 ## License
 
 MIT

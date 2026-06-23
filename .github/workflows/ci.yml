@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Host-buildable parts: the contracts lib + shared types + parsers. The eBPF crate +
+  # collector need nightly + bpf-linker (a self-hosted BPF runner) and are not built here.
+  lib:
+    name: lib + parsers (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustfmt (whole workspace — parse-only, no build)
+        run: cargo fmt --all -- --check
+      - name: clippy (host-buildable crates)
+        run: cargo clippy -p a3s-observer -p a3s-observer-common -- -D warnings
+      - name: test (contracts lib + common: SNI / ppid / cgroup parsers)
+        run: cargo test -p a3s-observer -p a3s-observer-common

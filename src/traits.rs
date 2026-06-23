@@ -192,7 +192,10 @@ mod tests {
             c.classify(Some("api.anthropic.com"), ip),
             Some(Provider::Anthropic)
         );
-        assert_eq!(c.classify(Some("api.openai.com"), ip), Some(Provider::OpenAi));
+        assert_eq!(
+            c.classify(Some("api.openai.com"), ip),
+            Some(Provider::OpenAi)
+        );
         assert_eq!(c.classify(Some("example.com"), ip), None);
     }
 
@@ -200,7 +203,10 @@ mod tests {
     fn cgroup_parse_containerd_docker_bare() {
         let cd = "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod1a2b3c4d_5e6f_7890_abcd_ef1234567890.slice/cri-containerd-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.scope";
         let k = parse_cgroup(cd);
-        assert_eq!(k.pod_uid.as_deref(), Some("1a2b3c4d-5e6f-7890-abcd-ef1234567890"));
+        assert_eq!(
+            k.pod_uid.as_deref(),
+            Some("1a2b3c4d-5e6f-7890-abcd-ef1234567890")
+        );
         assert_eq!(k.container_id.as_deref(), Some("abcdef012345"));
 
         let dk = "0::/system.slice/docker-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.scope";

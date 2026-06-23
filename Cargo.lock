@@ -6,6 +6,8 @@ version = 4
 name = "a3s-observer"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -26,6 +28,14 @@ dependencies = [
 [[package]]
 name = "a3s-observer-common"
 version = "0.1.0"
+
+[[package]]
+name = "a3s-observer-ebpf"
+version = "0.1.0"
+dependencies = [
+ "a3s-observer-common",
+ "aya-ebpf",
+]
 
 [[package]]
 name = "allocator-api2"
@@ -70,6 +80,49 @@ checksum = "59bc42f3c5ddacc34eca28a420b47e3cbb3f0f484137cb2bf1ad2153d0eae52a"
 dependencies = [
  "anyhow",
  "cargo_metadata",
+]
+
+[[package]]
+name = "aya-ebpf"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8dbaf5409a1a0982e5c9bdc0f499a55fe5ead39fe9c846012053faf0d404f73"
+dependencies = [
+ "aya-ebpf-bindings",
+ "aya-ebpf-cty",
+ "aya-ebpf-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "aya-ebpf-bindings"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71ee8e6a617f040d8da7565ec4010aea75e33cda4662f64c019c66ee97d17889"
+dependencies = [
+ "aya-build",
+ "aya-ebpf-cty",
+]
+
+[[package]]
+name = "aya-ebpf-cty"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6f33396742e7fd0f519c1e0de5141d84e1a8df69146a557c08cc222b0ceace4"
+dependencies = [
+ "aya-build",
+]
+
+[[package]]
+name = "aya-ebpf-macros"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96fd02363736177e7e91d6c95d7effbca07be87502c7b5b32fc194aed8b177a0"
+dependencies = [
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -288,6 +341,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro2-diagnostics"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "version_check",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -295,6 +360,12 @@ checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rustversion"
+version = "1.0.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "semver"
