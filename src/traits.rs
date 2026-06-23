@@ -29,6 +29,17 @@ pub enum Provider {
     OpenAi,
     Anthropic,
     Gemini,
+    Mistral,
+    Cohere,
+    XAi,
+    DeepSeek,
+    Groq,
+    Together,
+    Perplexity,
+    Fireworks,
+    OpenRouter,
+    AzureOpenAi,
+    Bedrock,
     Ollama,
     Other(String),
 }
@@ -48,9 +59,20 @@ impl ServiceClassifier for SniClassifier {
     fn classify(&self, sni: Option<&str>, _peer: IpAddr) -> Option<Provider> {
         let host = sni?;
         Some(match host {
+            h if h.ends_with("openai.azure.com") => Provider::AzureOpenAi,
             h if h.ends_with("openai.com") || h.ends_with("oaiusercontent.com") => Provider::OpenAi,
             h if h.ends_with("anthropic.com") => Provider::Anthropic,
             h if h.ends_with("googleapis.com") => Provider::Gemini,
+            h if h.ends_with("mistral.ai") => Provider::Mistral,
+            h if h.ends_with("cohere.ai") || h.ends_with("cohere.com") => Provider::Cohere,
+            h if h.ends_with("x.ai") => Provider::XAi,
+            h if h.ends_with("deepseek.com") => Provider::DeepSeek,
+            h if h.ends_with("groq.com") => Provider::Groq,
+            h if h.ends_with("together.xyz") || h.ends_with("together.ai") => Provider::Together,
+            h if h.ends_with("perplexity.ai") => Provider::Perplexity,
+            h if h.ends_with("fireworks.ai") => Provider::Fireworks,
+            h if h.ends_with("openrouter.ai") => Provider::OpenRouter,
+            h if h.ends_with("amazonaws.com") && h.contains("bedrock") => Provider::Bedrock,
             _ => return None,
         })
     }
@@ -195,6 +217,22 @@ mod tests {
         assert_eq!(
             c.classify(Some("api.openai.com"), ip),
             Some(Provider::OpenAi)
+        );
+        assert_eq!(
+            c.classify(Some("api.mistral.ai"), ip),
+            Some(Provider::Mistral)
+        );
+        assert_eq!(
+            c.classify(Some("api.deepseek.com"), ip),
+            Some(Provider::DeepSeek)
+        );
+        assert_eq!(
+            c.classify(Some("myorg.openai.azure.com"), ip),
+            Some(Provider::AzureOpenAi)
+        );
+        assert_eq!(
+            c.classify(Some("bedrock-runtime.us-east-1.amazonaws.com"), ip),
+            Some(Provider::Bedrock)
         );
         assert_eq!(c.classify(Some("example.com"), ip), None);
     }
