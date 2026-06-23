@@ -5,15 +5,17 @@ kernel-level events into semantic agent telemetry — which agent made which LLM
 ran which tools, touched which files, reached which endpoints — **with zero changes to
 the agent, across languages**.
 
-> **Status: working collector.** Three eBPF probes — `exec` + TLS-`SNI` + `connect` —
-> stream to ring buffers, enriched in userspace with identity (`/proc`) and a
-> `(pid,fd)→peer` correlation, then exported as NDJSON (or human log). A single event
-> captures **who** (process), **what** (LLM provider), and **where** (peer) for a call.
-> Built + validated on Linux (kernel 6.8, bpf-linker 0.10, nightly `build-std`). Additive
-> next: OTLP export, k8s identity, DNS, byte/latency metrics, opt-in SSL-payload — see
-> [v1 plan](#v1-plan).
+> **Status: production-ready collector.** Probes — `exec`, TLS-`SNI`, `connect`, `dns`
+> (incl. `sendmsg`/`sendmmsg`), `file` (writes), and per-socket LLM metrics — stream to ring
+> buffers, enriched in userspace with identity (k8s cgroup→pod, `/proc`, or in-kernel
+> `comm`) and a `(pid,fd)→peer` correlation, then exported as NDJSON (or human log). A
+> single event captures **who** (process / pod), **what** (tool, file, or LLM provider +
+> req/resp bytes + latency + TTFT), and **where** (peer). Built + validated on Linux
+> (kernel 6.8, bpf-linker 0.10, nightly `build-std`). OpenTelemetry via the Collector
+> ([config](deploy/otel-collector.yaml)). Roadmap: opt-in SSL-payload (prompt/response
+> content); in-guest probes for a3s-box.
 
-## Why eBPF (not an SDK / OTel)
+## Why eBPF (not an SDK)
 
 - **Zero-instrumentation, language-agnostic** — observe any agent (Python/Node/Go/Rust)
   without touching its code.
@@ -29,9 +31,9 @@ the agent, across languages**.
     need an opt-in TLS-payload extension (per TLS library) — deliberately **not** in the
     universal core.
 - **LLM calls identified via TLS SNI + DNS** (the ClientHello `server_name` is plaintext)
-  → provider + endpoint, language-agnostically. Plus flow metrics: req/resp bytes,
-  latency, a TTFT proxy (first response byte), frequency. Token/cost = byte-based
-  **estimate**.
+  → provider + endpoint, language-agnostically. Plus per-call metrics accumulated in-kernel:
+  req/resp bytes (wire bytes, incl. TLS framing), latency, and a TTFT proxy (first response
+  byte).
   - Risk: Encrypted ClientHello (ECH) will eventually hide SNI → fall back to IP/DNS.
 - **Full scope:** tool exec + file I/O + network egress + LLM flows.
 - **All environments:** Kubernetes, bare host, a3s-box MicroVM — via a pluggable
@@ -46,16 +48,18 @@ Probes (all language-agnostic kernel hooks):
 
 | probe | hook | gives |
 |---|---|---|
-| `exec` | `sched_process_exec` | tool / subprocess (argv, cwd, uid, ppid) |
-| `file` | `openat` / `read` / `write` | file access |
-| `flow` | `connect` / `sendmsg` / `recvmsg` | connections, bytes, latency |
-| `sni`  | parse outbound TLS ClientHello | LLM provider identification |
-| `dns`  | UDP:53 | hostnames |
+| `exec` | `sys_enter_execve` | tool / subprocess (argv, comm, uid) |
+| `file` | `sys_enter_openat` (write opens) | files the agent writes — **opt-in** (`A3S_OBSERVER_FILES=1`; high-volume on busy nodes) |
+| `connect` | `sys_enter_connect` | peer IP:port |
+| `sni`  | TLS ClientHello on `write` / `sendto` | LLM provider |
+| `dns`  | `sendto` / `sendmsg` / `sendmmsg` to :53 | resolved hostnames |
+| LLM metrics | `read` / `recv` + `close`, per socket | req/resp bytes, latency, TTFT |
 
 Extensions (trait, swappable, degrade gracefully):
-- `IdentityResolver` — k8s (cgroup→pod) / docker / a3s-box / bare pid-tree
-- `ServiceClassifier` — SNI/IP → `Provider`
-- `Exporter` — OTel (default target) / Prometheus / log
+- `IdentityResolver` — k8s (cgroup→pod) / bare host (`/proc` comm+ppid), with an in-kernel
+  `comm` fallback so short-lived processes are still attributed
+- `ServiceClassifier` — SNI → `Provider` (14 LLM providers)
+- `Exporter` — NDJSON / human log → OpenTelemetry Collector (see below)
 - *(deferred, opt-in)* TLS-payload provider — for model/tokens/prompt, per TLS library
 
 ## a3s-box note
@@ -65,15 +69,19 @@ Each box is a separate guest kernel, so **host-side eBPF can't see guest syscall
 net path → SNI/flow). **file/exec inside a box need in-guest eBPF** (guest kernel built
 with BPF + collector in-guest) — phase 2.
 
-## v1 plan
+## Status
 
-1. Host-side collector: `exec + file + flow + SNI + DNS` (bare host / k8s) → OTel.
-2. `IdentityResolver`: pid-tree + k8s.
-3. `ServiceClassifier`: SNI → major providers.
-4. a3s-box: host-side network attribution first; in-guest file/exec as phase 2.
+Implemented + validated on Linux 6.8 (language-agnostic kernel hooks, no uprobes):
 
-Stack: Rust + [Aya](https://aya-rs.dev) (CO-RE for portability). The eBPF programs will
-live in a sibling `a3s-observer-ebpf` crate (added with the probes); shared kernel/user
+- **Probes:** `exec`, `file` (writes), `connect`, TLS-`SNI`, `dns`
+  (`sendto`/`sendmsg`/`sendmmsg`), and per-socket LLM metrics (req/resp bytes, latency, TTFT).
+- **Identity:** k8s cgroup→pod, `/proc` comm+ppid, in-kernel `comm` fallback.
+- **Correlation:** `(pid,fd)→peer`. **Export:** NDJSON / log → OTel Collector.
+
+Roadmap: opt-in SSL-payload extension (prompt/response *content*, per TLS library — needs
+uprobes, so not language-agnostic); in-guest probes for a3s-box MicroVMs (phase 2).
+
+Stack: Rust + [Aya](https://aya-rs.dev). Probes in `a3s-observer-ebpf`; shared kernel/user
 types in `a3s-observer-common`.
 
 ## Build & run
@@ -91,6 +99,9 @@ cargo build --release -p a3s-observer-collector
 # run it (Linux only; needs root / CAP_BPF + CAP_PERFMON)
 sudo ./target/release/a3s-observer-collector                          # human-readable log
 A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON (pipe to vector/Loki/jq)
+
+# file-write capture is off by default (openat is high-volume on busy nodes); opt in with:
+A3S_OBSERVER_FILES=1 A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector
 ```
 
 Each event names the agent (process / k8s pod), the tool or LLM provider, and the peer.

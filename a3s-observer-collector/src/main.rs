@@ -34,7 +34,12 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "dns_sendmsg", "syscalls", "sys_enter_sendmsg")?;
     attach(&mut ebpf, "dns_sendmmsg", "syscalls", "sys_enter_sendmmsg")?;
-    attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
+    // File-write capture is opt-in: openat is a firehose on a busy node (e.g. containerd
+    // unpacking images), and the agent's own writes need downstream identity filtering.
+    let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
+    if files {
+        attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
+    }
     attach(&mut ebpf, "read_enter", "syscalls", "sys_enter_read")?;
     attach(&mut ebpf, "recv_enter", "syscalls", "sys_enter_recvfrom")?;
     attach(&mut ebpf, "read_exit", "syscalls", "sys_exit_read")?;
@@ -77,7 +82,9 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     tracing::info!(
-        "a3s-observer-collector: exec + TLS-SNI + connect + dns + file + LLM-metrics probes attached; streaming (Ctrl-C to stop)"
+        files,
+        "a3s-observer-collector: exec + TLS-SNI + connect + dns + LLM-metrics probes attached \
+         (file-write capture: set A3S_OBSERVER_FILES=1); streaming (Ctrl-C to stop)"
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

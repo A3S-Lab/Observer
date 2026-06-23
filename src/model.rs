@@ -18,10 +18,12 @@ pub enum AgentEvent {
     },
     /// A file was opened (`openat`).
     FileAccess { pid: u32, path: String, write: bool },
-    /// An outbound LLM call, derived from socket flow + TLS SNI.
+    /// An outbound LLM call (TLS connection to a known provider), with metrics accumulated
+    /// in-kernel over the connection's lifetime and emitted on close.
     ///
-    /// Payload (model, prompt, exact tokens) is NOT available at the network layer;
-    /// `est_tokens`/cost are derived from byte counts by the correlation engine.
+    /// Payload (model, prompt, exact tokens) is NOT available at the network layer — that
+    /// needs the opt-in TLS-payload extension. `req_bytes`/`resp_bytes` are wire bytes
+    /// (include TLS framing/handshake), a proxy for request/response size.
     LlmCall {
         pid: u32,
         /// `server_name` from the TLS ClientHello (plaintext), when present.

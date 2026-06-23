@@ -179,7 +179,7 @@ struct KubeId {
 fn parse_cgroup(s: &str) -> KubeId {
     let mut pod_uid = None;
     let mut container_id = None;
-    for seg in s.split(|c| c == '/' || c == '.' || c == '-') {
+    for seg in s.split(['/', '.', '-']) {
         if seg.len() == 64 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
             container_id = Some(seg[..12].to_owned()); // short id
         } else if let Some(uid) = seg.strip_prefix("pod") {
