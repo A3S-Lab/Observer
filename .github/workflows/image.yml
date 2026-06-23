@@ -52,7 +52,7 @@ jobs:
           sbom: true # SBOM attestation
       # Supply chain: scan for fixable CRITICAL CVEs, then keyless-sign the pushed digest.
       - name: Trivy image scan (report fixable CRITICAL/HIGH)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@master # TODO: pin to a release SHA once chosen
         with:
           image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
