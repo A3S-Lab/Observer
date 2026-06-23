@@ -58,3 +58,15 @@ pub struct DnsEvent {
     pub _pad: u16,
     pub data: [u8; DNS_SNAP_LEN],
 }
+
+/// A file opened for writing (`sys_enter_openat`, write/rw flags only — read opens are
+/// filtered out in-kernel to keep volume sane). Userspace reads the path from `data`.
+pub const PATH_SNAP_LEN: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileEvent {
+    pub pid: u32,
+    pub flags: u32,
+    pub path: [u8; PATH_SNAP_LEN],
+}

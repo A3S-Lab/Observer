@@ -1,16 +1,16 @@
 //! a3s-observer collector — loads the eBPF probes, pumps the ring buffers, and emits
 //! enriched events through the [`Exporter`] contract.
 //!
-//! Probes: `exec` (tools/subprocesses), `tls_*` (TLS ClientHello → SNI → provider), and
-//! `connect` (peer IP). Userspace enriches with identity (`/proc` comm+ppid, k8s
-//! cgroup→pod) and a `(pid,fd)→peer` correlation, then exports (NDJSON or log). OTLP is a
-//! drop-in via the `Exporter` trait.
+//! Probes: `exec` (tools), `tls_*` (TLS ClientHello → SNI → provider), `connect` (peer IP),
+//! `dns` (hostnames), `file_open` (files opened for writing). Userspace enriches with
+//! identity (`/proc` comm+ppid, k8s cgroup→pod) and a `(pid,fd)→peer` correlation, then
+//! exports (NDJSON or log). OTLP is a drop-in via the `Exporter` trait.
 
 use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
     LogExporter, ServiceClassifier, SniClassifier,
 };
-use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, TlsEvent};
+use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
     attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
+    attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
@@ -55,9 +56,13 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("DNS_EVENTS")
             .context("`DNS_EVENTS` missing")?,
     )?;
+    let mut file_ring = RingBuf::try_from(
+        ebpf.take_map("FILE_EVENTS")
+            .context("`FILE_EVENTS` missing")?,
+    )?;
 
     tracing::info!(
-        "a3s-observer-collector: exec + TLS-SNI + connect probes attached; streaming (Ctrl-C to stop)"
+        "a3s-observer-collector: exec + TLS-SNI + connect + dns + file probes attached; streaming (Ctrl-C to stop)"
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -135,6 +140,22 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                while let Some(item) = file_ring.next() {
+                    if let Some(ev) = read_pod::<FileEvent>(&item) {
+                        let path = cstr(&ev.path);
+                        if !path.is_empty() {
+                            exporter.export(&EnrichedEvent {
+                                identity: resolver.resolve(ev.pid, 0, 0),
+                                provider: None,
+                                event: AgentEvent::FileAccess {
+                                    pid: ev.pid,
+                                    path,
+                                    write: ev.flags & 0x3 != 0,
+                                },
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -162,11 +183,13 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
 }
 
 fn argv_of(filename: &[u8; 128]) -> Vec<String> {
-    let end = filename
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(filename.len());
-    vec![String::from_utf8_lossy(&filename[..end]).into_owned()]
+    vec![cstr(filename)]
+}
+
+/// A NUL-terminated byte buffer (from a kernel copy) as a lossy String.
+fn cstr(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 fn peer_ip(ev: &ConnectEvent) -> IpAddr {

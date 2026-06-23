@@ -2,7 +2,8 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, TlsEvent, DNS_SNAP_LEN, TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecEvent, FileEvent, TlsEvent, DNS_SNAP_LEN, PATH_SNAP_LEN,
+    TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -26,6 +27,9 @@ static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 #[map]
 static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+#[map]
+static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 // ---- tool / subprocess exec (sys_enter_execve) ----
 
@@ -206,6 +210,36 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
             n,
             buf as *const core::ffi::c_void,
         );
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- file opened for writing (sys_enter_openat) ----
+// Only write/rw opens are emitted (read opens are far too high-volume); userspace reads
+// the path. This is the "which files did the agent modify" signal.
+
+#[tracepoint]
+pub fn file_open(ctx: TracePointContext) -> u32 {
+    try_open(&ctx).unwrap_or(0)
+}
+
+fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_openat: dfd @16, filename @24, flags @32, mode @40.
+    let flags: u64 = unsafe { ctx.read_at(32)? };
+    if flags & 0x3 == 0 {
+        return Ok(0); // O_RDONLY — skip; keep only O_WRONLY / O_RDWR
+    }
+    let filename: *const u8 = unsafe { ctx.read_at(24)? };
+    let Some(mut entry) = FILE_EVENTS.reserve::<FileEvent>(0) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).flags = flags as u32;
+        (*ev).path = [0u8; PATH_SNAP_LEN];
+        let _ = bpf_probe_read_user_str_bytes(filename, &mut (*ev).path);
     }
     entry.submit(0);
     Ok(0)
