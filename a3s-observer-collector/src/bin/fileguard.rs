@@ -1,29 +1,31 @@
 //! a3s-observer-fileguard — OPT-IN file-access intervention via fanotify `FAN_OPEN_PERM`.
 //!
-//! The eBPF-native path (LSM `file_open`) needs `bpf` in the kernel's `lsm=` set, which is
-//! not enabled by default (checked: `lockdown,capability,landlock,yama,apparmor`). fanotify
-//! works on a stock kernel and is userspace-policy-driven — the same external-intervention
-//! model: the policy lives outside (a plain deny-prefix file any controller writes), the
-//! kernel asks this guard ALLOW/DENY per open. See `docs/enforcement.md`.
+//! Marks each file path listed in the policy and denies `open()` of it (EPERM). Marking the
+//! specific files (not the whole mount) is deliberate: a mount-wide `FAN_MARK_MOUNT` perm
+//! guard gates *every* open on the filesystem, including system services' own I/O, and can
+//! wedge them. The eBPF-native equivalent would be LSM `file_open`, but `bpf` is not in this
+//! kernel's `lsm=` set (would need a custom boot cmdline); fanotify is stock-kernel and
+//! userspace-policy-driven — the same external-intervention model as the egress guard.
 //!
-//!   sudo a3s-observer-fileguard <watch-path> <policy-file>
+//!   sudo a3s-observer-fileguard <policy-file>   # one file path per line to deny
 //!
-//! `<policy-file>`: one path prefix per line (`#` comments); an open whose resolved path
-//! starts with any prefix is denied (EPERM). Fail-open on anything else.
+//! ponytail: exact-file marks. Blocking a whole subtree by prefix needs FAN_MARK_MOUNT +
+//! path filtering, which gates the entire mount — add that only if a real use case needs it.
 
 use anyhow::{anyhow, Context as _};
 use std::fs;
 
-const FAN_ALLOW: u32 = 0x01;
 const FAN_DENY: u32 = 0x02;
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let usage = "usage: a3s-observer-fileguard <watch-path> <policy-file>";
-    let watch = args.next().context(usage)?;
-    let policy_path = args.next().context(usage)?;
+    let policy_path = std::env::args()
+        .nth(1)
+        .context("usage: a3s-observer-fileguard <policy-file>")?;
+    let deny = load_policy(&policy_path);
+    if deny.is_empty() {
+        return Err(anyhow!("no file paths in policy {policy_path}"));
+    }
 
-    // FAN_CLASS_CONTENT enables permission (allow/deny) events.
     let fan = unsafe {
         libc::fanotify_init(
             libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC,
@@ -36,29 +38,27 @@ fn main() -> anyhow::Result<()> {
             std::io::Error::last_os_error()
         ));
     }
-    // Read the policy BEFORE marking: once the mount is marked, any open on it (including this
-    // process's own) is gated until the read loop responds — opening the policy file after the
-    // mark would deadlock. ponytail: read-once; restart to reload, add mtime-poll if needed.
-    let deny = load_policy(&policy_path);
-    // Watch the whole mount of `watch`; we filter by path against the policy.
-    let cpath = std::ffi::CString::new(watch.clone())?;
-    let rc = unsafe {
-        libc::fanotify_mark(
-            fan,
-            libc::FAN_MARK_ADD | libc::FAN_MARK_MOUNT,
-            libc::FAN_OPEN_PERM,
-            libc::AT_FDCWD,
-            cpath.as_ptr(),
-        )
-    };
-    if rc < 0 {
-        return Err(anyhow!(
-            "fanotify_mark {watch} failed: {}",
-            std::io::Error::last_os_error()
-        ));
+
+    let mut marked = 0usize;
+    for p in &deny {
+        let c = std::ffi::CString::new(p.as_str())?;
+        let rc = unsafe {
+            libc::fanotify_mark(
+                fan,
+                libc::FAN_MARK_ADD,
+                libc::FAN_OPEN_PERM,
+                libc::AT_FDCWD,
+                c.as_ptr(),
+            )
+        };
+        if rc == 0 {
+            marked += 1;
+        } else {
+            eprintln!("warn: cannot mark {p}: {}", std::io::Error::last_os_error());
+        }
     }
     eprintln!(
-        "a3s-observer-fileguard: FAN_OPEN_PERM on mount of {watch}; {} deny-prefixes from {policy_path}",
+        "a3s-observer-fileguard: denying open() of {marked}/{} file(s) from {policy_path}",
         deny.len()
     );
 
@@ -74,18 +74,20 @@ fn main() -> anyhow::Result<()> {
         let mut off = 0usize;
         let meta_sz = std::mem::size_of::<libc::fanotify_event_metadata>();
         while off + meta_sz <= n as usize {
-            let meta = unsafe { &*(buf.as_ptr().add(off) as *const libc::fanotify_event_metadata) };
+            // read_unaligned: the byte buffer isn't 8-aligned, so a &reference would be UB.
+            let meta = unsafe {
+                std::ptr::read_unaligned(
+                    buf.as_ptr().add(off) as *const libc::fanotify_event_metadata
+                )
+            };
             if meta.vers != libc::FANOTIFY_METADATA_VERSION {
                 break;
             }
             if meta.mask & u64::from(libc::FAN_OPEN_PERM) != 0 && meta.fd >= 0 {
-                let path = fs::read_link(format!("/proc/self/fd/{}", meta.fd))
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let denied = deny.iter().any(|d| path.starts_with(d.as_str()));
+                // Only denied files are marked, so every permission event is a denial.
                 let resp = libc::fanotify_response {
                     fd: meta.fd,
-                    response: if denied { FAN_DENY } else { FAN_ALLOW },
+                    response: FAN_DENY,
                 };
                 unsafe {
                     libc::write(
@@ -94,9 +96,10 @@ fn main() -> anyhow::Result<()> {
                         std::mem::size_of::<libc::fanotify_response>(),
                     );
                 }
-                if denied {
-                    eprintln!("[fileguard] DENY open {path}");
-                }
+                let path = fs::read_link(format!("/proc/self/fd/{}", meta.fd))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                eprintln!("[fileguard] DENY open {path}");
             }
             if meta.fd >= 0 {
                 unsafe { libc::close(meta.fd) };
