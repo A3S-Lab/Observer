@@ -5,9 +5,10 @@ kernel-level events into semantic agent telemetry — which agent made which LLM
 ran which tools, touched which files, reached which endpoints — **with zero changes to
 the agent, across languages**.
 
-> **Status: design + contracts.** This crate currently defines the stable extension
-> contracts (`IdentityResolver`, `ServiceClassifier`, `Exporter`) and the data model.
-> The eBPF probe set (Aya) is the next milestone — see [v1 plan](#v1-plan).
+> **Status: first probe working end-to-end.** Stable contracts + data model + a bpftrace
+> PoC, and the first Aya probe: `execve` → eBPF → ring buffer → `Exporter` builds and runs
+> on Linux (kernel 6.8, bpf-linker 0.10, nightly `build-std`). SNI / flow / DNS probes +
+> correlation are next — see [v1 plan](#v1-plan).
 
 ## Why eBPF (not an SDK / OTel)
 
