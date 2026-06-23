@@ -74,4 +74,6 @@ Every deny is *also* emitted as an observed event, so enforcement is auditable.
 5. Harden: fail-safe semantics, per-cgroup scoping, audit-every-deny.
 
 > Enforcement must be validated on a **non-prod box** — blocking real syscalls/egress on a
-> shared prod node is unacceptable.
+> shared prod node is unacceptable. The validation is codified in
+> [`scripts/validate-enforcement.sh`](../scripts/validate-enforcement.sh) (egress block →
+> control connects → scoping → fail-open); run it there, then tag v0.3.0.
