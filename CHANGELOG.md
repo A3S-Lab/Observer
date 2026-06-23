@@ -2,6 +2,16 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.2.3] — data-loss visibility
+
+### Added
+
+- **Ring-drop counter:** events dropped because a ring buffer was full are counted in-kernel
+  (`PerCpuArray`, via a `reserve_or_drop` helper across all 7 emit sites) and surfaced in the
+  60s report as `dropped` — data loss is now visible, not silent. Validated on KVM:
+  `dropped=0` under normal node load (exec=502, egress=458, dns=136 captured, none dropped),
+  which also empirically confirms the 20ms poll loop keeps up without drops.
+
 ## [0.2.2] — operability
 
 ### Added

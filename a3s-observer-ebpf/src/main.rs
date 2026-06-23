@@ -12,7 +12,7 @@ use aya_ebpf::{
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{ring_buf::RingBufEntry, HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 
@@ -33,6 +33,10 @@ static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// Count of events dropped because a ring was full — data-loss visibility under extreme load.
+#[map]
+static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 // Per-LLM-socket accumulator: (pid<<32|fd) -> running byte/time stats, started at the
 // ClientHello and flushed on close. Only TLS-to-provider sockets are tracked → stays small.
@@ -57,6 +61,20 @@ fn sock_key(pid: u32, fd: u64) -> u64 {
     ((pid as u64) << 32) | (fd & 0xffff_ffff)
 }
 
+/// Reserve a ring-buffer slot, counting a drop if the ring is full (so userspace can report
+/// data loss instead of losing events silently).
+fn reserve_or_drop<T>(ring: &RingBuf) -> Option<RingBufEntry<T>> {
+    let entry = ring.reserve::<T>(0);
+    if entry.is_none() {
+        unsafe {
+            if let Some(c) = DROPS.get_ptr_mut(0) {
+                *c = (*c).wrapping_add(1);
+            }
+        }
+    }
+    entry
+}
+
 /// Read a `u64` (e.g. a pointer or length) from a user-space address.
 fn read_user_u64(addr: *const u8) -> Option<u64> {
     let mut b = [0u8; 8];
@@ -75,7 +93,7 @@ pub fn exec(ctx: TracePointContext) -> u32 {
 }
 
 fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
-    let Some(mut entry) = EVENTS.reserve::<ExecEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<ExecEvent>(&EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -146,7 +164,7 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
         },
         0,
     );
-    let Some(mut entry) = TLS_EVENTS.reserve::<TlsEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<TlsEvent>(&TLS_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -196,7 +214,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     if family != 2 && family != 10 {
         return Ok(0); // only AF_INET / AF_INET6
     }
-    let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<ConnectEvent>(&CONNECT_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -249,7 +267,7 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
     if count < 13 {
         return Ok(0); // DNS header(12) + >=1 question byte
     }
-    let Some(mut entry) = DNS_EVENTS.reserve::<DnsEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -325,7 +343,7 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
     if iov_base == 0 || iov_len < 13 {
         return Ok(0);
     }
-    let Some(mut entry) = DNS_EVENTS.reserve::<DnsEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -366,7 +384,7 @@ fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0); // O_RDONLY — skip; keep only O_WRONLY / O_RDWR
     }
     let filename: *const u8 = unsafe { ctx.read_at(24)? };
-    let Some(mut entry) = FILE_EVENTS.reserve::<FileEvent>(0) else {
+    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
@@ -455,7 +473,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         return 0; // not an LLM socket
     };
     let _ = LLM_SOCKS.remove(&key);
-    if let Some(mut entry) = LLM_EVENTS.reserve::<LlmEvent>(0) {
+    if let Some(mut entry) = reserve_or_drop::<LlmEvent>(&LLM_EVENTS) {
         let now = unsafe { bpf_ktime_get_ns() };
         let ev = entry.as_mut_ptr();
         unsafe {

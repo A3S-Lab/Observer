@@ -12,7 +12,11 @@ use a3s_observer::{
 };
 use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, TlsEvent};
 use anyhow::Context as _;
-use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
+use aya::{
+    maps::{PerCpuArray, RingBuf},
+    programs::TracePoint,
+    Ebpf,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -96,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("LLM_EVENTS")
             .context("`LLM_EVENTS` missing")?,
     )?;
+    // Cumulative count of events dropped because a ring was full (data-loss visibility).
+    let drops: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
 
     tracing::info!(
         attached,
@@ -113,13 +120,18 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             _ = sigint.recv() => break,
             _ = report.tick() => {
+                let dropped: u64 = drops
+                    .get(&0, 0)
+                    .map(|v| v.iter().copied().sum())
+                    .unwrap_or(0);
                 tracing::info!(
                     exec = stats.exec,
                     egress = stats.egress,
                     dns = stats.dns,
                     file = stats.file,
                     llm = stats.llm,
-                    "a3s-observer: events processed in the last 60s"
+                    dropped,
+                    "a3s-observer: events in the last 60s (dropped = cumulative ring-full)"
                 );
                 stats = Stats::default();
             }
