@@ -27,24 +27,40 @@ async fn main() -> anyhow::Result<()> {
     )))
     .context("load eBPF object")?;
 
-    attach(&mut ebpf, "exec", "syscalls", "sys_enter_execve")?;
-    attach(&mut ebpf, "tls_write", "syscalls", "sys_enter_write")?;
-    attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
-    attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
-    attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
-    attach(&mut ebpf, "dns_sendmsg", "syscalls", "sys_enter_sendmsg")?;
-    attach(&mut ebpf, "dns_sendmmsg", "syscalls", "sys_enter_sendmmsg")?;
     // File-write capture is opt-in: openat is a firehose on a busy node (e.g. containerd
     // unpacking images), and the agent's own writes need downstream identity filtering.
     let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
+    let mut probes = vec![
+        ("exec", "sys_enter_execve"),
+        ("tls_write", "sys_enter_write"),
+        ("tls_sendto", "sys_enter_sendto"),
+        ("connect", "sys_enter_connect"),
+        ("dns_query", "sys_enter_sendto"),
+        ("dns_sendmsg", "sys_enter_sendmsg"),
+        ("dns_sendmmsg", "sys_enter_sendmmsg"),
+        ("read_enter", "sys_enter_read"),
+        ("recv_enter", "sys_enter_recvfrom"),
+        ("read_exit", "sys_exit_read"),
+        ("recv_exit", "sys_exit_recvfrom"),
+        ("sock_close", "sys_enter_close"),
+    ];
     if files {
-        attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
+        probes.push(("file_open", "sys_enter_openat"));
     }
-    attach(&mut ebpf, "read_enter", "syscalls", "sys_enter_read")?;
-    attach(&mut ebpf, "recv_enter", "syscalls", "sys_enter_recvfrom")?;
-    attach(&mut ebpf, "read_exit", "syscalls", "sys_exit_read")?;
-    attach(&mut ebpf, "recv_exit", "syscalls", "sys_exit_recvfrom")?;
-    attach(&mut ebpf, "sock_close", "syscalls", "sys_enter_close")?;
+    // Per-probe attach is non-fatal: kernels vary, and one missing tracepoint shouldn't take
+    // down the whole collector — degrade to whatever attaches, fail only if nothing does.
+    let mut attached = 0usize;
+    for (prog, tp) in &probes {
+        match attach(&mut ebpf, prog, "syscalls", tp) {
+            Ok(()) => attached += 1,
+            Err(e) => {
+                tracing::warn!(probe = prog, error = %e, "probe failed to attach — continuing")
+            }
+        }
+    }
+    if attached == 0 {
+        anyhow::bail!("no eBPF probes could be attached");
+    }
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
@@ -82,9 +98,11 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     tracing::info!(
+        attached,
+        total = probes.len(),
         files,
-        "a3s-observer-collector: exec + TLS-SNI + connect + dns + LLM-metrics probes attached \
-         (file-write capture: set A3S_OBSERVER_FILES=1); streaming (Ctrl-C to stop)"
+        "a3s-observer-collector: probes attached (file-write capture: set A3S_OBSERVER_FILES=1); \
+         streaming (Ctrl-C to stop)"
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

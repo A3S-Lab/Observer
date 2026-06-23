@@ -2,6 +2,21 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.2.1] — robustness + deployability
+
+### Changed
+
+- **Graceful probe degradation:** per-probe attach is now non-fatal — a tracepoint missing
+  on the running kernel logs a warning and the collector continues with whatever attaches
+  (bails only if zero attach). One kernel-version difference no longer takes down the whole
+  collector. Validated: all 12 core probes attach, events flow.
+
+### Added
+
+- **Kubernetes deployment:** `deploy/Dockerfile` (multi-stage build with the eBPF
+  toolchain) + `deploy/daemonset.yaml` (privileged DaemonSet, NDJSON to stdout, no k8s
+  API/RBAC — pod identity from `/proc/<pid>/cgroup`). Pairs with `deploy/otel-collector.yaml`.
+
 ## [0.2.0] — production-ready
 
 Closes the gap between the design and the implementation: every capability the docs
