@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
-use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent, TLS_SNAP_LEN};
+use a3s_observer_common::{
+    ConnectEvent, DnsEvent, ExecEvent, TlsEvent, DNS_SNAP_LEN, TLS_SNAP_LEN,
+};
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
     helpers::{
@@ -21,6 +23,9 @@ static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+#[map]
+static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // ---- tool / subprocess exec (sys_enter_execve) ----
 
@@ -149,6 +154,58 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
             let _ = bpf_probe_read_user_buf(addr_ptr.add(8), &mut a); // sin6_addr
         }
         (*ev).addr = a;
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- DNS query (sys_enter_sendto to :53) ----
+// Detects a UDP DNS query by the dest port (sockaddr @ offset 48) and copies the packet;
+// userspace parses the question name. Connected-UDP sends (NULL dest addr) aren't covered.
+
+#[tracepoint]
+pub fn dns_query(ctx: TracePointContext) -> u32 {
+    try_dns(&ctx).unwrap_or(0)
+}
+
+fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
+    let addr_ptr: *const u8 = unsafe { ctx.read_at(48)? }; // dest sockaddr
+    let addr_len: u64 = unsafe { ctx.read_at(56)? };
+    if (addr_ptr as usize) == 0 || addr_len < 4 {
+        return Ok(0);
+    }
+    // sockaddr: family @0 (2 bytes), port @2 (2 bytes, network order).
+    let mut sa = [0u8; 4];
+    if unsafe { bpf_probe_read_user_buf(addr_ptr, &mut sa) }.is_err() {
+        return Ok(0);
+    }
+    if u16::from_be_bytes([sa[2], sa[3]]) != 53 {
+        return Ok(0);
+    }
+    let buf: *const u8 = unsafe { ctx.read_at(24)? };
+    let count: u64 = unsafe { ctx.read_at(32)? };
+    if count < 13 {
+        return Ok(0); // DNS header(12) + >=1 question byte
+    }
+    let Some(mut entry) = DNS_EVENTS.reserve::<DnsEvent>(0) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev)._pad = 0;
+        let n: u32 = if count > DNS_SNAP_LEN as u64 {
+            DNS_SNAP_LEN as u32
+        } else {
+            count as u32
+        };
+        (*ev).len = n as u16;
+        (*ev).data = [0u8; DNS_SNAP_LEN];
+        let _ = bpf_probe_read_user(
+            (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
+            n,
+            buf as *const core::ffi::c_void,
+        );
     }
     entry.submit(0);
     Ok(0)

@@ -45,3 +45,16 @@ pub struct ConnectEvent {
     pub port: u16,      // host byte order
     pub addr: [u8; 16], // IPv4 in [0..4], IPv6 uses all 16
 }
+
+/// The leading bytes of an outbound DNS query (sendto to :53). Userspace parses the
+/// question name → the hostname the process resolved. Queries have no name compression.
+pub const DNS_SNAP_LEN: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsEvent {
+    pub pid: u32,
+    pub len: u16,
+    pub _pad: u16,
+    pub data: [u8; DNS_SNAP_LEN],
+}

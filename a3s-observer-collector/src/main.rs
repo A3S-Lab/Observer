@@ -10,7 +10,7 @@ use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
     LogExporter, ServiceClassifier, SniClassifier,
 };
-use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
+use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
 use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "tls_write", "syscalls", "sys_enter_write")?;
     attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
+    attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
@@ -49,6 +50,10 @@ async fn main() -> anyhow::Result<()> {
     let mut connect_ring = RingBuf::try_from(
         ebpf.take_map("CONNECT_EVENTS")
             .context("`CONNECT_EVENTS` missing")?,
+    )?;
+    let mut dns_ring = RingBuf::try_from(
+        ebpf.take_map("DNS_EVENTS")
+            .context("`DNS_EVENTS` missing")?,
     )?;
 
     tracing::info!(
@@ -116,6 +121,18 @@ async fn main() -> anyhow::Result<()> {
                                 bytes: ev.len as u64,
                             },
                         });
+                    }
+                }
+                while let Some(item) = dns_ring.next() {
+                    if let Some(ev) = read_pod::<DnsEvent>(&item) {
+                        let len = (ev.len as usize).min(ev.data.len());
+                        if let Some(query) = parse_dns_qname(&ev.data[..len]) {
+                            exporter.export(&EnrichedEvent {
+                                identity: resolver.resolve(ev.pid, 0, 0),
+                                provider: None,
+                                event: AgentEvent::Dns { pid: ev.pid, query },
+                            });
+                        }
                     }
                 }
             }
@@ -195,9 +212,36 @@ fn be16(buf: &[u8], i: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]))
 }
 
+/// Parse the question name (hostname) from a DNS query packet. Queries carry no name
+/// compression, so this is a simple length-prefixed label walk. Bounds-checked.
+fn parse_dns_qname(buf: &[u8]) -> Option<String> {
+    if buf.len() < 13 {
+        return None;
+    }
+    let mut p = 12; // skip the fixed 12-byte header
+    let mut name = String::new();
+    loop {
+        let len = *buf.get(p)? as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 || name.len() + len > 255 {
+            return None; // compression pointer (absent in queries) or implausibly long
+        }
+        p += 1;
+        let label = core::str::from_utf8(buf.get(p..p + len)?).ok()?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(label);
+        p += len;
+    }
+    (!name.is_empty()).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_sni;
+    use super::{parse_dns_qname, parse_sni};
 
     #[test]
     fn parses_sni_from_minimal_clienthello() {
@@ -222,5 +266,17 @@ mod tests {
     fn rejects_truncated_or_garbage() {
         assert_eq!(parse_sni(&[0u8; 8]), None);
         assert_eq!(parse_sni(&[]), None);
+    }
+
+    #[test]
+    fn parses_dns_query_name() {
+        let mut q = vec![0u8; 12]; // header
+        q.extend_from_slice(&[
+            3, b'a', b'p', b'i', 9, b'a', b'n', b't', b'h', b'r', b'o', b'p', b'i', b'c', 3, b'c',
+            b'o', b'm', 0,
+        ]);
+        q.extend_from_slice(&[0, 1, 0, 1]); // qtype A, qclass IN
+        assert_eq!(parse_dns_qname(&q).as_deref(), Some("api.anthropic.com"));
+        assert_eq!(parse_dns_qname(&[0u8; 8]), None);
     }
 }

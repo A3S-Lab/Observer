@@ -40,6 +40,8 @@ pub enum AgentEvent {
         peer: IpAddr,
         bytes: u64,
     },
+    /// A DNS query — a hostname the process resolved (`sys_enter_sendto` to :53).
+    Dns { pid: u32, query: String },
 }
 
 /// An [`AgentEvent`] tagged with the resolved [`Identity`] and, for LLM calls, the
