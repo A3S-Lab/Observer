@@ -1,0 +1,10 @@
+[package]
+name = "a3s-observer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "General-purpose, language-agnostic eBPF observability for AI agents (LLM calls, tools, files, network egress)."
+repository = "https://github.com/A3S-Lab/Observer"
+
+[dependencies]
+tracing = "0.1"
