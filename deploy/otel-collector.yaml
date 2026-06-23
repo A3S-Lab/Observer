@@ -1,0 +1,49 @@
+# OpenTelemetry Collector config for a3s-observer.
+#
+# a3s-observer stays lean: it captures kernel events and emits one NDJSON line per event
+# (run it with A3S_OBSERVER_JSON=1). Shipping — batching, retry, backpressure, routing to a
+# backend — is the OpenTelemetry Collector's job, not a kernel-tracing tool's. So the
+# production pipeline is:
+#
+#     capture (a3s-observer)  →  NDJSON  →  OTel Collector (this config)  →  OTLP  →  backend
+#
+# This keeps the privileged, always-on probe binary minimal and lets the Collector own the
+# parts it's purpose-built for (and survives a backend outage without dropping capture).
+#
+# Run:
+#     A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector >> /var/log/a3s-observer.ndjson
+#     OTEL_EXPORTER_OTLP_ENDPOINT=http://otlp-backend:4317 \
+#         otelcol-contrib --config otel-collector.yaml
+#
+# In Kubernetes, run a3s-observer as a DaemonSet writing NDJSON to stdout; the container
+# log is then tailed by a Collector DaemonSet's filelog receiver (the standard node-logs
+# pattern) — point `include` at /var/log/pods/...
+#
+# Each NDJSON line is an EnrichedEvent, e.g.
+#   {"identity":{"agent":"curl"},"provider":"Anthropic",
+#    "event":{"LlmCall":{"sni":"api.anthropic.com","req_bytes":284,"resp_bytes":3832,...}}}
+
+receivers:
+  filelog:
+    include: [/var/log/a3s-observer.ndjson]
+    operators:
+      - type: json_parser # each line → structured attributes (identity/provider/event)
+        parse_from: body
+
+processors:
+  batch: {}
+
+exporters:
+  debug: # prints received records — use this to smoke-test the pipeline
+    verbosity: detailed
+  otlp:
+    endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT} # Tempo / Jaeger / Loki / vendor OTLP
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [batch]
+      exporters: [debug, otlp]

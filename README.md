@@ -104,6 +104,31 @@ Workspace:
 | `a3s-observer-ebpf` | the probes, compiled to BPF bytecode |
 | `a3s-observer-collector` | loader + correlation + export |
 
+## Export to OpenTelemetry
+
+a3s-observer stays lean: it captures and emits NDJSON. Shipping telemetry — batching,
+retry, routing to a backend — is the OpenTelemetry Collector's job, not a privileged
+kernel-tracing tool's. So the production pipeline is:
+
+```
+capture (a3s-observer)  →  NDJSON  →  OTel Collector (filelog → OTLP)  →  your backend
+```
+
+A ready Collector config is in [`deploy/otel-collector.yaml`](deploy/otel-collector.yaml):
+
+```bash
+A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector >> /var/log/a3s-observer.ndjson
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otlp-backend:4317 \
+    otelcol-contrib --config deploy/otel-collector.yaml
+```
+
+Every event is one valid-JSON line (verified: the `filelog` receiver's `json_parser`
+ingests them directly), so a3s-observer also drops straight into vector / Loki / `jq`. In
+Kubernetes, run a3s-observer as a DaemonSet writing to stdout and let a Collector DaemonSet
+tail the node logs. This keeps the always-on probe binary minimal and decoupled from
+backend availability; in-process OTLP push is intentionally **not** built — that's the
+Collector's job.
+
 ## License
 
 MIT
