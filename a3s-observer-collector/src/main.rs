@@ -5,7 +5,8 @@
 //! provider). Identity resolution + OTel export are the next milestones.
 
 use a3s_observer::{
-    AgentEvent, EnrichedEvent, Exporter, Identity, LogExporter, ServiceClassifier, SniClassifier,
+    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, LogExporter, ProcResolver,
+    ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
@@ -29,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
 
     let exporter = LogExporter;
     let classifier = SniClassifier;
+    let resolver = ProcResolver;
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
     let mut tls_ring =
         RingBuf::try_from(ebpf.take_map("TLS_EVENTS").context("`TLS_EVENTS` missing")?)?;
@@ -48,11 +50,11 @@ async fn main() -> anyhow::Result<()> {
                 while let Some(item) = exec_ring.next() {
                     if let Some(ev) = read_pod::<ExecEvent>(&item) {
                         exporter.export(&EnrichedEvent {
-                            identity: Identity::default(),
+                            identity: resolver.resolve(ev.pid, 0, 0),
                             provider: None,
                             event: AgentEvent::ToolExec {
                                 pid: ev.pid,
-                                ppid: ev.ppid,
+                                ppid: read_ppid(ev.pid),
                                 argv: argv_of(&ev.filename),
                                 cwd: String::new(),
                             },
@@ -67,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
                             .as_deref()
                             .and_then(|h| classifier.classify(Some(h), UNKNOWN_PEER));
                         exporter.export(&EnrichedEvent {
-                            identity: Identity::default(),
+                            identity: resolver.resolve(ev.pid, 0, 0),
                             provider,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -81,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                 while let Some(item) = connect_ring.next() {
                     if let Some(ev) = read_pod::<ConnectEvent>(&item) {
                         exporter.export(&EnrichedEvent {
-                            identity: Identity::default(),
+                            identity: resolver.resolve(ev.pid, 0, 0),
                             provider: None,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
