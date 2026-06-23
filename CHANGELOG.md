@@ -11,6 +11,9 @@ All notable changes to a3s-observer will be documented in this file.
   fanotify `FAN_OPEN_PERM` v0.4.0); the file guard uses fanotify, not LSM-BPF, because `bpf`
   isn't in this kernel's `lsm=` set.
 - Removed redundant `unsafe` blocks in the eBPF probes (clean build).
+- `deploy/otel-collector.yaml` hardened for production: `memory_limiter` (OOM guard under
+  backpressure) + `sending_queue` / `retry_on_failure` so it actually survives a backend
+  outage (which the header claimed but the config didn't do).
 
 ## [0.5.1] — production hardening
 

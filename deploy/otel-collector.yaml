@@ -31,19 +31,31 @@ receivers:
         parse_from: body
 
 processors:
-  batch: {}
+  # memory_limiter MUST be first — it sheds load before the Collector OOMs under backpressure
+  # (e.g. a slow/dead backend filling the sending queue).
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
 
 exporters:
-  debug: # prints received records — use this to smoke-test the pipeline
-    verbosity: detailed
   otlp:
     endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT} # Tempo / Jaeger / Loki / vendor OTLP
     tls:
-      insecure: true
+      insecure: true # production: set false and configure CA / mTLS
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      enabled: true # buffer across a backend outage; add file_storage to also survive restarts
+  debug: # add to a pipeline's exporters to smoke-test (prints received records)
+    verbosity: detailed
 
 service:
   pipelines:
     logs:
       receivers: [filelog]
-      processors: [batch]
-      exporters: [debug, otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp] # add `debug` to smoke-test the pipeline
