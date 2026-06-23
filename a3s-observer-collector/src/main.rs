@@ -106,16 +106,30 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut stats = Stats::default();
+    let mut report = tokio::time::interval(Duration::from_secs(60));
+    report.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
+            _ = report.tick() => {
+                tracing::info!(
+                    exec = stats.exec,
+                    egress = stats.egress,
+                    dns = stats.dns,
+                    file = stats.file,
+                    llm = stats.llm,
+                    "a3s-observer: events processed in the last 60s"
+                );
+                stats = Stats::default();
+            }
             // Drain all rings every 20ms. Adequate for production at moderate volume; the
             // rings (64-256 KiB) absorb bursts between ticks. For sustained extreme volume,
             // switch to AsyncFd (epoll) on the ring fds and/or enlarge the rings.
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
                 while let Some(item) = exec_ring.next() {
                     if let Some(ev) = read_pod::<ExecEvent>(&item) {
-                        exporter.export(&EnrichedEvent {
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider: None,
                             event: AgentEvent::ToolExec {
@@ -135,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
                             peers.clear(); // ponytail: crude cap; LRU if it ever matters
                         }
                         peers.insert(sock_key(ev.pid, ev.fd), peer);
-                        exporter.export(&EnrichedEvent {
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider: None,
                             event: AgentEvent::Egress {
@@ -164,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
                             llm_meta.clear(); // ponytail: crude cap; LRU if it ever matters
                         }
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
-                        exporter.export(&EnrichedEvent {
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider,
                             event: AgentEvent::Egress {
@@ -180,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<DnsEvent>(&item) {
                         let len = (ev.len as usize).min(ev.data.len());
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
-                            exporter.export(&EnrichedEvent {
+                            emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
@@ -192,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<FileEvent>(&item) {
                         let path = cstr(&ev.path);
                         if !path.is_empty() {
-                            exporter.export(&EnrichedEvent {
+                            emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
                                 provider: None,
                                 event: AgentEvent::FileAccess {
@@ -212,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
                             llm_meta.remove(&sock_key(ev.pid, ev.fd))
                         {
                             if provider.is_some() {
-                                exporter.export(&EnrichedEvent {
+                                emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity_for(&resolver, ev.pid, &ev.comm),
                                     provider,
                                     event: AgentEvent::LlmCall {
@@ -277,6 +291,28 @@ fn identity_for(r: &impl IdentityResolver, pid: u32, comm: &[u8; 16]) -> Identit
         }
     }
     id
+}
+
+/// Per-kind event counters for periodic throughput logging (collector operability).
+#[derive(Default)]
+struct Stats {
+    exec: u64,
+    egress: u64,
+    dns: u64,
+    file: u64,
+    llm: u64,
+}
+
+/// Export an event and count it by kind for the throughput report.
+fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
+    match &ev.event {
+        AgentEvent::ToolExec { .. } => stats.exec += 1,
+        AgentEvent::Egress { .. } => stats.egress += 1,
+        AgentEvent::Dns { .. } => stats.dns += 1,
+        AgentEvent::FileAccess { .. } => stats.file += 1,
+        AgentEvent::LlmCall { .. } => stats.llm += 1,
+    }
+    exporter.export(&ev);
 }
 
 fn peer_ip(ev: &ConnectEvent) -> IpAddr {

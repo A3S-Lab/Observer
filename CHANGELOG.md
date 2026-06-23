@@ -2,6 +2,15 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.2.2] — operability
+
+### Added
+
+- **Throughput stats:** the collector logs per-kind event counts (exec / egress / dns /
+  file / llm) every 60s, so operators can see it is alive and how much it is processing.
+  Validated on KVM: `exec=774 egress=526 dns=144 file=0 llm=1` over a 60s window. (In-kernel
+  ring-buffer drop counting — data-loss visibility under extreme load — is a noted follow-up.)
+
 ## [0.2.1] — robustness + deployability
 
 ### Changed
