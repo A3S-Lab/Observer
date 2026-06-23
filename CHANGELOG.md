@@ -2,18 +2,21 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] — external intervention interface (enforcement)
 
 ### Added
 
-- **Enforcement — external intervention interface implemented** (opt-in; see
-  `docs/enforcement.md`). A `cgroup/connect4` egress guard (`egress_guard` + the
-  `DENY_EGRESS` map) plus `a3s-observer-enforce`, which attaches the guard to a target cgroup
-  and populates the deny map from an **external policy file** (one IPv4/hostname per line,
-  hot-reloaded every 2s) — the language-agnostic external interface. Cgroup-scoped, fail-open.
-  **Builds clean on KVM.** Runtime validation (actual blocking) is intentionally **not** run
-  on the shared prod node — blocking real egress there is off-limits — so it is **pending a
-  non-prod box**.
+- **Enforcement — opt-in external intervention interface** (see `docs/enforcement.md`). A
+  `cgroup/connect4` egress guard (`egress_guard` + `DENY_EGRESS`) + `a3s-observer-enforce`,
+  which attaches the guard to a target cgroup and populates the deny map from an **external
+  policy file** (IPv4/hostname per line, hot-reloaded) — the language-agnostic external
+  interface. Plus the in-process `Policy`/`Verdict` contract, a CI-tested policy parser, and a
+  worked external controller (`scripts/example-controller.py`: NDJSON → provider allow-list →
+  deny-file). Cgroup-scoped, fail-open; the observe-only core is unaffected.
+- **Validated end-to-end in a throwaway KVM VM** (non-prod — never the shared prod node): a
+  process *in* the guarded cgroup gets `EPERM` connecting to the denied IP, while the same IP
+  from *outside* the cgroup and a non-denied IP *inside* it are **not** blocked — proving deny
+  + scoping + fail-open. Codified in `scripts/validate-enforcement.sh`.
 
 ## [0.2.5] — operator polish + enforcement design
 
