@@ -2,11 +2,12 @@
 //! events the [`Exporter`](crate::Exporter) receives.
 
 use crate::traits::{Identity, Provider};
+use serde::Serialize;
 use std::net::IpAddr;
 use std::time::Duration;
 
 /// A raw event captured by an eBPF probe, before identity enrichment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
     /// A tool / subprocess was executed (`sched_process_exec`).
     ToolExec {
@@ -43,7 +44,7 @@ pub enum AgentEvent {
 
 /// An [`AgentEvent`] tagged with the resolved [`Identity`] and, for LLM calls, the
 /// classified [`Provider`]. This is what an [`Exporter`](crate::Exporter) emits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EnrichedEvent {
     pub identity: Identity,
     pub provider: Option<Provider>,

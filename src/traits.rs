@@ -5,10 +5,11 @@
 //! probes.
 
 use crate::model::EnrichedEvent;
+use serde::Serialize;
 use std::net::IpAddr;
 
 /// Who an event belongs to. Resolved from kernel-side keys (pid / cgroup / netns).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Identity {
     pub agent: Option<String>,
     pub task: Option<String>,
@@ -23,7 +24,7 @@ pub trait IdentityResolver: Send + Sync {
 }
 
 /// Known service providers, identified language-agnostically from TLS SNI / DNS.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Provider {
     OpenAi,
     Anthropic,
@@ -66,6 +67,18 @@ pub struct LogExporter;
 impl Exporter for LogExporter {
     fn export(&self, event: &EnrichedEvent) {
         tracing::info!(?event, "a3s-observer event");
+    }
+}
+
+/// Exporter that writes each event as one NDJSON line to stdout — consumable by any log
+/// pipeline (vector / Loki / jq / files). OTLP is a drop-in via this same trait.
+pub struct JsonExporter;
+
+impl Exporter for JsonExporter {
+    fn export(&self, event: &EnrichedEvent) {
+        if let Ok(line) = serde_json::to_string(event) {
+            println!("{line}");
+        }
     }
 }
 

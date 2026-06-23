@@ -5,8 +5,8 @@
 //! provider). Identity resolution + OTel export are the next milestones.
 
 use a3s_observer::{
-    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, LogExporter, ProcResolver,
-    ServiceClassifier, SniClassifier,
+    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, LogExporter,
+    ProcResolver, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
@@ -29,7 +29,12 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
 
-    let exporter = LogExporter;
+    // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
+    let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
+        Box::new(JsonExporter)
+    } else {
+        Box::new(LogExporter)
+    };
     let classifier = SniClassifier;
     let resolver = ProcResolver;
     // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
