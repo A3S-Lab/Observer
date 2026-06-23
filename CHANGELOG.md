@@ -2,6 +2,19 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Enforcement — external intervention interface implemented** (opt-in; see
+  `docs/enforcement.md`). A `cgroup/connect4` egress guard (`egress_guard` + the
+  `DENY_EGRESS` map) plus `a3s-observer-enforce`, which attaches the guard to a target cgroup
+  and populates the deny map from an **external policy file** (one IPv4/hostname per line,
+  hot-reloaded every 2s) — the language-agnostic external interface. Cgroup-scoped, fail-open.
+  **Builds clean on KVM.** Runtime validation (actual blocking) is intentionally **not** run
+  on the shared prod node — blocking real egress there is off-limits — so it is **pending a
+  non-prod box**.
+
 ## [0.2.5] — operator polish + enforcement design
 
 ### Added

@@ -11,9 +11,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{cgroup_sock_addr, map, tracepoint},
     maps::{ring_buf::RingBufEntry, HashMap, PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{SockAddrContext, TracePointContext},
 };
 
 #[map]
@@ -37,6 +37,11 @@ static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 // Count of events dropped because a ring was full — data-loss visibility under extreme load.
 #[map]
 static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// Egress deny-list (dest IPv4, host byte order). Populated by userspace from an external
+// policy; the cgroup/connect4 guard denies connect() to any IP present here. Cgroup-scoped.
+#[map]
+static DENY_EGRESS: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
 
 // Per-LLM-socket accumulator: (pid<<32|fd) -> running byte/time stats, started at the
 // ClientHello and flushed on close. Only TLS-to-provider sockets are tracked → stays small.
@@ -492,6 +497,20 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         entry.submit(0);
     }
     0
+}
+
+// ---- egress enforcement (cgroup/connect4) — the OPT-IN intervention mechanism ----
+// Returns 1 = allow, 0 = deny (connect() then fails with EPERM). Denies only dest IPs in the
+// externally-populated DENY_EGRESS map; fail-open on a miss. Only affects processes in the
+// cgroup this program is attached to. See docs/enforcement.md.
+
+#[cgroup_sock_addr(connect4)]
+pub fn egress_guard(ctx: SockAddrContext) -> i32 {
+    let ip = unsafe { u32::from_be((*ctx.sock_addr).user_ip4) };
+    if unsafe { DENY_EGRESS.get(&ip) }.is_some() {
+        return 0; // deny
+    }
+    1 // allow
 }
 
 #[cfg(not(test))]
