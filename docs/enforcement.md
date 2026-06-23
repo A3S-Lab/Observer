@@ -3,6 +3,20 @@
 a3s-observer **observes**. This is the design for *optional* intervention (block / redirect),
 kept strictly separate so the observer core stays passive and safe.
 
+## What's shipped
+
+Two guards are implemented and KVM-validated, each driven by an **external policy file**:
+
+| Guard | Binary | Mechanism | Denies (returns `EPERM`) | Validated |
+|---|---|---|---|---|
+| **Egress** | `a3s-observer-enforce` | eBPF `cgroup/connect4` | `connect()` to policy IPs — cgroup-scoped, fail-open | v0.3.0 |
+| **File** | `a3s-observer-fileguard` | fanotify `FAN_OPEN_PERM` | `open()` of policy-listed files | v0.4.0 |
+
+The file guard uses **fanotify**, not LSM-BPF: `bpf` is not in this kernel's active `lsm=` set
+(LSM-BPF would need a custom boot cmdline), and fanotify is stock-kernel + userspace-driven —
+the same external-policy model. **Exec** blocking (LSM `bprm`) is the remaining item. The
+sections below are the broader design these two were built from.
+
 ## Why separate (first principles)
 
 Observation is passive and read-only — tracepoints → ring buffers **cannot block**.
@@ -64,16 +78,15 @@ Default policy = `AllowAll` (fail-open — never break an agent unless a rule op
 
 Every deny is *also* emitted as an observed event, so enforcement is auditable.
 
-## Staged plan (same shape the observer was built)
+## Staged plan — status
 
-1. Contract + this design + `Policy` / `Verdict` (the seam).
-2. PoC: TC-egress **SNI allowlist** — drop the ClientHello to non-approved providers, driven
-   by a policy map. Validate on a **non-prod box**.
-3. PoC: LSM `file_open` deny for a path policy.
-4. Control API for the out-of-process policy path (the language-agnostic external engine).
-5. Harden: fail-safe semantics, per-cgroup scoping, audit-every-deny.
+1. ✅ Contract + design + `Policy` / `Verdict` seam.
+2. ✅ **Egress** deny (`cgroup/connect4`, by IP/host), cgroup-scoped, fail-open — v0.3.0.
+3. ✅ **File** deny (fanotify `FAN_OPEN_PERM`, by path) — v0.4.0.
+4. ◻ **Exec** deny (LSM `bprm`) — needs `bpf` in the kernel's `lsm=` set (custom-cmdline box).
+5. ◻ Control API for the out-of-process path (today: the policy file; later a socket / gRPC).
 
-> Enforcement must be validated on a **non-prod box** — blocking real syscalls/egress on a
-> shared prod node is unacceptable. The validation is codified in
+> Enforcement is validated on a **non-prod box** — blocking real syscalls/egress on a shared
+> prod node is unacceptable. The egress check is codified in
 > [`scripts/validate-enforcement.sh`](../scripts/validate-enforcement.sh) (egress block →
-> control connects → scoping → fail-open); run it there, then tag v0.3.0.
+> control connects → scoping → fail-open); both shipped guards were KVM-validated this way.

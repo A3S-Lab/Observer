@@ -134,6 +134,11 @@ a3s-observer  →  NDJSON  →  OTel Collector (filelog → OTLP)  →  your bac
 
 Rust + [Aya](https://aya-rs.dev).
 
+## Security
+
+Privileged component — see [SECURITY.md](SECURITY.md) for the disclosure policy and how to
+verify a release image's signature (cosign / Sigstore).
+
 ## License
 
 MIT

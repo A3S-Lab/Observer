@@ -147,10 +147,10 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let buf: *const u8 = unsafe { ctx.read_at(24)? };
     let count: u64 = unsafe { ctx.read_at(32)? };
     let fd: u64 = unsafe { ctx.read_at(16)? };
-    let pid = (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32;
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let key = sock_key(pid, fd);
     // Already tracking this LLM socket → this write is request payload; accumulate + done.
-    if let Some(stat) = unsafe { LLM_SOCKS.get_ptr_mut(&key) } {
+    if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
         unsafe {
             (*stat).req_bytes = (*stat).req_bytes.saturating_add(count);
         }
@@ -224,7 +224,7 @@ pub fn ssl_write(ctx: ProbeContext) -> u32 {
 pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
     let buf = ctx.arg::<u64>(1).unwrap_or(0);
     if buf != 0 {
-        let tid = unsafe { bpf_get_current_pid_tgid() };
+        let tid = bpf_get_current_pid_tgid();
         let _ = SSL_READ_BUF.insert(&tid, &buf, 0);
     }
     0
@@ -232,7 +232,7 @@ pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn ssl_read_exit(ctx: RetProbeContext) -> u32 {
-    let tid = unsafe { bpf_get_current_pid_tgid() };
+    let tid = bpf_get_current_pid_tgid();
     let ret = ctx.ret::<i32>().unwrap_or(0) as i64; // SSL_read return value = bytes decrypted
     let buf = unsafe { SSL_READ_BUF.get(&tid) }.copied();
     let _ = SSL_READ_BUF.remove(&tid);
@@ -511,7 +511,7 @@ fn on_read_enter(ctx: &TracePointContext) -> u32 {
     let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
         return 0;
     };
-    let tgid = unsafe { bpf_get_current_pid_tgid() };
+    let tgid = bpf_get_current_pid_tgid();
     let key = sock_key((tgid >> 32) as u32, fd);
     // Stash only for tracked LLM sockets — keeps this node-wide hot path cheap.
     if unsafe { LLM_SOCKS.get(&key) }.is_some() {
@@ -521,7 +521,7 @@ fn on_read_enter(ctx: &TracePointContext) -> u32 {
 }
 
 fn on_read_exit(ctx: &TracePointContext) -> u32 {
-    let tgid = unsafe { bpf_get_current_pid_tgid() };
+    let tgid = bpf_get_current_pid_tgid();
     let Some(&fd) = (unsafe { READ_FD.get(&tgid) }) else {
         return 0;
     };
@@ -534,7 +534,7 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
         return 0;
     }
     let key = sock_key((tgid >> 32) as u32, fd as u64);
-    if let Some(stat) = unsafe { LLM_SOCKS.get_ptr_mut(&key) } {
+    if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
         unsafe {
             (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
             if (*stat).first_resp_ns == 0 {
@@ -551,7 +551,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
     let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
         return 0;
     };
-    let pid = (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32;
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let key = sock_key(pid, fd);
     let Some(&stat) = (unsafe { LLM_SOCKS.get(&key) }) else {
         return 0; // not an LLM socket

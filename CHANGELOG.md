@@ -2,6 +2,16 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Added / Changed
+
+- `SECURITY.md` — vulnerability disclosure policy + image-signature verification.
+- `docs/enforcement.md` reflects the **shipped** guards (egress `cgroup/connect4` v0.3.0, file
+  fanotify `FAN_OPEN_PERM` v0.4.0); the file guard uses fanotify, not LSM-BPF, because `bpf`
+  isn't in this kernel's `lsm=` set.
+- Removed redundant `unsafe` blocks in the eBPF probes (clean build).
+
 ## [0.5.1] — production hardening
 
 ### Changed
