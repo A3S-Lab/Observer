@@ -2,6 +2,18 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **File-access intervention** (opt-in): `a3s-observer-fileguard` — a fanotify `FAN_OPEN_PERM`
+  guard that denies `open()` of paths matching an external deny-prefix policy file (the other
+  example from the intervention ask, "阻止某些文件读写"). Chosen over eBPF LSM `file_open`
+  because `bpf` is **not** in this kernel's active `lsm=` set (would need a custom boot
+  cmdline); fanotify is stock-kernel and userspace-policy-driven — the same external model as
+  the egress guard. **Build-validated; runtime validation pending a non-prod VM** (file
+  enforcement on a host is gated to a non-prod box, same as egress).
+
 ## [0.3.0] — external intervention interface (enforcement)
 
 ### Added
