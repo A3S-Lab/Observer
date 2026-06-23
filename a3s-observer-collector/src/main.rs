@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
     attach(&mut ebpf, "tls_sendto", "syscalls", "sys_enter_sendto")?;
     attach(&mut ebpf, "connect", "syscalls", "sys_enter_connect")?;
     attach(&mut ebpf, "dns_query", "syscalls", "sys_enter_sendto")?;
+    attach(&mut ebpf, "dns_sendmsg", "syscalls", "sys_enter_sendmsg")?;
+    attach(&mut ebpf, "dns_sendmmsg", "syscalls", "sys_enter_sendmmsg")?;
     attach(&mut ebpf, "file_open", "syscalls", "sys_enter_openat")?;
     attach(&mut ebpf, "read_enter", "syscalls", "sys_enter_read")?;
     attach(&mut ebpf, "recv_enter", "syscalls", "sys_enter_recvfrom")?;

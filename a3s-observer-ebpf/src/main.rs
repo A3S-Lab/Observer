@@ -57,6 +57,16 @@ fn sock_key(pid: u32, fd: u64) -> u64 {
     ((pid as u64) << 32) | (fd & 0xffff_ffff)
 }
 
+/// Read a `u64` (e.g. a pointer or length) from a user-space address.
+fn read_user_u64(addr: *const u8) -> Option<u64> {
+    let mut b = [0u8; 8];
+    if unsafe { bpf_probe_read_user_buf(addr, &mut b) }.is_ok() {
+        Some(u64::from_ne_bytes(b))
+    } else {
+        None
+    }
+}
+
 // ---- tool / subprocess exec (sys_enter_execve) ----
 
 #[tracepoint]
@@ -255,6 +265,81 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
+        );
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- DNS query via sendmsg / sendmmsg (glibc getaddrinfo) ----
+// glibc's resolver sends A/AAAA queries with sendmmsg (and some resolvers use sendmsg);
+// both pass a `struct msghdr` (mmsghdr.msg_hdr is at offset 0). Walk it to the dest addr
+// (:53) and the first iovec (the query packet). Only the first message is parsed.
+
+#[tracepoint]
+pub fn dns_sendmsg(ctx: TracePointContext) -> u32 {
+    try_dns_msghdr(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn dns_sendmmsg(ctx: TracePointContext) -> u32 {
+    try_dns_msghdr(&ctx).unwrap_or(0)
+}
+
+fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_sendmsg(fd, msghdr*, flags) / sys_enter_sendmmsg(fd, mmsghdr*, vlen, flags):
+    // a struct msghdr is at the @24 pointer either way (mmsghdr.msg_hdr is at offset 0).
+    let hdr: u64 = unsafe { ctx.read_at(24)? };
+    if hdr == 0 {
+        return Ok(0);
+    }
+    let base = hdr as *const u8;
+    // struct msghdr: msg_name @0, msg_iov @16.
+    let Some(msg_name) = read_user_u64(base) else {
+        return Ok(0);
+    };
+    let Some(msg_iov) = read_user_u64(unsafe { base.add(16) }) else {
+        return Ok(0);
+    };
+    if msg_name == 0 || msg_iov == 0 {
+        return Ok(0);
+    }
+    // dest sockaddr: family @0, port @2 (network order).
+    let mut sa = [0u8; 4];
+    if unsafe { bpf_probe_read_user_buf(msg_name as *const u8, &mut sa) }.is_err() {
+        return Ok(0);
+    }
+    if u16::from_be_bytes([sa[2], sa[3]]) != 53 {
+        return Ok(0);
+    }
+    // iovec[0]: iov_base @0, iov_len @8 → the DNS query packet.
+    let Some(iov_base) = read_user_u64(msg_iov as *const u8) else {
+        return Ok(0);
+    };
+    let Some(iov_len) = read_user_u64(unsafe { (msg_iov as *const u8).add(8) }) else {
+        return Ok(0);
+    };
+    if iov_base == 0 || iov_len < 13 {
+        return Ok(0);
+    }
+    let Some(mut entry) = DNS_EVENTS.reserve::<DnsEvent>(0) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev)._pad = 0;
+        let n: u32 = if iov_len > DNS_SNAP_LEN as u64 {
+            DNS_SNAP_LEN as u32
+        } else {
+            iov_len as u32
+        };
+        (*ev).len = n as u16;
+        (*ev).data = [0u8; DNS_SNAP_LEN];
+        let _ = bpf_probe_read_user(
+            (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
+            n,
+            iov_base as *const core::ffi::c_void,
         );
     }
     entry.submit(0);
