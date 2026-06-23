@@ -1,8 +1,8 @@
 name: image
 
-# Canonical release: on a version tag, build the collector image from source (clean-room,
-# reproducible — unlike a manual host build) and push to GHCR. The internal A3S registry
-# (what the cluster pulls from) is then fed by promoting/mirroring this image.
+# Canonical release: on a version tag, build the collector clean-room (the eBPF crate +
+# userspace binary) and push the runtime image to GHCR. The internal A3S registry (what the
+# egress-constrained cluster pulls) is fed by promoting/mirroring this image.
 on:
   push:
     tags: ['v*']
@@ -14,9 +14,16 @@ permissions:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # 24.04 — glibc matches the ubuntu:24.04 runtime base
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src # build-std for the bpfel-unknown-none eBPF target
+      - run: cargo install bpf-linker --locked
+      - run: cargo build --release -p a3s-observer-collector
+      - name: stage binary (small build context)
+        run: mkdir -p dist && cp target/release/a3s-observer-collector dist/
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -32,8 +39,8 @@ jobs:
             type=ref,event=tag
       - uses: docker/build-push-action@v6
         with:
-          context: .
-          file: deploy/Dockerfile # multi-stage: builds the eBPF + collector from source
+          context: dist
+          file: deploy/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

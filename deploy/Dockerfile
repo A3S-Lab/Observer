@@ -1,17 +1,14 @@
-# Build the collector (with the eBPF toolchain) then ship just the binary.
-# Build from the crate root:  docker build -f deploy/Dockerfile -t a3s-observer:0.2.0 .
+# Runtime image for a3s-observer-collector.
 #
-# bpf-linker borrows rustc's bundled LLVM (aya-rustc-llvm-proxy), so no system LLVM is
-# needed; build.rs compiles the eBPF crate with the nightly toolchain + rust-src.
-
-FROM rust:1-bookworm AS build
-RUN rustup toolchain install nightly --component rust-src \
- && cargo install bpf-linker
-WORKDIR /src
-COPY . .
-RUN cargo build --release -p a3s-observer-collector
-
-FROM debian:bookworm-slim
-COPY --from=build /src/target/release/a3s-observer-collector /usr/local/bin/a3s-observer-collector
+# Two steps (this is what .github/workflows/image.yml does, and what was validated by hand):
+#   1. build the binary:   cargo build --release -p a3s-observer-collector
+#   2. stage + build:      mkdir -p dist && cp target/release/a3s-observer-collector dist/
+#                          docker build -f deploy/Dockerfile -t a3s-observer dist
+#
+# The base must match the build host's glibc — the binary is dynamically linked. CI builds on
+# ubuntu-latest (24.04) and ships on ubuntu:24.04; keep them in lockstep (or build static musl
+# for a distroless/scratch base).
+FROM ubuntu:24.04
+COPY a3s-observer-collector /usr/local/bin/a3s-observer-collector
 ENV A3S_OBSERVER_JSON=1
 ENTRYPOINT ["/usr/local/bin/a3s-observer-collector"]
