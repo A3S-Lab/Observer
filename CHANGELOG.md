@@ -2,6 +2,18 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **SSL/TLS content capture (#7)** — the long-deferred opt-in OpenSSL uprobe extension.
+  `A3S_OBSERVER_SSL=1` attaches uprobes to `SSL_write` / `SSL_read` and emits `SslContent`
+  events with the request (prompt) / response (completion) **plaintext**. This is deliberately
+  outside the universal core (Rule 2): a uprobe binds to a library symbol, so it is **not**
+  language-agnostic (OpenSSL only — Python `requests`/`httpx`, Node, curl …, not Go
+  `crypto/tls`), and it captures real content, so it is **off by default**. Build-validated;
+  runtime validation pending a non-prod VM (content capture is gated off the shared prod node).
+
 ## [0.4.0] — file-access intervention
 
 ### Added

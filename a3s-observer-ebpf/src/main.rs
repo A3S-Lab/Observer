@@ -2,8 +2,8 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, TlsEvent, DNS_SNAP_LEN, PATH_SNAP_LEN,
-    TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent, DNS_SNAP_LEN,
+    PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -11,9 +11,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
-    macros::{cgroup_sock_addr, map, tracepoint},
+    macros::{cgroup_sock_addr, map, tracepoint, uprobe, uretprobe},
     maps::{ring_buf::RingBufEntry, HashMap, PerCpuArray, RingBuf},
-    programs::{SockAddrContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 
 #[map]
@@ -52,6 +52,15 @@ static LLM_SOCKS: HashMap<u64, LlmStat> = HashMap::with_max_entries(4096, 0);
 // attribute the byte count (the exit tracepoint has the return value but not the fd).
 #[map]
 static READ_FD: HashMap<u64, u32> = HashMap::with_max_entries(10240, 0);
+
+// Opt-in OpenSSL content (uprobe). Bigger ring — payloads are up to SSL_SNAP_LEN each.
+#[map]
+static SSL_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+
+// SSL_read entry saves the caller's buffer ptr by tid so the uretprobe (which knows how many
+// bytes were decrypted into it) can snapshot the plaintext.
+#[map]
+static SSL_READ_BUF: HashMap<u64, u64> = HashMap::with_max_entries(10240, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -194,6 +203,76 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     }
     entry.submit(0);
     Ok(0)
+}
+
+// ---- OPT-IN OpenSSL content (uprobes on SSL_write / SSL_read) ----
+//
+// NOT language-agnostic (a uprobe binds to OpenSSL symbols) and captures real plaintext, so the
+// collector only attaches these when A3S_OBSERVER_SSL=1. SSL_write(ssl, buf, num): the request
+// plaintext is in `buf` at entry. SSL_read(ssl, buf, num): `buf` is filled during the call, so
+// snapshot it at return, with the byte count from the return value.
+
+#[uprobe]
+pub fn ssl_write(ctx: ProbeContext) -> u32 {
+    // SSL_write(ssl, buf, num): read args as raw register values (pointers carried as u64).
+    let buf = ctx.arg::<u64>(1).unwrap_or(0);
+    let num = ctx.arg::<u64>(2).unwrap_or(0);
+    emit_ssl(buf as *const u8, num, 0)
+}
+
+#[uprobe]
+pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
+    let buf = ctx.arg::<u64>(1).unwrap_or(0);
+    if buf != 0 {
+        let tid = unsafe { bpf_get_current_pid_tgid() };
+        let _ = SSL_READ_BUF.insert(&tid, &buf, 0);
+    }
+    0
+}
+
+#[uretprobe]
+pub fn ssl_read_exit(ctx: RetProbeContext) -> u32 {
+    let tid = unsafe { bpf_get_current_pid_tgid() };
+    let ret = ctx.ret::<i32>().unwrap_or(0) as i64; // SSL_read return value = bytes decrypted
+    let buf = unsafe { SSL_READ_BUF.get(&tid) }.copied();
+    let _ = SSL_READ_BUF.remove(&tid);
+    if ret <= 0 {
+        return 0;
+    }
+    match buf {
+        Some(addr) => emit_ssl(addr as *const u8, ret as u64, 1),
+        None => 0,
+    }
+}
+
+fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let Some(mut entry) = reserve_or_drop::<SslEvent>(&SSL_EVENTS) else {
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).is_read = is_read;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        // n <= SSL_SNAP_LEN (data capacity) and n <= len (bytes actually written/read).
+        let n: u32 = if len > SSL_SNAP_LEN as u64 {
+            SSL_SNAP_LEN as u32
+        } else {
+            len as u32
+        };
+        (*ev).len = n;
+        (*ev).data = [0u8; SSL_SNAP_LEN];
+        let _ = bpf_probe_read_user(
+            (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
+            n,
+            buf as *const core::ffi::c_void,
+        );
+    }
+    entry.submit(0);
+    0
 }
 
 // ---- outbound connection peer (sys_enter_connect) ----

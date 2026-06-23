@@ -10,11 +10,13 @@ use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, Identity, IdentityResolver, JsonExporter,
     KubeResolver, LogExporter, Provider, ServiceClassifier, SniClassifier,
 };
-use a3s_observer_common::{ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, TlsEvent};
+use a3s_observer_common::{
+    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
+};
 use anyhow::Context as _;
 use aya::{
     maps::{PerCpuArray, RingBuf},
-    programs::TracePoint,
+    programs::{TracePoint, UProbe},
     Ebpf,
 };
 use std::collections::HashMap;
@@ -33,7 +35,9 @@ async fn main() -> anyhow::Result<()> {
                 "a3s-observer-collector {} — language-agnostic eBPF observability for AI agents\n\n\
                  Run as root / CAP_BPF+CAP_PERFMON (Linux). Configure via env:\n  \
                  A3S_OBSERVER_JSON=1    emit NDJSON (default: human-readable log)\n  \
-                 A3S_OBSERVER_FILES=1   also capture file writes (high-volume; off by default)",
+                 A3S_OBSERVER_FILES=1   also capture file writes (high-volume; off by default)\n  \
+                 A3S_OBSERVER_SSL=1     also capture OpenSSL plaintext — prompts/responses \
+                 (uprobe, OpenSSL-only, off by default; or set a libssl path)",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
@@ -83,6 +87,34 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no eBPF probes could be attached");
     }
 
+    // Opt-in OpenSSL content capture (uprobes). Off by default — it captures real plaintext
+    // (prompts/completions) and binds to OpenSSL only. A3S_OBSERVER_SSL=1, or set it to a
+    // libssl path on distros where the default below is wrong.
+    if let Some(val) = std::env::var("A3S_OBSERVER_SSL")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        let lib = if val.contains('/') {
+            val
+        } else {
+            "/usr/lib/x86_64-linux-gnu/libssl.so.3".to_string()
+        };
+        let mut ssl_ok = 0;
+        for (prog, sym) in [
+            ("ssl_write", "SSL_write"),
+            ("ssl_read_enter", "SSL_read"),
+            ("ssl_read_exit", "SSL_read"),
+        ] {
+            match attach_uprobe(&mut ebpf, prog, sym, &lib) {
+                Ok(()) => ssl_ok += 1,
+                Err(e) => {
+                    tracing::warn!(probe = prog, lib = %lib, error = %e, "SSL uprobe failed to attach")
+                }
+            }
+        }
+        tracing::info!(lib = %lib, attached = ssl_ok, "A3S_OBSERVER_SSL: OpenSSL content capture (uprobes)");
+    }
+
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
         Box::new(JsonExporter)
@@ -117,6 +149,11 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("LLM_EVENTS")
             .context("`LLM_EVENTS` missing")?,
     )?;
+    // Opt-in OpenSSL content ring; stays empty unless A3S_OBSERVER_SSL attached the uprobes.
+    let mut ssl_ring = RingBuf::try_from(
+        ebpf.take_map("SSL_EVENTS")
+            .context("`SSL_EVENTS` missing")?,
+    )?;
     // Cumulative count of events dropped because a ring was full (data-loss visibility).
     let drops: PerCpuArray<_, u64> =
         PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
@@ -149,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
                     dns = stats.dns,
                     file = stats.file,
                     llm = stats.llm,
+                    ssl = stats.ssl,
                     dropped,
                     "a3s-observer: events in the last 60s (dropped = cumulative ring-full)"
                 );
@@ -275,6 +313,23 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                while let Some(item) = ssl_ring.next() {
+                    if let Some(ev) = read_pod::<SslEvent>(&item) {
+                        let len = (ev.len as usize).min(ev.data.len());
+                        let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
+                        if !content.is_empty() {
+                            emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                                identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                provider: None,
+                                event: AgentEvent::SslContent {
+                                    pid: ev.pid,
+                                    is_read: ev.is_read != 0,
+                                    content,
+                                },
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -284,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
         dns = stats.dns,
         file = stats.file,
         llm = stats.llm,
+        ssl = stats.ssl,
         "a3s-observer-collector: stopped (final window)"
     );
     Ok(())
@@ -300,6 +356,17 @@ fn attach(ebpf: &mut Ebpf, prog: &str, category: &str, name: &str) -> anyhow::Re
     p.load()?;
     p.attach(category, name)
         .with_context(|| format!("attach {category}:{name}"))?;
+    Ok(())
+}
+
+fn attach_uprobe(ebpf: &mut Ebpf, prog: &str, sym: &str, target: &str) -> anyhow::Result<()> {
+    let p: &mut UProbe = ebpf
+        .program_mut(prog)
+        .with_context(|| format!("`{prog}` program not found"))?
+        .try_into()?;
+    p.load()?;
+    p.attach(Some(sym), 0, target, None)
+        .with_context(|| format!("attach uprobe {sym} in {target}"))?;
     Ok(())
 }
 
@@ -339,6 +406,7 @@ struct Stats {
     dns: u64,
     file: u64,
     llm: u64,
+    ssl: u64,
 }
 
 /// Export an event and count it by kind for the throughput report.
@@ -349,6 +417,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
         AgentEvent::Dns { .. } => stats.dns += 1,
         AgentEvent::FileAccess { .. } => stats.file += 1,
         AgentEvent::LlmCall { .. } => stats.llm += 1,
+        AgentEvent::SslContent { .. } => stats.ssl += 1,
     }
     exporter.export(&ev);
 }

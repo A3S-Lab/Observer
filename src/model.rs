@@ -44,6 +44,16 @@ pub enum AgentEvent {
     },
     /// A DNS query — a hostname the process resolved (`sys_enter_sendto` to :53).
     Dns { pid: u32, query: String },
+    /// Plaintext from a TLS connection, captured by the **opt-in** OpenSSL uprobe extension
+    /// (`A3S_OBSERVER_SSL=1`): the request (prompt) or response (completion) body. OpenSSL
+    /// only (not language-agnostic), off by default. `content` is a UTF-8-lossy snapshot,
+    /// truncated to the kernel snapshot length.
+    SslContent {
+        pid: u32,
+        /// true = response (`SSL_read`, completion); false = request (`SSL_write`, prompt).
+        is_read: bool,
+        content: String,
+    },
 }
 
 /// An [`AgentEvent`] tagged with the resolved [`Identity`] and, for LLM calls, the

@@ -89,3 +89,23 @@ pub struct LlmEvent {
     pub ttft_ns: u64,    // ClientHello → first response byte; 0 = no response seen
     pub comm: [u8; 16],
 }
+
+/// A plaintext snapshot from a TLS connection, captured by **uprobes** on OpenSSL
+/// `SSL_write` / `SSL_read` — the OPT-IN content extension (LLM prompt / completion bodies).
+///
+/// Unlike every other probe this is **not** language-agnostic: a uprobe binds to a specific
+/// library symbol, so this covers **OpenSSL only** (Python `requests`/`httpx`, Node, curl, …),
+/// not Go's `crypto/tls` or BoringSSL. It also captures real request/response content, so it is
+/// **off by default** (`A3S_OBSERVER_SSL=1`) and must run where that's acceptable. This is why
+/// it lives outside the universal core — see Rule 2 (minimal core + external extensions).
+pub const SSL_SNAP_LEN: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SslEvent {
+    pub pid: u32,
+    pub is_read: u32, // 0 = SSL_write (request / prompt), 1 = SSL_read (response / completion)
+    pub len: u32,     // bytes captured into `data` (<= SSL_SNAP_LEN)
+    pub comm: [u8; 16],
+    pub data: [u8; SSL_SNAP_LEN],
+}
