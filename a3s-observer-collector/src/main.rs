@@ -5,8 +5,8 @@
 //! provider). Identity resolution + OTel export are the next milestones.
 
 use a3s_observer::{
-    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, LogExporter,
-    ProcResolver, ServiceClassifier, SniClassifier,
+    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
+    LogExporter, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{ConnectEvent, ExecEvent, TlsEvent};
 use anyhow::Context as _;
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         Box::new(LogExporter)
     };
     let classifier = SniClassifier;
-    let resolver = ProcResolver;
+    let resolver = KubeResolver; // cgroup→pod in k8s; falls back to comm on bare hosts
     // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
     let mut peers: HashMap<u64, IpAddr> = HashMap::new();
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;

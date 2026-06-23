@@ -120,6 +120,58 @@ fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
     tail.split_whitespace().nth(1)?.parse().ok() // remaining = [state, ppid, ...]
 }
 
+/// [`IdentityResolver`] for Kubernetes / containers: reads `/proc/<pid>/cgroup` for the
+/// pod UID + container id, falling back to the process `comm` on a bare host. Pod *names*
+/// need the k8s API (a future enhancement); this gives pod-UID / container-id attribution
+/// with zero cluster access.
+pub struct KubeResolver;
+
+impl IdentityResolver for KubeResolver {
+    fn resolve(&self, pid: u32, _cgroup_id: u64, _netns: u64) -> Identity {
+        if let Ok(cg) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+            let k = parse_cgroup(&cg);
+            if k.pod_uid.is_some() || k.container_id.is_some() {
+                return Identity {
+                    agent: k.pod_uid.or_else(|| k.container_id.clone()),
+                    task: Some(pid.to_string()),
+                    session: k.container_id,
+                };
+            }
+        }
+        Identity {
+            agent: read_comm(pid), // bare host
+            task: Some(pid.to_string()),
+            session: None,
+        }
+    }
+}
+
+struct KubeId {
+    pod_uid: Option<String>,
+    container_id: Option<String>,
+}
+
+/// Extract pod UID + (short) container id from a `/proc/<pid>/cgroup` body. Handles the
+/// common containerd (`...-pod<uid>.slice/cri-containerd-<64hex>.scope`) and docker
+/// (`docker-<64hex>.scope`) layouts; returns `None`s for a non-container cgroup.
+fn parse_cgroup(s: &str) -> KubeId {
+    let mut pod_uid = None;
+    let mut container_id = None;
+    for seg in s.split(|c| c == '/' || c == '.' || c == '-') {
+        if seg.len() == 64 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+            container_id = Some(seg[..12].to_owned()); // short id
+        } else if let Some(uid) = seg.strip_prefix("pod") {
+            if uid.len() >= 30 {
+                pod_uid = Some(uid.replace('_', "-")); // containerd uses '_' in the UID
+            }
+        }
+    }
+    KubeId {
+        pod_uid,
+        container_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +194,22 @@ mod tests {
         );
         assert_eq!(c.classify(Some("api.openai.com"), ip), Some(Provider::OpenAi));
         assert_eq!(c.classify(Some("example.com"), ip), None);
+    }
+
+    #[test]
+    fn cgroup_parse_containerd_docker_bare() {
+        let cd = "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod1a2b3c4d_5e6f_7890_abcd_ef1234567890.slice/cri-containerd-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.scope";
+        let k = parse_cgroup(cd);
+        assert_eq!(k.pod_uid.as_deref(), Some("1a2b3c4d-5e6f-7890-abcd-ef1234567890"));
+        assert_eq!(k.container_id.as_deref(), Some("abcdef012345"));
+
+        let dk = "0::/system.slice/docker-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.scope";
+        let k2 = parse_cgroup(dk);
+        assert_eq!(k2.container_id.as_deref(), Some("abcdef012345"));
+        assert_eq!(k2.pod_uid, None);
+
+        let bare = "0::/user.slice/user-1000.slice/session-3.scope";
+        let k3 = parse_cgroup(bare);
+        assert!(k3.pod_uid.is_none() && k3.container_id.is_none());
     }
 }

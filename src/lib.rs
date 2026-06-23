@@ -18,6 +18,6 @@ pub mod traits;
 
 pub use model::{AgentEvent, EnrichedEvent};
 pub use traits::{
-    read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, LogExporter, ProcResolver,
-    Provider, ServiceClassifier, SniClassifier,
+    read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LogExporter,
+    ProcResolver, Provider, ServiceClassifier, SniClassifier,
 };
