@@ -136,10 +136,12 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://otlp-backend:4317 \
 Every event is one valid-JSON line (verified: the `filelog` receiver's `json_parser`
 ingests them directly), so a3s-observer also drops straight into vector / Loki / `jq`.
 
-**Kubernetes:** build the image with [`deploy/Dockerfile`](deploy/Dockerfile) and deploy
-[`deploy/daemonset.yaml`](deploy/daemonset.yaml) (writes NDJSON to stdout); a node-level
-OTel Collector DaemonSet tails the container log. No k8s API/RBAC needed — pod identity
-comes from `/proc/<pid>/cgroup`. This keeps the always-on probe binary minimal and
+**Kubernetes:** CI publishes the image to **`ghcr.io/a3s-lab/observer:<ver>`** on each tag
+([`.github/workflows/image.yml`](.github/workflows/image.yml), built from
+[`deploy/Dockerfile`](deploy/Dockerfile)); mirror/promote it to a cluster-local registry for
+nodes that can't reach `ghcr.io`. Then deploy [`deploy/daemonset.yaml`](deploy/daemonset.yaml)
+(NDJSON to stdout); a node-level OTel Collector DaemonSet tails the container log. No k8s
+API/RBAC needed — pod identity comes from `/proc/<pid>/cgroup`. This keeps the always-on probe binary minimal and
 decoupled from backend availability; in-process OTLP push is intentionally **not** built —
 that's the Collector's job.
 
