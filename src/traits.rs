@@ -280,6 +280,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_cgroup_extracts_containerd_pod_and_container() {
+        // containerd / cri-o systemd layout — pod UID uses '_' which must become '-'.
+        let cg = "0::/kubepods.slice/kubepods-besteffort.slice/\
+                  kubepods-besteffort-poda1b2c3d4_e5f6_7890_abcd_ef1234567890.slice/\
+                  cri-containerd-1111111111111111111111111111111111111111111111111111111111111111.scope\n";
+        let k = parse_cgroup(cg);
+        assert_eq!(
+            k.pod_uid.as_deref(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+        assert_eq!(k.container_id.as_deref(), Some("111111111111")); // short id (12)
+    }
+
+    #[test]
+    fn parse_cgroup_extracts_docker_container_only() {
+        let cg = "0::/system.slice/\
+                  docker-2222222222222222222222222222222222222222222222222222222222222222.scope\n";
+        let k = parse_cgroup(cg);
+        assert_eq!(k.container_id.as_deref(), Some("222222222222"));
+        assert_eq!(k.pod_uid, None);
+    }
+
+    #[test]
+    fn parse_cgroup_none_for_bare_host() {
+        let k = parse_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n");
+        assert!(k.pod_uid.is_none());
+        assert!(k.container_id.is_none());
+    }
+
+    #[test]
+    fn json_exporter_export_is_nonblocking() {
+        use crate::model::AgentEvent;
+        let ex = JsonExporter::new();
+        let ev = EnrichedEvent {
+            identity: Identity {
+                agent: Some("agent-x".into()),
+                task: Some("1".into()),
+                session: None,
+            },
+            provider: None,
+            event: AgentEvent::ProcessExit {
+                pid: 1,
+                exit_code: 0,
+            },
+        };
+        for _ in 0..50 {
+            ex.export(&ev);
+        }
+        assert_eq!(ex.output_drops(), 0); // 50 << queue cap → nothing dropped, never blocks
+    }
+
+    #[test]
     fn cgroup_parse_containerd_docker_bare() {
         let cd = "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod1a2b3c4d_5e6f_7890_abcd_ef1234567890.slice/cri-containerd-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.scope";
         let k = parse_cgroup(cd);
