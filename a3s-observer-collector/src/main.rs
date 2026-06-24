@@ -11,7 +11,7 @@ use a3s_observer::{
     KubeResolver, LogExporter, Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
+    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
 };
 use anyhow::Context as _;
 use aya::{
@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
     let mut probes = vec![
         ("exec", "sys_enter_execve"),
+        ("proc_exit", "sys_enter_exit_group"),
         ("tls_write", "sys_enter_write"),
         ("tls_sendto", "sys_enter_sendto"),
         ("connect", "sys_enter_connect"),
@@ -129,6 +130,10 @@ async fn main() -> anyhow::Result<()> {
     // closes (the in-kernel LlmEvent) to build the metric-bearing LlmCall.
     let mut llm_meta: HashMap<u64, (Option<String>, Option<Provider>, IpAddr)> = HashMap::new();
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
+    let mut exit_ring = RingBuf::try_from(
+        ebpf.take_map("EXIT_EVENTS")
+            .context("`EXIT_EVENTS` missing")?,
+    )?;
     let mut tls_ring = RingBuf::try_from(
         ebpf.take_map("TLS_EVENTS")
             .context("`TLS_EVENTS` missing")?,
@@ -194,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(0);
                 tracing::info!(
                     exec = stats.exec,
+                    exit = stats.exit,
                     egress = stats.egress,
                     dns = stats.dns,
                     file = stats.file,
@@ -218,6 +224,18 @@ async fn main() -> anyhow::Result<()> {
                                 ppid: read_ppid(ev.pid),
                                 argv: argv_of(&ev),
                                 cwd: read_cwd(ev.pid),
+                            },
+                        });
+                    }
+                }
+                while let Some(item) = exit_ring.next() {
+                    if let Some(ev) = read_pod::<ExitEvent>(&item) {
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            provider: None,
+                            event: AgentEvent::ProcessExit {
+                                pid: ev.pid,
+                                exit_code: ev.exit_code,
                             },
                         });
                     }
@@ -347,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(
         exec = stats.exec,
+        exit = stats.exit,
         egress = stats.egress,
         dns = stats.dns,
         file = stats.file,
@@ -432,6 +451,7 @@ fn identity_for(r: &impl IdentityResolver, pid: u32, comm: &[u8; 16]) -> Identit
 #[derive(Default)]
 struct Stats {
     exec: u64,
+    exit: u64,
     egress: u64,
     dns: u64,
     file: u64,
@@ -443,6 +463,7 @@ struct Stats {
 fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
     match &ev.event {
         AgentEvent::ToolExec { .. } => stats.exec += 1,
+        AgentEvent::ProcessExit { .. } => stats.exit += 1,
         AgentEvent::Egress { .. } => stats.egress += 1,
         AgentEvent::Dns { .. } => stats.dns += 1,
         AgentEvent::FileAccess { .. } => stats.file += 1,

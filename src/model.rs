@@ -16,6 +16,9 @@ pub enum AgentEvent {
         argv: Vec<String>,
         cwd: String,
     },
+    /// A process exited (`sys_enter_exit_group`) — the tool's outcome / exit code. Pairs with
+    /// `ToolExec` to bracket a tool's lifecycle (started → finished with this status).
+    ProcessExit { pid: u32, exit_code: u32 },
     /// A file was opened (`openat`).
     FileAccess { pid: u32, path: String, write: bool },
     /// An outbound LLM call (TLS connection to a known provider), with metrics accumulated

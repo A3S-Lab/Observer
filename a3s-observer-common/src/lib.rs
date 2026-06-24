@@ -25,6 +25,17 @@ pub struct ExecEvent {
     pub args: [[u8; ARG_LEN]; ARGV_SLOTS], // argv[0..argc], each NUL-terminated
 }
 
+/// A process exit (`sys_enter_exit_group`) — the other end of the tool lifecycle, carrying the
+/// exit status so tool *outcomes* are visible (did the command succeed?), not just that it ran.
+/// Catches clean exits (the C runtime's `exit()` calls `exit_group`); signal kills don't.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExitEvent {
+    pub pid: u32,
+    pub exit_code: u32, // exit_group status; the low byte is the code passed to exit()
+    pub comm: [u8; 16],
+}
+
 /// The leading bytes of an outbound TLS ClientHello, captured at the send syscall.
 ///
 /// The eBPF side only detects + copies (verifier-friendly); userspace parses the SNI

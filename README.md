@@ -44,6 +44,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | signal | kernel hook | event |
 |---|---|---|
 | `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess: **full argv** + cwd, comm, uid |
+| `exit` | `sys_enter_exit_group` | `ProcessExit` — tool outcome + **exit code** (clean exits) |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |

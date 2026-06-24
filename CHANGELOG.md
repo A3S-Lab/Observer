@@ -2,6 +2,21 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.8.0] — process lifecycle (exit + exit code)
+
+### Added
+
+- **`ProcessExit` event** — `sys_enter_exit_group` captures a process's exit + **exit code**,
+  pairing with `ToolExec` to bracket a tool's lifecycle (started → finished with this status).
+  You now see tool *outcomes* (did the command succeed / fail?), not just that it ran.
+  Host-validated: `exit 42` surfaced `{"exit_code":42}`. Catches clean exits (the C runtime's
+  `exit()` calls `exit_group`); signal kills don't.
+
+### Changed
+
+- Exec ring 256→512 KiB — the v0.7.0 argv buffer made `ExecEvent` ~928 B (6×), which had
+  halved the exec ring; restore headroom so a process burst doesn't drop. fileguard clippy-clean.
+
 ## [0.7.0] — richer tool observability (full argv + cwd)
 
 ### Added / Changed

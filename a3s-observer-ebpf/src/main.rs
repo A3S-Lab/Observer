@@ -2,8 +2,8 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent, ARGV_SLOTS,
-    ARG_LEN, DNS_SNAP_LEN, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
+    ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -20,6 +20,9 @@ use aya_ebpf::{
 // keep a process burst (a build spawning many subprocesses) from dropping events.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+
+#[map]
+static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 #[map]
 static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -140,6 +143,28 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
                 (*ev).argc += 1;
             }
         }
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- process exit (sys_enter_exit_group) — the tool's outcome / exit code ----
+
+#[tracepoint]
+pub fn proc_exit(ctx: TracePointContext) -> u32 {
+    try_proc_exit(&ctx).unwrap_or(0)
+}
+
+fn try_proc_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+    let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        // sys_enter_exit_group: `long error_code` at offset 16 (low byte = the exit() code).
+        (*ev).exit_code = ctx.read_at::<u64>(16).unwrap_or(0) as u32;
     }
     entry.submit(0);
     Ok(0)
