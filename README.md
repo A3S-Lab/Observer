@@ -194,6 +194,19 @@ a3s-observer  →  NDJSON  →  OTel Collector (filelog → OTLP)  →  your bac
 
 Rust + [Aya](https://aya-rs.dev). Validated on Linux 6.8.
 
+## Tested
+
+Soak-tested under sustained load — observe on a production host, intervene in an isolated VM:
+
+| path | cases (all leak-free + correct under load) |
+|---|---|
+| **observe** | steady 20 min · edge-input · **a real a3s-code agent** · throughput 110k ev/60s · memory-bound (256 Mi) · restart ×8 · idle + heartbeat · SIGTERM · concurrent collectors · backpressure · connection-churn |
+| **intervene** | egress · file/exec · SSL-content guards — and all three running alongside the collector |
+
+Two robustness bugs surfaced and were fixed this way: NDJSON stdout pollution (v0.9.1) and an
+output-backpressure event-loop stall (v0.9.2). Lib line coverage **79.6%** (`cargo llvm-cov`) —
+the untrusted SNI / DNS / cgroup parsers and the full 14-provider classifier are unit-tested.
+
 ## Security
 
 Privileged component — see [SECURITY.md](SECURITY.md) for the disclosure policy and how to
