@@ -43,7 +43,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 
 | signal | kernel hook | event |
 |---|---|---|
-| `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess (argv, comm, uid) |
+| `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess: **full argv** + cwd, comm, uid |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |
@@ -63,7 +63,8 @@ in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **corr
  "req_bytes":284,"resp_bytes":3832,"latency":{"secs":1,"nanos":210000000},
  "ttft":{"secs":0,"nanos":410000000}}}}
 {"identity":{"agent":"python3","task":"1903","session":null},"provider":null,
- "event":{"ToolExec":{"pid":1903,"ppid":1841,"argv":["/usr/bin/git"],"cwd":""}}}
+ "event":{"ToolExec":{"pid":1903,"ppid":1841,
+ "argv":["git","clone","https://github.com/acme/repo"],"cwd":"/home/agent/work"}}}
 {"identity":{"agent":"python3","task":"1841","session":null},"provider":null,
  "event":{"SslContent":{"pid":1841,"is_read":false,
  "content":"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n..."}}}

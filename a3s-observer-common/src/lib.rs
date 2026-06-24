@@ -8,14 +8,21 @@
 ///
 /// This is the language-agnostic "tool ran" signal — AgentSight's flagship is catching
 /// subprocesses that bypass app-level instrumentation, and this is how we see them.
+/// Up to `ARGV_SLOTS` arguments, each truncated to `ARG_LEN` bytes, are captured per exec —
+/// the args carry the agent's intent (`curl <url>`, `sh -c "<cmd>"`), not just the binary.
+pub const ARGV_SLOTS: usize = 12;
+pub const ARG_LEN: usize = 64;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExecEvent {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
+    pub argc: u32, // number of args captured into `args` (may be < the real argc)
     pub comm: [u8; 16],
     pub filename: [u8; 128],
+    pub args: [[u8; ARG_LEN]; ARGV_SLOTS], // argv[0..argc], each NUL-terminated
 }
 
 /// The leading bytes of an outbound TLS ClientHello, captured at the send syscall.

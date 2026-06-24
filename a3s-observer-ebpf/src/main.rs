@@ -2,8 +2,8 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent, DNS_SNAP_LEN,
-    PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecEvent, FileEvent, LlmEvent, SslEvent, TlsEvent, ARGV_SLOTS,
+    ARG_LEN, DNS_SNAP_LEN, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -121,6 +121,22 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
         // sys_enter_execve: `const char *filename` at offset 16.
         if let Ok(filename_ptr) = ctx.read_at::<*const u8>(16) {
             let _ = bpf_probe_read_user_str_bytes(filename_ptr, &mut (*ev).filename);
+        }
+        // `const char *const *argv` at offset 24 — capture up to ARGV_SLOTS args (the intent:
+        // which URL / which command, not just the binary). Bounded for the verifier.
+        (*ev).argc = 0;
+        (*ev).args = [[0u8; ARG_LEN]; ARGV_SLOTS];
+        if let Ok(argv) = ctx.read_at::<*const u8>(24) {
+            for i in 0..ARGV_SLOTS {
+                let Some(argp) = read_user_u64(argv.add(i * 8)) else {
+                    break;
+                };
+                if argp == 0 {
+                    break; // end of argv
+                }
+                let _ = bpf_probe_read_user_str_bytes(argp as *const u8, &mut (*ev).args[i]);
+                (*ev).argc += 1;
+            }
         }
     }
     entry.submit(0);

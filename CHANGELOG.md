@@ -2,10 +2,14 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
-## [Unreleased]
+## [0.7.0] — richer tool observability (full argv + cwd)
 
-### Changed
+### Added / Changed
 
+- **Full command line on `ToolExec`** — the exec probe captures `argv[0..]` in-kernel (up to 12
+  args × 64 bytes), not just the binary, so an agent's *intent* is visible
+  (`curl --url=… "two words"`, `sh -c "<cmd>"`); the working directory (`cwd`) is filled from
+  `/proc/<pid>/cwd`. Host-validated: a marker exec surfaced its full argv + cwd.
 - The collector warns if the liveness heartbeat write fails — an unwritable
   `A3S_OBSERVER_HEARTBEAT` path would otherwise cause a silent livenessProbe restart-loop.
 

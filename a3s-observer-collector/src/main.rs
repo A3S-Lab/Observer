@@ -216,8 +216,8 @@ async fn main() -> anyhow::Result<()> {
                             event: AgentEvent::ToolExec {
                                 pid: ev.pid,
                                 ppid: read_ppid(ev.pid),
-                                argv: argv_of(&ev.filename),
-                                cwd: String::new(),
+                                argv: argv_of(&ev),
+                                cwd: read_cwd(ev.pid),
                             },
                         });
                     }
@@ -387,8 +387,26 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
         .then(|| unsafe { core::ptr::read_unaligned(item.as_ptr() as *const T) })
 }
 
-fn argv_of(filename: &[u8; 128]) -> Vec<String> {
-    vec![cstr(filename)]
+/// Full argv (argv[0..argc]) captured in-kernel; falls back to the binary path if none.
+fn argv_of(ev: &ExecEvent) -> Vec<String> {
+    let n = (ev.argc as usize).min(ev.args.len());
+    let argv: Vec<String> = ev.args[..n]
+        .iter()
+        .map(|a| cstr(a))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if argv.is_empty() {
+        vec![cstr(&ev.filename)]
+    } else {
+        argv
+    }
+}
+
+/// The process's current working directory (≈ exec-time for a fresh process).
+fn read_cwd(pid: u32) -> String {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// A NUL-terminated byte buffer (from a kernel copy) as a lossy String.
