@@ -170,7 +170,12 @@ async fn main() -> anyhow::Result<()> {
     // livenessProbe can detect a wedged collector (file goes stale → restart the pod).
     let heartbeat = std::env::var("A3S_OBSERVER_HEARTBEAT")
         .unwrap_or_else(|_| "/run/a3s-observer.alive".into());
-    let _ = std::fs::write(&heartbeat, b"ok");
+    if let Err(e) = std::fs::write(&heartbeat, b"ok") {
+        // Warn loudly: a livenessProbe watching a never-written file would false-restart.
+        tracing::warn!(path = %heartbeat, error = %e,
+            "heartbeat write failed — set A3S_OBSERVER_HEARTBEAT to a writable path, or a \
+             livenessProbe on it will restart-loop the pod");
+    }
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

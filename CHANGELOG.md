@@ -2,6 +2,13 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- The collector warns if the liveness heartbeat write fails — an unwritable
+  `A3S_OBSERVER_HEARTBEAT` path would otherwise cause a silent livenessProbe restart-loop.
+
 ## [0.6.0] — exec intervention + fileguard hot-reload
 
 ### Added / Changed
