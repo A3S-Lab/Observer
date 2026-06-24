@@ -2,6 +2,21 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.9.1] — fix: operational logs to stderr (NDJSON stdout was polluted)
+
+### Fixed
+
+- **Logs now go to stderr** (were on stdout, interleaved with the NDJSON event stream) — found
+  by deep testing: an NDJSON consumer (`jq` / vector / OTel `filelog`) would hit the `INFO …`
+  log lines and fail. stdout is now pure NDJSON; the operational logs (startup, throughput, drop
+  counter) are on stderr at INFO by default. The OTel sample's `json_parser` now also skips
+  non-JSON lines (for the k8s pod log, where stdout+stderr interleave).
+
+### Tested
+
+- Deep test (sustained mixed workload): all event types flow together, **dropped=0** at ~110 k
+  events/60 s, RSS flat (no leak), no panics.
+
 ## [0.9.0] — file deletions (destructive actions)
 
 ### Added

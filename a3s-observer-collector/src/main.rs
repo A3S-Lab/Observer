@@ -45,7 +45,12 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {}
     }
-    tracing_subscriber::fmt::init();
+    // Logs go to STDERR so STDOUT stays pure NDJSON (the event stream a pipeline parses), at
+    // INFO by default so the operational logs (throughput, drop counter) are actually visible.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),

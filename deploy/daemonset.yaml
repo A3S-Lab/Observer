@@ -25,7 +25,7 @@ spec:
       terminationGracePeriodSeconds: 30 # the collector flushes a final report on SIGTERM
       containers:
         - name: a3s-observer
-          image: 10.12.111.133:49164/a3s/observer:0.9.0 # mirror of ghcr.io/a3s-lab/observer:0.9.0
+          image: 10.12.111.133:49164/a3s/observer:0.9.1 # mirror of ghcr.io/a3s-lab/observer:0.9.1
           securityContext:
             # eBPF load + tracepoint attach requires privileged. (Verified: a non-root
             # process with only CAP_BPF+CAP_PERFMON fails to attach — the tracefs tracepoint

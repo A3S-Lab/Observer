@@ -28,6 +28,7 @@ receivers:
     include: [/var/log/a3s-observer.ndjson]
     operators:
       - type: json_parser # each line → structured attributes (identity/provider/event)
+        if: 'body matches "^[{]"' # only parse NDJSON; skip any interleaved stderr log lines
         parse_from: body
 
 processors:
