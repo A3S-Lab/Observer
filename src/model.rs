@@ -21,6 +21,8 @@ pub enum AgentEvent {
     ProcessExit { pid: u32, exit_code: u32 },
     /// A file was opened (`openat`).
     FileAccess { pid: u32, path: String, write: bool },
+    /// A file was deleted (`unlinkat`) — a destructive action; pairs with `FileAccess`.
+    FileDelete { pid: u32, path: String },
     /// An outbound LLM call (TLS connection to a known provider), with metrics accumulated
     /// in-kernel over the connection's lifetime and emitted on close.
     ///

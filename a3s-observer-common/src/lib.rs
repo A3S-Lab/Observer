@@ -93,6 +93,10 @@ pub struct FileEvent {
     pub path: [u8; PATH_SNAP_LEN],
 }
 
+/// `FileEvent.flags` sentinel marking a deletion (`unlinkat`) rather than an open — no real
+/// `openat` flag combination equals `u32::MAX`, so userspace can tell them apart on one ring.
+pub const FILE_DELETE_FLAG: u32 = u32::MAX;
+
 /// Metrics for one LLM call, emitted when its TLS socket closes. Bytes/timing are
 /// accumulated in-kernel per `(pid,fd)`; userspace joins this with the SNI/provider/peer it
 /// recorded at ClientHello time to build the full `LlmCall`.

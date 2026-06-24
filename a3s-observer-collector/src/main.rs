@@ -12,6 +12,7 @@ use a3s_observer::{
 };
 use a3s_observer_common::{
     ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
+    FILE_DELETE_FLAG,
 };
 use anyhow::Context as _;
 use aya::{
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     ];
     if files {
         probes.push(("file_open", "sys_enter_openat"));
+        probes.push(("file_unlink", "sys_enter_unlinkat"));
     }
     // Per-probe attach is non-fatal: kernels vary, and one missing tracepoint shouldn't take
     // down the whole collector — degrade to whatever attaches, fail only if nothing does.
@@ -305,14 +307,20 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<FileEvent>(&item) {
                         let path = cstr(&ev.path);
                         if !path.is_empty() {
-                            emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                                identity: identity_for(&resolver, ev.pid, &ev.comm),
-                                provider: None,
-                                event: AgentEvent::FileAccess {
+                            // Same ring carries opens and deletes — the sentinel flag tells them apart.
+                            let event = if ev.flags == FILE_DELETE_FLAG {
+                                AgentEvent::FileDelete { pid: ev.pid, path }
+                            } else {
+                                AgentEvent::FileAccess {
                                     pid: ev.pid,
                                     path,
                                     write: ev.flags & 0x3 != 0,
-                                },
+                                }
+                            };
+                            emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                                identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                provider: None,
+                                event,
                             });
                         }
                     }
@@ -467,6 +475,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
         AgentEvent::Egress { .. } => stats.egress += 1,
         AgentEvent::Dns { .. } => stats.dns += 1,
         AgentEvent::FileAccess { .. } => stats.file += 1,
+        AgentEvent::FileDelete { .. } => stats.file += 1,
         AgentEvent::LlmCall { .. } => stats.llm += 1,
         AgentEvent::SslContent { .. } => stats.ssl += 1,
     }

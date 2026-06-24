@@ -3,7 +3,7 @@
 
 use a3s_observer_common::{
     ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
-    ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, FILE_DELETE_FLAG, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -520,6 +520,30 @@ fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
         (*ev).flags = flags as u32;
         (*ev).path = [0u8; PATH_SNAP_LEN];
         let _ = bpf_probe_read_user_str_bytes(filename, &mut (*ev).path);
+    }
+    entry.submit(0);
+    Ok(0)
+}
+
+// ---- file deleted (sys_enter_unlinkat) — the "which files did the agent destroy" signal ----
+
+#[tracepoint]
+pub fn file_unlink(ctx: TracePointContext) -> u32 {
+    try_unlink(&ctx).unwrap_or(0)
+}
+
+fn try_unlink(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_unlinkat: dfd @16, pathname @24, flag @32.
+    let pathname: *const u8 = unsafe { ctx.read_at(24)? };
+    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).flags = FILE_DELETE_FLAG; // distinguish from an openat on the shared FILE_EVENTS ring
+        (*ev).path = [0u8; PATH_SNAP_LEN];
+        let _ = bpf_probe_read_user_str_bytes(pathname, &mut (*ev).path);
     }
     entry.submit(0);
     Ok(0)

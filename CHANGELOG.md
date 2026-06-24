@@ -2,6 +2,16 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.9.0] — file deletions (destructive actions)
+
+### Added
+
+- **`FileDelete` event** — `sys_enter_unlinkat` captures which files an agent **deletes**
+  (opt-in with `A3S_OBSERVER_FILES=1`), completing the file lifecycle (write + delete). You now
+  see destructive actions: `rm -rf /data` shows *which* files went, not just that `rm` ran.
+  Host-validated: deleting a marker file surfaced `FileDelete{path:…}`. Shares the file ring via
+  a `flags` sentinel (no extra ring/struct).
+
 ## [0.8.0] — process lifecycle (exit + exit code)
 
 ### Added
