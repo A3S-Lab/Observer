@@ -11,8 +11,8 @@ use a3s_observer::{
     KubeResolver, LogExporter, Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
-    FILE_DELETE_FLAG,
+    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
+    TlsEvent, FILE_DELETE_FLAG, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
@@ -74,6 +74,11 @@ async fn main() -> anyhow::Result<()> {
         ("read_exit", "sys_exit_read"),
         ("recv_exit", "sys_exit_recvfrom"),
         ("sock_close", "sys_enter_close"),
+        ("sec_setuid", "sys_enter_setuid"),
+        ("sec_setresuid", "sys_enter_setresuid"),
+        ("sec_setreuid", "sys_enter_setreuid"),
+        ("sec_ptrace", "sys_enter_ptrace"),
+        ("sec_bind", "sys_enter_bind"),
     ];
     if files {
         probes.push(("file_open", "sys_enter_openat"));
@@ -173,6 +178,10 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("SSL_EVENTS")
             .context("`SSL_EVENTS` missing")?,
     )?;
+    let mut sec_ring = RingBuf::try_from(
+        ebpf.take_map("SEC_EVENTS")
+            .context("`SEC_EVENTS` missing")?,
+    )?;
     // Cumulative count of events dropped because a ring was full (data-loss visibility).
     let drops: PerCpuArray<_, u64> =
         PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
@@ -220,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
                     file = stats.file,
                     llm = stats.llm,
                     ssl = stats.ssl,
+                    sec = stats.sec,
                     dropped,
                     output_dropped,
                     "a3s-observer: events in the last 60s (dropped = cumulative ring-full, \
@@ -255,6 +265,25 @@ async fn main() -> anyhow::Result<()> {
                                 pid: ev.pid,
                                 exit_code: ev.exit_code,
                                 signal: ev.signal,
+                            },
+                        });
+                    }
+                }
+                while let Some(item) = sec_ring.next() {
+                    if let Some(ev) = read_pod::<SecEvent>(&item) {
+                        let kind = match ev.kind {
+                            SEC_SETUID => "setuid-root",
+                            SEC_PTRACE => "ptrace",
+                            SEC_BIND => "bind",
+                            _ => continue,
+                        };
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            provider: None,
+                            event: AgentEvent::SecurityAction {
+                                pid: ev.pid,
+                                kind,
+                                detail: ev.detail,
                             },
                         });
                     }
@@ -415,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
         file = stats.file,
         llm = stats.llm,
         ssl = stats.ssl,
+        sec = stats.sec,
         "a3s-observer-collector: stopped (final window)"
     );
     Ok(())
@@ -512,6 +542,7 @@ struct Stats {
     file: u64,
     llm: u64,
     ssl: u64,
+    sec: u64,
 }
 
 /// Export an event and count it by kind for the throughput report.
@@ -526,6 +557,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
         AgentEvent::LlmCall { .. } => stats.llm += 1,
         AgentEvent::SslContent { .. } => stats.ssl += 1,
         AgentEvent::LlmApi { .. } => stats.llm += 1,
+        AgentEvent::SecurityAction { .. } => stats.sec += 1,
     }
     exporter.export(&ev);
 }

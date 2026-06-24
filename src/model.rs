@@ -78,6 +78,19 @@ pub enum AgentEvent {
         prompt_tokens: Option<u32>,
         completion_tokens: Option<u32>,
     },
+    /// A security-sensitive action — rare and high-signal, filtered in-kernel: privilege escalation
+    /// (`setuid`/`setresuid`/`setreuid` → root from non-root — note legitimate `sudo`/`su` also fire
+    /// this; it's a real transition, expected to pair with a `ToolExec`), process injection (`ptrace`
+    /// attach/seize of another process), or opening an off-host-reachable listening port (`bind` to a
+    /// fixed non-loopback port). `kind` names which; `detail` is kind-specific. Group (`setgid`) and
+    /// loopback-only binds are intentionally out of scope.
+    SecurityAction {
+        pid: u32,
+        /// "setuid-root" (privesc) | "ptrace" (injection) | "bind" (opened a port).
+        kind: &'static str,
+        /// ptrace: target pid · bind: port · setuid-root: 0.
+        detail: u64,
+    },
 }
 
 /// An [`AgentEvent`] tagged with the resolved [`Identity`] and, for LLM calls, the

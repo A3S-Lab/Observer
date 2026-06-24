@@ -53,6 +53,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | `unlink`\* | `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
 | `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
 | `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
+| `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
 
 Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+ppid, or an
 in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **correlation**, and

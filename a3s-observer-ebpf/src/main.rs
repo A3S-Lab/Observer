@@ -2,8 +2,9 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SslEvent, TlsEvent,
-    ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, FILE_DELETE_FLAG, PATH_SNAP_LEN, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
+    TlsEvent, ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, FILE_DELETE_FLAG, PATH_SNAP_LEN, SEC_BIND,
+    SEC_PTRACE, SEC_SETUID, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     helpers::gen::bpf_probe_read_user,
@@ -38,6 +39,11 @@ static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// Security-sensitive actions (privesc / injection / open-port). In-kernel-filtered to the loud
+// cases, so this stays near-empty — a small ring is plenty.
+#[map]
+static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // Count of events dropped because a ring was full — data-loss visibility under extreme load.
 #[map]
@@ -373,6 +379,131 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
         (*ev).addr = a;
     }
     entry.submit(0);
+    Ok(0)
+}
+
+// ---- security-sensitive actions: privesc (setuid) / injection (ptrace) / open-port (bind) ----
+//
+// One ring, in-kernel-filtered to the loud cases. These syscalls are rare for a normal agent, so
+// when one fires it's worth a look — that's the whole point of a separate "rare and loud" tier.
+
+fn emit_sec(kind: u32, detail: u64) {
+    let Some(mut entry) = reserve_or_drop::<SecEvent>(&SEC_EVENTS) else {
+        return;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).kind = kind;
+        (*ev).detail = detail;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+    }
+    entry.submit(0);
+}
+
+// Escalation TO root from a non-root caller — the loud case. Dropping privs (root → nobody, which
+// every daemon does at boot) is noise and is filtered out. NOTE: legitimate setuid-root tools
+// (sudo/su/passwd) also fire here — it's a genuine privilege transition, expected to pair with a
+// ToolExec of the setuid binary, not inherently malicious.
+fn try_setuid_to(target: u32) {
+    // glibc broadcasts setuid/setresuid/setreuid to EVERY thread (NPTL setxid), so one logical
+    // escalation fires this per-thread — the same fanout do_exit has. Emit once, from the
+    // thread-group leader (tgid == tid), matching the proc_exit convention. (A raw setuid syscall
+    // from a non-leader thread is thus missed — vanishingly rare vs the glibc/single-threaded paths.)
+    let id = bpf_get_current_pid_tgid();
+    if (id >> 32) as u32 != id as u32 {
+        return;
+    }
+    if target == 0 && (bpf_get_current_uid_gid() as u32) != 0 {
+        emit_sec(SEC_SETUID, 0);
+    }
+}
+
+#[tracepoint]
+pub fn sec_setuid(ctx: TracePointContext) -> u32 {
+    try_sec_setuid(&ctx).unwrap_or(0)
+}
+fn try_sec_setuid(ctx: &TracePointContext) -> Result<u32, i64> {
+    let uid: u64 = unsafe { ctx.read_at(16)? }; // sys_enter_setuid: uid_t uid @16
+    try_setuid_to(uid as u32);
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sec_setresuid(ctx: TracePointContext) -> u32 {
+    try_sec_setresuid(&ctx).unwrap_or(0)
+}
+fn try_sec_setresuid(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_setresuid: ruid @16, euid @24, suid @32 — the euid grants effective privilege.
+    let euid: u64 = unsafe { ctx.read_at(24)? };
+    try_setuid_to(euid as u32);
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sec_setreuid(ctx: TracePointContext) -> u32 {
+    try_sec_setreuid(&ctx).unwrap_or(0)
+}
+fn try_sec_setreuid(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_setreuid: ruid @16, euid @24 — euid is the effective uid being set (the privesc
+    // path os.setreuid / seteuid take, which neither setuid nor setresuid catches).
+    let euid: u64 = unsafe { ctx.read_at(24)? };
+    try_setuid_to(euid as u32);
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sec_ptrace(ctx: TracePointContext) -> u32 {
+    try_sec_ptrace(&ctx).unwrap_or(0)
+}
+fn try_sec_ptrace(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_ptrace: long request @16, long pid @24.
+    let request: u64 = unsafe { ctx.read_at(16)? };
+    let target: u64 = unsafe { ctx.read_at(24)? };
+    // PTRACE_ATTACH = 16, PTRACE_SEIZE = 0x4206 — the gateway to memory/register injection
+    // (you must attach before POKE*). TRACEME = 0 is benign self-trace. Skip self-targeting.
+    let self_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if (request == 16 || request == 0x4206) && target as u32 != self_pid {
+        emit_sec(SEC_PTRACE, target);
+    }
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sec_bind(ctx: TracePointContext) -> u32 {
+    try_sec_bind(&ctx).unwrap_or(0)
+}
+fn try_sec_bind(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_bind: int fd @16, struct sockaddr *umyaddr @24, int addrlen @32 — same shape as connect.
+    let addr_ptr: *const u8 = unsafe { ctx.read_at(24)? };
+    let addrlen: u64 = unsafe { ctx.read_at(32)? };
+    if addrlen < 8 {
+        return Ok(0);
+    }
+    let mut fam = [0u8; 2];
+    if unsafe { bpf_probe_read_user_buf(addr_ptr, &mut fam) }.is_err() {
+        return Ok(0);
+    }
+    let family = u16::from_ne_bytes(fam);
+    if family != 2 && family != 10 {
+        return Ok(0); // AF_INET / AF_INET6 only
+    }
+    // Skip loopback (127.0.0.0/8) binds — local-only helper sockets (runtime debug/metrics servers)
+    // are common noise; an off-host-reachable listener is the loud case. (IPv6 ::1 not filtered.)
+    if family == 2 {
+        let mut oct = [0u8; 1];
+        let _ = unsafe { bpf_probe_read_user_buf(addr_ptr.add(4), &mut oct) }; // first octet of sin_addr
+        if oct[0] == 127 {
+            return Ok(0);
+        }
+    }
+    let mut port = [0u8; 2];
+    let _ = unsafe { bpf_probe_read_user_buf(addr_ptr.add(2), &mut port) }; // sin_port (network order)
+    let port = u16::from_be_bytes(port);
+    // port 0 = kernel picks (a client's ephemeral source port); a fixed port = a server listening.
+    if port != 0 {
+        emit_sec(SEC_BIND, port as u64);
+    }
     Ok(0)
 }
 
