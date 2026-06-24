@@ -2,7 +2,7 @@
 
 Kernel-level **eBPF observability — and optional intervention — for AI agents.** It turns
 syscalls and network events into agent-semantic telemetry (which agent ran which tool, made
-which LLM call, touched which files, reached which endpoint) with **zero changes to the agent
+which LLM call, touched which files, reached which endpoint, escalated privileges) with **zero changes to the agent
 and no per-language instrumentation** — and the same kernel vantage point can **intervene**:
 deny an agent's egress, file access, or process execution from an external policy.
 
@@ -19,12 +19,12 @@ can never break observability.
 ```
   AI agent + its tool subprocesses                  unmodified · any language
             │
-            │   execve · connect · TLS ClientHello · DNS · openat · read/recv · SSL_*
+            │   execve · do_exit · connect · TLS ClientHello · DNS · openat · setuid/ptrace/bind · SSL_*
   ══════════╪═══════════════════════════════════════════════  KERNEL  (eBPF + fanotify)
             ▼
    OBSERVE  (passive, always-on)            INTERVENE  (opt-in, external policy)
-     exec  connect  sni  dns                  enforce   → cgroup/connect4: deny egress
-     llm-metrics  file*  ssl-content*         fileguard → fanotify: deny open + exec
+     exec  exit  connect  sni  dns           enforce   → cgroup/connect4: deny egress
+     security  llm-metrics  file*  ssl*      fileguard → fanotify: deny open + exec
             │
             │  ring buffers
   ══════════╪═══════════════════════════════════════════════  USERSPACE
@@ -198,16 +198,21 @@ Rust + [Aya](https://aya-rs.dev). Validated on Linux 6.8.
 
 ## Tested
 
-Soak-tested under sustained load — observe on a production host, intervene in an isolated VM:
+Soak-tested under sustained load — observe on real hosts (including a **24-min large-scale soak
+across an 8-node Kubernetes cluster**, observe-only DaemonSet: flat RSS, zero drops, zero
+restarts, non-disruptive), intervene in an isolated VM:
 
 | path | cases (all leak-free + correct under load) |
 |---|---|
-| **observe** | steady 20 min · edge-input · **a real a3s-code agent** · throughput 110k ev/60s · memory-bound (256 Mi) · restart ×8 · idle + heartbeat · SIGTERM · concurrent collectors · backpressure · connection-churn |
+| **observe** | steady 20 min · edge-input · **a real a3s-code agent** · throughput 110k ev/60s · memory-bound (256 Mi) · restart ×8 · idle + heartbeat · SIGTERM · concurrent collectors · backpressure · connection-churn · **8-node cluster** |
 | **intervene** | egress · file/exec · SSL-content guards — and all three running alongside the collector |
 
-Two robustness bugs surfaced and were fixed this way: NDJSON stdout pollution (v0.9.1) and an
+Every new signal is validated live (correct payload, verifier loads clean) and reviewed by an
+adversarial multi-agent pass before release — which has **twice** caught a per-thread event
+duplication (multithreaded `do_exit` / `setuid`) that single-threaded tests missed. Soak also
+surfaced two robustness bugs, since fixed: NDJSON stdout pollution (v0.9.1) and an
 output-backpressure event-loop stall (v0.9.2). Lib line coverage **79.6%** (`cargo llvm-cov`) —
-the untrusted SNI / DNS / cgroup parsers and the full 14-provider classifier are unit-tested.
+the untrusted SNI / DNS / cgroup parsers and the full 15-provider classifier are unit-tested.
 
 ## Security
 
