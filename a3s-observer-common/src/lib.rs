@@ -133,3 +133,19 @@ pub struct SslEvent {
     pub comm: [u8; 16],
     pub data: [u8; SSL_SNAP_LEN],
 }
+
+/// A security-sensitive action — rare and high-signal, filtered in-kernel so volume stays near
+/// zero. One event/ring covers several syscalls (privilege escalation, process injection, opening
+/// a listening port) instead of a probe-per-syscall sprawl — keeps the model + ring count bounded.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SecEvent {
+    pub pid: u32,
+    pub kind: u32,   // SEC_* below
+    pub detail: u64, // SEC_SETUID: 0 (escalated-to uid) · SEC_PTRACE: target pid · SEC_BIND: port
+    pub comm: [u8; 16],
+}
+
+pub const SEC_SETUID: u32 = 1; // setuid/setresuid → euid 0 from a non-root caller (privesc)
+pub const SEC_PTRACE: u32 = 2; // ptrace(ATTACH|SEIZE) of another process (injection)
+pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a listener)

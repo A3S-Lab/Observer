@@ -2,6 +2,24 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.11.0] — SecurityAction: privesc / injection / open-port
+
+### Added
+
+- **`AgentEvent::SecurityAction { pid, kind, detail }`** — one rare-and-loud, in-kernel-filtered
+  event for the security-sensitive syscalls an agent rarely makes but that matter when it does.
+  Three kinds, all on a single `SEC_EVENTS` ring:
+  - `setuid-root` — `setuid`/`setresuid`/`setreuid` setting (e)uid 0 from a non-root caller
+    (privilege escalation, including the EPERM-bound *attempt*). Gated to the thread-group leader,
+    so glibc's NPTL setxid broadcast doesn't fan out one escalation into N duplicate events.
+  - `ptrace` — `ptrace(ATTACH|SEIZE)` of another process (`detail` = target pid): process injection.
+  - `bind` — `bind()` to a fixed **non-loopback** port (`detail` = port): an off-host-reachable
+    listener. Loopback (127.0.0.0/8) binds are filtered as common local-helper noise.
+
+  Group escalation (`setgid`) and loopback-only binds are intentionally out of scope. Validated
+  live on Linux 6.8 (all three fire with correct `detail`, verifier loads clean, multithreaded
+  `setuid` deduped to one event), and adversarially reviewed before release.
+
 ## [0.10.0] — richer signals: exit-signal, LLM model, dest-port, uid
 
 ### Added
