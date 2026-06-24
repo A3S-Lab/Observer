@@ -600,4 +600,35 @@ mod tests {
         assert_eq!(parse_dns_qname(&q).as_deref(), Some("api.anthropic.com"));
         assert_eq!(parse_dns_qname(&[0u8; 8]), None);
     }
+
+    #[test]
+    fn parse_sni_rejects_malicious_name_len_without_panicking() {
+        // Long enough to reach the extension walk, but the server_name name_len (0xffff) points
+        // far past the buffer — a hand-rolled parser without bounds checks would OOB-panic here.
+        let mut b = vec![0x16, 0x03, 0x01, 0x00, 0x00];
+        b.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        b.extend_from_slice(&[0x03, 0x03]);
+        b.extend_from_slice(&[0u8; 32]);
+        b.push(0x00); // session_id len 0
+        b.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
+        b.extend_from_slice(&[0x01, 0x00]); // compression
+        b.extend_from_slice(&[0x00, 0x09]); // extensions total len
+        b.extend_from_slice(&[0x00, 0x00]); // ext type: server_name
+        b.extend_from_slice(&[0x00, 0x05]); // ext len
+        b.extend_from_slice(&[0x00, 0x03]); // server_name_list len
+        b.push(0x00); // name_type
+        b.extend_from_slice(&[0xff, 0xff]); // name_len 65535 — past the buffer
+        assert_eq!(parse_sni(&b), None);
+    }
+
+    #[test]
+    fn parse_dns_rejects_compression_pointer_and_label_overrun() {
+        let mut ptr = vec![0u8; 12];
+        ptr.extend_from_slice(&[0xc0, 0x0c]); // compression pointer — never valid in a query
+        assert_eq!(parse_dns_qname(&ptr), None);
+        let mut overrun = vec![0u8; 12];
+        overrun.push(50); // claims a 50-byte label...
+        overrun.extend_from_slice(b"short"); // ...but only 5 bytes follow
+        assert_eq!(parse_dns_qname(&overrun), None);
+    }
 }
