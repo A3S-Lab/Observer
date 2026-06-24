@@ -55,6 +55,23 @@ Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+
 in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **correlation**, and
 **provider** classification (SNI → 15 LLM providers); then exports **NDJSON** (or a human log).
 
+**Example output** (`A3S_OBSERVER_JSON=1`, one event per line — wrapped here for readability):
+
+```json
+{"identity":{"agent":"python3","task":"1841","session":null},"provider":"Anthropic",
+ "event":{"LlmCall":{"pid":1841,"sni":"api.anthropic.com","peer":"160.79.104.10",
+ "req_bytes":284,"resp_bytes":3832,"latency":{"secs":1,"nanos":210000000},
+ "ttft":{"secs":0,"nanos":410000000}}}}
+{"identity":{"agent":"python3","task":"1903","session":null},"provider":null,
+ "event":{"ToolExec":{"pid":1903,"ppid":1841,"argv":["/usr/bin/git"],"cwd":""}}}
+{"identity":{"agent":"python3","task":"1841","session":null},"provider":null,
+ "event":{"SslContent":{"pid":1841,"is_read":false,
+ "content":"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n..."}}}
+```
+
+Filter with `jq`, e.g. every LLM call and its provider:
+`… | jq -c 'select(.event.LlmCall) | {agent:.identity.agent, provider, sni:.event.LlmCall.sni}'`.
+
 ## Intervene — egress / file / exec (opt-in)
 
 The same vantage point enforces an **external policy** — a plain file any controller writes; the
@@ -66,8 +83,46 @@ kernel asks a guard allow/deny per action. The observe-only core is untouched. B
 | `a3s-observer-enforce` | eBPF `cgroup/connect4` | `connect()` to policy IPs/hosts — cgroup-scoped, fail-open, DNS-re-resolved |
 | `a3s-observer-fileguard` | fanotify `FAN_OPEN_PERM` + `FAN_OPEN_EXEC_PERM` | `open()` **and** `exec` of policy-listed files |
 
-Drive it in-process (the `Policy` trait) or out-of-process — `scripts/example-controller.py`
-turns observed events into a deny-list. See [`docs/enforcement.md`](docs/enforcement.md).
+### Bring your own policy
+
+The decision logic is **yours**, in any language. a3s-observer gives you the signal (events)
+and the enforcement primitive (a guard that reads a deny-file); you write the policy in between:
+
+```
+events (NDJSON) → your controller (your rules) → deny-file → guard → kernel denies (EPERM)
+```
+
+**Egress allow-list** — an agent may only reach approved LLM providers; everything else is cut:
+
+```bash
+# 1. observe  →  2. your controller writes the deny-list  →  3. enforce on the agent's cgroup
+A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
+  | ./scripts/example-controller.py egress-deny.txt &
+sudo a3s-observer-enforce /sys/fs/cgroup/<agent> egress-deny.txt
+```
+
+The controller is ~10 lines — the `if` is the part you own (`scripts/example-controller.py`):
+
+```python
+ALLOWED = {"Anthropic", "OpenAi", "Gemini"}          # your rule
+for line in sys.stdin:                               # the NDJSON event stream
+    ev = json.loads(line); call = ev.get("event", {}).get("Egress")
+    if call and call.get("sni") and ev.get("provider") not in ALLOWED:
+        denied.add(call["peer"])                     # → write egress-deny.txt (hot-reloaded)
+        open(sys.argv[1], "w").write("\n".join(sorted(denied)) + "\n")
+```
+
+**File / exec deny** — no event stream needed, just a path list (also hot-reloaded):
+
+```bash
+printf '%s\n' /etc/shadow /usr/bin/curl > deny.txt   # deny open(/etc/shadow) + exec(curl)
+sudo a3s-observer-fileguard deny.txt                 # edit deny.txt → applies within ~2s
+```
+
+Deny-file formats: **egress** = one IPv4 or hostname per line (hostnames are DNS-re-resolved
+each reload); **file/exec** = one path per line. Prefer in-process (Rust) embedding? Implement
+the `Policy` trait (`egress` / `file_write` / `exec` → `Verdict`). Full design + both paths:
+[`docs/enforcement.md`](docs/enforcement.md).
 
 ## Why eBPF, and the boundary
 
