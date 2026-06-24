@@ -276,6 +276,33 @@ mod tests {
             c.classify(Some("bedrock-runtime.us-east-1.amazonaws.com"), ip),
             Some(Provider::Bedrock)
         );
+        assert_eq!(
+            c.classify(Some("generativelanguage.googleapis.com"), ip),
+            Some(Provider::Gemini)
+        );
+        assert_eq!(
+            c.classify(Some("api.cohere.ai"), ip),
+            Some(Provider::Cohere)
+        );
+        assert_eq!(c.classify(Some("api.x.ai"), ip), Some(Provider::XAi));
+        assert_eq!(c.classify(Some("api.groq.com"), ip), Some(Provider::Groq));
+        assert_eq!(
+            c.classify(Some("api.together.xyz"), ip),
+            Some(Provider::Together)
+        );
+        assert_eq!(
+            c.classify(Some("api.perplexity.ai"), ip),
+            Some(Provider::Perplexity)
+        );
+        assert_eq!(
+            c.classify(Some("api.fireworks.ai"), ip),
+            Some(Provider::Fireworks)
+        );
+        assert_eq!(
+            c.classify(Some("openrouter.ai"), ip),
+            Some(Provider::OpenRouter)
+        );
+        assert_eq!(c.classify(None, ip), None); // no SNI → unclassified
         assert_eq!(c.classify(Some("example.com"), ip), None);
     }
 

@@ -2,6 +2,18 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.9.3] — soak validation + test coverage (no runtime change)
+
+### Tested
+
+- Full-stack soak validation — 15 cases, leak-free and correct under load on a prod host + an
+  isolated VM. Observe: steady 20 min, edge-input, a real a3s-code agent, throughput (110k ev/60s),
+  memory-bound (256 Mi), restart ×8, idle + heartbeat, SIGTERM, concurrent collectors,
+  backpressure, connection-churn. Intervene: egress, file/exec, and SSL-content guards — plus all
+  three running alongside the collector.
+- Lib line coverage 72% → **79.6%** (`cargo llvm-cov`): adversarial SNI/DNS parser tests, the
+  cgroup→pod parser, the full 14-provider SNI classifier, and the v0.9.2 writer-thread path.
+
 ## [0.9.2] — fix: output backpressure no longer stalls the event loop
 
 ### Fixed
