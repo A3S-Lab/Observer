@@ -27,12 +27,14 @@ pub struct ExecEvent {
 
 /// A process exit (`sys_enter_exit_group`) — the other end of the tool lifecycle, carrying the
 /// exit status so tool *outcomes* are visible (did the command succeed?), not just that it ran.
-/// Catches clean exits (the C runtime's `exit()` calls `exit_group`); signal kills don't.
+/// Captured via a `do_exit` kprobe, so it catches EVERY exit — clean exits and signal-kills
+/// (crash / SIGKILL / OOM) alike.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExitEvent {
     pub pid: u32,
-    pub exit_code: u32, // exit_group status; the low byte is the code passed to exit()
+    pub exit_code: u32, // exit() status (0 when terminated by a signal)
+    pub signal: u32,    // terminating signal, 0 = clean exit (9 SIGKILL/OOM, 11 SIGSEGV crash, …)
     pub comm: [u8; 16],
 }
 

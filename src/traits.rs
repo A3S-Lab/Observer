@@ -350,6 +350,7 @@ mod tests {
             event: AgentEvent::ProcessExit {
                 pid: 1,
                 exit_code: 0,
+                signal: 0,
             },
         };
         for _ in 0..50 {

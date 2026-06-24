@@ -17,7 +17,7 @@ use a3s_observer_common::{
 use anyhow::Context as _;
 use aya::{
     maps::{PerCpuArray, RingBuf},
-    programs::{TracePoint, UProbe},
+    programs::{KProbe, TracePoint, UProbe},
     Ebpf,
 };
 use std::collections::HashMap;
@@ -63,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
     let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
     let mut probes = vec![
         ("exec", "sys_enter_execve"),
-        ("proc_exit", "sys_enter_exit_group"),
         ("tls_write", "sys_enter_write"),
         ("tls_sendto", "sys_enter_sendto"),
         ("connect", "sys_enter_connect"),
@@ -89,6 +88,14 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 tracing::warn!(probe = prog, error = %e, "probe failed to attach — continuing")
             }
+        }
+    }
+    // proc_exit is a do_exit kprobe (not a tracepoint): do_exit fires for EVERY task exit,
+    // including signal-kills (crash / OOM) that sys_enter_exit_group never sees.
+    match attach_kprobe(&mut ebpf, "proc_exit", "do_exit") {
+        Ok(()) => attached += 1,
+        Err(e) => {
+            tracing::warn!(error = %e, "proc_exit (do_exit kprobe) failed — exit signals unavailable")
         }
     }
     if attached == 0 {
@@ -132,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let classifier = SniClassifier;
     let resolver = KubeResolver; // cgroup→pod in k8s; falls back to comm on bare hosts
                                  // (pid,fd) -> peer, populated by connect, read by the TLS probe to fuse provider+peer.
-    let mut peers: HashMap<u64, IpAddr> = HashMap::new();
+    let mut peers: HashMap<u64, (IpAddr, u16)> = HashMap::new();
     // (pid,fd) -> (sni, provider, peer): recorded at ClientHello, read when the socket
     // closes (the in-kernel LlmEvent) to build the metric-bearing LlmCall.
     let mut llm_meta: HashMap<u64, (Option<String>, Option<Provider>, IpAddr)> = HashMap::new();
@@ -232,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                             event: AgentEvent::ToolExec {
                                 pid: ev.pid,
                                 ppid: read_ppid(ev.pid),
+                                uid: ev.uid,
                                 argv: argv_of(&ev),
                                 cwd: read_cwd(ev.pid),
                             },
@@ -246,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
                             event: AgentEvent::ProcessExit {
                                 pid: ev.pid,
                                 exit_code: ev.exit_code,
+                                signal: ev.signal,
                             },
                         });
                     }
@@ -257,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
                         if peers.len() > 8192 {
                             peers.clear(); // ponytail: crude cap; LRU if it ever matters
                         }
-                        peers.insert(sock_key(ev.pid, ev.fd), peer);
+                        peers.insert(sock_key(ev.pid, ev.fd), (peer, ev.port));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
                             provider: None,
@@ -265,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
                                 pid: ev.pid,
                                 sni: None,
                                 peer,
+                                port: ev.port,
                                 bytes: 0,
                             },
                         });
@@ -275,10 +285,10 @@ async fn main() -> anyhow::Result<()> {
                         let len = (ev.len as usize).min(ev.data.len());
                         let sni = parse_sni(&ev.data[..len]);
                         // Correlated peer for this socket (the LLM endpoint).
-                        let peer = peers
+                        let (peer, port) = peers
                             .get(&sock_key(ev.pid, ev.fd))
                             .copied()
-                            .unwrap_or(UNKNOWN_PEER);
+                            .unwrap_or((UNKNOWN_PEER, 0));
                         let provider =
                             sni.as_deref().and_then(|h| classifier.classify(Some(h), peer));
                         // Remember the call so the close event can build a metric-bearing
@@ -294,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
                                 pid: ev.pid,
                                 sni,
                                 peer,
+                                port,
                                 bytes: ev.len as u64,
                             },
                         });
@@ -364,8 +375,25 @@ async fn main() -> anyhow::Result<()> {
                         let len = (ev.len as usize).min(ev.data.len());
                         let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
                         if !content.is_empty() {
+                            let identity = identity_for(&resolver, ev.pid, &ev.comm);
+                            // Structured LLM telemetry (model/tokens) alongside the raw content.
+                            if let Some((model, prompt_tokens, completion_tokens)) =
+                                parse_llm_meta(&content)
+                            {
+                                emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                                    identity: identity.clone(),
+                                    provider: None,
+                                    event: AgentEvent::LlmApi {
+                                        pid: ev.pid,
+                                        is_request: ev.is_read == 0,
+                                        model,
+                                        prompt_tokens,
+                                        completion_tokens,
+                                    },
+                                });
+                            }
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                                identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                identity,
                                 provider: None,
                                 event: AgentEvent::SslContent {
                                     pid: ev.pid,
@@ -403,6 +431,17 @@ fn attach(ebpf: &mut Ebpf, prog: &str, category: &str, name: &str) -> anyhow::Re
     p.load()?;
     p.attach(category, name)
         .with_context(|| format!("attach {category}:{name}"))?;
+    Ok(())
+}
+
+fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, sym: &str) -> anyhow::Result<()> {
+    let p: &mut KProbe = ebpf
+        .program_mut(prog)
+        .with_context(|| format!("`{prog}` program not found"))?
+        .try_into()?;
+    p.load()?;
+    p.attach(sym, 0)
+        .with_context(|| format!("attach kprobe {sym}"))?;
     Ok(())
 }
 
@@ -486,6 +525,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
         AgentEvent::FileDelete { .. } => stats.file += 1,
         AgentEvent::LlmCall { .. } => stats.llm += 1,
         AgentEvent::SslContent { .. } => stats.ssl += 1,
+        AgentEvent::LlmApi { .. } => stats.llm += 1,
     }
     exporter.export(&ev);
 }
@@ -560,9 +600,33 @@ fn parse_dns_qname(buf: &[u8]) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Best-effort LLM-API fields from captured TLS plaintext: `"model"` from a request body, token
+/// `usage` from a response. None if absent (not an LLM call, or the bytes weren't captured).
+/// Consumes untrusted plaintext — every index is bounds-checked, must never panic.
+fn parse_llm_meta(s: &str) -> Option<(Option<String>, Option<u32>, Option<u32>)> {
+    let model = json_str_after(s, "\"model\"");
+    let pt = json_num_after(s, "\"prompt_tokens\"");
+    let ct = json_num_after(s, "\"completion_tokens\"");
+    (model.is_some() || pt.is_some() || ct.is_some()).then_some((model, pt, ct))
+}
+
+fn json_str_after(s: &str, key: &str) -> Option<String> {
+    let rest = &s[s.find(key)? + key.len()..]; // find() ≤ len, +key.len() ≤ len → in-bounds
+    let body = &rest[rest.find('"')? + 1..]; // past the value's opening quote
+    Some(body[..body.find('"')?].to_owned())
+}
+
+fn json_num_after(s: &str, key: &str) -> Option<u32> {
+    let rest = s[s.find(key)? + key.len()..].trim_start_matches([':', ' ', '\t']);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_dns_qname, parse_sni};
+    use super::{parse_dns_qname, parse_llm_meta, parse_sni};
 
     #[test]
     fn parses_sni_from_minimal_clienthello() {
@@ -587,6 +651,16 @@ mod tests {
     fn rejects_truncated_or_garbage() {
         assert_eq!(parse_sni(&[0u8; 8]), None);
         assert_eq!(parse_sni(&[]), None);
+    }
+
+    #[test]
+    fn parse_llm_meta_extracts_model_and_tokens() {
+        let req = r#"POST /v1/chat/completions HTTP/1.1 ... {"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(parse_llm_meta(req).unwrap().0.as_deref(), Some("gpt-4o"));
+        let resp = r#"{"id":"x","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34}}"#;
+        let (_, pt, ct) = parse_llm_meta(resp).unwrap();
+        assert_eq!((pt, ct), (Some(12), Some(34)));
+        assert!(parse_llm_meta("just plaintext, no json fields here").is_none());
     }
 
     #[test]
