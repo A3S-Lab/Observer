@@ -2,10 +2,19 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] — exec intervention + fileguard hot-reload
 
 ### Added / Changed
 
+- **Exec blocking** — `a3s-observer-fileguard` now denies **exec** as well as `open()`
+  (`FAN_OPEN_EXEC_PERM`), completing the intervention triad (egress + file + exec), all via
+  fanotify on a stock kernel (no bpf-lsm). KVM-validated: exec of a guarded binary → `EPERM`,
+  a non-guarded binary runs.
+- **fileguard hot-reload** — the policy is re-read every ~2s (marks added/removed live), so an
+  external controller can change denials without a restart (matching the egress enforcer).
+  KVM-validated: a path added to the policy is denied within the reload window.
+- SSL content-capture overhead measured (KVM, 3k-TLS-call soak): **+0.3% CPU, +~50 KB RSS** vs
+  baseline — negligible.
 - `SECURITY.md` — vulnerability disclosure policy + image-signature verification.
 - `docs/enforcement.md` reflects the **shipped** guards (egress `cgroup/connect4` v0.3.0, file
   fanotify `FAN_OPEN_PERM` v0.4.0); the file guard uses fanotify, not LSM-BPF, because `bpf`

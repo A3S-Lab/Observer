@@ -69,7 +69,7 @@ The observe-only core is untouched.
 | guard | mechanism | denies |
 |---|---|---|
 | `a3s-observer-enforce` | `cgroup/connect4` eBPF | egress to policy IPs/hosts — **cgroup-scoped**, fail-open |
-| `a3s-observer-fileguard` | fanotify `FAN_OPEN_PERM` | `open()` of policy-listed files |
+| `a3s-observer-fileguard` | fanotify `FAN_OPEN_PERM` + `FAN_OPEN_EXEC_PERM` | `open()` **and** `exec` of policy-listed files; policy **hot-reloaded** |
 
 Both KVM-validated: a denied connect / file-open returns `EPERM`, everything else is
 untouched. Drive it in-process (the `Policy` trait) or out-of-process — `scripts/example-controller.py`
