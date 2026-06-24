@@ -16,8 +16,10 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 
+// Exec events now carry full argv (~928 B each), so this ring is larger than the others to
+// keep a process burst (a build spawning many subprocesses) from dropping events.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
 #[map]
 static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const FAN_DENY: u32 = 0x02;
 
 fn perm_mask() -> u64 {
-    u64::from(libc::FAN_OPEN_PERM) | u64::from(libc::FAN_OPEN_EXEC_PERM)
+    libc::FAN_OPEN_PERM | libc::FAN_OPEN_EXEC_PERM
 }
 
 fn main() -> anyhow::Result<()> {
@@ -128,7 +128,7 @@ fn drain(fan: i32, buf: &mut [u8]) {
                 let path = fs::read_link(format!("/proc/self/fd/{}", meta.fd))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let kind = if meta.mask & u64::from(libc::FAN_OPEN_EXEC_PERM) != 0 {
+                let kind = if meta.mask & libc::FAN_OPEN_EXEC_PERM != 0 {
                     "exec"
                 } else {
                     "open"
