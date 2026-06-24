@@ -13,12 +13,19 @@ pub enum AgentEvent {
     ToolExec {
         pid: u32,
         ppid: u32,
+        /// Real UID the tool runs as (0 = root) — surfaces privilege / privesc.
+        uid: u32,
         argv: Vec<String>,
         cwd: String,
     },
-    /// A process exited (`sys_enter_exit_group`) — the tool's outcome / exit code. Pairs with
-    /// `ToolExec` to bracket a tool's lifecycle (started → finished with this status).
-    ProcessExit { pid: u32, exit_code: u32 },
+    /// A process exited (`do_exit` kprobe) — the tool's outcome: exit code AND terminating signal
+    /// (0 = clean; 9 = SIGKILL/OOM; 11 = SIGSEGV crash). Pairs with `ToolExec` to bracket a tool's
+    /// lifecycle (started → finished / crashed / killed).
+    ProcessExit {
+        pid: u32,
+        exit_code: u32,
+        signal: u32,
+    },
     /// A file was opened (`openat`).
     FileAccess { pid: u32, path: String, write: bool },
     /// A file was deleted (`unlinkat`) — a destructive action; pairs with `FileAccess`.
@@ -45,6 +52,8 @@ pub enum AgentEvent {
         pid: u32,
         sni: Option<String>,
         peer: IpAddr,
+        /// Destination port (host order) — the service class: 443 API, 22 SSH, 5432 PG, 6379 Redis…
+        port: u16,
         bytes: u64,
     },
     /// A DNS query — a hostname the process resolved (`sys_enter_sendto` to :53).
@@ -58,6 +67,16 @@ pub enum AgentEvent {
         /// true = response (`SSL_read`, completion); false = request (`SSL_write`, prompt).
         is_read: bool,
         content: String,
+    },
+    /// Structured LLM-API telemetry parsed from captured TLS content: `model` from the request
+    /// body, token `usage` from the response. Best-effort (depends on the bytes landing within the
+    /// snapshot); pairs with `SslContent` to turn raw plaintext into "which model, how many tokens".
+    LlmApi {
+        pid: u32,
+        is_request: bool,
+        model: Option<String>,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
     },
 }
 

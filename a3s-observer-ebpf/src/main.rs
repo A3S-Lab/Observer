@@ -11,7 +11,7 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
-    macros::{cgroup_sock_addr, map, tracepoint, uprobe, uretprobe},
+    macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
     maps::{ring_buf::RingBufEntry, HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
@@ -148,23 +148,33 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-// ---- process exit (sys_enter_exit_group) — the tool's outcome / exit code ----
+// ---- process exit (do_exit kprobe) — the tool's outcome: exit code AND terminating signal ----
 
-#[tracepoint]
-pub fn proc_exit(ctx: TracePointContext) -> u32 {
+#[kprobe]
+pub fn proc_exit(ctx: ProbeContext) -> u32 {
     try_proc_exit(&ctx).unwrap_or(0)
 }
 
-fn try_proc_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+// do_exit(long code) fires for EVERY task exit, including signal-kills (SIGSEGV crash, SIGKILL /
+// OOM) that never call exit_group. `code` is the wait-status: low 7 bits = terminating signal,
+// (code >> 8) & 0xff = the exit() status.
+fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
+    // do_exit fires per-THREAD; emit once per PROCESS by gating on the thread-group leader
+    // (tgid == task pid). Without this a multithreaded agent emits N duplicate ProcessExit/pid.
+    let id = bpf_get_current_pid_tgid();
+    if (id >> 32) as u32 != id as u32 {
+        return Ok(0);
+    }
+    let code: u64 = ctx.arg(0).unwrap_or(0);
     let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).pid = (id >> 32) as u32;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        // sys_enter_exit_group: `long error_code` at offset 16 (low byte = the exit() code).
-        (*ev).exit_code = ctx.read_at::<u64>(16).unwrap_or(0) as u32;
+        (*ev).exit_code = ((code >> 8) & 0xff) as u32;
+        (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
     }
     entry.submit(0);
     Ok(0)

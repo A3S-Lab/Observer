@@ -1,6 +1,6 @@
 [package]
 name = "a3s-observer-collector"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 description = "a3s-observer collector: loads the eBPF probes and exports enriched events."

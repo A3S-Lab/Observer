@@ -44,7 +44,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | signal | kernel hook | event |
 |---|---|---|
 | `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess: **full argv** + cwd, comm, uid |
-| `exit` | `sys_enter_exit_group` | `ProcessExit` — tool outcome + **exit code** (clean exits) |
+| `exit` | `do_exit` kprobe | `ProcessExit` — outcome: **exit code + signal** (clean / SIGSEGV crash / SIGKILL-OOM), one per process |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |
@@ -52,6 +52,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | `file`\* | `sys_enter_openat` (write opens) | `FileAccess` — files written (`A3S_OBSERVER_FILES=1`) |
 | `unlink`\* | `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
 | `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
+| `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
 
 Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+ppid, or an
 in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **correlation**, and

@@ -2,6 +2,33 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.10.0] — richer signals: exit-signal, LLM model, dest-port, uid
+
+### Added
+
+- **Exit signal** — `ProcessExit` now carries `signal` (0 clean / 9 SIGKILL+OOM / 11 SIGSEGV
+  crash). The probe moved from the `sys_enter_exit_group` tracepoint to a `do_exit` kprobe, so
+  crashes and signal-kills — which the tracepoint never saw — are captured. Gated to the
+  thread-group leader: one event per process, not per thread.
+- **LLM model + tokens** — `AgentEvent::LlmApi {model, prompt_tokens, completion_tokens}`, parsed
+  in userspace from the opt-in TLS content: which model the agent called + token usage. Pairs
+  with the raw `SslContent`.
+- **Destination port on `Egress`** — the service class the agent dials (443 API / 22 SSH / 5432
+  Postgres / 6379 Redis / 11434 Ollama). The port was already read in-kernel and discarded.
+- **UID on `ToolExec`** — the real UID a tool runs as (0 = root): privilege / privesc visibility.
+
+### Fixed
+
+- `build.rs` now emits `rerun-if-changed` for the eBPF crate, so a probe-source-only change no
+  longer reuses stale bytecode.
+
+### Tested
+
+- Each signal validated live on the production cluster (crash/kill/OOM; LlmApi model over TLS;
+  port 6443/etcd/redis; uid root/service/nobody). An adversarial fan-out review caught + fixed a
+  per-thread `ProcessExit` duplication regression (multithreaded agents) before release; the
+  untrusted-input LLM parser passed a 50M-iteration fuzz.
+
 ## [0.9.3] — soak validation + test coverage (no runtime change)
 
 ### Tested
