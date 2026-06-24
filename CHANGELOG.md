@@ -2,6 +2,19 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [0.9.2] — fix: output backpressure no longer stalls the event loop
+
+### Fixed
+
+- **A slow/stalled stdout consumer no longer wedges the collector.** The NDJSON write was
+  blocking, so under sustained backpressure the event loop stalled inside the write — the 60s
+  report and the liveness heartbeat stopped firing, `/run/a3s-observer.alive` went stale, and the
+  livenessProbe would kill the pod (with drops going silent). Found by soak testing: the heartbeat
+  aged 23→143s monotonically under a slow consumer. Now a dedicated writer thread owns stdout, fed
+  by a bounded queue; when the consumer can't keep up, lines are dropped and counted
+  (`output_dropped` in the 60s report) instead of blocking. Re-tested: the heartbeat refreshes on
+  every tick under backpressure.
+
 ## [0.9.1] — fix: operational logs to stderr (NDJSON stdout was polluted)
 
 ### Fixed

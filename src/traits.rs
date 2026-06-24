@@ -81,6 +81,10 @@ impl ServiceClassifier for SniClassifier {
 /// Sink for enriched telemetry. Implementations: OTel (default target), Prometheus, log.
 pub trait Exporter: Send + Sync {
     fn export(&self, event: &EnrichedEvent);
+    /// Output lines dropped because the write queue was full (slow/stalled consumer). Cumulative.
+    fn output_drops(&self) -> u64 {
+        0
+    }
 }
 
 /// Trivial exporter that logs via `tracing`. Useful for bring-up; OTel is the real target.
@@ -94,13 +98,51 @@ impl Exporter for LogExporter {
 
 /// Exporter that writes each event as one NDJSON line to stdout — consumable by any log
 /// pipeline (vector / Loki / jq / files). OTLP is a drop-in via this same trait.
-pub struct JsonExporter;
+///
+/// A dedicated writer thread owns stdout, fed by a bounded queue, so a slow/stalled consumer can
+/// never block the caller's event loop — which would stall the 60s report + liveness heartbeat
+/// and get the collector killed. When the queue is full, lines are dropped and counted instead.
+pub struct JsonExporter {
+    tx: std::sync::mpsc::SyncSender<String>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl JsonExporter {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(4096);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            while let Ok(line) = rx.recv() {
+                let _ = writeln!(out, "{line}");
+            }
+        });
+        Self {
+            tx,
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for JsonExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Exporter for JsonExporter {
     fn export(&self, event: &EnrichedEvent) {
         if let Ok(line) = serde_json::to_string(event) {
-            println!("{line}");
+            // Non-blocking: a full queue means the consumer is slower than collection — drop the
+            // line (counted) rather than stall the event loop on a blocking write.
+            if self.tx.try_send(line).is_err() {
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+    }
+    fn output_drops(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

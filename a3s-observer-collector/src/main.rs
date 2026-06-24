@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
     let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
-        Box::new(JsonExporter)
+        Box::new(JsonExporter::new())
     } else {
         Box::new(LogExporter)
     };
@@ -204,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
                     .get(&0, 0)
                     .map(|v| v.iter().copied().sum())
                     .unwrap_or(0);
+                let output_dropped = exporter.output_drops();
                 tracing::info!(
                     exec = stats.exec,
                     exit = stats.exit,
@@ -213,7 +214,9 @@ async fn main() -> anyhow::Result<()> {
                     llm = stats.llm,
                     ssl = stats.ssl,
                     dropped,
-                    "a3s-observer: events in the last 60s (dropped = cumulative ring-full)"
+                    output_dropped,
+                    "a3s-observer: events in the last 60s (dropped = cumulative ring-full, \
+                     output_dropped = slow-consumer backpressure)"
                 );
                 stats = Stats::default();
             }
