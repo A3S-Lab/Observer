@@ -18,7 +18,7 @@ pub mod policy;
 pub mod traits;
 
 pub use model::{AgentEvent, EnrichedEvent};
-pub use policy::{parse_egress_policy, AllowAll, Policy, Verdict};
+pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
     read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LogExporter,
     ProcResolver, Provider, ServiceClassifier, SniClassifier,
