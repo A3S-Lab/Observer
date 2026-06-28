@@ -129,6 +129,29 @@ each reload); **file/exec** = one path per line. Prefer in-process (Rust) embedd
 the `Policy` trait (`egress` / `file_write` / `exec` → `Verdict`). Full design + both paths:
 [`docs/enforcement.md`](docs/enforcement.md).
 
+**Built-in `ProviderPolicy`** — a shipped `Policy` that allow-lists egress **by LLM provider**
+(classified from SNI by the default `SniClassifier`, or any `ServiceClassifier` via
+`.with_classifier(classifier, allowed)`) and **denies any connection whose provider isn't on the
+list** — the `connect4`/cgroup guard enforces the deny in-kernel. observer's side of "keep the
+agent on approved models, off the unapproved API relay / supply chain". **Egress-only** —
+file/exec stay fail-open. It's the proactive complement to
+[a3s-sentry](https://github.com/A3S-Lab/Sentry)'s *reactive* per-destination denies (only approved
+providers are ever reachable in the first place), and **host-buildable** — it adds no eBPF, the
+core is untouched:
+
+```rust
+use a3s_observer::{Provider, ProviderPolicy};
+
+// Default: only a *known, non-approved* provider is denied; unknown destinations
+// (package mirrors, telemetry, your own APIs) still pass — deny_unclassified is false.
+let policy = ProviderPolicy::new([Provider::Anthropic, Provider::OpenAi]);
+// api.anthropic.com → Allow · api.deepseek.com → Deny (known provider, not approved) · github.com → Allow
+
+// Strict "approved providers only" cage: anything that isn't allow-listed — incl. unknown hosts — is denied.
+let cage = ProviderPolicy::new([Provider::Anthropic]).deny_unclassified(true);
+// api.anthropic.com → Allow · github.com → Deny · no-SNI → Deny
+```
+
 ## Why eBPF, and the boundary
 
 - **Zero-instrumentation, language-agnostic** — observe or guard any agent (Python/Node/Go/Rust)
