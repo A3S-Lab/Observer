@@ -91,6 +91,31 @@ pub enum AgentEvent {
         /// ptrace: target pid · bind: port · setuid-root: 0.
         detail: u64,
     },
+    /// Collector liveness and throughput telemetry. This is an observer-side control-plane event,
+    /// not an agent action. It lets downstream platforms detect node/DaemonSet coverage gaps,
+    /// slow consumers, ring drops, and feature enablement without requiring any agent SDK.
+    CollectorHeartbeat {
+        collector_id: String,
+        node_name: Option<String>,
+        namespace: Option<String>,
+        pod_name: Option<String>,
+        version: String,
+        mode: String,
+        attached_probes: u32,
+        enabled_features: Vec<String>,
+        interval_secs: u64,
+        observed_agents: u64,
+        exec: u64,
+        exit: u64,
+        egress: u64,
+        dns: u64,
+        file: u64,
+        llm: u64,
+        ssl: u64,
+        sec: u64,
+        dropped: u64,
+        output_dropped: u64,
+    },
 }
 
 /// An [`AgentEvent`] tagged with the resolved [`Identity`] and, for LLM calls, the

@@ -54,10 +54,13 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
 | `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
 | `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
+| collector heartbeat | userspace timer | `CollectorHeartbeat` — collector id, node/pod, attached probes, feature flags, per-window counts, ring drops, output drops |
 
 Userspace enriches each event with **identity** (k8s cgroup→pod, `/proc` comm+ppid, or an
 in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **correlation**, and
 **provider** classification (SNI → 15 LLM providers); then exports **NDJSON** (or a human log).
+`CollectorHeartbeat` is a control-plane event for platforms such as AnySentry; it is not an
+agent action and should not be fed into security policy decisions.
 
 **Example output** (`A3S_OBSERVER_JSON=1`, one event per line — wrapped here for readability):
 
@@ -76,6 +79,9 @@ in-kernel `comm` fallback for short-lived processes), a `(pid,fd)→peer` **corr
 
 Filter with `jq`, e.g. every LLM call and its provider:
 `… | jq -c 'select(.event.LlmCall) | {agent:.identity.agent, provider, sni:.event.LlmCall.sni}'`.
+
+Set `A3S_OBSERVER_COLLECTOR_ID` and `A3S_NODE_NAME` in DaemonSets when you want stable collector
+identity in downstream fleet-health views. If unset, the collector falls back to pod/host names.
 
 ## Intervene — egress / file / exec (opt-in)
 

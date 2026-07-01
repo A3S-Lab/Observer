@@ -20,7 +20,7 @@ use aya::{
     programs::{KProbe, TracePoint, UProbe},
     Ebpf,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -205,9 +205,23 @@ async fn main() -> anyhow::Result<()> {
              livenessProbe on it will restart-loop the pod");
     }
 
+    let collector = CollectorMeta::from_env(
+        files,
+        std::env::var_os("A3S_OBSERVER_SSL").is_some(),
+        attached,
+    );
+
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut stats = Stats::default();
+    emit_collector_heartbeat(
+        exporter.as_ref(),
+        &collector,
+        0,
+        &stats,
+        0,
+        exporter.output_drops(),
+    );
     let mut report = tokio::time::interval(Duration::from_secs(60));
     report.tick().await; // consume the immediate first tick
     loop {
@@ -221,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|v| v.iter().copied().sum())
                     .unwrap_or(0);
                 let output_dropped = exporter.output_drops();
+                emit_collector_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped, output_dropped);
                 tracing::info!(
                     exec = stats.exec,
                     exit = stats.exit,
@@ -543,6 +558,110 @@ struct Stats {
     llm: u64,
     ssl: u64,
     sec: u64,
+    agents: HashSet<String>,
+}
+
+struct CollectorMeta {
+    collector_id: String,
+    node_name: Option<String>,
+    namespace: Option<String>,
+    pod_name: Option<String>,
+    version: String,
+    mode: String,
+    attached_probes: u32,
+    enabled_features: Vec<String>,
+}
+
+impl CollectorMeta {
+    fn from_env(files: bool, ssl: bool, attached: usize) -> Self {
+        let node_name = env_any(&["A3S_NODE_NAME", "NODE_NAME", "K8S_NODE_NAME"]).or_else(hostname);
+        let namespace = env_any(&["A3S_NAMESPACE", "POD_NAMESPACE", "K8S_NAMESPACE"]);
+        let pod_name = env_any(&["A3S_POD_NAME", "POD_NAME", "HOSTNAME"]);
+        let collector_id = env_any(&["A3S_OBSERVER_COLLECTOR_ID", "COLLECTOR_ID"])
+            .or_else(|| pod_name.clone())
+            .or_else(|| node_name.clone())
+            .unwrap_or_else(|| "a3s-observer".to_string());
+        let mut enabled_features = vec![
+            "exec".to_string(),
+            "network".to_string(),
+            "dns".to_string(),
+            "security".to_string(),
+        ];
+        if files {
+            enabled_features.push("files".to_string());
+        }
+        if ssl {
+            enabled_features.push("ssl".to_string());
+        }
+        let mode = if files || ssl {
+            "observe+extensions"
+        } else {
+            "observe"
+        }
+        .to_string();
+        Self {
+            collector_id,
+            node_name,
+            namespace,
+            pod_name,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            mode,
+            attached_probes: attached as u32,
+            enabled_features,
+        }
+    }
+}
+
+fn env_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn emit_collector_heartbeat(
+    exporter: &dyn Exporter,
+    meta: &CollectorMeta,
+    interval_secs: u64,
+    stats: &Stats,
+    dropped: u64,
+    output_dropped: u64,
+) {
+    exporter.export(&EnrichedEvent {
+        identity: Identity::default(),
+        provider: None,
+        event: AgentEvent::CollectorHeartbeat {
+            collector_id: meta.collector_id.clone(),
+            node_name: meta.node_name.clone(),
+            namespace: meta.namespace.clone(),
+            pod_name: meta.pod_name.clone(),
+            version: meta.version.clone(),
+            mode: meta.mode.clone(),
+            attached_probes: meta.attached_probes,
+            enabled_features: meta.enabled_features.clone(),
+            interval_secs,
+            observed_agents: stats.agents.len() as u64,
+            exec: stats.exec,
+            exit: stats.exit,
+            egress: stats.egress,
+            dns: stats.dns,
+            file: stats.file,
+            llm: stats.llm,
+            ssl: stats.ssl,
+            sec: stats.sec,
+            dropped,
+            output_dropped,
+        },
+    });
 }
 
 /// Export an event and count it by kind for the throughput report.
@@ -558,6 +677,12 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
         AgentEvent::SslContent { .. } => stats.ssl += 1,
         AgentEvent::LlmApi { .. } => stats.llm += 1,
         AgentEvent::SecurityAction { .. } => stats.sec += 1,
+        AgentEvent::CollectorHeartbeat { .. } => {}
+    }
+    if !matches!(ev.event, AgentEvent::CollectorHeartbeat { .. }) {
+        if let Some(agent) = &ev.identity.agent {
+            stats.agents.insert(agent.clone());
+        }
     }
     exporter.export(&ev);
 }
