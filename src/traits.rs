@@ -346,6 +346,7 @@ mod tests {
                 task: Some("1".into()),
                 session: None,
             },
+            process: None,
             provider: None,
             event: AgentEvent::ProcessExit {
                 pid: 1,
