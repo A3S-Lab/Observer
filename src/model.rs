@@ -6,6 +6,20 @@ use serde::Serialize;
 use std::net::IpAddr;
 use std::time::Duration;
 
+/// Kernel-observed process context used by downstream attribution engines.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProcessContext {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+}
+
 /// A raw event captured by an eBPF probe, before identity enrichment.
 #[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
@@ -123,6 +137,8 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct EnrichedEvent {
     pub identity: Identity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessContext>,
     pub provider: Option<Provider>,
     pub event: AgentEvent,
 }

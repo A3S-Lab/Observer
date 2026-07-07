@@ -8,7 +8,7 @@
 
 use a3s_observer::{
     read_ppid, AgentEvent, EnrichedEvent, Exporter, Identity, IdentityResolver, JsonExporter,
-    KubeResolver, LogExporter, Provider, ServiceClassifier, SniClassifier,
+    KubeResolver, LogExporter, ProcessContext, Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{
     ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<ExecEvent>(&item) {
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::ToolExec {
                                 pid: ev.pid,
@@ -275,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<ExitEvent>(&item) {
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::ProcessExit {
                                 pid: ev.pid,
@@ -294,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                         };
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::SecurityAction {
                                 pid: ev.pid,
@@ -313,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
                         peers.insert(sock_key(ev.pid, ev.fd), (peer, ev.port));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -343,6 +347,7 @@ async fn main() -> anyhow::Result<()> {
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            process: Some(process_context(ev.pid, &ev.comm)),
                             provider,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -360,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
                             });
@@ -382,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
                             };
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event,
                             });
@@ -398,6 +405,7 @@ async fn main() -> anyhow::Result<()> {
                             if provider.is_some() {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                    process: Some(process_context(ev.pid, &ev.comm)),
                                     provider,
                                     event: AgentEvent::LlmCall {
                                         pid: ev.pid,
@@ -426,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
                             {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity.clone(),
+                                    process: Some(process_context(ev.pid, &ev.comm)),
                                     provider: None,
                                     event: AgentEvent::LlmApi {
                                         pid: ev.pid,
@@ -438,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity,
+                                process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::SslContent {
                                     pid: ev.pid,
@@ -526,6 +536,32 @@ fn read_cwd(pid: u32) -> String {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+fn read_exe(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn read_cgroup(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn process_context(pid: u32, comm: &[u8; 16]) -> ProcessContext {
+    let cwd = read_cwd(pid);
+    ProcessContext {
+        pid,
+        ppid: read_ppid(pid),
+        comm: cstr(comm),
+        exe: read_exe(pid),
+        cwd: (!cwd.is_empty()).then_some(cwd),
+        cgroup: read_cgroup(pid),
+    }
 }
 
 /// A NUL-terminated byte buffer (from a kernel copy) as a lossy String.
@@ -638,6 +674,7 @@ fn emit_collector_heartbeat(
 ) {
     exporter.export(&EnrichedEvent {
         identity: Identity::default(),
+        process: None,
         provider: None,
         event: AgentEvent::CollectorHeartbeat {
             collector_id: meta.collector_id.clone(),
