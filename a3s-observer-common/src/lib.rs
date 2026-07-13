@@ -11,7 +11,7 @@
 /// Up to `ARGV_SLOTS` arguments, each truncated to `ARG_LEN` bytes, are captured per exec —
 /// the args carry the agent's intent (`curl <url>`, `sh -c "<cmd>"`), not just the binary.
 pub const ARGV_SLOTS: usize = 12;
-pub const ARG_LEN: usize = 64;
+pub const ARG_LEN: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
