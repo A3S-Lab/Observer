@@ -5,15 +5,20 @@ edition = "2021"
 license = "MIT"
 description = "a3s-observer collector: loads the eBPF probes and exports enriched events."
 
+[features]
+default = []
+legacy-kernel-4-19 = ["aya/async_tokio", "dep:bytes"]
+
 [dependencies]
 a3s-observer = { path = ".." }
 a3s-observer-common = { path = "../a3s-observer-common" }
 aya = "0.13"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 libc = "0.2"
+bytes = { version = "1", optional = true }
 
 [build-dependencies]
 aya-build = "0.1"

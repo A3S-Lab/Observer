@@ -1,0 +1,14 @@
+[package]
+name = "a3s-observer-ebpf-legacy"
+version = "0.11.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+a3s-observer-common = { path = "../a3s-observer-common" }
+
+[[bin]]
+name = "probes-legacy"
+path = "src/main.rs"

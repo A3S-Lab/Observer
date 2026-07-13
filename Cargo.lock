@@ -20,6 +20,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-build",
+ "bytes",
  "libc",
  "tokio",
  "tracing",
@@ -32,6 +33,14 @@ version = "0.11.0"
 
 [[package]]
 name = "a3s-observer-ebpf"
+version = "0.11.0"
+dependencies = [
+ "a3s-observer-common",
+ "aya-ebpf",
+]
+
+[[package]]
+name = "a3s-observer-ebpf-legacy"
 version = "0.11.0"
 dependencies = [
  "a3s-observer-common",
@@ -71,6 +80,7 @@ dependencies = [
  "object",
  "once_cell",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -447,6 +457,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "socket2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +536,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
+ "socket2",
  "tokio-macros",
  "windows-sys",
 ]

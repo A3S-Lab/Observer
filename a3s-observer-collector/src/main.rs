@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "legacy-kernel-4-19", allow(dead_code, unused_imports))]
+
 //! a3s-observer collector — loads the eBPF probes, pumps the ring buffers, and emits
 //! enriched events through the [`Exporter`] contract.
 //!
@@ -24,6 +26,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+#[cfg(feature = "legacy-kernel-4-19")]
+mod legacy;
+
+#[cfg(not(feature = "legacy-kernel-4-19"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -473,6 +479,12 @@ async fn main() -> anyhow::Result<()> {
         "a3s-observer-collector: stopped (final window)"
     );
     Ok(())
+}
+
+#[cfg(feature = "legacy-kernel-4-19")]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    legacy::run().await
 }
 
 // ponytail: peer IP arrives with the flow probe (#5); SNI alone identifies the provider.
