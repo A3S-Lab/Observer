@@ -108,10 +108,13 @@ observer_commit=$(git -C "$ROOT_DIR" rev-parse HEAD)
 install -m 0644 \
   "$ROOT_DIR/docs/linux-4.19-hotfix-target-install.md" \
   "$OUTPUT_DIR/TARGET_INSTALL.md"
+install -m 0755 \
+  "$ROOT_DIR/scripts/run-target-hotfix2-smoke.sh" \
+  "$OUTPUT_DIR/RUN_TARGET_SMOKE.sh"
 
 (
   cd "$OUTPUT_DIR"
-  sha256sum a3s-observer-collector PROVENANCE TARGET_INSTALL.md > SHA256SUMS
+  sha256sum a3s-observer-collector PROVENANCE TARGET_INSTALL.md RUN_TARGET_SMOKE.sh > SHA256SUMS
   sha256sum --check SHA256SUMS
 )
 
