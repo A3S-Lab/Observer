@@ -84,7 +84,7 @@ fi
 # Target command: a3s-observer-collector --version
 if command -v qemu-aarch64 >/dev/null 2>&1; then
   qemu-aarch64 "$collector" --version | grep -F 'backend=perf-kprobe-legacy'
-elif ! strings "$collector" | grep -Fq 'backend=perf-kprobe-legacy'; then
+elif ! grep -aFq 'backend=perf-kprobe-legacy' "$collector"; then
   echo "Collector does not identify the legacy backend" >&2
   exit 1
 fi

@@ -27,4 +27,5 @@ test('hotfix builder emits checksums and provenance', () => {
   assert.match(builder, /PROVENANCE/);
   assert.match(builder, /git[^\n]*rev-parse HEAD/);
   assert.match(builder, /a3s-observer-collector --version/);
+  assert.match(builder, /grep -aFq 'backend=perf-kprobe-legacy'/);
 });
