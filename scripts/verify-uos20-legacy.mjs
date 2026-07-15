@@ -58,6 +58,7 @@ expect(ebpfC, /SEC\("kprobe"\)/u, 'Linux 4.19 probes use legacy kprobe ELF secti
 expect(ebpfC, /READ_EXEC_ARG\(11\)/u, 'exec argument capture is explicitly unrolled');
 expect(ebpfC, /bpf_probe_read_str/u, 'C probes use the Linux 4.19 string helper');
 expect(objectBuild, /-target bpfel/u, 'legacy object build selects little-endian BPF');
+expect(objectBuild, /-mcpu=v1/u, 'legacy object build limits instructions to the Linux 4.19 BPF ISA');
 expect(objectBuild, /-g0/u, 'legacy object build disables BTF-producing debug data');
 expect(objectBuild, /verify-legacy-bpf-object\.mjs/u, 'legacy object build enforces object validation');
 
@@ -74,8 +75,10 @@ expect(collectorLegacy, /no effective legacy probes/u, 'legacy collector fails i
 expect(objectVerifier, /expected EM_BPF object/u, 'legacy object verifier requires the BPF ELF machine');
 expect(objectVerifier, /forbidden BTF section/u, 'legacy object verifier rejects kernel-incompatible BTF');
 expect(objectVerifier, /backward jump/u, 'legacy object verifier rejects pre-5.3 loop instructions');
+expect(objectVerifier, /JMP32 instruction unavailable on Linux 4\.19/u, 'legacy object verifier rejects post-4.19 JMP32 instructions');
 expect(objectVerifierTest, /rejects BTF sections/u, 'legacy object verifier has a BTF regression test');
 expect(objectVerifierTest, /rejects backward jumps/u, 'legacy object verifier has a loop regression test');
+expect(objectVerifierTest, /rejects JMP32 instructions unavailable on Linux 4\.19/u, 'legacy object verifier has an ISA regression test');
 
 if (failures) {
   console.error(`Legacy Observer verification failed with ${failures} issue(s)`);

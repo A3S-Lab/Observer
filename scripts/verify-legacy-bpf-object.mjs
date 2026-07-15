@@ -84,7 +84,10 @@ export function validateLegacyBpfObject(buffer) {
       const code = section.data.readUInt8(offset);
       const instructionClass = code & 0x07;
       const operation = code & 0xf0;
-      if ((instructionClass === 0x05 || instructionClass === 0x06)
+      if (instructionClass === 0x06) {
+        fail(`JMP32 instruction unavailable on Linux 4.19 in section ${section.name} at instruction ${offset / 8}`);
+      }
+      if (instructionClass === 0x05
           && operation !== 0x80 && operation !== 0x90
           && section.data.readInt16LE(offset + 2) < 0) {
         fail(`backward jump in section ${section.name} at instruction ${offset / 8}`);

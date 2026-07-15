@@ -6,7 +6,7 @@
 以下命令假定热修复目录上传到了：
 
 ```bash
-export HOTFIX_DIR=/opt/shannon/anysentry/v0.1.0/anysentry-observer-linux-4.19-arm64-hotfix
+export HOTFIX_DIR=/opt/shannon/anysentry/v0.1.0/anysentry-observer-linux-4.19-arm64-hotfix2
 export PACKAGE_DIR=/opt/shannon/anysentry/v0.1.0/anysentry-security-suite-0.1.0-compat1-uos20-arm64
 cd "$HOTFIX_DIR"
 ```

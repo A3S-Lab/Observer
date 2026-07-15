@@ -17,6 +17,7 @@ docker run --rm \
   --entrypoint clang \
   "$BPF_BUILDER_IMAGE" \
   -target bpfel \
+  -mcpu=v1 \
   -O2 \
   -g0 \
   -Wall \

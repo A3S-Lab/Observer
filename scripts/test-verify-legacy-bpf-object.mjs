@@ -47,12 +47,14 @@ function symbol(nameOffset, info, section, value, size) {
   return entry;
 }
 
-function fixture({ btf = false, backwardJump = false, missingSymbol = false } = {}) {
+function fixture({ btf = false, backwardJump = false, jmp32 = false, missingSymbol = false } = {}) {
   const keptMaps = missingSymbol ? maps.slice(0, -1) : maps;
   const symbolNames = [...programs, ...keptMaps];
   const strtab = strings(symbolNames);
   const code = Buffer.alloc(8);
-  if (backwardJump) {
+  if (jmp32) {
+    code.writeUInt8(0x16, 0); // BPF_JMP32 | BPF_JEQ | BPF_K
+  } else if (backwardJump) {
     code.writeUInt8(0x05, 0); // BPF_JMP | BPF_JA
     code.writeInt16LE(-1, 2);
   } else {
@@ -142,6 +144,12 @@ test('rejects backward jumps', () => {
   const result = verify(fixture({ backwardJump: true }));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /backward jump/);
+});
+
+test('rejects JMP32 instructions unavailable on Linux 4.19', () => {
+  const result = verify(fixture({ jmp32: true }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /JMP32 instruction/);
 });
 
 test('rejects missing required symbols', () => {

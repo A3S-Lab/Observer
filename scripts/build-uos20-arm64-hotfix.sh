@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-OUTPUT_DIR=${1:-/home/chensicheng/a3s/security/release/anysentry-observer-linux-4.19-arm64-hotfix}
-BUILD_DIR=${A3S_HOTFIX_BUILD_DIR:-$ROOT_DIR/target/uos20-arm64-hotfix}
+OUTPUT_DIR=${1:-/home/chensicheng/a3s/security/release/anysentry-observer-linux-4.19-arm64-hotfix2}
+BUILD_DIR=${A3S_HOTFIX_BUILD_DIR:-$ROOT_DIR/target/uos20-arm64-hotfix2}
 OBSERVER_TARGET=aarch64-unknown-linux-gnu.2.28
 OBSERVER_RUST_TARGET=aarch64-unknown-linux-gnu
 MAX_GLIBC=GLIBC_2.28
@@ -91,10 +91,11 @@ fi
 
 observer_commit=$(git -C "$ROOT_DIR" rev-parse HEAD)
 {
-  echo "artifact=anysentry-observer-linux-4.19-arm64-hotfix"
+  echo "artifact=anysentry-observer-linux-4.19-arm64-hotfix2"
   echo "observer_commit=$observer_commit"
   echo "target=$OBSERVER_TARGET"
   echo "backend=perf-kprobe-legacy"
+  echo "bpf_isa=v1"
   echo "max_glibc=$MAX_GLIBC"
   echo "target_page_size=$TARGET_PAGE_SIZE"
   echo "bpf_builder_image=${A3S_BPF_BUILDER_IMAGE:-clickhouse/binary-builder@sha256:050ad5096036206c44ac8b015eee5bbdb3207b4250fec957b0f3abd362dfcf9f}"
