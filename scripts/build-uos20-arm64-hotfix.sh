@@ -117,6 +117,7 @@ install -m 0755 \
   sha256sum a3s-observer-collector PROVENANCE TARGET_INSTALL.md RUN_TARGET_SMOKE.sh > SHA256SUMS
   sha256sum --check SHA256SUMS
 )
+chmod 0644 "$OUTPUT_DIR/PROVENANCE" "$OUTPUT_DIR/SHA256SUMS"
 
 echo "PASS AArch64 hotfix ABI: glibc ${required_glibc:-none} <= ${MAX_GLIBC#GLIBC_}, 64 KiB pages"
 echo "AnySentry Observer hotfix staged at $OUTPUT_DIR"

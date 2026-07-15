@@ -50,4 +50,5 @@ test('hotfix package includes the target smoke script in checksums', () => {
   assert.match(builder, /run-target-hotfix2-smoke\.sh/);
   assert.match(builder, /RUN_TARGET_SMOKE\.sh/);
   assert.match(builder, /TARGET_INSTALL\.md RUN_TARGET_SMOKE\.sh/);
+  assert.match(builder, /chmod 0644 "\$OUTPUT_DIR\/PROVENANCE" "\$OUTPUT_DIR\/SHA256SUMS"/);
 });
