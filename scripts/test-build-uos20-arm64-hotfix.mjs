@@ -25,6 +25,8 @@ test('hotfix builder embeds only a verified legacy object', () => {
 test('hotfix builder emits checksums and provenance', () => {
   assert.match(builder, /SHA256SUMS/);
   assert.match(builder, /PROVENANCE/);
+  assert.match(builder, /linux-4\.19-hotfix-target-install\.md/);
+  assert.match(builder, /a3s-observer-collector PROVENANCE TARGET_INSTALL\.md/);
   assert.match(builder, /git[^\n]*rev-parse HEAD/);
   assert.match(builder, /a3s-observer-collector --version/);
   assert.match(builder, /grep -aFq 'backend=perf-kprobe-legacy'/);

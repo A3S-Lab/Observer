@@ -104,9 +104,13 @@ observer_commit=$(git -C "$ROOT_DIR" rev-parse HEAD)
   echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$OUTPUT_DIR/PROVENANCE"
 
+install -m 0644 \
+  "$ROOT_DIR/docs/linux-4.19-hotfix-target-install.md" \
+  "$OUTPUT_DIR/TARGET_INSTALL.md"
+
 (
   cd "$OUTPUT_DIR"
-  sha256sum a3s-observer-collector PROVENANCE > SHA256SUMS
+  sha256sum a3s-observer-collector PROVENANCE TARGET_INSTALL.md > SHA256SUMS
   sha256sum --check SHA256SUMS
 )
 
