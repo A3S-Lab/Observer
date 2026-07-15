@@ -47,7 +47,14 @@ function symbol(nameOffset, info, section, value, size) {
   return entry;
 }
 
-function fixture({ btf = false, backwardJump = false, jmp32 = false, missingSymbol = false } = {}) {
+function fixture({
+  btf = false,
+  backwardJump = false,
+  jmp32 = false,
+  missingSymbol = false,
+  omitVersion = false,
+  versionCode = 0x04135a,
+} = {}) {
   const keptMaps = missingSymbol ? maps.slice(0, -1) : maps;
   const symbolNames = [...programs, ...keptMaps];
   const strtab = strings(symbolNames);
@@ -66,6 +73,11 @@ function fixture({ btf = false, backwardJump = false, jmp32 = false, missingSymb
     { name: 'kprobe', type: 1, flags: 6, align: 8, data: code },
     { name: 'maps', type: 1, flags: 3, align: 8, data: mapData },
   ];
+  if (!omitVersion) {
+    const version = Buffer.alloc(4);
+    version.writeUInt32LE(versionCode);
+    sections.push({ name: 'version', type: 1, flags: 3, align: 4, data: version });
+  }
   if (btf) sections.push({ name: '.BTF', type: 1, flags: 0, align: 4, data: Buffer.from('btf') });
   const strtabIndex = sections.length;
   sections.push({ name: '.strtab', type: 3, flags: 0, align: 1, data: strtab.data });
@@ -132,6 +144,18 @@ test('accepts a Linux 4.19 compatible legacy object', () => {
   const result = verify(fixture());
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Legacy BPF object verification passed/);
+});
+
+test('rejects an object without the UOS 4.19.90 kernel version', () => {
+  const result = verify(fixture({ omitVersion: true }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /missing required kernel version section/);
+});
+
+test('rejects the uname 4.19.0 code that the UOS kernel refuses', () => {
+  const result = verify(fixture({ versionCode: 0x041300 }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /expected 0x0004135a.*found 0x00041300/);
 });
 
 test('rejects BTF sections', () => {

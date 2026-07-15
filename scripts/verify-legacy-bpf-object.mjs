@@ -11,6 +11,7 @@ const requiredMaps = [
   'EXEC_SCRATCH', 'EXIT_SCRATCH', 'CONNECT_SCRATCH', 'FILE_SCRATCH',
   'SEC_SCRATCH', 'DROPS',
 ];
+const requiredKernelVersion = 0x0004135a;
 
 function fail(message) {
   throw new Error(message);
@@ -95,6 +96,17 @@ export function validateLegacyBpfObject(buffer) {
     }
   }
 
+  const versionSection = sections.find((section) => section.name === 'version');
+  if (!versionSection || versionSection.size !== 4) {
+    fail('missing required kernel version section for UOS 4.19.90');
+  }
+  const kernelVersion = versionSection.data.readUInt32LE(0);
+  if (kernelVersion !== requiredKernelVersion) {
+    const expected = `0x${requiredKernelVersion.toString(16).padStart(8, '0')}`;
+    const actual = `0x${kernelVersion.toString(16).padStart(8, '0')}`;
+    fail(`expected ${expected} (4.19.90), found ${actual}`);
+  }
+
   const symbols = new Map();
   for (const section of sections.filter((candidate) => candidate.type === 2)) {
     if (section.link >= sections.length || section.entrySize < 24 || section.size % section.entrySize !== 0) {
@@ -116,7 +128,12 @@ export function validateLegacyBpfObject(buffer) {
     if (!symbols.has(map)) fail(`missing required symbol ${map}`);
     if (symbols.get(map) !== 'maps') fail(`map ${map} is not in the maps section`);
   }
-  return { sections: sectionCount, symbols: symbols.size, bytes: buffer.length };
+  return {
+    sections: sectionCount,
+    symbols: symbols.size,
+    bytes: buffer.length,
+    kernelVersion,
+  };
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
@@ -127,7 +144,7 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
   }
   try {
     const result = validateLegacyBpfObject(fs.readFileSync(objectPath));
-    console.log(`Legacy BPF object verification passed: bytes=${result.bytes} sections=${result.sections} symbols=${result.symbols}`);
+    console.log(`Legacy BPF object verification passed: bytes=${result.bytes} sections=${result.sections} symbols=${result.symbols} kernel_version=0x${result.kernelVersion.toString(16).padStart(8, '0')}`);
   } catch (error) {
     console.error(`FAIL ${error.message}`);
     process.exit(1);

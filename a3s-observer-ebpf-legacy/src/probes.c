@@ -34,6 +34,7 @@ struct pt_regs {
 #define SEC_PTRACE 2
 #define SEC_BIND 3
 #define BPF_F_CURRENT_CPU 0xffffffffULL
+#define UOS_KERNEL_VERSION_4_19_90 0x0004135aU
 
 struct exec_event {
     u32 pid;
@@ -102,6 +103,9 @@ SCRATCH_MAP(CONNECT_SCRATCH, struct connect_event);
 SCRATCH_MAP(FILE_SCRATCH, struct file_event);
 SCRATCH_MAP(SEC_SCRATCH, struct sec_event);
 SCRATCH_MAP(DROPS, u64);
+
+/* UOS reports 4.19.0 in uname but its BPF KProbe gate requires 4.19.90. */
+u32 A3S_KERNEL_VERSION SEC("version") = UOS_KERNEL_VERSION_4_19_90;
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)4;

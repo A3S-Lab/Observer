@@ -9,14 +9,16 @@ import test from 'node:test';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const builderPath = path.join(root, 'scripts/build-uos20-arm64-hotfix.sh');
 const builder = fs.existsSync(builderPath) ? fs.readFileSync(builderPath, 'utf8') : '';
-const smokePath = path.join(root, 'scripts/run-target-hotfix2-smoke.sh');
+const smokePath = path.join(root, 'scripts/run-target-hotfix3-smoke.sh');
 const smoke = fs.existsSync(smokePath) ? fs.readFileSync(smokePath, 'utf8') : '';
 
 test('hotfix builder targets the UOS 20 ABI', () => {
   assert.match(builder, /aarch64-unknown-linux-gnu\.2\.28/);
   assert.match(builder, /TARGET_PAGE_SIZE=65536/);
   assert.match(builder, /MAX_GLIBC=GLIBC_2\.28/);
-  assert.match(builder, /hotfix2/);
+  assert.match(builder, /hotfix3/);
+  assert.match(builder, /kernel_version_code=0x0004135a/);
+  assert.match(builder, /kernel_version=4\.19\.90/);
 });
 
 test('hotfix builder embeds only a verified legacy object', () => {
@@ -47,7 +49,7 @@ test('target smoke script is self-contained and non-installing', () => {
 });
 
 test('hotfix package includes the target smoke script in checksums', () => {
-  assert.match(builder, /run-target-hotfix2-smoke\.sh/);
+  assert.match(builder, /run-target-hotfix3-smoke\.sh/);
   assert.match(builder, /RUN_TARGET_SMOKE\.sh/);
   assert.match(builder, /TARGET_INSTALL\.md RUN_TARGET_SMOKE\.sh/);
   assert.match(builder, /chmod 0644 "\$OUTPUT_DIR\/PROVENANCE" "\$OUTPUT_DIR\/SHA256SUMS"/);
