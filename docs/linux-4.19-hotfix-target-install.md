@@ -30,45 +30,16 @@ backend=perf-kprobe-legacy
 ## 2. 不替换文件，先直接验证探针
 
 当前主机的 Observer unit 已经不在 systemd 中，`reset-failed` 返回
-`Unit ... not loaded` 是预期现象。先直接运行新 collector：
+`Unit ... not loaded` 是预期现象。运行随包提供的自动测试脚本：
 
 ```bash
-systemctl stop anysentry-observer.service 2>/dev/null || true
-
-run_id=$$
-heartbeat=/tmp/anysentry-observer-hotfix-$run_id.alive
-stdout=/tmp/anysentry-observer-hotfix-$run_id.stdout
-stderr=/tmp/anysentry-observer-hotfix-$run_id.stderr
-
-A3S_OBSERVER_JSON=1 \
-A3S_OBSERVER_FILES=1 \
-A3S_OBSERVER_HEARTBEAT="$heartbeat" \
-  "$HOTFIX_DIR/a3s-observer-collector" >"$stdout" 2>"$stderr" &
-collector_pid=$!
-
-for i in $(seq 1 15); do
-  test -f "$heartbeat" && break
-  kill -0 "$collector_pid" 2>/dev/null || break
-  sleep 1
-done
-
-/bin/sh -c 'echo anysentry-observer-hotfix-smoke >/dev/null'
-/usr/bin/env >/dev/null
-sleep 3
-
-if kill -0 "$collector_pid" 2>/dev/null; then
-  kill -TERM "$collector_pid"
-  wait "$collector_pid"
-  collector_rc=$?
-else
-  wait "$collector_pid"
-  collector_rc=$?
-fi
-
-echo "collector_exit_code=$collector_rc"
-sed -n '1,160p' "$stderr"
-sed -n '1,20p' "$stdout"
+./RUN_TARGET_SMOKE.sh
 ```
+
+脚本会自动校验文件、停止正在运行的 Observer、启动热修复 collector、等待
+heartbeat、触发测试事件、收集日志并输出 `RESULT=PASS` 或 `RESULT=FAIL`。如果
+Observer 原来处于运行状态，脚本退出时会尝试恢复它；脚本不会替换正式文件，也
+不会重启 ClickHouse 或 AnySentry API。
 
 通过条件：
 
@@ -78,7 +49,8 @@ sed -n '1,20p' "$stdout"
   `no effective legacy probes attached`；
 - stdout 至少包含 collector heartbeat，触发命令后应出现 exec 事件。
 
-如果本步骤失败，不要替换正式文件，请把 stderr 全部发回开发机分析。
+如果本步骤失败，不要替换正式文件，请把脚本完整输出发回开发机分析。完整日志
+保存在脚本打印的 `logs=/tmp/anysentry-observer-hotfix2.*` 目录中。
 
 ## 3. 备份并原子替换 collector
 
