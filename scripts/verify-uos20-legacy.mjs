@@ -33,6 +33,8 @@ const collectorManifest = source('a3s-observer-collector/Cargo.toml');
 const collectorBuild = source('a3s-observer-collector/build.rs');
 const collectorMain = source('a3s-observer-collector/src/main.rs');
 const collectorLegacy = source('a3s-observer-collector/src/legacy.rs');
+const objectVerifier = source('scripts/verify-legacy-bpf-object.mjs');
+const objectVerifierTest = source('scripts/test-verify-legacy-bpf-object.mjs');
 
 expect(workspace, /a3s-observer-ebpf-legacy/u, 'workspace includes the legacy eBPF crate');
 expect(ebpfManifest, /aya-ebpf/u, 'legacy eBPF crate uses Aya');
@@ -60,6 +62,11 @@ expect(collectorLegacy, /__arm64_sys_connect/u, 'legacy collector tries the ARM6
 expect(collectorLegacy, /perf-kprobe-legacy/u, 'legacy heartbeat identifies its backend');
 expect(collectorLegacy, /effective_probes/u, 'legacy collector distinguishes effective probes');
 expect(collectorLegacy, /no effective legacy probes/u, 'legacy collector fails instead of reporting blind health');
+expect(objectVerifier, /expected EM_BPF object/u, 'legacy object verifier requires the BPF ELF machine');
+expect(objectVerifier, /forbidden BTF section/u, 'legacy object verifier rejects kernel-incompatible BTF');
+expect(objectVerifier, /backward jump/u, 'legacy object verifier rejects pre-5.3 loop instructions');
+expect(objectVerifierTest, /rejects BTF sections/u, 'legacy object verifier has a BTF regression test');
+expect(objectVerifierTest, /rejects backward jumps/u, 'legacy object verifier has a loop regression test');
 
 if (failures) {
   console.error(`Legacy Observer verification failed with ${failures} issue(s)`);
