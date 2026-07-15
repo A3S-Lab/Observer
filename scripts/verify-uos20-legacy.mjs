@@ -29,12 +29,14 @@ function expect(text, pattern, label) {
 const workspace = source('Cargo.toml');
 const ebpfManifest = source('a3s-observer-ebpf-legacy/Cargo.toml');
 const ebpf = source('a3s-observer-ebpf-legacy/src/main.rs');
+const ebpfC = source('a3s-observer-ebpf-legacy/src/probes.c');
 const collectorManifest = source('a3s-observer-collector/Cargo.toml');
 const collectorBuild = source('a3s-observer-collector/build.rs');
 const collectorMain = source('a3s-observer-collector/src/main.rs');
 const collectorLegacy = source('a3s-observer-collector/src/legacy.rs');
 const objectVerifier = source('scripts/verify-legacy-bpf-object.mjs');
 const objectVerifierTest = source('scripts/test-verify-legacy-bpf-object.mjs');
+const objectBuild = source('scripts/build-legacy-bpf-object.sh');
 
 expect(workspace, /a3s-observer-ebpf-legacy/u, 'workspace includes the legacy eBPF crate');
 expect(ebpfManifest, /aya-ebpf/u, 'legacy eBPF crate uses Aya');
@@ -52,9 +54,16 @@ if (/maps::[^;]*RingBuf|RingBuf::|bpf_probe_read_user(?:_buf|_str)?\s*\(/u.test(
   console.error('FAIL legacy implementation references a RingBuf or post-4.19 user-read helper');
   failures += 1;
 } else console.log('PASS legacy implementation avoids RingBuf and post-4.19 user-read helpers');
+expect(ebpfC, /SEC\("kprobe"\)/u, 'Linux 4.19 probes use legacy kprobe ELF sections');
+expect(ebpfC, /READ_EXEC_ARG\(11\)/u, 'exec argument capture is explicitly unrolled');
+expect(ebpfC, /bpf_probe_read_str/u, 'C probes use the Linux 4.19 string helper');
+expect(objectBuild, /-target bpfel/u, 'legacy object build selects little-endian BPF');
+expect(objectBuild, /-g0/u, 'legacy object build disables BTF-producing debug data');
+expect(objectBuild, /verify-legacy-bpf-object\.mjs/u, 'legacy object build enforces object validation');
 
 expect(collectorManifest, /legacy-kernel-4-19/u, 'collector exposes a legacy build feature');
 expect(collectorBuild, /a3s-observer-ebpf-legacy/u, 'collector build embeds the legacy object');
+expect(collectorBuild, /A3S_LEGACY_BPF_OBJECT/u, 'legacy collector consumes a verified external BPF object');
 expect(collectorMain, /cfg\(feature = "legacy-kernel-4-19"\)/u, 'collector selects legacy runtime by build feature');
 expect(collectorLegacy, /AsyncPerfEventArray/u, 'legacy userspace consumes per-CPU perf buffers');
 expect(collectorLegacy, /__arm64_sys_execve/u, 'legacy collector tries the ARM64 exec syscall symbol');
