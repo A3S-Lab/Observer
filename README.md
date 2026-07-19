@@ -83,6 +83,49 @@ Filter with `jq`, e.g. every LLM call and its provider:
 Set `A3S_OBSERVER_COLLECTOR_ID` and `A3S_NODE_NAME` in DaemonSets when you want stable collector
 identity in downstream fleet-health views. If unset, the collector falls back to pod/host names.
 
+### Workload attribution and freshness contract
+
+`EnrichedEvent` can also carry provider-neutral `workload` and `observation` objects for
+per-replica signals:
+
+```json
+{
+  "workload": {
+    "workload_id": "workload-01HV7F5N",
+    "deployment_id": "deployment-01HV7F6A",
+    "revision_id": "revision-sha256:8f3a",
+    "replica_id": "replica-0007",
+    "provider_unit_id": "containerd:4f6c2d8a",
+    "node_id": "node-us-east-1a-03"
+  },
+  "observation": {
+    "observed_at_unix_nanos": 1720000015000000000,
+    "sampled_at_unix_nanos": 1720000014000000000,
+    "collection_interval_nanos": 15000000000,
+    "freshness": "fresh"
+  }
+}
+```
+
+`WorkloadIdentity` is complete by construction: a producer must provide stable workload,
+deployment, immutable revision, logical replica, current provider-unit, and node IDs. Each ID is
+an opaque platform identifier limited to 128 ASCII bytes and a label-safe alphabet. Producers
+must normalize provider IDs and must never copy tenant secrets, display names, or raw user labels
+into these fields. A logical `replica_id` survives process restart, adoption, and rescheduling;
+`provider_unit_id` changes when the runtime unit is replaced.
+
+`ObservationMetadata` reports an observation time, an optional collection interval, and one of
+`fresh`, `stale`, `unavailable`, or `unknown`. Fresh and stale data include the actual sample
+timestamp. Unavailable and unknown observations omit it, giving producers an explicit
+missing-data state instead of a zero-usage sentinel.
+
+This is the transport contract, not a claim that per-replica resource collection is complete.
+Existing `IdentityResolver` implementations return no workload identity by default, and the
+node-wide collector intentionally does not apply one static environment identity to every event.
+Multi-replica Linux collection, CPU/memory/network/process/restart/availability samples,
+restart/adoption fixtures, and equivalent OTLP and Prometheus metric exporters remain follow-up
+work.
+
 ## Intervene — egress / file / exec (opt-in)
 
 The same vantage point enforces an **external policy** — a plain file any controller writes; the

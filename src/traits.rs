@@ -5,6 +5,7 @@
 //! probes.
 
 use crate::model::EnrichedEvent;
+use crate::workload::WorkloadIdentity;
 use serde::Serialize;
 use std::net::IpAddr;
 
@@ -21,6 +22,19 @@ pub struct Identity {
 /// Implementations: k8s (cgroup→pod), docker, a3s-box (pid/netns→box), bare pid-tree.
 pub trait IdentityResolver: Send + Sync {
     fn resolve(&self, pid: u32, cgroup_id: u64, netns: u64) -> Identity;
+
+    /// Resolve a complete, provider-neutral workload identity when one is available.
+    ///
+    /// Existing process-only resolvers remain valid and default to no workload attribution.
+    /// Implementations must return `None` rather than inventing or partially filling identity.
+    fn resolve_workload(
+        &self,
+        _pid: u32,
+        _cgroup_id: u64,
+        _netns: u64,
+    ) -> Option<WorkloadIdentity> {
+        None
+    }
 }
 
 /// Known service providers, identified language-agnostically from TLS SNI / DNS.
@@ -346,6 +360,8 @@ mod tests {
                 task: Some("1".into()),
                 session: None,
             },
+            workload: None,
+            observation: None,
             process: None,
             provider: None,
             event: AgentEvent::ProcessExit {

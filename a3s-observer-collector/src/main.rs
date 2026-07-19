@@ -260,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<ExecEvent>(&item) {
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::ToolExec {
@@ -276,6 +278,8 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ev) = read_pod::<ExitEvent>(&item) {
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::ProcessExit {
@@ -296,6 +300,8 @@ async fn main() -> anyhow::Result<()> {
                         };
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::SecurityAction {
@@ -316,6 +322,8 @@ async fn main() -> anyhow::Result<()> {
                         peers.insert(sock_key(ev.pid, ev.fd), (peer, ev.port));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::Egress {
@@ -347,6 +355,8 @@ async fn main() -> anyhow::Result<()> {
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider,
                             event: AgentEvent::Egress {
@@ -365,6 +375,8 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
@@ -388,6 +400,8 @@ async fn main() -> anyhow::Result<()> {
                             };
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event,
@@ -405,6 +419,8 @@ async fn main() -> anyhow::Result<()> {
                             if provider.is_some() {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                    observation: None,
                                     process: Some(process_context(ev.pid, &ev.comm)),
                                     provider,
                                     event: AgentEvent::LlmCall {
@@ -428,12 +444,15 @@ async fn main() -> anyhow::Result<()> {
                         let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
                         if !content.is_empty() {
                             let identity = identity_for(&resolver, ev.pid, &ev.comm);
+                            let workload = resolver.resolve_workload(ev.pid, 0, 0);
                             // Structured LLM telemetry (model/tokens) alongside the raw content.
                             if let Some((model, prompt_tokens, completion_tokens)) =
                                 parse_llm_meta(&content)
                             {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity.clone(),
+                                    workload: workload.clone(),
+                                    observation: None,
                                     process: Some(process_context(ev.pid, &ev.comm)),
                                     provider: None,
                                     event: AgentEvent::LlmApi {
@@ -447,6 +466,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity,
+                                workload,
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::SslContent {
@@ -674,6 +695,8 @@ fn emit_collector_heartbeat(
 ) {
     exporter.export(&EnrichedEvent {
         identity: Identity::default(),
+        workload: None,
+        observation: None,
         process: None,
         provider: None,
         event: AgentEvent::CollectorHeartbeat {

@@ -2,6 +2,7 @@
 //! events the [`Exporter`](crate::Exporter) receives.
 
 use crate::traits::{Identity, Provider};
+use crate::workload::{ObservationMetadata, WorkloadIdentity};
 use serde::Serialize;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -137,6 +138,12 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct EnrichedEvent {
     pub identity: Identity,
+    /// Complete workload attribution, when a resolver can prove every stable identity field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<WorkloadIdentity>,
+    /// Explicit timing and freshness for sampled signals. Consumers must not infer zero when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ObservationMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessContext>,
     pub provider: Option<Provider>,
