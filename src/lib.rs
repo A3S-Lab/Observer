@@ -16,10 +16,15 @@
 pub mod model;
 pub mod policy;
 pub mod traits;
+pub mod workload;
 
 pub use model::{AgentEvent, EnrichedEvent, ProcessContext};
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
     read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LogExporter,
     ProcResolver, Provider, ServiceClassifier, SniClassifier,
+};
+pub use workload::{
+    Freshness, ObservationMetadata, ObservationMetadataError, WorkloadIdentity,
+    WorkloadIdentityValue, WorkloadIdentityValueError, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
 };
