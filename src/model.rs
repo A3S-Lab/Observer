@@ -31,6 +31,19 @@ pub enum AgentEvent {
         /// Real UID the tool runs as (0 = root) — surfaces privilege / privesc.
         uid: u32,
         argv: Vec<String>,
+        /// True when the configured argument-count or total-byte budget was exceeded.
+        argv_truncated: bool,
+        /// True when one or more kernel chunks were missing or reassembly timed out.
+        argv_incomplete: bool,
+        /// True when `sched_process_exec` confirmed that the kernel committed this exec.
+        exec_confirmed: bool,
+        /// `kernel_fragments` or `proc_cmdline` when a successful exec was supplemented.
+        argv_source: String,
+        captured_argc: u16,
+        captured_bytes: u32,
+        /// Argument count and bytes in the final exported argv after best-effort supplementation.
+        observed_argc: u32,
+        observed_bytes: u32,
         cwd: String,
     },
     /// A process exited (`do_exit` kprobe) — the tool's outcome: exit code AND terminating signal
@@ -128,6 +141,9 @@ pub enum AgentEvent {
         llm: u64,
         ssl: u64,
         sec: u64,
+        exec_truncated: u64,
+        exec_incomplete: u64,
+        exec_reassembly_timeout: u64,
         dropped: u64,
         output_dropped: u64,
     },

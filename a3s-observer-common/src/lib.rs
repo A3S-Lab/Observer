@@ -6,24 +6,46 @@
 
 /// A process / tool execution, captured at `sys_enter_execve`.
 ///
-/// This is the language-agnostic "tool ran" signal — AgentSight's flagship is catching
-/// subprocesses that bypass app-level instrumentation, and this is how we see them.
-/// Up to `ARGV_SLOTS` arguments, each truncated to `ARG_LEN` bytes, are captured per exec —
-/// the args carry the agent's intent (`curl <url>`, `sh -c "<cmd>"`), not just the binary.
+/// Exec payloads are emitted as one header, zero or more argument chunks, and one end record.
+/// Keeping each ring-buffer record small avoids the verifier/runtime failure caused by embedding
+/// every argument in one large event while still allowing long shell commands to be reconstructed.
 pub const ARGV_SLOTS: usize = 12;
-pub const ARG_LEN: usize = 128;
+pub const EXEC_ARG_CHUNK_LEN: usize = 128;
+/// `bpf_probe_read_user_str` reserves one byte for NUL in every chunk.
+pub const EXEC_ARG_CHUNK_PAYLOAD: usize = EXEC_ARG_CHUNK_LEN - 1;
+pub const EXEC_MAX_CHUNKS: usize = 64;
+pub const EXEC_MAX_ARGV_BYTES: usize = EXEC_ARG_CHUNK_PAYLOAD * EXEC_MAX_CHUNKS;
+
+pub const EXEC_RECORD_HEADER: u8 = 1;
+pub const EXEC_RECORD_ARG_CHUNK: u8 = 2;
+pub const EXEC_RECORD_END: u8 = 3;
+/// Emitted from `sched_process_exec` after the kernel successfully commits the exec.
+pub const EXEC_RECORD_COMMIT: u8 = 4;
+
+pub const EXEC_FLAG_ARGV_TRUNCATED: u8 = 1 << 0;
+pub const EXEC_FLAG_ARGV_INCOMPLETE: u8 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ExecEvent {
+pub struct ExecRecord {
+    pub exec_id: u64,
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
-    pub argc: u32, // number of args captured into `args` (may be < the real argc)
+    pub captured_bytes: u32,
+    pub argc: u16,
+    pub arg_index: u16,
+    pub chunk_index: u16,
+    pub data_len: u16,
+    pub kind: u8,
+    pub flags: u8,
+    pub _pad: [u8; 2],
     pub comm: [u8; 16],
-    pub filename: [u8; 128],
-    pub args: [[u8; ARG_LEN]; ARGV_SLOTS], // argv[0..argc], each NUL-terminated
+    /// Header: executable filename. Chunk: argument bytes. End: unused.
+    pub data: [u8; EXEC_ARG_CHUNK_LEN],
 }
+
+const _: [(); 184] = [(); core::mem::size_of::<ExecRecord>()];
 
 /// A process exit (`sys_enter_exit_group`) — the other end of the tool lifecycle, carrying the
 /// exit status so tool *outcomes* are visible (did the command succeed?), not just that it ran.
