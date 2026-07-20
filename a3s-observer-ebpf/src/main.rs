@@ -2,23 +2,27 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
-    TlsEvent, ARGV_SLOTS, ARG_LEN, DNS_SNAP_LEN, FILE_DELETE_FLAG, PATH_SNAP_LEN, SEC_BIND,
-    SEC_PTRACE, SEC_SETUID, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
+    TlsEvent, ARGV_SLOTS, DNS_SNAP_LEN, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE,
+    EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT,
+    EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_DELETE_FLAG, PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE,
+    SEC_SETUID, SSL_SNAP_LEN, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
+    cty::c_void,
     helpers::gen::bpf_probe_read_user,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_loop, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
-    maps::{ring_buf::RingBufEntry, HashMap, PerCpuArray, RingBuf},
+    maps::{ring_buf::RingBufEntry, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 
-// Exec events now carry full argv (~928 B each), so this ring is larger than the others to
-// keep a process burst (a build spawning many subprocesses) from dropping events.
+// Exec records are fixed at 184 B. Typical commands need one header, a few argument chunks and
+// one end record; long argv values can use up to EXEC_MAX_CHUNKS records without inflating every
+// short exec event.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
@@ -48,6 +52,16 @@ static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 // Count of events dropped because a ring was full — data-loss visibility under extreme load.
 #[map]
 static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// child tgid -> parent tgid, captured before the child runs (with syscall-exit fallback). Exec must carry
+// this in-kernel snapshot because short-lived tools can exit before userspace reads /proc.
+#[map]
+static PARENTS: LruHashMap<u32, u32> = LruHashMap::with_max_entries(65_536, 0);
+
+// tgid -> latest syscall-entry capture. `sched_process_exec` consumes it only after a successful
+// exec, so userspace can distinguish committed images from failed execve attempts.
+#[map]
+static EXEC_IDS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(65_536, 0);
 
 // Egress deny-list (dest IPv4, host byte order). Populated by userspace from an external
 // policy; the cgroup/connect4 guard denies connect() to any IP present here. Cgroup-scoped.
@@ -110,7 +124,199 @@ fn read_user_u64(addr: *const u8) -> Option<u64> {
     }
 }
 
-// ---- tool / subprocess exec (sys_enter_execve) ----
+unsafe fn init_exec_record(
+    record: *mut ExecRecord,
+    exec_id: u64,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    comm: [u8; 16],
+) {
+    (*record).exec_id = exec_id;
+    (*record).pid = pid;
+    (*record).ppid = ppid;
+    (*record).uid = uid;
+    (*record).captured_bytes = 0;
+    (*record).argc = 0;
+    (*record).arg_index = 0;
+    (*record).chunk_index = 0;
+    (*record).data_len = 0;
+    (*record).kind = 0;
+    (*record).flags = 0;
+    (*record)._pad = [0; 2];
+    (*record).comm = comm;
+    zero_exec_data(record);
+}
+
+#[inline(always)]
+unsafe fn zero_exec_data(record: *mut ExecRecord) {
+    // Avoid lowering `[0; 128]` to a bounded memset loop. This function runs inside the
+    // 64-iteration argv chunk loop; nesting those two loops makes the kernel verifier explore
+    // more than one million instructions and reject the exec probe. Fixed stores keep the same
+    // fully-initialized ring-buffer contract without adding another verifier loop.
+    let data = core::ptr::addr_of_mut!((*record).data) as *mut u64;
+    core::ptr::write_unaligned(data.add(0), 0);
+    core::ptr::write_unaligned(data.add(1), 0);
+    core::ptr::write_unaligned(data.add(2), 0);
+    core::ptr::write_unaligned(data.add(3), 0);
+    core::ptr::write_unaligned(data.add(4), 0);
+    core::ptr::write_unaligned(data.add(5), 0);
+    core::ptr::write_unaligned(data.add(6), 0);
+    core::ptr::write_unaligned(data.add(7), 0);
+    core::ptr::write_unaligned(data.add(8), 0);
+    core::ptr::write_unaligned(data.add(9), 0);
+    core::ptr::write_unaligned(data.add(10), 0);
+    core::ptr::write_unaligned(data.add(11), 0);
+    core::ptr::write_unaligned(data.add(12), 0);
+    core::ptr::write_unaligned(data.add(13), 0);
+    core::ptr::write_unaligned(data.add(14), 0);
+    core::ptr::write_unaligned(data.add(15), 0);
+}
+
+#[repr(C)]
+struct ExecLoopContext {
+    argv: u64,
+    exec_id: u64,
+    argp: u64,
+    arg_offset: u32,
+    captured_bytes: u32,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    arg_index: u16,
+    chunk_index: u16,
+    captured_argc: u16,
+    flags: u8,
+    done: u8,
+    comm: [u8; 16],
+}
+
+unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut ExecLoopContext);
+    if state.done != 0 {
+        return 1;
+    }
+
+    if state.argp == 0 {
+        if state.arg_index as usize >= ARGV_SLOTS {
+            match read_user_u64((state.argv as *const u8).add(ARGV_SLOTS * 8)) {
+                Some(0) => {}
+                Some(_) => state.flags |= EXEC_FLAG_ARGV_TRUNCATED,
+                None => state.flags |= EXEC_FLAG_ARGV_INCOMPLETE,
+            }
+            state.done = 1;
+            return 1;
+        }
+        let Some(next_arg) =
+            read_user_u64((state.argv as *const u8).add(state.arg_index as usize * 8))
+        else {
+            state.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+            state.done = 1;
+            return 1;
+        };
+        if next_arg == 0 {
+            state.done = 1;
+            return 1;
+        }
+        state.argp = next_arg;
+        state.captured_argc += 1;
+    }
+
+    let Some(mut chunk_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+        state.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+        state.done = 1;
+        return 1;
+    };
+    let chunk = chunk_entry.as_mut_ptr();
+    init_exec_record(
+        chunk,
+        state.exec_id,
+        state.pid,
+        state.ppid,
+        state.uid,
+        state.comm,
+    );
+    (*chunk).kind = EXEC_RECORD_ARG_CHUNK;
+    (*chunk).arg_index = state.arg_index;
+    (*chunk).chunk_index = state.chunk_index;
+
+    let len = match bpf_probe_read_user_str_bytes(
+        (state.argp as *const u8).add(state.arg_offset as usize),
+        &mut (*chunk).data,
+    ) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => {
+            chunk_entry.discard(0);
+            state.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+            state.done = 1;
+            return 1;
+        }
+    };
+    (*chunk).data_len = len as u16;
+    chunk_entry.submit(0);
+    state.captured_bytes += len as u32;
+
+    if len < EXEC_ARG_CHUNK_PAYLOAD {
+        state.arg_index += 1;
+        state.chunk_index = 0;
+        state.arg_offset = 0;
+        state.argp = 0;
+    } else {
+        state.chunk_index += 1;
+        state.arg_offset += len as u32;
+    }
+    0
+}
+
+// ---- process ancestry + tool exec ----
+
+#[tracepoint]
+pub fn track_process_fork(ctx: TracePointContext) -> u32 {
+    // Linux 6.17 tracepoint payload uses dynamic comm strings: parent_pid at offset 12, child_pid at offset 20.
+    let Ok(parent) = (unsafe { ctx.read_at::<i32>(12) }) else {
+        return 0;
+    };
+    let Ok(child) = (unsafe { ctx.read_at::<i32>(20) }) else {
+        return 0;
+    };
+    if parent > 0 && child > 0 {
+        let _ = PARENTS.insert(&(child as u32), &(parent as u32), 0);
+    }
+    0
+}
+
+#[tracepoint]
+pub fn track_clone(ctx: TracePointContext) -> u32 {
+    track_child(&ctx)
+}
+
+#[tracepoint]
+pub fn track_clone3(ctx: TracePointContext) -> u32 {
+    track_child(&ctx)
+}
+
+#[tracepoint]
+pub fn track_fork(ctx: TracePointContext) -> u32 {
+    track_child(&ctx)
+}
+
+#[tracepoint]
+pub fn track_vfork(ctx: TracePointContext) -> u32 {
+    track_child(&ctx)
+}
+
+fn track_child(ctx: &TracePointContext) -> u32 {
+    // sys_exit_clone/fork/vfork: positive return value is the child PID in the parent process.
+    let Ok(child) = (unsafe { ctx.read_at::<i64>(16) }) else {
+        return 0;
+    };
+    if child <= 0 || child > u32::MAX as i64 {
+        return 0;
+    }
+    let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let _ = PARENTS.insert(&(child as u32), &parent, 0);
+    0
+}
 
 #[tracepoint]
 pub fn exec(ctx: TracePointContext) -> u32 {
@@ -118,40 +324,113 @@ pub fn exec(ctx: TracePointContext) -> u32 {
 }
 
 fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
-    let Some(mut entry) = reserve_or_drop::<ExecEvent>(&EVENTS) else {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
+    let comm = bpf_get_current_comm().unwrap_or_default();
+    let exec_id = unsafe { bpf_ktime_get_ns() } ^ pid_tgid;
+    let mut flags = 0u8;
+    let _ = EXEC_IDS.insert(&pid, &exec_id, 0);
+
+    let Some(mut header_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
         return Ok(0);
     };
-    let ev = entry.as_mut_ptr();
+    let header = header_entry.as_mut_ptr();
     unsafe {
-        let pid_tgid = bpf_get_current_pid_tgid();
-        (*ev).pid = (pid_tgid >> 32) as u32;
-        (*ev).uid = bpf_get_current_uid_gid() as u32;
-        (*ev).ppid = 0;
-        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        (*ev).filename = [0u8; 128];
+        init_exec_record(header, exec_id, pid, ppid, uid, comm);
+        (*header).kind = EXEC_RECORD_HEADER;
         // sys_enter_execve: `const char *filename` at offset 16.
         if let Ok(filename_ptr) = ctx.read_at::<*const u8>(16) {
-            let _ = bpf_probe_read_user_str_bytes(filename_ptr, &mut (*ev).filename);
-        }
-        // `const char *const *argv` at offset 24 — capture up to ARGV_SLOTS args (the intent:
-        // which URL / which command, not just the binary). Bounded for the verifier.
-        (*ev).argc = 0;
-        (*ev).args = [[0u8; ARG_LEN]; ARGV_SLOTS];
-        if let Ok(argv) = ctx.read_at::<*const u8>(24) {
-            for i in 0..ARGV_SLOTS {
-                let Some(argp) = read_user_u64(argv.add(i * 8)) else {
-                    break;
-                };
-                if argp == 0 {
-                    break; // end of argv
-                }
-                let _ = bpf_probe_read_user_str_bytes(argp as *const u8, &mut (*ev).args[i]);
-                (*ev).argc += 1;
+            match bpf_probe_read_user_str_bytes(filename_ptr, &mut (*header).data) {
+                Ok(bytes) => (*header).data_len = bytes.len() as u16,
+                Err(_) => flags |= EXEC_FLAG_ARGV_INCOMPLETE,
             }
+        } else {
+            flags |= EXEC_FLAG_ARGV_INCOMPLETE;
         }
+        (*header).flags = flags;
     }
-    entry.submit(0);
+    header_entry.submit(0);
+
+    let captured_argc: u16;
+    let captured_bytes: u32;
+
+    unsafe {
+        // `const char *const *argv` at offset 24. bpf_loop verifies the callback once instead of
+        // exploring every state transition through a 64-iteration in-program loop.
+        if let Ok(argv) = ctx.read_at::<*const u8>(24) {
+            let mut loop_ctx = ExecLoopContext {
+                argv: argv as u64,
+                exec_id,
+                argp: 0,
+                arg_offset: 0,
+                captured_bytes: 0,
+                pid,
+                ppid,
+                uid,
+                arg_index: 0,
+                chunk_index: 0,
+                captured_argc: 0,
+                flags,
+                done: 0,
+                comm,
+            };
+            let iterations = bpf_loop(
+                EXEC_MAX_CHUNKS as u32,
+                capture_exec_chunk as *mut c_void,
+                &mut loop_ctx as *mut ExecLoopContext as *mut c_void,
+                0,
+            );
+            if iterations < 0 {
+                loop_ctx.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+            } else if loop_ctx.done == 0 {
+                loop_ctx.flags |= EXEC_FLAG_ARGV_TRUNCATED;
+            }
+            flags = loop_ctx.flags;
+            captured_argc = loop_ctx.captured_argc;
+            captured_bytes = loop_ctx.captured_bytes;
+        } else {
+            flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+            captured_argc = 0;
+            captured_bytes = 0;
+        }
+
+        let Some(mut end_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+            return Ok(0);
+        };
+        let end = end_entry.as_mut_ptr();
+        init_exec_record(end, exec_id, pid, ppid, uid, comm);
+        (*end).kind = EXEC_RECORD_END;
+        (*end).flags = flags;
+        (*end).argc = captured_argc;
+        (*end).captured_bytes = captured_bytes;
+        end_entry.submit(0);
+    }
     Ok(0)
+}
+
+/// Successful exec commit. Userspace correlates this small record with the bounded syscall-entry
+/// fragments and can then read `/proc/<pid>/cmdline` while the committed image is still alive.
+#[tracepoint]
+pub fn track_process_exec(_ctx: TracePointContext) -> u32 {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let Some(exec_id) = (unsafe { EXEC_IDS.get(&pid).copied() }) else {
+        return 0;
+    };
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
+    let comm = bpf_get_current_comm().unwrap_or_default();
+    if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS) {
+        let record = entry.as_mut_ptr();
+        unsafe {
+            init_exec_record(record, exec_id, pid, ppid, uid, comm);
+            (*record).kind = EXEC_RECORD_COMMIT;
+        }
+        entry.submit(0);
+    }
+    let _ = EXEC_IDS.remove(&pid);
+    0
 }
 
 // ---- process exit (do_exit kprobe) — the tool's outcome: exit code AND terminating signal ----
@@ -183,6 +462,9 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
         (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
     }
     entry.submit(0);
+    let pid = (id >> 32) as u32;
+    let _ = PARENTS.remove(&pid);
+    let _ = EXEC_IDS.remove(&pid);
     Ok(0)
 }
 

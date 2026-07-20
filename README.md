@@ -43,7 +43,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 
 | signal | kernel hook | event |
 |---|---|---|
-| `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess: **full argv** + cwd, comm, uid |
+| `exec` | `sys_enter_execve` + `sched_process_exec` | `ToolExec` — bounded argv fragments, successful-exec confirmation, `/proc` supplementation + cwd, comm, uid |
 | `exit` | `do_exit` kprobe | `ProcessExit` — outcome: **exit code + signal** (clean / SIGSEGV crash / SIGKILL-OOM), one per process |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
@@ -71,11 +71,24 @@ agent action and should not be fed into security policy decisions.
  "ttft":{"secs":0,"nanos":410000000}}}}
 {"identity":{"agent":"python3","task":"1903","session":null},"provider":null,
  "event":{"ToolExec":{"pid":1903,"ppid":1841,
- "argv":["git","clone","https://github.com/acme/repo"],"cwd":"/home/agent/work"}}}
+ "argv":["git","clone","https://github.com/acme/repo"],"argv_truncated":false,
+ "argv_incomplete":false,"exec_confirmed":true,"argv_source":"kernel_fragments",
+ "captured_argc":3,"captured_bytes":36,"observed_argc":3,"observed_bytes":36,
+ "cwd":"/home/agent/work"}}}
 {"identity":{"agent":"python3","task":"1841","session":null},"provider":null,
  "event":{"SslContent":{"pid":1841,"is_read":false,
  "content":"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n..."}}}
 ```
+
+`ToolExec.argv` is reconstructed in the collector from bounded 128-byte kernel records. The
+collector captures up to 12 arguments and roughly 8 KiB across argv. `argv_truncated=true` means
+the configured limit was reached; `argv_incomplete=true` means a chunk was lost or reassembly
+timed out. After `sched_process_exec` confirms a successful exec, the collector attempts to replace
+truncated/incomplete fragments with `/proc/<pid>/cmdline` (bounded to 2 MiB). `argv_source` states
+which source won and `exec_confirmed` distinguishes committed execs from failed attempts. Very
+short-lived processes can exit before `/proc` is read, so the explicit truncation/incomplete flags
+remain the authoritative evidence-quality signal. Neither condition is silent, and both counters
+are included in collector heartbeats.
 
 Filter with `jq`, e.g. every LLM call and its provider:
 `… | jq -c 'select(.event.LlmCall) | {agent:.identity.agent, provider, sni:.event.LlmCall.sni}'`.
