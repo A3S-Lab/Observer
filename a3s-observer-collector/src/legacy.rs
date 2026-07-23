@@ -43,6 +43,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .init();
 
