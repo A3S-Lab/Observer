@@ -2,6 +2,27 @@
 
 All notable changes to a3s-observer will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- A provider-neutral workload attribution contract: `WorkloadIdentity` requires stable workload,
+  deployment, immutable revision, logical replica, provider-unit, and node IDs. Each
+  `WorkloadIdentityValue` is bounded to 128 ASCII bytes and rejects whitespace, control
+  characters, free-form Unicode, and non-canonical boundary characters without echoing rejected
+  input in validation errors.
+- Explicit `ObservationMetadata` for sampled signals, including observation timestamp, optional
+  sample timestamp and collection interval, and `fresh`, `stale`, `unavailable`, or `unknown`
+  state. Unavailable and unknown observations represent missing data without a zero-valued
+  sentinel.
+- Optional `workload` and `observation` fields in NDJSON `EnrichedEvent` output.
+  `IdentityResolver::resolve_workload` defaults to `None`, preserving existing resolver
+  implementations and preventing incomplete attribution.
+
+This contract is the first slice of workload metrics support. Multi-replica Linux collection,
+resource/restart/availability measurements, lifecycle fixtures, and OTLP/Prometheus metric parity
+are not included yet.
+
 ## [0.11.0] — SecurityAction: privesc / injection / open-port
 
 ### Added

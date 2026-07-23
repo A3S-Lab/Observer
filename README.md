@@ -43,7 +43,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 
 | signal | kernel hook | event |
 |---|---|---|
-| `exec` | `sys_enter_execve` | `ToolExec` — tool / subprocess: **full argv** + cwd, comm, uid |
+| `exec` | `sys_enter_execve` + `sched_process_exec` | `ToolExec` — bounded argv fragments, successful-exec confirmation, `/proc` supplementation + cwd, comm, uid |
 | `exit` | `do_exit` kprobe | `ProcessExit` — outcome: **exit code + signal** (clean / SIGSEGV crash / SIGKILL-OOM), one per process |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
@@ -71,17 +71,73 @@ agent action and should not be fed into security policy decisions.
  "ttft":{"secs":0,"nanos":410000000}}}}
 {"identity":{"agent":"python3","task":"1903","session":null},"provider":null,
  "event":{"ToolExec":{"pid":1903,"ppid":1841,
- "argv":["git","clone","https://github.com/acme/repo"],"cwd":"/home/agent/work"}}}
+ "argv":["git","clone","https://github.com/acme/repo"],"argv_truncated":false,
+ "argv_incomplete":false,"exec_confirmed":true,"argv_source":"kernel_fragments",
+ "captured_argc":3,"captured_bytes":36,"observed_argc":3,"observed_bytes":36,
+ "cwd":"/home/agent/work"}}}
 {"identity":{"agent":"python3","task":"1841","session":null},"provider":null,
  "event":{"SslContent":{"pid":1841,"is_read":false,
  "content":"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n..."}}}
 ```
+
+`ToolExec.argv` is reconstructed in the collector from bounded 128-byte kernel records. The
+collector captures up to 12 arguments and roughly 8 KiB across argv. `argv_truncated=true` means
+the configured limit was reached; `argv_incomplete=true` means a chunk was lost or reassembly
+timed out. After `sched_process_exec` confirms a successful exec, the collector attempts to replace
+truncated/incomplete fragments with `/proc/<pid>/cmdline` (bounded to 2 MiB). `argv_source` states
+which source won and `exec_confirmed` distinguishes committed execs from failed attempts. Very
+short-lived processes can exit before `/proc` is read, so the explicit truncation/incomplete flags
+remain the authoritative evidence-quality signal. Neither condition is silent, and both counters
+are included in collector heartbeats.
 
 Filter with `jq`, e.g. every LLM call and its provider:
 `… | jq -c 'select(.event.LlmCall) | {agent:.identity.agent, provider, sni:.event.LlmCall.sni}'`.
 
 Set `A3S_OBSERVER_COLLECTOR_ID` and `A3S_NODE_NAME` in DaemonSets when you want stable collector
 identity in downstream fleet-health views. If unset, the collector falls back to pod/host names.
+
+### Workload attribution and freshness contract
+
+`EnrichedEvent` can also carry provider-neutral `workload` and `observation` objects for
+per-replica signals:
+
+```json
+{
+  "workload": {
+    "workload_id": "workload-01HV7F5N",
+    "deployment_id": "deployment-01HV7F6A",
+    "revision_id": "revision-sha256:8f3a",
+    "replica_id": "replica-0007",
+    "provider_unit_id": "containerd:4f6c2d8a",
+    "node_id": "node-us-east-1a-03"
+  },
+  "observation": {
+    "observed_at_unix_nanos": 1720000015000000000,
+    "sampled_at_unix_nanos": 1720000014000000000,
+    "collection_interval_nanos": 15000000000,
+    "freshness": "fresh"
+  }
+}
+```
+
+`WorkloadIdentity` is complete by construction: a producer must provide stable workload,
+deployment, immutable revision, logical replica, current provider-unit, and node IDs. Each ID is
+an opaque platform identifier limited to 128 ASCII bytes and a label-safe alphabet. Producers
+must normalize provider IDs and must never copy tenant secrets, display names, or raw user labels
+into these fields. A logical `replica_id` survives process restart, adoption, and rescheduling;
+`provider_unit_id` changes when the runtime unit is replaced.
+
+`ObservationMetadata` reports an observation time, an optional collection interval, and one of
+`fresh`, `stale`, `unavailable`, or `unknown`. Fresh and stale data include the actual sample
+timestamp. Unavailable and unknown observations omit it, giving producers an explicit
+missing-data state instead of a zero-usage sentinel.
+
+This is the transport contract, not a claim that per-replica resource collection is complete.
+Existing `IdentityResolver` implementations return no workload identity by default, and the
+node-wide collector intentionally does not apply one static environment identity to every event.
+Multi-replica Linux collection, CPU/memory/network/process/restart/availability samples,
+restart/adoption fixtures, and equivalent OTLP and Prometheus metric exporters remain follow-up
+work.
 
 ## Intervene — egress / file / exec (opt-in)
 

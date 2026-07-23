@@ -13,8 +13,10 @@ use a3s_observer::{
     KubeResolver, LogExporter, ProcessContext, Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecEvent, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
-    TlsEvent, FILE_DELETE_FLAG, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
+    TlsEvent, ARGV_SLOTS, EXEC_ARG_CHUNK_LEN, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE,
+    EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT,
+    EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_DELETE_FLAG, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
@@ -22,9 +24,243 @@ use aya::{
     programs::{KProbe, TracePoint, UProbe},
     Ebpf,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const EXEC_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
+const EXEC_REASSEMBLY_LIMIT: usize = 4096;
+const PROC_CMDLINE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+struct PendingExec {
+    first_seen: Instant,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    comm: [u8; 16],
+    filename: [u8; EXEC_ARG_CHUNK_LEN],
+    saw_header: bool,
+    saw_commit: bool,
+    argc: Option<u16>,
+    captured_bytes: Option<u32>,
+    flags: u8,
+    chunks: HashMap<u16, BTreeMap<u16, Vec<u8>>>,
+}
+
+impl PendingExec {
+    fn new(record: &ExecRecord, now: Instant) -> Self {
+        Self {
+            first_seen: now,
+            pid: record.pid,
+            ppid: record.ppid,
+            uid: record.uid,
+            comm: record.comm,
+            filename: [0; EXEC_ARG_CHUNK_LEN],
+            saw_header: false,
+            saw_commit: false,
+            argc: None,
+            captured_bytes: None,
+            flags: 0,
+            chunks: HashMap::new(),
+        }
+    }
+
+    fn apply(&mut self, record: &ExecRecord) {
+        self.flags |= record.flags;
+        match record.kind {
+            EXEC_RECORD_HEADER => {
+                self.saw_header = true;
+                let len = (record.data_len as usize).min(record.data.len());
+                self.filename[..len].copy_from_slice(&record.data[..len]);
+            }
+            EXEC_RECORD_ARG_CHUNK => {
+                if record.arg_index as usize >= ARGV_SLOTS
+                    || record.chunk_index as usize >= EXEC_MAX_CHUNKS
+                    || record.data_len as usize > record.data.len()
+                {
+                    self.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+                    return;
+                }
+                let len = record.data_len as usize;
+                let value = record.data[..len].to_vec();
+                let chunks = self.chunks.entry(record.arg_index).or_default();
+                if let Some(existing) = chunks.get(&record.chunk_index) {
+                    if existing != &value {
+                        self.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+                    }
+                } else {
+                    chunks.insert(record.chunk_index, value);
+                }
+            }
+            EXEC_RECORD_END => {
+                self.argc = Some(record.argc.min(ARGV_SLOTS as u16));
+                self.captured_bytes = Some(record.captured_bytes);
+            }
+            EXEC_RECORD_COMMIT => self.saw_commit = true,
+            _ => self.flags |= EXEC_FLAG_ARGV_INCOMPLETE,
+        }
+    }
+
+    fn finish(mut self, timed_out: bool) -> CompletedExec {
+        let mut argv_incomplete = timed_out
+            || !self.saw_header
+            || self.argc.is_none()
+            || self.flags & EXEC_FLAG_ARGV_INCOMPLETE != 0;
+        let argv_truncated = self.flags & EXEC_FLAG_ARGV_TRUNCATED != 0;
+        let inferred_argc = self
+            .chunks
+            .keys()
+            .max()
+            .map(|index| index.saturating_add(1))
+            .unwrap_or(0);
+        let captured_argc = self.argc.unwrap_or(inferred_argc).min(ARGV_SLOTS as u16);
+        let mut argv = Vec::with_capacity(captured_argc as usize);
+        let mut assembled_bytes = 0u32;
+
+        for arg_index in 0..captured_argc {
+            let Some(chunks) = self.chunks.remove(&arg_index) else {
+                argv_incomplete = true;
+                argv.push(String::new());
+                continue;
+            };
+            let mut bytes = Vec::new();
+            let mut expected_chunk = 0u16;
+            let mut saw_terminator = false;
+            for (chunk_index, chunk) in chunks {
+                if chunk_index != expected_chunk {
+                    argv_incomplete = true;
+                }
+                expected_chunk = chunk_index.saturating_add(1);
+                assembled_bytes = assembled_bytes.saturating_add(chunk.len() as u32);
+                if chunk.len() < EXEC_ARG_CHUNK_PAYLOAD {
+                    saw_terminator = true;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if !(saw_terminator || argv_truncated && arg_index + 1 == captured_argc) {
+                argv_incomplete = true;
+            }
+            argv.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        if !self.chunks.is_empty() {
+            argv_incomplete = true;
+        }
+        if let Some(expected_bytes) = self.captured_bytes {
+            if expected_bytes != assembled_bytes {
+                argv_incomplete = true;
+            }
+        }
+        if argv.is_empty() {
+            let filename = cstr(&self.filename);
+            if !filename.is_empty() {
+                argv.push(filename);
+            }
+        }
+
+        CompletedExec {
+            pid: self.pid,
+            ppid: self.ppid,
+            uid: self.uid,
+            comm: self.comm,
+            filename: self.filename,
+            argv,
+            argv_truncated,
+            argv_incomplete,
+            captured_argc,
+            captured_bytes: self.captured_bytes.unwrap_or(assembled_bytes),
+            reassembly_timed_out: timed_out && (self.argc.is_none() || !self.saw_header),
+            exec_confirmed: self.saw_commit,
+        }
+    }
+}
+
+struct CompletedExec {
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    comm: [u8; 16],
+    filename: [u8; EXEC_ARG_CHUNK_LEN],
+    argv: Vec<String>,
+    argv_truncated: bool,
+    argv_incomplete: bool,
+    captured_argc: u16,
+    captured_bytes: u32,
+    reassembly_timed_out: bool,
+    exec_confirmed: bool,
+}
+
+struct ExecAssembler {
+    pending: HashMap<(u64, u32), PendingExec>,
+    require_commit: bool,
+}
+
+impl Default for ExecAssembler {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            require_commit: true,
+        }
+    }
+}
+
+impl ExecAssembler {
+    fn new(require_commit: bool) -> Self {
+        Self {
+            pending: HashMap::new(),
+            require_commit,
+        }
+    }
+
+    fn push(&mut self, record: ExecRecord, now: Instant) -> Vec<CompletedExec> {
+        let mut completed = Vec::with_capacity(2);
+        let key = (record.exec_id, record.pid);
+        if !self.pending.contains_key(&key) && self.pending.len() >= EXEC_REASSEMBLY_LIMIT {
+            if let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, pending)| pending.first_seen)
+                .map(|(key, _)| *key)
+            {
+                if let Some(pending) = self.pending.remove(&oldest) {
+                    completed.push(pending.finish(true));
+                }
+            }
+        }
+
+        self.pending
+            .entry(key)
+            .or_insert_with(|| PendingExec::new(&record, now))
+            .apply(&record);
+        let ready = self.pending.get(&key).is_some_and(|pending| {
+            pending.argc.is_some() && (pending.saw_commit || !self.require_commit)
+        });
+        if ready {
+            if let Some(pending) = self.pending.remove(&key) {
+                completed.push(pending.finish(false));
+            }
+        }
+        completed
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<CompletedExec> {
+        let expired: Vec<(u64, u32)> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                now.duration_since(pending.first_seen) >= EXEC_REASSEMBLY_TIMEOUT
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|key| self.pending.remove(&key))
+            .map(|pending| pending.finish(true))
+            .collect()
+    }
+}
 
 #[cfg(feature = "legacy-kernel-4-19")]
 mod legacy;
@@ -68,6 +304,10 @@ async fn main() -> anyhow::Result<()> {
     // unpacking images), and the agent's own writes need downstream identity filtering.
     let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
     let mut probes = vec![
+        ("track_clone", "sys_exit_clone"),
+        ("track_clone3", "sys_exit_clone3"),
+        ("track_fork", "sys_exit_fork"),
+        ("track_vfork", "sys_exit_vfork"),
         ("exec", "sys_enter_execve"),
         ("tls_write", "sys_enter_write"),
         ("tls_sendto", "sys_enter_sendto"),
@@ -101,6 +341,33 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // sched_process_fork runs before the child can execute, so its parent PID is available even for short-lived tools.
+    match attach(
+        &mut ebpf,
+        "track_process_fork",
+        "sched",
+        "sched_process_fork",
+    ) {
+        Ok(()) => attached += 1,
+        Err(e) => {
+            tracing::warn!(error = %e, "sched_process_fork probe failed - using syscall-exit ancestry fallback")
+        }
+    }
+    let exec_commit_probe_attached = match attach(
+        &mut ebpf,
+        "track_process_exec",
+        "sched",
+        "sched_process_exec",
+    ) {
+        Ok(()) => {
+            attached += 1;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sched_process_exec probe failed - proc cmdline supplementation disabled");
+            false
+        }
+    };
     // proc_exit is a do_exit kprobe (not a tracepoint): do_exit fires for EVERY task exit,
     // including signal-kills (crash / OOM) that sys_enter_exit_group never sees.
     match attach_kprobe(&mut ebpf, "proc_exit", "do_exit") {
@@ -154,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     // (pid,fd) -> (sni, provider, peer): recorded at ClientHello, read when the socket
     // closes (the in-kernel LlmEvent) to build the metric-bearing LlmCall.
     let mut llm_meta: HashMap<u64, (Option<String>, Option<Provider>, IpAddr)> = HashMap::new();
+    let mut exec_assembler = ExecAssembler::new(exec_commit_probe_attached);
     let mut exec_ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("`EVENTS` missing")?)?;
     let mut exit_ring = RingBuf::try_from(
         ebpf.take_map("EXIT_EVENTS")
@@ -194,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         attached,
-        total = probes.len(),
+        total = probes.len() + 3,
         files,
         "a3s-observer-collector: probes attached (file-write capture: set A3S_OBSERVER_FILES=1); \
          streaming (Ctrl-C to stop)"
@@ -244,6 +512,9 @@ async fn main() -> anyhow::Result<()> {
                 emit_collector_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped, output_dropped);
                 tracing::info!(
                     exec = stats.exec,
+                    exec_truncated = stats.exec_truncated,
+                    exec_incomplete = stats.exec_incomplete,
+                    exec_reassembly_timeout = stats.exec_reassembly_timeout,
                     exit = stats.exit,
                     egress = stats.egress,
                     dns = stats.dns,
@@ -263,34 +534,19 @@ async fn main() -> anyhow::Result<()> {
             // switch to AsyncFd (epoll) on the ring fds and/or enlarge the rings.
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
                 while let Some(item) = exec_ring.next() {
-                    if let Some(ev) = read_pod::<ExecEvent>(&item) {
-                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            process: Some(process_context(ev.pid, &ev.comm)),
-                            provider: None,
-                            event: AgentEvent::ToolExec {
-                                pid: ev.pid,
-                                ppid: read_ppid(ev.pid),
-                                uid: ev.uid,
-                                argv: argv_of(&ev),
-                                cwd: read_cwd(ev.pid),
-                            },
-                        });
+                    if let Some(record) = read_pod::<ExecRecord>(&item) {
+                        for completed in exec_assembler.push(record, Instant::now()) {
+                            emit_completed_exec(
+                                exporter.as_ref(),
+                                &mut stats,
+                                &resolver,
+                                completed,
+                            );
+                        }
                     }
                 }
-                while let Some(item) = exit_ring.next() {
-                    if let Some(ev) = read_pod::<ExitEvent>(&item) {
-                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            process: Some(process_context(ev.pid, &ev.comm)),
-                            provider: None,
-                            event: AgentEvent::ProcessExit {
-                                pid: ev.pid,
-                                exit_code: ev.exit_code,
-                                signal: ev.signal,
-                            },
-                        });
-                    }
+                for completed in exec_assembler.expire(Instant::now()) {
+                    emit_completed_exec(exporter.as_ref(), &mut stats, &resolver, completed);
                 }
                 while let Some(item) = sec_ring.next() {
                     if let Some(ev) = read_pod::<SecEvent>(&item) {
@@ -302,6 +558,8 @@ async fn main() -> anyhow::Result<()> {
                         };
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::SecurityAction {
@@ -322,6 +580,8 @@ async fn main() -> anyhow::Result<()> {
                         peers.insert(sock_key(ev.pid, ev.fd), (peer, ev.port));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider: None,
                             event: AgentEvent::Egress {
@@ -353,6 +613,8 @@ async fn main() -> anyhow::Result<()> {
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                             identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
                             process: Some(process_context(ev.pid, &ev.comm)),
                             provider,
                             event: AgentEvent::Egress {
@@ -371,6 +633,8 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
@@ -394,6 +658,8 @@ async fn main() -> anyhow::Result<()> {
                             };
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event,
@@ -411,6 +677,8 @@ async fn main() -> anyhow::Result<()> {
                             if provider.is_some() {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity_for(&resolver, ev.pid, &ev.comm),
+                                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                    observation: None,
                                     process: Some(process_context(ev.pid, &ev.comm)),
                                     provider,
                                     event: AgentEvent::LlmCall {
@@ -434,12 +702,15 @@ async fn main() -> anyhow::Result<()> {
                         let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
                         if !content.is_empty() {
                             let identity = identity_for(&resolver, ev.pid, &ev.comm);
+                            let workload = resolver.resolve_workload(ev.pid, 0, 0);
                             // Structured LLM telemetry (model/tokens) alongside the raw content.
                             if let Some((model, prompt_tokens, completion_tokens)) =
                                 parse_llm_meta(&content)
                             {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                     identity: identity.clone(),
+                                    workload: workload.clone(),
+                                    observation: None,
                                     process: Some(process_context(ev.pid, &ev.comm)),
                                     provider: None,
                                     event: AgentEvent::LlmApi {
@@ -453,6 +724,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
                                 identity,
+                                workload,
+                                observation: None,
                                 process: Some(process_context(ev.pid, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::SslContent {
@@ -464,11 +737,37 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // Exit is drained last so downstream process caches can attribute all prior
+                // exec, file, network and security events before the PID lifecycle closes.
+                while let Some(item) = exit_ring.next() {
+                    if let Some(ev) = read_pod::<ExitEvent>(&item) {
+                        emit(exporter.as_ref(), &mut stats, EnrichedEvent {
+                            identity: identity_for(&resolver, ev.pid, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            observation: None,
+                            process: Some(process_context(ev.pid, &ev.comm)),
+                            provider: None,
+                            event: AgentEvent::ProcessExit {
+                                pid: ev.pid,
+                                exit_code: ev.exit_code,
+                                signal: ev.signal,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
+    let dropped: u64 = drops
+        .get(&0, 0)
+        .map(|v| v.iter().copied().sum())
+        .unwrap_or(0);
+    let output_dropped = exporter.output_drops();
     tracing::info!(
         exec = stats.exec,
+        exec_truncated = stats.exec_truncated,
+        exec_incomplete = stats.exec_incomplete,
+        exec_reassembly_timeout = stats.exec_reassembly_timeout,
         exit = stats.exit,
         egress = stats.egress,
         dns = stats.dns,
@@ -476,6 +775,8 @@ async fn main() -> anyhow::Result<()> {
         llm = stats.llm,
         ssl = stats.ssl,
         sec = stats.sec,
+        dropped,
+        output_dropped,
         "a3s-observer-collector: stopped (final window)"
     );
     Ok(())
@@ -528,21 +829,6 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
         .then(|| unsafe { core::ptr::read_unaligned(item.as_ptr() as *const T) })
 }
 
-/// Full argv (argv[0..argc]) captured in-kernel; falls back to the binary path if none.
-fn argv_of(ev: &ExecEvent) -> Vec<String> {
-    let n = (ev.argc as usize).min(ev.args.len());
-    let argv: Vec<String> = ev.args[..n]
-        .iter()
-        .map(|a| cstr(a))
-        .filter(|s| !s.is_empty())
-        .collect();
-    if argv.is_empty() {
-        vec![cstr(&ev.filename)]
-    } else {
-        argv
-    }
-}
-
 /// The process's current working directory (≈ exec-time for a fresh process).
 fn read_cwd(pid: u32) -> String {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
@@ -576,6 +862,142 @@ fn process_context(pid: u32, comm: &[u8; 16]) -> ProcessContext {
     }
 }
 
+fn exec_ppid(ev: &CompletedExec) -> u32 {
+    if ev.ppid != 0 {
+        ev.ppid
+    } else {
+        read_ppid(ev.pid)
+    }
+}
+
+fn exec_process_context(ev: &CompletedExec, ppid: u32) -> ProcessContext {
+    let cwd = read_cwd(ev.pid);
+    let captured_exe = cstr(&ev.filename);
+    ProcessContext {
+        pid: ev.pid,
+        ppid,
+        comm: cstr(&ev.comm),
+        exe: read_exe(ev.pid).or_else(|| (!captured_exe.is_empty()).then_some(captured_exe)),
+        cwd: (!cwd.is_empty()).then_some(cwd),
+        cgroup: read_cgroup(ev.pid),
+    }
+}
+
+struct ProcCmdline {
+    argv: Vec<String>,
+    observed_bytes: u32,
+    truncated: bool,
+}
+
+fn read_proc_cmdline_at(
+    proc_root: &Path,
+    pid: u32,
+    max_bytes: usize,
+) -> std::io::Result<ProcCmdline> {
+    let file = File::open(proc_root.join(pid.to_string()).join("cmdline"))?;
+    let mut raw = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut raw)?;
+    let truncated = raw.len() > max_bytes;
+    if truncated {
+        raw.truncate(max_bytes);
+    }
+    let observed_bytes = raw.len().min(u32::MAX as usize) as u32;
+    let argv = raw
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    Ok(ProcCmdline {
+        argv,
+        observed_bytes,
+        truncated,
+    })
+}
+
+fn same_executable(ev: &CompletedExec, proc_argv: &[String]) -> bool {
+    let Some(proc_argv0) = proc_argv.first().filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if ev.argv.first().is_some_and(|value| value == proc_argv0) {
+        return true;
+    }
+    let captured = cstr(&ev.filename);
+    let captured_name = Path::new(&captured).file_name();
+    let proc_name = Path::new(proc_argv0).file_name();
+    captured_name.is_some() && captured_name == proc_name
+}
+
+fn supplement_exec_argv_at(
+    mut ev: CompletedExec,
+    proc_root: &Path,
+    max_bytes: usize,
+) -> (CompletedExec, &'static str, u32, u32) {
+    let should_supplement = ev.exec_confirmed && (ev.argv_truncated || ev.argv_incomplete);
+    if should_supplement {
+        if let Ok(cmdline) = read_proc_cmdline_at(proc_root, ev.pid, max_bytes) {
+            if !cmdline.argv.is_empty() && same_executable(&ev, &cmdline.argv) {
+                ev.argv = cmdline.argv;
+                ev.argv_truncated = cmdline.truncated;
+                ev.argv_incomplete = false;
+                let argc = ev.argv.len().min(u32::MAX as usize) as u32;
+                return (ev, "proc_cmdline", argc, cmdline.observed_bytes);
+            }
+        }
+    }
+    let argc = ev.argv.len().min(u32::MAX as usize) as u32;
+    let bytes = ev
+        .argv
+        .iter()
+        .fold(0usize, |total, arg| total.saturating_add(arg.len()))
+        .min(u32::MAX as usize) as u32;
+    (ev, "kernel_fragments", argc, bytes)
+}
+
+fn supplement_exec_argv(ev: CompletedExec) -> (CompletedExec, &'static str, u32, u32) {
+    supplement_exec_argv_at(ev, Path::new("/proc"), PROC_CMDLINE_MAX_BYTES)
+}
+
+fn emit_completed_exec(
+    exporter: &dyn Exporter,
+    stats: &mut Stats,
+    resolver: &impl IdentityResolver,
+    ev: CompletedExec,
+) {
+    if ev.reassembly_timed_out {
+        stats.exec_reassembly_timeout += 1;
+    }
+    let (ev, argv_source, observed_argc, observed_bytes) = supplement_exec_argv(ev);
+    let ppid = exec_ppid(&ev);
+    let cwd = read_cwd(ev.pid);
+    emit(
+        exporter,
+        stats,
+        EnrichedEvent {
+            identity: identity_for(resolver, ev.pid, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            observation: None,
+            process: Some(exec_process_context(&ev, ppid)),
+            provider: None,
+            event: AgentEvent::ToolExec {
+                pid: ev.pid,
+                ppid,
+                uid: ev.uid,
+                argv: ev.argv,
+                argv_truncated: ev.argv_truncated,
+                argv_incomplete: ev.argv_incomplete,
+                exec_confirmed: ev.exec_confirmed,
+                argv_source: argv_source.to_string(),
+                captured_argc: ev.captured_argc,
+                captured_bytes: ev.captured_bytes,
+                observed_argc,
+                observed_bytes,
+                cwd,
+            },
+        },
+    );
+}
+
 /// A NUL-terminated byte buffer (from a kernel copy) as a lossy String.
 fn cstr(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -599,6 +1021,9 @@ fn identity_for(r: &impl IdentityResolver, pid: u32, comm: &[u8; 16]) -> Identit
 #[derive(Default)]
 struct Stats {
     exec: u64,
+    exec_truncated: u64,
+    exec_incomplete: u64,
+    exec_reassembly_timeout: u64,
     exit: u64,
     egress: u64,
     dns: u64,
@@ -686,6 +1111,8 @@ fn emit_collector_heartbeat(
 ) {
     exporter.export(&EnrichedEvent {
         identity: Identity::default(),
+        workload: None,
+        observation: None,
         process: None,
         provider: None,
         event: AgentEvent::CollectorHeartbeat {
@@ -707,6 +1134,9 @@ fn emit_collector_heartbeat(
             llm: stats.llm,
             ssl: stats.ssl,
             sec: stats.sec,
+            exec_truncated: stats.exec_truncated,
+            exec_incomplete: stats.exec_incomplete,
+            exec_reassembly_timeout: stats.exec_reassembly_timeout,
             dropped,
             output_dropped,
         },
@@ -716,7 +1146,15 @@ fn emit_collector_heartbeat(
 /// Export an event and count it by kind for the throughput report.
 fn emit(exporter: &dyn Exporter, stats: &mut Stats, ev: EnrichedEvent) {
     match &ev.event {
-        AgentEvent::ToolExec { .. } => stats.exec += 1,
+        AgentEvent::ToolExec {
+            argv_truncated,
+            argv_incomplete,
+            ..
+        } => {
+            stats.exec += 1;
+            stats.exec_truncated += u64::from(*argv_truncated);
+            stats.exec_incomplete += u64::from(*argv_incomplete);
+        }
         AgentEvent::ProcessExit { .. } => stats.exit += 1,
         AgentEvent::Egress { .. } => stats.egress += 1,
         AgentEvent::Dns { .. } => stats.dns += 1,
@@ -832,7 +1270,210 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dns_qname, parse_llm_meta, parse_sni};
+    use super::{
+        exec_ppid, exec_process_context, parse_dns_qname, parse_llm_meta, parse_sni,
+        supplement_exec_argv_at, CompletedExec, ExecAssembler, EXEC_REASSEMBLY_TIMEOUT,
+    };
+    use a3s_observer_common::{
+        ExecRecord, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK,
+        EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
+    };
+    use std::fs;
+    use std::time::Instant;
+
+    fn exec_record(exec_id: u64, kind: u8) -> ExecRecord {
+        let mut record: ExecRecord = unsafe { std::mem::zeroed() };
+        record.exec_id = exec_id;
+        record.pid = u32::MAX;
+        record.ppid = 42;
+        record.uid = 1000;
+        record.kind = kind;
+        record
+    }
+
+    fn chunk(exec_id: u64, arg_index: u16, chunk_index: u16, value: &[u8]) -> ExecRecord {
+        let mut record = exec_record(exec_id, EXEC_RECORD_ARG_CHUNK);
+        record.arg_index = arg_index;
+        record.chunk_index = chunk_index;
+        record.data_len = value.len() as u16;
+        record.data[..value.len()].copy_from_slice(value);
+        record
+    }
+
+    #[test]
+    fn exec_uses_kernel_parent_snapshot_and_filename_fallback() {
+        let mut ev = CompletedExec {
+            pid: u32::MAX,
+            ppid: 42,
+            uid: 1000,
+            comm: [0; 16],
+            filename: [0; 128],
+            argv: vec!["bash".to_string()],
+            argv_truncated: false,
+            argv_incomplete: false,
+            captured_argc: 1,
+            captured_bytes: 4,
+            reassembly_timed_out: false,
+            exec_confirmed: true,
+        };
+        let filename = b"/usr/bin/bash";
+        ev.filename[..filename.len()].copy_from_slice(filename);
+
+        assert_eq!(exec_ppid(&ev), 42);
+        let process = exec_process_context(&ev, exec_ppid(&ev));
+        assert_eq!(process.ppid, 42);
+        assert_eq!(process.exe.as_deref(), Some("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn reassembles_long_arguments_without_silent_truncation() {
+        let now = Instant::now();
+        let mut assembler = ExecAssembler::default();
+        let mut header = exec_record(7, EXEC_RECORD_HEADER);
+        header.data_len = 9;
+        header.data[..9].copy_from_slice(b"/bin/bash");
+        assert!(assembler.push(header, now).is_empty());
+        assert!(assembler.push(chunk(7, 0, 0, b"bash"), now).is_empty());
+
+        let long = [b'x'; EXEC_ARG_CHUNK_PAYLOAD + 73];
+        assert!(assembler
+            .push(chunk(7, 1, 0, &long[..EXEC_ARG_CHUNK_PAYLOAD]), now)
+            .is_empty());
+        assert!(assembler
+            .push(chunk(7, 1, 1, &long[EXEC_ARG_CHUNK_PAYLOAD..]), now)
+            .is_empty());
+        let mut end = exec_record(7, EXEC_RECORD_END);
+        end.argc = 2;
+        end.captured_bytes = (4 + long.len()) as u32;
+        assert!(assembler.push(end, now).is_empty());
+        let completed = assembler
+            .push(exec_record(7, EXEC_RECORD_COMMIT), now)
+            .pop()
+            .unwrap();
+
+        assert_eq!(completed.argv[0], "bash");
+        assert_eq!(completed.argv[1].len(), long.len());
+        assert!(!completed.argv_truncated);
+        assert!(!completed.argv_incomplete);
+    }
+
+    #[test]
+    fn marks_missing_chunks_and_timeouts_as_incomplete() {
+        let now = Instant::now();
+        let mut assembler = ExecAssembler::default();
+        let header = exec_record(8, EXEC_RECORD_HEADER);
+        assembler.push(header, now);
+        assembler.push(chunk(8, 0, 1, b"tail"), now);
+        let mut end = exec_record(8, EXEC_RECORD_END);
+        end.argc = 1;
+        end.captured_bytes = 4;
+        assembler.push(end, now);
+        let missing = assembler
+            .push(exec_record(8, EXEC_RECORD_COMMIT), now)
+            .pop()
+            .unwrap();
+        assert!(missing.argv_incomplete);
+
+        assembler.push(exec_record(9, EXEC_RECORD_HEADER), now);
+        let timed_out = assembler.expire(now + EXEC_REASSEMBLY_TIMEOUT);
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out[0].argv_incomplete);
+        assert!(timed_out[0].reassembly_timed_out);
+    }
+
+    #[test]
+    fn emits_without_waiting_when_exec_commit_probe_is_unavailable() {
+        let now = Instant::now();
+        let mut assembler = ExecAssembler::new(false);
+        assembler.push(exec_record(11, EXEC_RECORD_HEADER), now);
+        assembler.push(chunk(11, 0, 0, b"echo"), now);
+        let mut end = exec_record(11, EXEC_RECORD_END);
+        end.argc = 1;
+        end.captured_bytes = 4;
+
+        let completed = assembler.push(end, now).pop().unwrap();
+        assert_eq!(completed.argv, ["echo"]);
+        assert!(!completed.exec_confirmed);
+        assert!(!completed.argv_incomplete);
+        assert!(!completed.reassembly_timed_out);
+    }
+
+    #[test]
+    fn failed_exec_is_unconfirmed_but_not_a_reassembly_timeout() {
+        let now = Instant::now();
+        let mut assembler = ExecAssembler::default();
+        assembler.push(exec_record(12, EXEC_RECORD_HEADER), now);
+        assembler.push(chunk(12, 0, 0, b"missing-command"), now);
+        let mut end = exec_record(12, EXEC_RECORD_END);
+        end.argc = 1;
+        end.captured_bytes = 15;
+        assembler.push(end, now);
+
+        let completed = assembler
+            .expire(now + EXEC_REASSEMBLY_TIMEOUT)
+            .pop()
+            .unwrap();
+        assert!(!completed.exec_confirmed);
+        assert!(completed.argv_incomplete);
+        assert!(!completed.reassembly_timed_out);
+    }
+
+    #[test]
+    fn preserves_explicit_kernel_truncation() {
+        let now = Instant::now();
+        let mut assembler = ExecAssembler::default();
+        assembler.push(exec_record(10, EXEC_RECORD_HEADER), now);
+        assembler.push(chunk(10, 0, 0, &[b'x'; EXEC_ARG_CHUNK_PAYLOAD]), now);
+        let mut end = exec_record(10, EXEC_RECORD_END);
+        end.argc = 1;
+        end.captured_bytes = EXEC_ARG_CHUNK_PAYLOAD as u32;
+        end.flags = EXEC_FLAG_ARGV_TRUNCATED;
+        assembler.push(end, now);
+        let completed = assembler
+            .push(exec_record(10, EXEC_RECORD_COMMIT), now)
+            .pop()
+            .unwrap();
+        assert!(completed.argv_truncated);
+        assert!(!completed.argv_incomplete);
+    }
+
+    #[test]
+    fn supplements_truncated_argv_from_matching_proc_cmdline() {
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("observer-proc-test-{pid}"));
+        let proc_dir = root.join(pid.to_string());
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(
+            proc_dir.join("cmdline"),
+            b"/usr/bin/bash\0-c\0echo complete-dangerous-tail\0",
+        )
+        .unwrap();
+        let mut filename = [0; 128];
+        filename[..13].copy_from_slice(b"/usr/bin/bash");
+        let event = CompletedExec {
+            pid,
+            ppid: 1,
+            uid: 1000,
+            comm: [0; 16],
+            filename,
+            argv: vec!["/usr/bin/bash".into(), "-c".into(), "echo complete".into()],
+            argv_truncated: true,
+            argv_incomplete: false,
+            captured_argc: 3,
+            captured_bytes: 32,
+            reassembly_timed_out: false,
+            exec_confirmed: true,
+        };
+
+        let (event, source, argc, bytes) = supplement_exec_argv_at(event, &root, 4096);
+        assert_eq!(source, "proc_cmdline");
+        assert_eq!(event.argv[2], "echo complete-dangerous-tail");
+        assert!(!event.argv_truncated);
+        assert!(!event.argv_incomplete);
+        assert_eq!(argc, 3);
+        assert!(bytes > event.captured_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_sni_from_minimal_clienthello() {
