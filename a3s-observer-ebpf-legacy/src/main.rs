@@ -2,8 +2,8 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, ExecEvent, ExitEvent, FileEvent, SecEvent, ARGV_SLOTS, ARG_LEN, FILE_DELETE_FLAG,
-    PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG,
+    LEGACY_ARG_LEN, PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use aya_ebpf::{
     helpers::{
@@ -16,7 +16,7 @@ use aya_ebpf::{
 };
 
 #[map]
-static EVENTS: PerfEventArray<ExecEvent> = PerfEventArray::new(0);
+static EVENTS: PerfEventArray<LegacyExecEvent> = PerfEventArray::new(0);
 #[map]
 static EXIT_EVENTS: PerfEventArray<ExitEvent> = PerfEventArray::new(0);
 #[map]
@@ -26,10 +26,10 @@ static FILE_EVENTS: PerfEventArray<FileEvent> = PerfEventArray::new(0);
 #[map]
 static SEC_EVENTS: PerfEventArray<SecEvent> = PerfEventArray::new(0);
 
-// ExecEvent is larger than the 512-byte BPF stack. Per-CPU scratch slots also keep concurrent
+// LegacyExecEvent is larger than the 512-byte BPF stack. Per-CPU scratch slots keep concurrent
 // events isolated without requiring map locks on the target's 16 CPUs.
 #[map]
-static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0);
+static EXEC_SCRATCH: PerCpuArray<LegacyExecEvent> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static EXIT_SCRATCH: PerCpuArray<ExitEvent> = PerCpuArray::with_max_entries(1, 0);
 #[map]
@@ -104,7 +104,7 @@ fn try_exec(ctx: &ProbeContext) -> Result<u32, i64> {
         (*ev).argc = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).filename = [0; 128];
-        (*ev).args = [[0; ARG_LEN]; ARGV_SLOTS];
+        (*ev).args = [[0; LEGACY_ARG_LEN]; ARGV_SLOTS];
         read_string(filename, (*ev).filename.as_mut_ptr(), 128);
         if argv != 0 {
             for i in 0..ARGV_SLOTS {
@@ -114,7 +114,7 @@ fn try_exec(ctx: &ProbeContext) -> Result<u32, i64> {
                 if arg == 0 {
                     break;
                 }
-                read_string(arg, (*ev).args[i].as_mut_ptr(), ARG_LEN as u32);
+                read_string(arg, (*ev).args[i].as_mut_ptr(), LEGACY_ARG_LEN as u32);
                 (*ev).argc += 1;
             }
         }

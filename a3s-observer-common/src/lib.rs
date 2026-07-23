@@ -47,6 +47,26 @@ pub struct ExecRecord {
 
 const _: [(); 184] = [(); core::mem::size_of::<ExecRecord>()];
 
+/// Fixed-size exec payload used only by the Linux 4.19 perf-kprobe backend.
+///
+/// The legacy verifier cannot load the modern chunked exec program. Keep this ABI separate from
+/// `ExecRecord` so current kernels can evolve without silently changing the customer probe layout.
+pub const LEGACY_ARG_LEN: usize = 128;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LegacyExecEvent {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub argc: u32,
+    pub comm: [u8; 16],
+    pub filename: [u8; 128],
+    pub args: [[u8; LEGACY_ARG_LEN]; ARGV_SLOTS],
+}
+
+const _: [(); 1696] = [(); core::mem::size_of::<LegacyExecEvent>()];
+
 /// A process exit (`sys_enter_exit_group`) — the other end of the tool lifecycle, carrying the
 /// exit status so tool *outcomes* are visible (did the command succeed?), not just that it ran.
 /// Captured via a `do_exit` kprobe, so it catches EVERY exit — clean exits and signal-kills

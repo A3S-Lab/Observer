@@ -1,10 +1,11 @@
-use super::{argv_of, cstr, emit, identity_for, peer_ip, process_context, CollectorMeta, Stats};
+use super::{cstr, emit, identity_for, peer_ip, process_context, CollectorMeta, Stats};
 use a3s_observer::{
-    read_ppid, AgentEvent, EnrichedEvent, Exporter, JsonExporter, KubeResolver, LogExporter,
+    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
+    LogExporter,
 };
 use a3s_observer_common::{
-    ConnectEvent, ExecEvent, ExitEvent, FileEvent, SecEvent, FILE_DELETE_FLAG, SEC_BIND,
-    SEC_PTRACE, SEC_SETUID,
+    ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG,
+    LEGACY_ARG_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
@@ -25,7 +26,7 @@ use std::{
 use tokio::sync::mpsc;
 
 enum RawEvent {
-    Exec(Box<ExecEvent>),
+    Exec(Box<LegacyExecEvent>),
     Exit(ExitEvent),
     Connect(ConnectEvent),
     File(Box<FileEvent>),
@@ -290,7 +291,7 @@ fn read_value<T: Copy>(bytes: &[u8]) -> Option<T> {
         .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
-fn wrap_exec(event: ExecEvent) -> RawEvent {
+fn wrap_exec(event: LegacyExecEvent) -> RawEvent {
     RawEvent::Exec(Box::new(event))
 }
 
@@ -298,22 +299,55 @@ fn wrap_file(event: FileEvent) -> RawEvent {
     RawEvent::File(Box::new(event))
 }
 
+fn legacy_argv(event: &LegacyExecEvent) -> Vec<String> {
+    event.args[..(event.argc as usize).min(ARGV_SLOTS)]
+        .iter()
+        .map(|arg| cstr(arg))
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
+
 fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stats, raw: RawEvent) {
     let enriched = match raw {
-        RawEvent::Exec(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, &ev.comm),
-            process: Some(process_context(ev.pid, &ev.comm)),
-            provider: None,
-            event: AgentEvent::ToolExec {
-                pid: ev.pid,
-                ppid: read_ppid(ev.pid),
-                uid: ev.uid,
-                argv: argv_of(&ev),
-                cwd: super::read_cwd(ev.pid),
-            },
-        },
+        RawEvent::Exec(ev) => {
+            let argv = legacy_argv(&ev);
+            let captured_argc = argv.len().min(u16::MAX as usize) as u16;
+            let captured_bytes = argv
+                .iter()
+                .fold(0usize, |total, arg| total.saturating_add(arg.len()))
+                .min(u32::MAX as usize) as u32;
+            let argv_truncated = ev.argc as usize >= ARGV_SLOTS
+                || ev.args[..(ev.argc as usize).min(ARGV_SLOTS)]
+                    .iter()
+                    .any(|arg| arg[LEGACY_ARG_LEN - 1] != 0);
+            let ppid = read_ppid(ev.pid);
+            EnrichedEvent {
+                identity: identity_for(resolver, ev.pid, &ev.comm),
+                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                observation: None,
+                process: Some(process_context(ev.pid, &ev.comm)),
+                provider: None,
+                event: AgentEvent::ToolExec {
+                    pid: ev.pid,
+                    ppid,
+                    uid: ev.uid,
+                    argv,
+                    argv_truncated,
+                    argv_incomplete: false,
+                    exec_confirmed: false,
+                    argv_source: "legacy-kprobe".to_string(),
+                    captured_argc,
+                    captured_bytes,
+                    observed_argc: captured_argc as u32,
+                    observed_bytes: captured_bytes,
+                    cwd: super::read_cwd(ev.pid),
+                },
+            }
+        }
         RawEvent::Exit(ev) => EnrichedEvent {
             identity: identity_for(resolver, ev.pid, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            observation: None,
             process: Some(process_context(ev.pid, &ev.comm)),
             provider: None,
             event: AgentEvent::ProcessExit {
@@ -324,6 +358,8 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
         },
         RawEvent::Connect(ev) => EnrichedEvent {
             identity: identity_for(resolver, ev.pid, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            observation: None,
             process: Some(process_context(ev.pid, &ev.comm)),
             provider: None,
             event: AgentEvent::Egress {
@@ -339,6 +375,8 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             if ev.flags == FILE_DELETE_FLAG {
                 EnrichedEvent {
                     identity: identity_for(resolver, ev.pid, &ev.comm),
+                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                    observation: None,
                     process: Some(process_context(ev.pid, &ev.comm)),
                     provider: None,
                     event: AgentEvent::FileDelete { pid: ev.pid, path },
@@ -346,6 +384,8 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             } else {
                 EnrichedEvent {
                     identity: identity_for(resolver, ev.pid, &ev.comm),
+                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                    observation: None,
                     process: Some(process_context(ev.pid, &ev.comm)),
                     provider: None,
                     event: AgentEvent::FileAccess {
@@ -358,6 +398,8 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
         }
         RawEvent::Security(ev) => EnrichedEvent {
             identity: identity_for(resolver, ev.pid, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            observation: None,
             process: Some(process_context(ev.pid, &ev.comm)),
             provider: None,
             event: AgentEvent::SecurityAction {
