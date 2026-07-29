@@ -304,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
 
     // File-write capture is opt-in: openat is a firehose on a busy node (e.g. containerd
     // unpacking images), and the agent's own writes need downstream identity filtering.
-    let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
+    let files = env_enabled("A3S_OBSERVER_FILES");
     let mut probes = vec![
         ("track_clone", "sys_exit_clone"),
         ("track_clone3", "sys_exit_clone3"),
@@ -387,7 +387,8 @@ async fn main() -> anyhow::Result<()> {
     // libssl path on distros where the default below is wrong.
     if let Some(val) = std::env::var("A3S_OBSERVER_SSL")
         .ok()
-        .filter(|v| !v.is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !env_value_disabled(value))
     {
         let lib = if val.contains('/') {
             val
@@ -411,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
-    let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
+    let exporter: Box<dyn Exporter> = if env_enabled("A3S_OBSERVER_JSON") {
         Box::new(JsonExporter::new())
     } else {
         Box::new(LogExporter)
@@ -481,11 +482,7 @@ async fn main() -> anyhow::Result<()> {
              livenessProbe on it will restart-loop the pod");
     }
 
-    let collector = CollectorMeta::from_env(
-        files,
-        std::env::var_os("A3S_OBSERVER_SSL").is_some(),
-        attached,
-    );
+    let collector = CollectorMeta::from_env(files, env_enabled("A3S_OBSERVER_SSL"), attached);
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1149,6 +1146,20 @@ fn env_any(names: &[&str]) -> Option<String> {
     })
 }
 
+fn env_value_disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no" | "disabled"
+    )
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty() && !env_value_disabled(&value))
+        .unwrap_or(false)
+}
+
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -1326,7 +1337,7 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        exec_ppid, exec_process_context, parse_dns_qname, parse_llm_meta,
+        env_value_disabled, exec_ppid, exec_process_context, parse_dns_qname, parse_llm_meta,
         parse_process_start_time_ticks, parse_sni, supplement_exec_argv_at, CompletedExec,
         ExecAssembler, EXEC_REASSEMBLY_TIMEOUT,
     };
@@ -1336,6 +1347,16 @@ mod tests {
     };
     use std::fs;
     use std::time::Instant;
+
+    #[test]
+    fn observer_feature_flags_honor_explicit_off_values() {
+        for disabled in ["0", "false", "FALSE", "off", "no", "disabled"] {
+            assert!(env_value_disabled(disabled), "{disabled}");
+        }
+        for enabled in ["1", "true", "on", "/usr/lib/libssl.so"] {
+            assert!(!env_value_disabled(enabled), "{enabled}");
+        }
+    }
 
     fn exec_record(exec_id: u64, kind: u8) -> ExecRecord {
         let mut record: ExecRecord = unsafe { std::mem::zeroed() };
