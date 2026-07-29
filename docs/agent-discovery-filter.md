@@ -1,6 +1,7 @@
 # Agent Discovery Observation Contract
 
-Status: Observer-side implementation contract for `feat/agent-discovery-filter`
+Status: Observer-side contract implemented and development-environment verified on
+`feat/agent-discovery-filter`
 
 ## Purpose
 
@@ -145,6 +146,24 @@ re-parsing the cgroup path for every event.
 
 The current user-space filter is completed before any optional kernel prefilter. This sequencing
 keeps the first discovery/template/behavior iterations reversible and observable.
+
+## Implementation status (2026-07-30)
+
+Observer now emits the additive process facts, captures event-time cgroup ID in all relevant raw
+layouts, caches process and cgroup enrichment, invalidates process entries on exit, and drains
+process-exit events after other signal rings. The observe-only collector feature flags and current
+24-probe real-container startup path have been verified.
+
+AnySentry consumes numeric `start_time_ticks` and `cgroup_id` without losing ProcessKey identity.
+Its bootstrap process snapshot is retained as bounded unknown cache state, so already-paid
+`/proc` reads are not discarded, and recent cached parent chains avoid repeated ancestry reads.
+Heartbeat metrics distinguish one-time bootstrap reads from current-process fallback and ancestry
+reads.
+
+`TRACKED_CGROUPS` and `TRACKED_PROCESSES` are not present or enabled in the current eBPF programs.
+They remain an optional future observation prefilter that requires production shadow recall and
+loss evidence first. This preserves the current ability to discover an unregistered Agent and to
+forward a first short-lived event as unknown when no cgroup-to-container binding exists yet.
 
 ## Test requirements
 
