@@ -137,6 +137,15 @@ Performance acceptance is based on measured filter hit rate, events copied and f
 RSS, wakeups, ring drops, and output drops. A target is not considered met until validated on the
 target kernel and event mix.
 
+The end-state user-space hot path must not compensate for missing lifecycle state by reading the
+same `/proc/<pid>` files on every file, network, or security event. Exec/fork/exit observations
+populate a bounded ProcessCache; `/proc` remains a cache-miss and event-reordering fallback.
+Likewise, an event-time `cgroup_id` is converted to a physical workload once and cached instead of
+re-parsing the cgroup path for every event.
+
+The current user-space filter is completed before any optional kernel prefilter. This sequencing
+keeps the first discovery/template/behavior iterations reversible and observable.
+
 ## Test requirements
 
 - all raw event layouts preserve and serialize cgroup ID;
