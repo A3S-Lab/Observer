@@ -209,10 +209,7 @@ pub struct KubeResolver;
 
 impl IdentityResolver for KubeResolver {
     fn resolve(&self, pid: u32, cgroup_id: u64, _netns: u64) -> Identity {
-        let cache_key = (
-            cgroup_id,
-            (cgroup_id == 0).then_some(pid).unwrap_or_default(),
-        );
+        let cache_key = (cgroup_id, if cgroup_id == 0 { pid } else { 0 });
         let now = Instant::now();
         let cached = kube_identity_cache().lock().ok().and_then(|mut cache| {
             let cached = cache.get(&cache_key)?;
