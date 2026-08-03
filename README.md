@@ -16,6 +16,9 @@ swappable trait. Two paths share one kernel vantage point: **observe** is always
 (tracepoints can't block); **intervene** is opt-in (cgroup-BPF / fanotify), so a policy mistake
 can never break observability.
 
+The additive process/workload facts used by AnySentry's observation-only Agent discovery filter
+are specified in [`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.md).
+
 ```
   AI agent + its tool subprocesses                  unmodified · any language
             │

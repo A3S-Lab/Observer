@@ -12,8 +12,9 @@ use aya_ebpf::{
     cty::c_void,
     helpers::gen::bpf_probe_read_user,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_loop, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
+        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_loop, bpf_probe_read_user_buf,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
     maps::{ring_buf::RingBufEntry, HashMap, LruHashMap, PerCpuArray, RingBuf},
@@ -127,12 +128,14 @@ fn read_user_u64(addr: *const u8) -> Option<u64> {
 unsafe fn init_exec_record(
     record: *mut ExecRecord,
     exec_id: u64,
+    cgroup_id: u64,
     pid: u32,
     ppid: u32,
     uid: u32,
     comm: [u8; 16],
 ) {
     (*record).exec_id = exec_id;
+    (*record).cgroup_id = cgroup_id;
     (*record).pid = pid;
     (*record).ppid = ppid;
     (*record).uid = uid;
@@ -177,6 +180,7 @@ unsafe fn zero_exec_data(record: *mut ExecRecord) {
 struct ExecLoopContext {
     argv: u64,
     exec_id: u64,
+    cgroup_id: u64,
     argp: u64,
     arg_offset: u32,
     captured_bytes: u32,
@@ -231,6 +235,7 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
     init_exec_record(
         chunk,
         state.exec_id,
+        state.cgroup_id,
         state.pid,
         state.ppid,
         state.uid,
@@ -327,6 +332,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let uid = bpf_get_current_uid_gid() as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
     let exec_id = unsafe { bpf_ktime_get_ns() } ^ pid_tgid;
@@ -338,7 +344,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let header = header_entry.as_mut_ptr();
     unsafe {
-        init_exec_record(header, exec_id, pid, ppid, uid, comm);
+        init_exec_record(header, exec_id, cgroup_id, pid, ppid, uid, comm);
         (*header).kind = EXEC_RECORD_HEADER;
         // sys_enter_execve: `const char *filename` at offset 16.
         if let Ok(filename_ptr) = ctx.read_at::<*const u8>(16) {
@@ -363,6 +369,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
             let mut loop_ctx = ExecLoopContext {
                 argv: argv as u64,
                 exec_id,
+                cgroup_id,
                 argp: 0,
                 arg_offset: 0,
                 captured_bytes: 0,
@@ -400,7 +407,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
             return Ok(0);
         };
         let end = end_entry.as_mut_ptr();
-        init_exec_record(end, exec_id, pid, ppid, uid, comm);
+        init_exec_record(end, exec_id, cgroup_id, pid, ppid, uid, comm);
         (*end).kind = EXEC_RECORD_END;
         (*end).flags = flags;
         (*end).argc = captured_argc;
@@ -419,12 +426,13 @@ pub fn track_process_exec(_ctx: TracePointContext) -> u32 {
         return 0;
     };
     let uid = bpf_get_current_uid_gid() as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
     if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS) {
         let record = entry.as_mut_ptr();
         unsafe {
-            init_exec_record(record, exec_id, pid, ppid, uid, comm);
+            init_exec_record(record, exec_id, cgroup_id, pid, ppid, uid, comm);
             (*record).kind = EXEC_RECORD_COMMIT;
         }
         entry.submit(0);
@@ -456,6 +464,7 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (id >> 32) as u32;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).exit_code = ((code >> 8) & 0xff) as u32;
@@ -524,6 +533,7 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev)._pad = 0;
@@ -595,6 +605,7 @@ fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).is_read = is_read;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
@@ -644,6 +655,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).fd = fd as u32;
         (*ev).family = family;
@@ -675,6 +687,7 @@ fn emit_sec(kind: u32, detail: u64) {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).kind = kind;
         (*ev).detail = detail;
@@ -822,6 +835,7 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
@@ -898,6 +912,7 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
@@ -939,6 +954,7 @@ fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).flags = flags as u32;
         (*ev).path = [0u8; PATH_SNAP_LEN];
@@ -963,6 +979,7 @@ fn try_unlink(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let ev = entry.as_mut_ptr();
     unsafe {
+        (*ev).cgroup_id = bpf_get_current_cgroup_id();
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).flags = FILE_DELETE_FLAG; // distinguish from an openat on the shared FILE_EVENTS ring
         (*ev).path = [0u8; PATH_SNAP_LEN];
@@ -1051,6 +1068,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         let now = unsafe { bpf_ktime_get_ns() };
         let ev = entry.as_mut_ptr();
         unsafe {
+            (*ev).cgroup_id = bpf_get_current_cgroup_id();
             (*ev).pid = pid;
             (*ev).fd = fd as u32;
             (*ev).req_bytes = stat.req_bytes;
