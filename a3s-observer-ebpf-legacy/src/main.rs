@@ -135,6 +135,9 @@ pub fn legacy_exit(ctx: ProbeContext) -> u32 {
     };
     let code = ctx.arg::<u64>(0).unwrap_or(0);
     unsafe {
+        // Keep the legacy backend verifier-friendly. The userspace resolver falls back to
+        // /proc when this event-time identifier is unavailable on the UOS 4.19 target.
+        (*ev).cgroup_id = 0;
         (*ev).pid = (id >> 32) as u32;
         (*ev).exit_code = ((code >> 8) & 0xff) as u32;
         (*ev).signal = (code & 0x7f) as u32;
@@ -165,6 +168,7 @@ pub fn legacy_connect(ctx: ProbeContext) -> u32 {
         return 0;
     };
     unsafe {
+        (*ev).cgroup_id = 0;
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).fd = fd as u32;
         (*ev).family = family;
@@ -190,6 +194,7 @@ fn emit_file(ctx: &ProbeContext, path: u64, flags: u32) {
         return;
     };
     unsafe {
+        (*ev).cgroup_id = 0;
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).flags = flags;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
@@ -221,6 +226,7 @@ fn emit_security(ctx: &ProbeContext, kind: u32, detail: u64) {
         return;
     };
     unsafe {
+        (*ev).cgroup_id = 0;
         (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).kind = kind;
         (*ev).detail = detail;

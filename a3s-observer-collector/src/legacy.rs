@@ -323,10 +323,12 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
                     .any(|arg| arg[LEGACY_ARG_LEN - 1] != 0);
             let ppid = read_ppid(ev.pid);
             EnrichedEvent {
-                identity: identity_for(resolver, ev.pid, &ev.comm),
+                // The UOS 4.19 exec perf ABI intentionally has no cgroup field. Passing zero
+                // keeps that proven ABI stable and lets the resolver fall back to /proc by pid.
+                identity: identity_for(resolver, ev.pid, 0, &ev.comm),
                 workload: resolver.resolve_workload(ev.pid, 0, 0),
                 observation: None,
-                process: Some(process_context(ev.pid, &ev.comm)),
+                process: Some(process_context(ev.pid, 0, &ev.comm)),
                 provider: None,
                 event: AgentEvent::ToolExec {
                     pid: ev.pid,
@@ -346,10 +348,10 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             }
         }
         RawEvent::Exit(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
             observation: None,
-            process: Some(process_context(ev.pid, &ev.comm)),
+            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
             provider: None,
             event: AgentEvent::ProcessExit {
                 pid: ev.pid,
@@ -358,10 +360,10 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             },
         },
         RawEvent::Connect(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
             observation: None,
-            process: Some(process_context(ev.pid, &ev.comm)),
+            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
             provider: None,
             event: AgentEvent::Egress {
                 pid: ev.pid,
@@ -375,19 +377,19 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             let path = cstr(&ev.path);
             if ev.flags == FILE_DELETE_FLAG {
                 EnrichedEvent {
-                    identity: identity_for(resolver, ev.pid, &ev.comm),
-                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                    identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                    workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                     observation: None,
-                    process: Some(process_context(ev.pid, &ev.comm)),
+                    process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                     provider: None,
                     event: AgentEvent::FileDelete { pid: ev.pid, path },
                 }
             } else {
                 EnrichedEvent {
-                    identity: identity_for(resolver, ev.pid, &ev.comm),
-                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                    identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                    workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                     observation: None,
-                    process: Some(process_context(ev.pid, &ev.comm)),
+                    process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                     provider: None,
                     event: AgentEvent::FileAccess {
                         pid: ev.pid,
@@ -398,10 +400,10 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
             }
         }
         RawEvent::Security(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
             observation: None,
-            process: Some(process_context(ev.pid, &ev.comm)),
+            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
             provider: None,
             event: AgentEvent::SecurityAction {
                 pid: ev.pid,

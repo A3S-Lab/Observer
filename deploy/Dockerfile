@@ -8,7 +8,8 @@
 # The base must match the build host's glibc — the binary is dynamically linked. CI builds on
 # ubuntu-latest (24.04) and ships on ubuntu:24.04; keep them in lockstep (or build static musl
 # for a distroless/scratch base).
-FROM ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
 COPY a3s-observer-collector /usr/local/bin/a3s-observer-collector
 ENV A3S_OBSERVER_JSON=1
 ENTRYPOINT ["/usr/local/bin/a3s-observer-collector"]

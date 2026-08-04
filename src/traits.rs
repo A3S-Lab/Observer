@@ -7,7 +7,10 @@
 use crate::model::EnrichedEvent;
 use crate::workload::WorkloadIdentity;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Who an event belongs to. Resolved from kernel-side keys (pid / cgroup / netns).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -198,32 +201,73 @@ fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
     tail.split_whitespace().nth(1)?.parse().ok() // remaining = [state, ppid, ...]
 }
 
-/// [`IdentityResolver`] for Kubernetes / containers: reads `/proc/<pid>/cgroup` for the
-/// pod UID + container id, falling back to the process `comm` on a bare host. Pod *names*
-/// need the k8s API (a future enhancement); this gives pod-UID / container-id attribution
-/// with zero cluster access.
+/// [`IdentityResolver`] for Kubernetes / containers: reads `/proc/<pid>/cgroup` once per
+/// cgroup identity and caches the parsed pod UID + container id. Bare-host process names are
+/// supplied by the collector's kernel `comm` fallback, avoiding another per-event `/proc` read.
+/// Pod *names* still come from the AnySentry Kubernetes identity snapshot.
 pub struct KubeResolver;
 
 impl IdentityResolver for KubeResolver {
-    fn resolve(&self, pid: u32, _cgroup_id: u64, _netns: u64) -> Identity {
-        if let Ok(cg) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
-            let k = parse_cgroup(&cg);
-            if k.pod_uid.is_some() || k.container_id.is_some() {
+    fn resolve(&self, pid: u32, cgroup_id: u64, _netns: u64) -> Identity {
+        let cache_key = (cgroup_id, if cgroup_id == 0 { pid } else { 0 });
+        let now = Instant::now();
+        let cached = kube_identity_cache().lock().ok().and_then(|mut cache| {
+            let cached = cache.get(&cache_key)?;
+            if now.duration_since(cached.refreshed_at) <= KUBE_IDENTITY_CACHE_TTL {
+                Some(cached.identity.clone())
+            } else {
+                cache.remove(&cache_key);
+                None
+            }
+        });
+        let resolved = cached.or_else(|| {
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+            let parsed = parse_cgroup(&cgroup);
+            if let Ok(mut cache) = kube_identity_cache().lock() {
+                if cache.len() >= KUBE_IDENTITY_CACHE_LIMIT {
+                    cache.clear();
+                }
+                cache.insert(
+                    cache_key,
+                    CachedKubeId {
+                        identity: parsed.clone(),
+                        refreshed_at: now,
+                    },
+                );
+            }
+            Some(parsed)
+        });
+        if let Some(kube) = resolved {
+            if kube.pod_uid.is_some() || kube.container_id.is_some() {
                 return Identity {
-                    agent: k.pod_uid.or_else(|| k.container_id.clone()),
+                    agent: kube.pod_uid.or_else(|| kube.container_id.clone()),
                     task: Some(pid.to_string()),
-                    session: k.container_id,
+                    session: kube.container_id,
                 };
             }
         }
         Identity {
-            agent: read_comm(pid), // bare host
+            agent: None,
             task: Some(pid.to_string()),
             session: None,
         }
     }
 }
 
+const KUBE_IDENTITY_CACHE_LIMIT: usize = 65_536;
+const KUBE_IDENTITY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn kube_identity_cache() -> &'static Mutex<HashMap<(u64, u32), CachedKubeId>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u64, u32), CachedKubeId>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct CachedKubeId {
+    identity: KubeId,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone)]
 struct KubeId {
     pod_uid: Option<String>,
     container_id: Option<String>,
