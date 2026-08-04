@@ -10,8 +10,14 @@ use std::time::Duration;
 /// Kernel-observed process context used by downstream attribution engines.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProcessContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
     pub pid: u32,
     pub ppid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
     pub comm: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
@@ -19,6 +25,8 @@ pub struct ProcessContext {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroup: Option<String>,
+    /// cgroup kernfs id captured by eBPF at event time.
+    pub cgroup_id: u64,
 }
 
 /// A raw event captured by an eBPF probe, before identity enrichment.
