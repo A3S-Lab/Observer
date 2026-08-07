@@ -27,15 +27,81 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const EXEC_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
 const EXEC_REASSEMBLY_LIMIT: usize = 4096;
 const PROC_CMDLINE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PROCESS_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(2);
+const PROCESS_CONTEXT_CACHE_STALE: Duration = Duration::from_secs(30);
+const PROCESS_CONTEXT_CACHE_LIMIT: usize = 65_536;
+
+#[derive(Clone)]
+struct CachedProcessContext {
+    context: ProcessContext,
+    refreshed_at: Instant,
+}
+
+#[derive(Default)]
+struct ProcessContextCache {
+    entries: HashMap<u32, CachedProcessContext>,
+    hits: u64,
+    misses: u64,
+}
+
+impl ProcessContextCache {
+    fn get(
+        &mut self,
+        pid: u32,
+        cgroup_id: u64,
+        comm: &str,
+        now: Instant,
+    ) -> Option<ProcessContext> {
+        let cached = self.entries.get(&pid)?;
+        let valid = now.duration_since(cached.refreshed_at) <= PROCESS_CONTEXT_CACHE_TTL
+            && cached.context.cgroup_id == cgroup_id
+            && (comm.is_empty() || cached.context.comm == comm);
+        if valid {
+            self.hits += 1;
+            Some(cached.context.clone())
+        } else {
+            self.entries.remove(&pid);
+            None
+        }
+    }
+
+    fn insert(&mut self, context: ProcessContext, now: Instant) {
+        if self.entries.len() >= PROCESS_CONTEXT_CACHE_LIMIT {
+            self.entries.retain(|_, cached| {
+                now.duration_since(cached.refreshed_at) <= PROCESS_CONTEXT_CACHE_STALE
+            });
+            if self.entries.len() >= PROCESS_CONTEXT_CACHE_LIMIT {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(
+            context.pid,
+            CachedProcessContext {
+                context,
+                refreshed_at: now,
+            },
+        );
+    }
+
+    fn remove(&mut self, pid: u32) {
+        self.entries.remove(&pid);
+    }
+}
+
+fn process_context_cache() -> &'static Mutex<ProcessContextCache> {
+    static CACHE: OnceLock<Mutex<ProcessContextCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ProcessContextCache::default()))
+}
 
 struct PendingExec {
     first_seen: Instant,
+    cgroup_id: u64,
     pid: u32,
     ppid: u32,
     uid: u32,
@@ -53,6 +119,7 @@ impl PendingExec {
     fn new(record: &ExecRecord, now: Instant) -> Self {
         Self {
             first_seen: now,
+            cgroup_id: record.cgroup_id,
             pid: record.pid,
             ppid: record.ppid,
             uid: record.uid,
@@ -69,6 +136,9 @@ impl PendingExec {
 
     fn apply(&mut self, record: &ExecRecord) {
         self.flags |= record.flags;
+        if self.cgroup_id != record.cgroup_id {
+            self.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
+        }
         match record.kind {
             EXEC_RECORD_HEADER => {
                 self.saw_header = true;
@@ -160,6 +230,7 @@ impl PendingExec {
         }
 
         CompletedExec {
+            cgroup_id: self.cgroup_id,
             pid: self.pid,
             ppid: self.ppid,
             uid: self.uid,
@@ -177,6 +248,7 @@ impl PendingExec {
 }
 
 struct CompletedExec {
+    cgroup_id: u64,
     pid: u32,
     ppid: u32,
     uid: u32,
@@ -297,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
 
     // File-write capture is opt-in: openat is a firehose on a busy node (e.g. containerd
     // unpacking images), and the agent's own writes need downstream identity filtering.
-    let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
+    let files = env_enabled("A3S_OBSERVER_FILES");
     let mut probes = vec![
         ("track_clone", "sys_exit_clone"),
         ("track_clone3", "sys_exit_clone3"),
@@ -380,7 +452,8 @@ async fn main() -> anyhow::Result<()> {
     // libssl path on distros where the default below is wrong.
     if let Some(val) = std::env::var("A3S_OBSERVER_SSL")
         .ok()
-        .filter(|v| !v.is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !env_value_disabled(value))
     {
         let lib = if val.contains('/') {
             val
@@ -404,7 +477,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
-    let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
+    let exporter: Box<dyn Exporter> = if env_enabled("A3S_OBSERVER_JSON") {
         Box::new(JsonExporter::new())
     } else {
         Box::new(LogExporter)
@@ -474,11 +547,7 @@ async fn main() -> anyhow::Result<()> {
              livenessProbe on it will restart-loop the pod");
     }
 
-    let collector = CollectorMeta::from_env(
-        files,
-        std::env::var_os("A3S_OBSERVER_SSL").is_some(),
-        attached,
-    );
+    let collector = CollectorMeta::from_env(files, env_enabled("A3S_OBSERVER_SSL"), attached);
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -552,10 +621,10 @@ async fn main() -> anyhow::Result<()> {
                             _ => continue,
                         };
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                             observation: None,
-                            process: Some(process_context(ev.pid, &ev.comm)),
+                            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                             provider: None,
                             event: AgentEvent::SecurityAction {
                                 pid: ev.pid,
@@ -574,10 +643,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         peers.insert(sock_key(ev.pid, ev.fd), (peer, ev.port));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                             observation: None,
-                            process: Some(process_context(ev.pid, &ev.comm)),
+                            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                             provider: None,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -607,10 +676,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         llm_meta.insert(sock_key(ev.pid, ev.fd), (sni.clone(), provider.clone(), peer));
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                             observation: None,
-                            process: Some(process_context(ev.pid, &ev.comm)),
+                            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                             provider,
                             event: AgentEvent::Egress {
                                 pid: ev.pid,
@@ -627,10 +696,10 @@ async fn main() -> anyhow::Result<()> {
                         let len = (ev.len as usize).min(ev.data.len());
                         if let Some(query) = parse_dns_qname(&ev.data[..len]) {
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                                identity: identity_for(&resolver, ev.pid, &ev.comm),
-                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                                 observation: None,
-                                process: Some(process_context(ev.pid, &ev.comm)),
+                                process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::Dns { pid: ev.pid, query },
                             });
@@ -652,10 +721,10 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             };
                             emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                                identity: identity_for(&resolver, ev.pid, &ev.comm),
-                                workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                                workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                                 observation: None,
-                                process: Some(process_context(ev.pid, &ev.comm)),
+                                process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                                 provider: None,
                                 event,
                             });
@@ -671,10 +740,10 @@ async fn main() -> anyhow::Result<()> {
                         {
                             if provider.is_some() {
                                 emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                                    identity: identity_for(&resolver, ev.pid, &ev.comm),
-                                    workload: resolver.resolve_workload(ev.pid, 0, 0),
+                                    identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                                    workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                                     observation: None,
-                                    process: Some(process_context(ev.pid, &ev.comm)),
+                                    process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                                     provider,
                                     event: AgentEvent::LlmCall {
                                         pid: ev.pid,
@@ -696,8 +765,9 @@ async fn main() -> anyhow::Result<()> {
                         let len = (ev.len as usize).min(ev.data.len());
                         let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
                         if !content.is_empty() {
-                            let identity = identity_for(&resolver, ev.pid, &ev.comm);
-                            let workload = resolver.resolve_workload(ev.pid, 0, 0);
+                            let identity =
+                                identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm);
+                            let workload = resolver.resolve_workload(ev.pid, ev.cgroup_id, 0);
                             // Structured LLM telemetry (model/tokens) alongside the raw content.
                             if let Some((model, prompt_tokens, completion_tokens)) =
                                 parse_llm_meta(&content)
@@ -706,7 +776,11 @@ async fn main() -> anyhow::Result<()> {
                                     identity: identity.clone(),
                                     workload: workload.clone(),
                                     observation: None,
-                                    process: Some(process_context(ev.pid, &ev.comm)),
+                                    process: Some(process_context(
+                                        ev.pid,
+                                        ev.cgroup_id,
+                                        &ev.comm,
+                                    )),
                                     provider: None,
                                     event: AgentEvent::LlmApi {
                                         pid: ev.pid,
@@ -721,7 +795,7 @@ async fn main() -> anyhow::Result<()> {
                                 identity,
                                 workload,
                                 observation: None,
-                                process: Some(process_context(ev.pid, &ev.comm)),
+                                process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                                 provider: None,
                                 event: AgentEvent::SslContent {
                                     pid: ev.pid,
@@ -737,10 +811,10 @@ async fn main() -> anyhow::Result<()> {
                 while let Some(item) = exit_ring.next() {
                     if let Some(ev) = read_pod::<ExitEvent>(&item) {
                         emit(exporter.as_ref(), &mut stats, EnrichedEvent {
-                            identity: identity_for(&resolver, ev.pid, &ev.comm),
-                            workload: resolver.resolve_workload(ev.pid, 0, 0),
+                            identity: identity_for(&resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                             observation: None,
-                            process: Some(process_context(ev.pid, &ev.comm)),
+                            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                             provider: None,
                             event: AgentEvent::ProcessExit {
                                 pid: ev.pid,
@@ -748,6 +822,7 @@ async fn main() -> anyhow::Result<()> {
                                 signal: ev.signal,
                             },
                         });
+                        forget_process_context(ev.pid);
                     }
                 }
             }
@@ -758,6 +833,10 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v.iter().copied().sum())
         .unwrap_or(0);
     let output_dropped = exporter.output_drops();
+    let (process_cache_entries, process_cache_hits, process_cache_misses) = process_context_cache()
+        .lock()
+        .map(|cache| (cache.entries.len(), cache.hits, cache.misses))
+        .unwrap_or_default();
     tracing::info!(
         exec = stats.exec,
         exec_truncated = stats.exec_truncated,
@@ -772,6 +851,9 @@ async fn main() -> anyhow::Result<()> {
         sec = stats.sec,
         dropped,
         output_dropped,
+        process_cache_entries,
+        process_cache_hits,
+        process_cache_misses,
         "a3s-observer-collector: stopped (final window)"
     );
     Ok(())
@@ -839,6 +921,19 @@ fn read_cgroup(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn parse_process_start_time_ticks(stat: &str) -> Option<u64> {
+    let tail = stat.rsplit_once(')')?.1;
+    // `/proc/<pid>/stat` field 22. The tail starts at field 3 (`state`).
+    tail.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn read_start_time_ticks(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(parse_process_start_time_ticks)
+}
+
 fn boot_id() -> Option<String> {
     static BOOT_ID: OnceLock<Option<String>> = OnceLock::new();
     BOOT_ID
@@ -851,26 +946,6 @@ fn boot_id() -> Option<String> {
         .clone()
 }
 
-fn process_start_time_ns(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let command_end = stat.rfind(')')?;
-    let fields = stat
-        .get(command_end + 2..)?
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    let start_ticks = fields.get(19)?.parse::<u128>().ok()?;
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_second <= 0 {
-        return None;
-    }
-    Some(
-        start_ticks
-            .saturating_mul(1_000_000_000)
-            .checked_div(ticks_per_second as u128)?
-            .to_string(),
-    )
-}
-
 fn mount_namespace(pid: u32) -> Option<u64> {
     let target = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()?;
     let value = target.to_string_lossy();
@@ -880,18 +955,63 @@ fn mount_namespace(pid: u32) -> Option<u64> {
         .and_then(|inode| inode.parse::<u64>().ok())
 }
 
-fn process_context(pid: u32, comm: &[u8; 16]) -> ProcessContext {
+fn host_id() -> Option<String> {
+    static HOST_ID: OnceLock<Option<String>> = OnceLock::new();
+    HOST_ID
+        .get_or_init(|| {
+            env_any(&[
+                "A3S_OBSERVER_HOST_ID",
+                "A3S_NODE_NAME",
+                "NODE_NAME",
+                "K8S_NODE_NAME",
+            ])
+            .or_else(|| {
+                std::fs::read_to_string("/etc/machine-id")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(hostname)
+        })
+        .clone()
+}
+
+fn read_process_context(pid: u32, cgroup_id: u64, comm: &str) -> ProcessContext {
     let cwd = read_cwd(pid);
     ProcessContext {
+        host_id: host_id(),
+        boot_id: boot_id(),
         pid,
         ppid: read_ppid(pid),
-        comm: cstr(comm),
-        boot_id: boot_id(),
-        start_time_ns: process_start_time_ns(pid),
+        start_time_ticks: read_start_time_ticks(pid),
+        comm: comm.to_string(),
         mount_namespace: mount_namespace(pid),
         exe: read_exe(pid),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(pid),
+        cgroup_id,
+    }
+}
+
+fn process_context(pid: u32, cgroup_id: u64, comm: &[u8; 16]) -> ProcessContext {
+    let comm = cstr(comm);
+    let now = Instant::now();
+    if let Ok(mut cache) = process_context_cache().lock() {
+        if let Some(context) = cache.get(pid, cgroup_id, &comm, now) {
+            return context;
+        }
+        cache.misses += 1;
+    }
+    let context = read_process_context(pid, cgroup_id, &comm);
+    if let Ok(mut cache) = process_context_cache().lock() {
+        cache.insert(context.clone(), now);
+    }
+    context
+}
+
+fn forget_process_context(pid: u32) {
+    if let Ok(mut cache) = process_context_cache().lock() {
+        cache.remove(pid);
     }
 }
 
@@ -906,17 +1026,23 @@ fn exec_ppid(ev: &CompletedExec) -> u32 {
 fn exec_process_context(ev: &CompletedExec, ppid: u32) -> ProcessContext {
     let cwd = read_cwd(ev.pid);
     let captured_exe = cstr(&ev.filename);
-    ProcessContext {
+    let context = ProcessContext {
+        host_id: host_id(),
+        boot_id: boot_id(),
         pid: ev.pid,
         ppid,
+        start_time_ticks: read_start_time_ticks(ev.pid),
         comm: cstr(&ev.comm),
-        boot_id: boot_id(),
-        start_time_ns: process_start_time_ns(ev.pid),
         mount_namespace: mount_namespace(ev.pid),
         exe: read_exe(ev.pid).or_else(|| (!captured_exe.is_empty()).then_some(captured_exe)),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(ev.pid),
+        cgroup_id: ev.cgroup_id,
+    };
+    if let Ok(mut cache) = process_context_cache().lock() {
+        cache.insert(context.clone(), Instant::now());
     }
+    context
 }
 
 struct ProcCmdline {
@@ -1005,15 +1131,16 @@ fn emit_completed_exec(
     }
     let (ev, argv_source, observed_argc, observed_bytes) = supplement_exec_argv(ev);
     let ppid = exec_ppid(&ev);
-    let cwd = read_cwd(ev.pid);
+    let process = exec_process_context(&ev, ppid);
+    let cwd = process.cwd.clone().unwrap_or_default();
     emit(
         exporter,
         stats,
         EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, 0, 0),
+            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
             observation: None,
-            process: Some(exec_process_context(&ev, ppid)),
+            process: Some(process),
             provider: None,
             event: AgentEvent::ToolExec {
                 pid: ev.pid,
@@ -1042,8 +1169,8 @@ fn cstr(buf: &[u8]) -> String {
 
 /// Resolve identity, falling back to the in-kernel `comm` when the /proc lookup fails (a
 /// short-lived process that exited before we read it) — so no event is left unattributed.
-fn identity_for(r: &impl IdentityResolver, pid: u32, comm: &[u8; 16]) -> Identity {
-    let mut id = r.resolve(pid, 0, 0);
+fn identity_for(r: &impl IdentityResolver, pid: u32, cgroup_id: u64, comm: &[u8; 16]) -> Identity {
+    let mut id = r.resolve(pid, cgroup_id, 0);
     if id.agent.is_none() {
         let c = cstr(comm);
         if !c.is_empty() {
@@ -1128,6 +1255,20 @@ fn env_any(names: &[&str]) -> Option<String> {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     })
+}
+
+fn env_value_disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no" | "disabled"
+    )
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty() && !env_value_disabled(&value))
+        .unwrap_or(false)
 }
 
 fn hostname() -> Option<String> {
@@ -1307,15 +1448,54 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        exec_ppid, exec_process_context, parse_dns_qname, parse_llm_meta, parse_sni,
-        supplement_exec_argv_at, CompletedExec, ExecAssembler, EXEC_REASSEMBLY_TIMEOUT,
+        env_value_disabled, exec_ppid, exec_process_context, parse_dns_qname, parse_llm_meta,
+        parse_process_start_time_ticks, parse_sni, supplement_exec_argv_at, CompletedExec,
+        ExecAssembler, ProcessContextCache, EXEC_REASSEMBLY_TIMEOUT,
     };
+    use a3s_observer::ProcessContext;
     use a3s_observer_common::{
         ExecRecord, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK,
         EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
     };
     use std::fs;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn observer_feature_flags_honor_explicit_off_values() {
+        for disabled in ["0", "false", "FALSE", "off", "no", "disabled"] {
+            assert!(env_value_disabled(disabled), "{disabled}");
+        }
+        for enabled in ["1", "true", "on", "/usr/lib/libssl.so"] {
+            assert!(!env_value_disabled(enabled), "{enabled}");
+        }
+    }
+
+    #[test]
+    fn process_context_cache_reuses_stable_instances_and_invalidates_changes() {
+        let mut cache = ProcessContextCache::default();
+        let now = Instant::now();
+        cache.insert(
+            ProcessContext {
+                pid: 42,
+                comm: "worker".into(),
+                cgroup_id: 77,
+                start_time_ticks: Some(900),
+                ..ProcessContext::default()
+            },
+            now,
+        );
+        assert_eq!(
+            cache
+                .get(42, 77, "worker", now + Duration::from_millis(10))
+                .and_then(|context| context.start_time_ticks),
+            Some(900),
+        );
+        assert!(cache
+            .get(42, 78, "worker", now + Duration::from_millis(20))
+            .is_none());
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.hits, 1);
+    }
 
     fn exec_record(exec_id: u64, kind: u8) -> ExecRecord {
         let mut record: ExecRecord = unsafe { std::mem::zeroed() };
@@ -1339,6 +1519,7 @@ mod tests {
     #[test]
     fn exec_uses_kernel_parent_snapshot_and_filename_fallback() {
         let mut ev = CompletedExec {
+            cgroup_id: 73,
             pid: u32::MAX,
             ppid: 42,
             uid: 1000,
@@ -1359,6 +1540,7 @@ mod tests {
         let process = exec_process_context(&ev, exec_ppid(&ev));
         assert_eq!(process.ppid, 42);
         assert_eq!(process.exe.as_deref(), Some("/usr/bin/bash"));
+        assert_eq!(process.cgroup_id, 73);
     }
 
     #[test]
@@ -1487,6 +1669,7 @@ mod tests {
         let mut filename = [0; 128];
         filename[..13].copy_from_slice(b"/usr/bin/bash");
         let event = CompletedExec {
+            cgroup_id: 99,
             pid,
             ppid: 1,
             uid: 1000,
@@ -1509,6 +1692,14 @@ mod tests {
         assert_eq!(argc, 3);
         assert!(bytes > event.captured_bytes);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_start_time_from_proc_stat_with_complex_comm() {
+        let stat =
+            "9 (worker (agent) one) R 42 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 987654 19";
+        assert_eq!(parse_process_start_time_ticks(stat), Some(987654));
+        assert_eq!(parse_process_start_time_ticks("garbage"), None);
     }
 
     #[test]

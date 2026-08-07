@@ -10,20 +10,18 @@ use std::time::Duration;
 /// Kernel-observed process context used by downstream attribution engines.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProcessContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
     pub pid: u32,
     pub ppid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
     pub comm: String,
-    /// Host boot identity. Together with `pid` and `start_time_ns`, this prevents PID reuse
-    /// from joining unrelated process instances.
-    #[serde(rename = "bootId", skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<String>,
-    /// Process start time since boot, expressed in nanoseconds as a decimal string so JSON
-    /// consumers do not lose integer precision.
-    #[serde(rename = "startTimeNs", skip_serializing_if = "Option::is_none")]
-    pub start_time_ns: Option<String>,
     /// Linux mount namespace inode. This scopes path-based file identity when a resolved
     /// device/inode pair is not available.
-    #[serde(rename = "mountNamespace", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_namespace: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
@@ -31,6 +29,8 @@ pub struct ProcessContext {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroup: Option<String>,
+    /// cgroup kernfs id captured by eBPF at event time.
+    pub cgroup_id: u64,
 }
 
 /// A raw event captured by an eBPF probe, before identity enrichment.

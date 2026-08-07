@@ -29,6 +29,8 @@ pub const EXEC_FLAG_ARGV_INCOMPLETE: u8 = 1 << 1;
 #[derive(Clone, Copy)]
 pub struct ExecRecord {
     pub exec_id: u64,
+    /// cgroup v2 kernfs id captured while the syscall is executing.
+    pub cgroup_id: u64,
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
@@ -45,7 +47,7 @@ pub struct ExecRecord {
     pub data: [u8; EXEC_ARG_CHUNK_LEN],
 }
 
-const _: [(); 184] = [(); core::mem::size_of::<ExecRecord>()];
+const _: [(); 192] = [(); core::mem::size_of::<ExecRecord>()];
 
 /// A process exit (`sys_enter_exit_group`) — the other end of the tool lifecycle, carrying the
 /// exit status so tool *outcomes* are visible (did the command succeed?), not just that it ran.
@@ -54,6 +56,7 @@ const _: [(); 184] = [(); core::mem::size_of::<ExecRecord>()];
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExitEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub exit_code: u32, // exit() status (0 when terminated by a signal)
     pub signal: u32,    // terminating signal, 0 = clean exit (9 SIGKILL/OOM, 11 SIGSEGV crash, …)
@@ -70,6 +73,7 @@ pub const TLS_SNAP_LEN: usize = 512;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlsEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub fd: u32, // socket fd, for (pid,fd) correlation with ConnectEvent
     pub len: u16,
@@ -82,6 +86,7 @@ pub struct TlsEvent {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ConnectEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub fd: u32,        // socket fd, keys the userspace (pid,fd)->peer join
     pub family: u16,    // AF_INET = 2, AF_INET6 = 10
@@ -97,6 +102,7 @@ pub const DNS_SNAP_LEN: usize = 256;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DnsEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub len: u16,
     pub _pad: u16,
@@ -111,6 +117,7 @@ pub const PATH_SNAP_LEN: usize = 256;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub flags: u32,
     pub comm: [u8; 16],
@@ -127,6 +134,7 @@ pub const FILE_DELETE_FLAG: u32 = u32::MAX;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LlmEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub fd: u32,
     pub req_bytes: u64,  // bytes written after ClientHello (approx request size)
@@ -149,6 +157,7 @@ pub const SSL_SNAP_LEN: usize = 1024;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SslEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub is_read: u32, // 0 = SSL_write (request / prompt), 1 = SSL_read (response / completion)
     pub len: u32,     // bytes captured into `data` (<= SSL_SNAP_LEN)
@@ -162,6 +171,7 @@ pub struct SslEvent {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SecEvent {
+    pub cgroup_id: u64,
     pub pid: u32,
     pub kind: u32,   // SEC_* below
     pub detail: u64, // SEC_SETUID: 0 (escalated-to uid) · SEC_PTRACE: target pid · SEC_BIND: port

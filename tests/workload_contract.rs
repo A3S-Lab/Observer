@@ -165,21 +165,23 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
 }
 
 #[test]
-fn process_instance_identity_uses_json_safe_contract_fields() {
+fn process_context_serializes_mount_namespace_with_stable_identity() {
     let event = EnrichedEvent {
         identity: Identity::default(),
         workload: None,
         observation: None,
         process: Some(ProcessContext {
+            host_id: Some("host-1".into()),
+            boot_id: Some("boot-1".into()),
             pid: 42,
             ppid: 1,
+            start_time_ticks: Some(987_654),
             comm: "agent".into(),
-            boot_id: Some("boot-1".into()),
-            start_time_ns: Some("18446744073709551615".into()),
             mount_namespace: Some(4_026_531_840),
             exe: None,
             cwd: None,
             cgroup: None,
+            cgroup_id: 73,
         }),
         provider: None,
         event: AgentEvent::ProcessExit {
@@ -190,12 +192,11 @@ fn process_instance_identity_uses_json_safe_contract_fields() {
     };
 
     let value = serde_json::to_value(event).unwrap();
-    assert_eq!(value["process"]["bootId"], "boot-1");
-    assert_eq!(
-        value["process"]["startTimeNs"], "18446744073709551615",
-        "start time must remain a string so JavaScript does not lose precision"
-    );
-    assert_eq!(value["process"]["mountNamespace"], 4_026_531_840u64);
+    assert_eq!(value["process"]["host_id"], "host-1");
+    assert_eq!(value["process"]["boot_id"], "boot-1");
+    assert_eq!(value["process"]["start_time_ticks"], 987_654u64);
+    assert_eq!(value["process"]["mount_namespace"], 4_026_531_840u64);
+    assert_eq!(value["process"]["cgroup_id"], 73u64);
 }
 
 #[test]
