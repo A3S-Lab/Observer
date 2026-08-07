@@ -1,6 +1,6 @@
 use a3s_observer::{
     AgentEvent, EnrichedEvent, Freshness, Identity, IdentityResolver, ObservationMetadata,
-    WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
+    ProcessContext, WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -162,6 +162,40 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
         value["observation"]["sampled_at_unix_nanos"],
         1_720_000_014u64
     );
+}
+
+#[test]
+fn process_instance_identity_uses_json_safe_contract_fields() {
+    let event = EnrichedEvent {
+        identity: Identity::default(),
+        workload: None,
+        observation: None,
+        process: Some(ProcessContext {
+            pid: 42,
+            ppid: 1,
+            comm: "agent".into(),
+            boot_id: Some("boot-1".into()),
+            start_time_ns: Some("18446744073709551615".into()),
+            mount_namespace: Some(4_026_531_840),
+            exe: None,
+            cwd: None,
+            cgroup: None,
+        }),
+        provider: None,
+        event: AgentEvent::ProcessExit {
+            pid: 42,
+            exit_code: 0,
+            signal: 0,
+        },
+    };
+
+    let value = serde_json::to_value(event).unwrap();
+    assert_eq!(value["process"]["bootId"], "boot-1");
+    assert_eq!(
+        value["process"]["startTimeNs"], "18446744073709551615",
+        "start time must remain a string so JavaScript does not lose precision"
+    );
+    assert_eq!(value["process"]["mountNamespace"], 4_026_531_840u64);
 }
 
 #[test]

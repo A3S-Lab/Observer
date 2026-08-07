@@ -13,6 +13,18 @@ pub struct ProcessContext {
     pub pid: u32,
     pub ppid: u32,
     pub comm: String,
+    /// Host boot identity. Together with `pid` and `start_time_ns`, this prevents PID reuse
+    /// from joining unrelated process instances.
+    #[serde(rename = "bootId", skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// Process start time since boot, expressed in nanoseconds as a decimal string so JSON
+    /// consumers do not lose integer precision.
+    #[serde(rename = "startTimeNs", skip_serializing_if = "Option::is_none")]
+    pub start_time_ns: Option<String>,
+    /// Linux mount namespace inode. This scopes path-based file identity when a resolved
+    /// device/inode pair is not available.
+    #[serde(rename = "mountNamespace", skip_serializing_if = "Option::is_none")]
+    pub mount_namespace: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

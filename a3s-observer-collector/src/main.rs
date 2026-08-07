@@ -27,6 +27,7 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const EXEC_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -838,12 +839,56 @@ fn read_cgroup(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn boot_id() -> Option<String> {
+    static BOOT_ID: OnceLock<Option<String>> = OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .clone()
+}
+
+fn process_start_time_ns(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let command_end = stat.rfind(')')?;
+    let fields = stat
+        .get(command_end + 2..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_ticks = fields.get(19)?.parse::<u128>().ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    Some(
+        start_ticks
+            .saturating_mul(1_000_000_000)
+            .checked_div(ticks_per_second as u128)?
+            .to_string(),
+    )
+}
+
+fn mount_namespace(pid: u32) -> Option<u64> {
+    let target = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()?;
+    let value = target.to_string_lossy();
+    value
+        .strip_prefix("mnt:[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|inode| inode.parse::<u64>().ok())
+}
+
 fn process_context(pid: u32, comm: &[u8; 16]) -> ProcessContext {
     let cwd = read_cwd(pid);
     ProcessContext {
         pid,
         ppid: read_ppid(pid),
         comm: cstr(comm),
+        boot_id: boot_id(),
+        start_time_ns: process_start_time_ns(pid),
+        mount_namespace: mount_namespace(pid),
         exe: read_exe(pid),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(pid),
@@ -865,6 +910,9 @@ fn exec_process_context(ev: &CompletedExec, ppid: u32) -> ProcessContext {
         pid: ev.pid,
         ppid,
         comm: cstr(&ev.comm),
+        boot_id: boot_id(),
+        start_time_ns: process_start_time_ns(ev.pid),
+        mount_namespace: mount_namespace(ev.pid),
         exe: read_exe(ev.pid).or_else(|| (!captured_exe.is_empty()).then_some(captured_exe)),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(ev.pid),
