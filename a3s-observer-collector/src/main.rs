@@ -946,6 +946,15 @@ fn boot_id() -> Option<String> {
         .clone()
 }
 
+fn mount_namespace(pid: u32) -> Option<u64> {
+    let target = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()?;
+    let value = target.to_string_lossy();
+    value
+        .strip_prefix("mnt:[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|inode| inode.parse::<u64>().ok())
+}
+
 fn host_id() -> Option<String> {
     static HOST_ID: OnceLock<Option<String>> = OnceLock::new();
     HOST_ID
@@ -976,6 +985,7 @@ fn read_process_context(pid: u32, cgroup_id: u64, comm: &str) -> ProcessContext 
         ppid: read_ppid(pid),
         start_time_ticks: read_start_time_ticks(pid),
         comm: comm.to_string(),
+        mount_namespace: mount_namespace(pid),
         exe: read_exe(pid),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(pid),
@@ -1023,6 +1033,7 @@ fn exec_process_context(ev: &CompletedExec, ppid: u32) -> ProcessContext {
         ppid,
         start_time_ticks: read_start_time_ticks(ev.pid),
         comm: cstr(&ev.comm),
+        mount_namespace: mount_namespace(ev.pid),
         exe: read_exe(ev.pid).or_else(|| (!captured_exe.is_empty()).then_some(captured_exe)),
         cwd: (!cwd.is_empty()).then_some(cwd),
         cgroup: read_cgroup(ev.pid),

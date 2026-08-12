@@ -19,6 +19,10 @@ pub struct ProcessContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_time_ticks: Option<u64>,
     pub comm: String,
+    /// Linux mount namespace inode. This scopes path-based file identity when a resolved
+    /// device/inode pair is not available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_namespace: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

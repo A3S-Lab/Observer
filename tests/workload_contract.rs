@@ -1,6 +1,6 @@
 use a3s_observer::{
     AgentEvent, EnrichedEvent, Freshness, Identity, IdentityResolver, ObservationMetadata,
-    WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
+    ProcessContext, WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -162,6 +162,41 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
         value["observation"]["sampled_at_unix_nanos"],
         1_720_000_014u64
     );
+}
+
+#[test]
+fn process_context_serializes_mount_namespace_with_stable_identity() {
+    let event = EnrichedEvent {
+        identity: Identity::default(),
+        workload: None,
+        observation: None,
+        process: Some(ProcessContext {
+            host_id: Some("host-1".into()),
+            boot_id: Some("boot-1".into()),
+            pid: 42,
+            ppid: 1,
+            start_time_ticks: Some(987_654),
+            comm: "agent".into(),
+            mount_namespace: Some(4_026_531_840),
+            exe: None,
+            cwd: None,
+            cgroup: None,
+            cgroup_id: 73,
+        }),
+        provider: None,
+        event: AgentEvent::ProcessExit {
+            pid: 42,
+            exit_code: 0,
+            signal: 0,
+        },
+    };
+
+    let value = serde_json::to_value(event).unwrap();
+    assert_eq!(value["process"]["host_id"], "host-1");
+    assert_eq!(value["process"]["boot_id"], "boot-1");
+    assert_eq!(value["process"]["start_time_ticks"], 987_654u64);
+    assert_eq!(value["process"]["mount_namespace"], 4_026_531_840u64);
+    assert_eq!(value["process"]["cgroup_id"], 73u64);
 }
 
 #[test]
