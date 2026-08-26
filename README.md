@@ -53,7 +53,7 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |
 | llm metrics | per-socket `read`/`recv` + `close` | `LlmCall` — req/resp wire bytes, latency, TTFT |
 | `file`\* | `sys_enter_openat` (write opens) | `FileAccess` — files written (`A3S_OBSERVER_FILES=1`) |
-| `unlink`\* | `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
+| `unlink`\* | `sys_enter_unlink` + `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
 | `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
 | `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
 | `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
@@ -245,8 +245,74 @@ A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON
 ```
 
 Linux only; needs root (CAP_BPF + CAP_PERFMON). Env knobs: `A3S_OBSERVER_JSON` (NDJSON),
-`A3S_OBSERVER_FILES` (file writes — high-volume), `A3S_OBSERVER_SSL` (OpenSSL content),
-`A3S_OBSERVER_HEARTBEAT` (liveness file path).
+`A3S_OBSERVER_FILES` (legacy combined FileAccess/FileDelete switch),
+`A3S_OBSERVER_FILE_ACCESS` / `A3S_OBSERVER_FILE_DELETE` (independent overrides),
+`A3S_OBSERVER_SSL` (OpenSSL content), `A3S_OBSERVER_HEARTBEAT` (liveness file path), and
+`A3S_OBSERVER_JSON_QUEUE_CAPACITY` (bounded NDJSON burst queue, default 32768; 4096–262144).
+
+Each ring is drained by an event-driven reader into physically independent Critical, Semantic, and
+Bulk inboxes; raw probe evidence maps only to Critical or Semantic. The readers copy fixed PODs and
+never perform `/proc`, workload resolution, classification, or JSON work. A bounded event-time
+coordinator and single-writer processor perform those operations after ring admission. Configure
+the inboxes with `A3S_OBSERVER_CRITICAL_INBOX_CAPACITY` (default 16384),
+`A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY` (32768), and `A3S_OBSERVER_BULK_INBOX_CAPACITY` (4096).
+`A3S_OBSERVER_REORDER_CAPACITY` (65536) and `A3S_OBSERVER_REORDER_WINDOW_NS` (2000000) bound
+cross-ring reordering.
+
+NDJSON is written in batches of at most 256 lines or five milliseconds through a 1 MiB userspace
+buffer. Its three priority queues use `A3S_OBSERVER_JSON_CRITICAL_QUEUE_CAPACITY` (default 8192),
+`A3S_OBSERVER_JSON_SEMANTIC_QUEUE_CAPACITY` (defaults to the legacy queue setting), and
+`A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY` (8192). A terminal heartbeat is acknowledged only after
+all previously admitted priority-lane events have been flushed. FileAccess has an independent
+1 MiB ring; FileDelete uses a separate 4 MiB ring because package/container cleanup can unlink
+thousands of files in milliseconds. Kernel-ring, Collector-inbox, semantic-output, and writer-queue
+loss remain separate counters and are never presented as filtering.
+
+High-volume file capture can consume a hot-reloaded, node-local cgroup decision snapshot by setting
+`ANYSENTRY_FILTER_RULES_FILE`. Without this variable the historical full-capture behavior is
+preserved. With it configured, authoritative Infrastructure decisions can filter before the ring,
+while map misses, stale/conflicting rules, candidate drops, and `sample` decisions are kept by
+default. Only an authoritative `drop` can suppress FileDelete. Snapshot replacement is epoch-atomic:
+
+The unified S5 capture path is opt-in with `ANYSENTRY_CAPTURE_PROFILE_MODE=shadow|enforce` and uses
+the same `ANYSENTRY_FILTER_RULES_FILE`. `shadow` keeps all ten probes at FULL while reporting desired
+decisions. `enforce` applies bounded SAMPLE/AGGREGATE decisions before payload construction and ring
+reservation; DROP remains disabled until the current Collector instance has durably written the
+preview ACK and then validated a generation-fenced activation grant. The ACK defaults to
+`${ANYSENTRY_FILTER_RULES_FILE}.ack.json` and can be overridden with
+`ANYSENTRY_FILTER_RULES_ACK_FILE`. Missing, stale, conflicting, oversized, malformed, unacknowledged,
+or expired state remains discovery-safe. `legacy` is the default and preserves the original v1 File
+filter. S5 and v1 File decisions are mutually exclusive.
+
+Exact cumulative SAMPLE/AGGREGATE/DROP summaries are emitted as `CaptureAggregate` Bulk events.
+The kernel ledger is deliberately bounded to 4096 keys; saturation never restores an unbounded raw
+stream, but switches to the shared emergency sample budget and sets
+`captureProfile.aggregateLedgerDegraded` plus per-probe `aggregateError`. Decision counters use
+`decision_op`; ring delivery counters use `physical_record` and must not be added together for Exec.
+
+```json
+{
+  "schemaVersion": "anysentry.filter_rule_snapshot.v1",
+  "epoch": 42,
+  "entries": [
+    {
+      "cgroupId": "18412",
+      "action": "keep",
+      "authority": "authoritative",
+      "epoch": 42,
+      "expiresAt": "2026-08-17T09:00:15Z"
+    }
+  ]
+}
+```
+
+`A3S_OBSERVER_FILE_UNKNOWN_POLICY=keep` is the default and guarantees that unresolved FileAccess is
+not budget-suppressed. Set it explicitly to `sample` only for compatibility with the earlier bounded
+discovery mode. Its optional controls are `A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP` (default 20 per
+window), `A3S_OBSERVER_FILE_UNKNOWN_PER_NODE` (default 1000, divided across CPUs), and
+`A3S_OBSERVER_FILE_SAMPLE_WINDOW_MS` (default 1000). Candidate `drop` entries are safely downgraded
+to the configured Unknown policy; malformed, mixed-epoch, or non-monotonic snapshots leave the last
+valid epoch active.
 
 Opt-in enforcement — run against an agent's cgroup and/or a deny-list file:
 

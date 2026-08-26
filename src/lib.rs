@@ -18,11 +18,16 @@ pub mod policy;
 pub mod traits;
 pub mod workload;
 
-pub use model::{AgentEvent, EnrichedEvent, ProcessContext};
+pub use model::{
+    AgentEvent, CollectorCaptureProbeStats, CollectorCaptureProfileStats, CollectorFileFilterStats,
+    CollectorIngressAccounting, CollectorPipelineAccounting, CollectorPipelineUnit,
+    CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent, EventCaptureDecision,
+    EventTiming, ProcessContext,
+};
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
-    read_ppid, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LogExporter,
-    ProcResolver, Provider, ServiceClassifier, SniClassifier,
+    read_ppid, ExportOutcome, ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter,
+    KubeResolver, LogExporter, ProcResolver, Provider, ServiceClassifier, SniClassifier,
 };
 pub use workload::{
     Freshness, ObservationMetadata, ObservationMetadataError, WorkloadIdentity,

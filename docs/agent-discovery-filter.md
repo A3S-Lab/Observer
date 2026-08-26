@@ -71,9 +71,10 @@ and bounded argv behavior remains unchanged.
 - PID alone must never carry classification across a start-time change;
 - an unavailable `/proc` record produces partial facts, not a fabricated identity.
 
-The current in-kernel `PARENTS` map remains the source for exec parent snapshots. Observer exports
-events in an order that drains process exit after other signal rings so downstream caches see the
-action before lifecycle cleanup.
+The current in-kernel `PARENTS` map remains the source for exec parent snapshots. Every ring record
+carries the kernel monotonic capture time. Independent event-driven readers feed a bounded
+event-time coordinator keyed by `(cgroup_id, pid)`, so exec/exit and connect/TLS relationships no
+longer depend on a hard-coded ring polling order.
 
 ## Workload identity boundary
 
@@ -147,12 +148,15 @@ re-parsing the cgroup path for every event.
 The current user-space filter is completed before any optional kernel prefilter. This sequencing
 keeps the first discovery/template/behavior iterations reversible and observable.
 
-## Implementation status (2026-07-30)
+## Implementation status (2026-08-20)
 
-Observer now emits the additive process facts, captures event-time cgroup ID in all relevant raw
-layouts, caches process and cgroup enrichment, invalidates process entries on exit, and drains
-process-exit events after other signal rings. The observe-only collector feature flags and current
-24-probe real-container startup path have been verified.
+Observer now emits additive process facts, captures event-time cgroup ID and monotonic timestamps in
+all raw layouts, caches process and cgroup enrichment, and invalidates process entries by the exact
+exec generation on exit. Ten independent `AsyncFd` readers drain rings into bounded service-class
+channels without enrichment or serialization. The processor uses event time instead of ring order,
+and heartbeats distinguish kernel ring drops, Collector handoff drops, logical queue drops, and
+writer backpressure. The observe-only collector feature flags and real-container startup path have
+been verified.
 
 AnySentry consumes numeric `start_time_ticks` and `cgroup_id` without losing ProcessKey identity.
 Its bootstrap process snapshot is retained as bounded unknown cache state, so already-paid
