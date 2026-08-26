@@ -33,7 +33,13 @@ spec:
             privileged: true
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
-            # - { name: A3S_OBSERVER_FILES, value: "1" }   # opt in to file-write capture
+            # - { name: A3S_OBSERVER_FILES, value: "1" }   # legacy: FileAccess + FileDelete
+            # - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" } # independent high-volume write-open
+            # - { name: A3S_OBSERVER_FILE_DELETE, value: "1" } # independent delete evidence
+            # - { name: ANYSENTRY_FILTER_RULES_FILE, value: "/etc/anysentry/file-filter-rules.json" }
+            # Unknown FileAccess is lossless by default. Use "sample" only as an explicit
+            # compatibility mode while validating constrained discovery budgets.
+            # - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "keep" }
             # - { name: A3S_OBSERVER_SSL, value: "1" }     # opt in to OpenSSL content (uprobe)
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys

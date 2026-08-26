@@ -2,28 +2,54 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
-    TlsEvent, ARGV_SLOTS, DNS_SNAP_LEN, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE,
-    EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT,
-    EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_DELETE_FLAG, PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    capture_cpu_sample_quota, capture_probe_is_protected, capture_profile_default_actions,
+    capture_sample_partitions, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
+    CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+    CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+    CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
+    FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
+    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, SslEvent, TlsEvent, ARGV_SLOTS,
+    CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+    CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
+    CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
+    CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
+    CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DECISION_FLAG_SHADOW, CAPTURE_DISPOSITION_MISS,
+    CAPTURE_DISPOSITION_RULE, CAPTURE_DISPOSITION_STALE, CAPTURE_MODE_SHADOW,
+    CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT,
+    CAPTURE_PROBE_FILE_ACCESS, CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ,
+    CAPTURE_PROBE_LLM, CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS,
+    CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_FLAG_AGENT, CAPTURE_PROFILE_FLAG_CONFLICT,
+    CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_SECURITY_FULL,
+    CAPTURE_PROFILE_UNKNOWN_DISCOVERY, CAPTURE_PROMOTION_FLAG_DESCENDANT,
+    CAPTURE_PROMOTION_FLAG_INVESTIGATION, CAPTURE_PROMOTION_FLAG_ROOT, DNS_SNAP_LEN,
+    EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
+    EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
+    FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
+    FILE_ACCESS_MODE_UNKNOWN, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
+    FILE_FILTER_AUTHORITY_AUTHORITATIVE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
+    PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
+    PIPELINE_RING_SSL, PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, SSL_SNAP_LEN,
+    TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     cty::c_void,
     helpers::gen::bpf_probe_read_user,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_loop, bpf_probe_read_user_buf,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_uid_gid, bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_loop,
+        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
-    maps::{ring_buf::RingBufEntry, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{
+        ring_buf::RingBufEntry, Array, HashMap, LruHashMap, PerCpuArray, PerCpuHashMap, RingBuf,
+    },
     programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 
-// Exec records are fixed at 184 B. Typical commands need one header, a few argument chunks and
-// one end record; long argv values can use up to EXEC_MAX_CHUNKS records without inflating every
-// short exec event.
+// Exec records are fixed at 216 B after the additive S4 event-time and D1 decision tails. Typical commands need
+// one header, a few argument chunks and one end record; long argv values can use up to
+// EXEC_MAX_CHUNKS records without inflating every short exec event.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
@@ -40,7 +66,85 @@ static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 #[map]
-static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+// Confirmed Agent workloads bypass Unknown sampling and can legitimately open thousands of files
+// in a short build/tool burst. One MiB keeps that burst isolated without returning to an unbounded
+// shared ring; FileDelete remains on its own high-priority channel below.
+static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+
+// Read-only opens are opt-in for exact Agent Runtime/Root scopes and intentionally use a separate
+// bulk channel. A repository scan must never consume the write/delete/security ring capacity.
+#[map]
+static FILE_READ_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+// Package managers and container cleanup can unlink thousands of files in milliseconds. A
+// dedicated 4 MiB ring prevents access traffic from starving those bursts while preserving an
+// independent loss counter.
+#[map]
+static FILE_DELETE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+// Userspace fills an entire epoch before switching FILE_FILTER_CONFIG.active_epoch. Keeping epoch
+// in the key makes that switch atomic even when the same cgroup exists in both generations.
+#[map]
+static FILE_FILTER_RULES: HashMap<FileFilterKey, FileFilterValue> =
+    HashMap::with_max_entries(131_072, 0);
+
+#[map]
+static FILE_FILTER_CONFIG: Array<FileFilterConfig> = Array::with_max_entries(1, 0);
+
+#[map]
+static FILE_FILTER_STATS: PerCpuArray<FileFilterStats> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static UNKNOWN_FILE_WINDOWS: LruHashMap<u64, FileFilterSampleWindow> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+#[map]
+static UNKNOWN_FILE_GLOBAL_WINDOW: PerCpuArray<FileFilterSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// Host ProcessTree shadow skeleton. V1 deliberately does not consult it: a PID-only enforcement
+// decision would be unsafe until start-generation synchronization is available to the kernel side.
+#[map]
+static TRACKED_FILE_PROCESSES: LruHashMap<FileProcessFilterKey, FileFilterValue> =
+    LruHashMap::with_max_entries(1_024, 0);
+
+// S5 is entirely additive to the v1 File filter. Userspace enables exactly one path: legacy keeps
+// these maps disabled; shadow/enforce disable FILE_FILTER_CONFIG and switch this epoch atomically.
+#[map]
+static CAPTURE_PROFILE_RULES: HashMap<CaptureProfileKey, CaptureProfileValue> =
+    // Two complete generations coexist until the config array atomically switches epoch.
+    HashMap::with_max_entries(131_072, 0);
+
+#[map]
+static CAPTURE_PROFILE_CONFIG: Array<CaptureProfileConfig> = Array::with_max_entries(1, 0);
+
+#[map]
+static CAPTURE_PROFILE_STATS: PerCpuArray<CaptureProbeStats> =
+    PerCpuArray::with_max_entries(PIPELINE_RING_COUNT as u32, 0);
+
+#[map]
+static CAPTURE_SAMPLE_WINDOWS: LruHashMap<CaptureSampleKey, CaptureSampleWindow> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+#[map]
+static CAPTURE_GLOBAL_SAMPLE_WINDOWS: PerCpuArray<CaptureSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// A separate, bounded reserve protects first discovery samples from established noisy scopes while
+// still enforcing a hard node/CPU cap. It is a partition of, not an addition to, the global limit.
+#[map]
+static CAPTURE_FIRST_SAMPLE_WINDOWS: PerCpuArray<CaptureSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// Deliberately bounded to 4096 keys: as a per-CPU map, a 65k capacity would multiply memory by the
+// host CPU count. Insert failure is visible and falls back to the bounded emergency sample lane.
+#[map]
+static CAPTURE_AGGREGATES: PerCpuHashMap<CaptureAggregateKey, CaptureAggregateValue> =
+    PerCpuHashMap::with_max_entries(4_096, 0);
+
+#[map]
+static CAPTURE_PROMOTED_PROCESSES: LruHashMap<CaptureProcessKey, CapturePromotionValue> =
+    LruHashMap::with_max_entries(131_072, 0);
 
 #[map]
 static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
@@ -54,15 +158,35 @@ static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 #[map]
 static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+// Per-ring physical-record accounting. This is additive to `DROPS`: the legacy aggregate remains
+// byte-for-byte compatible while userspace can now identify which ring admitted or lost records.
+#[map]
+static PIPELINE_ACCOUNTING: PerCpuArray<RingPipelineStats> =
+    PerCpuArray::with_max_entries(PIPELINE_RING_COUNT as u32, 0);
+
 // child tgid -> parent tgid, captured before the child runs (with syscall-exit fallback). Exec must carry
 // this in-kernel snapshot because short-lived tools can exit before userspace reads /proc.
 #[map]
 static PARENTS: LruHashMap<u32, u32> = LruHashMap::with_max_entries(65_536, 0);
 
-// tgid -> latest syscall-entry capture. `sched_process_exec` consumes it only after a successful
-// exec, so userspace can distinguish committed images from failed execve attempts.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PendingExecState {
+    exec_id: u64,
+    capture_decision: CaptureDecisionContext,
+}
+
+// tgid -> latest syscall-entry generation and its exact capture decision. `sched_process_exec`
+// consumes both only after a successful exec, so every physical fragment and COMMIT carries one
+// identical D1 decision even if the active profile changes while execve is in progress.
 #[map]
-static EXEC_IDS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(65_536, 0);
+static EXEC_IDS: LruHashMap<u32, PendingExecState> = LruHashMap::with_max_entries(65_536, 0);
+
+// tgid -> latest successfully committed exec generation. Unlike EXEC_IDS this survives the
+// sched_process_exec commit and is consumed only by do_exit, giving ProcessExit an event-time
+// generation key that cannot be confused by later `/proc/<pid>` reuse.
+#[map]
+static COMMITTED_EXEC_IDS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(65_536, 0);
 
 // Egress deny-list (dest IPv4, host byte order). Populated by userspace from an external
 // policy; the cgroup/connect4 guard denies connect() to any IP present here. Cgroup-scoped.
@@ -102,17 +226,1204 @@ fn sock_key(pid: u32, fd: u64) -> u64 {
 }
 
 /// Reserve a ring-buffer slot, counting a drop if the ring is full (so userspace can report
-/// data loss instead of losing events silently).
-fn reserve_or_drop<T>(ring: &RingBuf) -> Option<RingBufEntry<T>> {
+/// data loss instead of losing events silently). A successful reservation is not a submitted
+/// physical record until `submit_accounted` commits it; probes may still discard the slot.
+fn reserve_or_drop<T>(ring: &RingBuf, ring_index: u32) -> Option<RingBufEntry<T>> {
     let entry = ring.reserve::<T>(0);
-    if entry.is_none() {
-        unsafe {
+    unsafe {
+        if let Some(stats) = PIPELINE_ACCOUNTING.get_ptr_mut(ring_index) {
+            if entry.is_none() {
+                (*stats).dropped = (*stats).dropped.wrapping_add(1);
+            }
+        }
+        if entry.is_none() {
+            if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(ring_index) {
+                (*stats).ring_dropped = (*stats).ring_dropped.wrapping_add(1);
+            }
+        }
+        if entry.is_none() {
             if let Some(c) = DROPS.get_ptr_mut(0) {
                 *c = (*c).wrapping_add(1);
             }
         }
     }
     entry
+}
+
+#[inline(always)]
+fn submit_accounted<T>(entry: RingBufEntry<T>, ring_index: u32) {
+    unsafe {
+        if let Some(stats) = PIPELINE_ACCOUNTING.get_ptr_mut(ring_index) {
+            (*stats).submitted = (*stats).submitted.wrapping_add(1);
+        }
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(ring_index) {
+            (*stats).ring_submitted = (*stats).ring_submitted.wrapping_add(1);
+        }
+    }
+    entry.submit(0);
+}
+
+const CAPTURE_STAT_ATTEMPTED: u8 = 1;
+const CAPTURE_STAT_FULL: u8 = 2;
+const CAPTURE_STAT_AGGREGATE: u8 = 3;
+const CAPTURE_STAT_SAMPLE: u8 = 4;
+const CAPTURE_STAT_SAMPLE_REJECTED: u8 = 5;
+const CAPTURE_STAT_DROP: u8 = 6;
+const CAPTURE_STAT_DECISION_ERROR: u8 = 7;
+const CAPTURE_STAT_PAYLOAD_SELECTED: u8 = 8;
+const CAPTURE_STAT_PAYLOAD_ERROR: u8 = 9;
+const CAPTURE_STAT_WOULD_FULL: u8 = 10;
+const CAPTURE_STAT_WOULD_AGGREGATE: u8 = 11;
+const CAPTURE_STAT_WOULD_SAMPLE: u8 = 12;
+const CAPTURE_STAT_WOULD_DROP: u8 = 13;
+const CAPTURE_STAT_RULE_HIT: u8 = 14;
+const CAPTURE_STAT_RULE_MISS: u8 = 15;
+const CAPTURE_STAT_STALE: u8 = 16;
+const CAPTURE_STAT_PROMOTION_HIT: u8 = 17;
+const CAPTURE_STAT_AGGREGATE_ERROR: u8 = 18;
+const CAPTURE_STAT_PROMOTION_ERROR: u8 = 19;
+const CAPTURE_STAT_PROBE_ERROR: u8 = 20;
+const CAPTURE_STAT_NOT_ENABLED: u8 = 21;
+
+#[inline(always)]
+fn increment_capture_stat(probe: u8, kind: u8) {
+    if probe as usize >= PIPELINE_RING_COUNT {
+        return;
+    }
+    unsafe {
+        let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) else {
+            return;
+        };
+        match kind {
+            CAPTURE_STAT_ATTEMPTED => (*stats).attempted = (*stats).attempted.wrapping_add(1),
+            CAPTURE_STAT_FULL => (*stats).full_selected = (*stats).full_selected.wrapping_add(1),
+            CAPTURE_STAT_AGGREGATE => {
+                (*stats).aggregate_selected = (*stats).aggregate_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_SAMPLE => {
+                (*stats).sample_selected = (*stats).sample_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_SAMPLE_REJECTED => {
+                (*stats).sample_rejected = (*stats).sample_rejected.wrapping_add(1)
+            }
+            CAPTURE_STAT_DROP => (*stats).drop_selected = (*stats).drop_selected.wrapping_add(1),
+            CAPTURE_STAT_DECISION_ERROR => {
+                (*stats).decision_error = (*stats).decision_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PAYLOAD_SELECTED => {
+                (*stats).payload_selected = (*stats).payload_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_PAYLOAD_ERROR => {
+                (*stats).payload_error = (*stats).payload_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_FULL => (*stats).would_full = (*stats).would_full.wrapping_add(1),
+            CAPTURE_STAT_WOULD_AGGREGATE => {
+                (*stats).would_aggregate = (*stats).would_aggregate.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_SAMPLE => {
+                (*stats).would_sample = (*stats).would_sample.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_DROP => (*stats).would_drop = (*stats).would_drop.wrapping_add(1),
+            CAPTURE_STAT_RULE_HIT => (*stats).rule_hit = (*stats).rule_hit.wrapping_add(1),
+            CAPTURE_STAT_RULE_MISS => (*stats).rule_miss = (*stats).rule_miss.wrapping_add(1),
+            CAPTURE_STAT_STALE => (*stats).stale_rule = (*stats).stale_rule.wrapping_add(1),
+            CAPTURE_STAT_PROMOTION_HIT => {
+                (*stats).promotion_hit = (*stats).promotion_hit.wrapping_add(1)
+            }
+            CAPTURE_STAT_AGGREGATE_ERROR => {
+                (*stats).aggregate_error = (*stats).aggregate_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PROMOTION_ERROR => {
+                (*stats).promotion_error = (*stats).promotion_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PROBE_ERROR => (*stats).probe_error = (*stats).probe_error.wrapping_add(1),
+            CAPTURE_STAT_NOT_ENABLED => (*stats).not_enabled = (*stats).not_enabled.wrapping_add(1),
+            _ => {}
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_payload_candidate(probe: u8) {
+    if capture_profile_enabled() {
+        increment_capture_stat(probe, CAPTURE_STAT_PAYLOAD_SELECTED);
+    }
+}
+
+#[inline(always)]
+fn capture_payload_error(probe: u8) {
+    if capture_profile_enabled() {
+        increment_capture_stat(probe, CAPTURE_STAT_PAYLOAD_ERROR);
+    }
+}
+
+#[inline(always)]
+fn capture_profile_enabled() -> bool {
+    CAPTURE_PROFILE_CONFIG
+        .get(0)
+        .copied()
+        .is_some_and(|config| config.enabled())
+}
+
+#[inline(always)]
+fn capture_would(probe: u8, action: u8) {
+    // Keep the map-value offsets statically visible to the verifier. Passing the untrusted action
+    // through the generic `kind` switch lets LLVM synthesize `base + action * 8`; the verifier then
+    // has to admit action=255 and rejects an apparent access beyond CaptureProbeStats.
+    if action == CAPTURE_ACTION_AGGREGATE {
+        increment_capture_would_aggregate(probe);
+        return;
+    }
+    if action == CAPTURE_ACTION_SAMPLE {
+        increment_capture_would_sample(probe);
+        return;
+    }
+    if action == CAPTURE_ACTION_DROP {
+        increment_capture_would_drop(probe);
+        return;
+    }
+    increment_capture_would_full(probe);
+}
+
+#[inline(never)]
+fn increment_capture_would_full(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_full = (*stats).would_full.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_aggregate(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_aggregate = (*stats).would_aggregate.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_sample(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_sample = (*stats).would_sample.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_drop(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_drop = (*stats).would_drop.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn capture_window_allows(
+    state: *mut CaptureSampleWindow,
+    now: u64,
+    window_ns: u64,
+    limit: u32,
+) -> bool {
+    if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+        (*state).started_at_boot_ns = now;
+        (*state).count = 0;
+    }
+    if (*state).count >= limit {
+        return false;
+    }
+    (*state).count = (*state).count.saturating_add(1);
+    true
+}
+
+/// 1=allowed, 0=rejected, -1=state error (caller uses the bounded emergency lane).
+#[inline(always)]
+fn capture_sample_allowed(key: &CaptureSampleKey, config: &CaptureProfileConfig, now: u64) -> i8 {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let scope_limit = config.sample_per_scope_limit.max(1);
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    // CPU hotplug beyond the collector-observed count gets no lossy sample budget until the next
+    // snapshot; protected events remain FULL.
+    let global_limit =
+        capture_cpu_sample_quota(config.sample_node_limit, config.sample_cpu_count, cpu);
+    let first_samples = config.first_samples.max(1) as u32;
+
+    let scope_count = unsafe {
+        if let Some(state) = CAPTURE_SAMPLE_WINDOWS.get_ptr_mut(key) {
+            if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+                (*state).started_at_boot_ns = now;
+                (*state).count = 0;
+            }
+            if (*state).count >= scope_limit {
+                return 0;
+            }
+            (*state).count = (*state).count.saturating_add(1);
+            (*state).count
+        } else {
+            let initial = CaptureSampleWindow {
+                started_at_boot_ns: now,
+                count: 1,
+                _reserved: 0,
+            };
+            if CAPTURE_SAMPLE_WINDOWS.insert(key, &initial, 0).is_err() {
+                return -1;
+            }
+            1
+        }
+    };
+
+    if global_limit == 0 {
+        return 0;
+    }
+    let (first_reserve, regular_limit) = capture_sample_partitions(global_limit);
+    // First samples use their own fixed partition, so established noisy scopes cannot consume the
+    // discovery reserve. The two partitions sum to the hard configured global limit.
+    if scope_count <= first_samples {
+        return unsafe {
+            match CAPTURE_FIRST_SAMPLE_WINDOWS.get_ptr_mut(0) {
+                Some(state) => {
+                    i8::from(capture_window_allows(state, now, window_ns, first_reserve))
+                }
+                None => -1,
+            }
+        };
+    }
+    if regular_limit == 0 {
+        return 0;
+    }
+    unsafe {
+        match CAPTURE_GLOBAL_SAMPLE_WINDOWS.get_ptr_mut(0) {
+            Some(state) => i8::from(capture_window_allows(state, now, window_ns, regular_limit)),
+            None => -1,
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_emergency_sample_allowed(_probe: u8, config: &CaptureProfileConfig, now: u64) -> i8 {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    let quota = capture_cpu_sample_quota(config.sample_node_limit, config.sample_cpu_count, cpu);
+    let (_, regular_limit) = capture_sample_partitions(quota);
+    if regular_limit == 0 {
+        return 0;
+    }
+    unsafe {
+        match CAPTURE_GLOBAL_SAMPLE_WINDOWS.get_ptr_mut(0) {
+            Some(state) => i8::from(capture_window_allows(state, now, window_ns, regular_limit)),
+            None => -1,
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_aggregate_attempt(
+    cgroup_id: u64,
+    epoch: u64,
+    probe: u8,
+    action: u8,
+    qualifier: u8,
+    profile: u8,
+    authority: u8,
+    disposition: u8,
+    bytes: u64,
+) -> bool {
+    let key = CaptureAggregateKey {
+        cgroup_id,
+        epoch,
+        probe,
+        action,
+        qualifier,
+        profile,
+        authority,
+        disposition,
+        _reserved: [0; 2],
+    };
+    unsafe {
+        if let Some(value) = CAPTURE_AGGREGATES.get_ptr_mut(&key) {
+            (*value).count = (*value).count.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            true
+        } else {
+            CAPTURE_AGGREGATES
+                .insert(&key, &CaptureAggregateValue { count: 1, bytes }, 0)
+                .is_ok()
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_promotion_valid(
+    pid: u32,
+    cgroup_id: u64,
+    config: &CaptureProfileConfig,
+    now: u64,
+) -> bool {
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&key).copied() }) else {
+        return false;
+    };
+    if value.cgroup_id != cgroup_id
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return false;
+    }
+    if value.expected_exec_id != 0 {
+        let committed = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+        if committed != value.expected_exec_id {
+            if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+                increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn inherit_capture_promotion(parent: u32, child: u32) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !capture_promotion_valid(parent, cgroup_id, &config, now) {
+        return;
+    }
+    let parent_key = CaptureProcessKey {
+        pid: parent,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(parent_value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&parent_key).copied() })
+    else {
+        return;
+    };
+    let child_key = CaptureProcessKey {
+        pid: child,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let child_value = CapturePromotionValue {
+        cgroup_id,
+        expected_exec_id: 0,
+        root_exec_id: parent_value.root_exec_id,
+        expires_at_boot_ns: parent_value.expires_at_boot_ns,
+        root_pid: parent_value.root_pid,
+        flags: (parent_value.flags & CAPTURE_PROMOTION_FLAG_INVESTIGATION)
+            | CAPTURE_PROMOTION_FLAG_DESCENDANT,
+    };
+    if CAPTURE_PROMOTED_PROCESSES
+        .insert(&child_key, &child_value, 0)
+        .is_err()
+    {
+        increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn commit_capture_promotion(pid: u32, exec_id: u64, cgroup_id: u64) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(mut value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&key).copied() }) else {
+        return;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    if value.cgroup_id != cgroup_id
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return;
+    }
+    // A configured root is fenced to the exact commit generation. A descendant begins with zero
+    // at fork and is advanced to its own generation only after this successful commit hook.
+    if value.flags & CAPTURE_PROMOTION_FLAG_ROOT != 0
+        && value.expected_exec_id != 0
+        && value.expected_exec_id != exec_id
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return;
+    }
+    value.expected_exec_id = exec_id;
+    if CAPTURE_PROMOTED_PROCESSES.insert(&key, &value, 0).is_err() {
+        increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn promote_security_runtime(pid: u32, cgroup_id: u64) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let exec_id = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let value = CapturePromotionValue {
+        cgroup_id,
+        expected_exec_id: exec_id,
+        root_exec_id: exec_id,
+        expires_at_boot_ns: now.saturating_add(config.investigation_ttl_ns.max(1)),
+        root_pid: pid,
+        flags: CAPTURE_PROMOTION_FLAG_ROOT | CAPTURE_PROMOTION_FLAG_INVESTIGATION,
+    };
+    if CAPTURE_PROMOTED_PROCESSES.insert(&key, &value, 0).is_err() {
+        increment_capture_stat(CAPTURE_PROBE_SECURITY, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn remove_capture_promotion(pid: u32) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if config.active_epoch == 0 {
+        return;
+    }
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let _ = CAPTURE_PROMOTED_PROCESSES.remove(&key);
+}
+
+#[inline(always)]
+fn capture_decision(
+    epoch: u64,
+    profile: u8,
+    action: u8,
+    authority: u8,
+    disposition: u8,
+    flags: u8,
+) -> CaptureDecisionContext {
+    CaptureDecisionContext {
+        capture_epoch: epoch,
+        capture_profile: profile,
+        capture_action: action,
+        capture_authority: authority,
+        capture_disposition: disposition,
+        flags,
+        _reserved: [0; 3],
+    }
+}
+
+#[inline(always)]
+fn selected_capture_decision(
+    epoch: u64,
+    profile: u8,
+    action: u8,
+    authority: u8,
+    disposition: u8,
+    flags: u8,
+) -> CaptureDecisionContext {
+    capture_decision(
+        epoch,
+        profile,
+        action,
+        authority,
+        disposition,
+        flags | CAPTURE_DECISION_FLAG_SELECTED,
+    )
+}
+
+#[inline(always)]
+fn legacy_selected_capture_decision() -> CaptureDecisionContext {
+    selected_capture_decision(
+        0,
+        CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+        CAPTURE_ACTION_FULL,
+        0,
+        CAPTURE_DISPOSITION_MISS,
+        CAPTURE_DECISION_FLAG_LEGACY,
+    )
+}
+
+/// Returns the exact decision made before raw payload construction and Ring reservation.
+/// AGGREGATE/DROP/sample rejection return an unselected context and terminate at the caller.
+#[inline(always)]
+fn capture_raw_decision(
+    probe: u8,
+    cgroup_id: u64,
+    pid: u32,
+    bytes: u64,
+    qualifier: u8,
+) -> CaptureDecisionContext {
+    if probe as usize >= PIPELINE_RING_COUNT {
+        return legacy_selected_capture_decision();
+    }
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        return legacy_selected_capture_decision();
+    }
+    increment_capture_stat(probe, CAPTURE_STAT_ATTEMPTED);
+    let now = unsafe { bpf_ktime_get_ns() };
+    let protected = capture_probe_is_protected(probe);
+    let promoted = !protected && capture_promotion_valid(pid, cgroup_id, &config, now);
+
+    let key = CaptureProfileKey {
+        cgroup_id,
+        epoch: config.active_epoch,
+    };
+    let rule = unsafe { CAPTURE_PROFILE_RULES.get(&key).copied() };
+    let mut profile = CAPTURE_PROFILE_UNKNOWN_DISCOVERY;
+    let mut action = capture_profile_default_actions(profile)[probe as usize];
+    let mut desired = action;
+    let mut authority = 0;
+    let mut disposition = CAPTURE_DISPOSITION_MISS;
+    if config.expires_at_boot_ns != 0 && now >= config.expires_at_boot_ns {
+        if !protected && !promoted {
+            increment_capture_stat(probe, CAPTURE_STAT_STALE);
+        }
+        disposition = CAPTURE_DISPOSITION_STALE;
+    } else if let Some(value) = rule {
+        if value.epoch != config.active_epoch
+            || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+        {
+            if !protected && !promoted {
+                increment_capture_stat(probe, CAPTURE_STAT_STALE);
+            }
+            disposition = CAPTURE_DISPOSITION_STALE;
+        } else {
+            if !protected && !promoted {
+                increment_capture_stat(probe, CAPTURE_STAT_RULE_HIT);
+            }
+            profile = value.profile;
+            authority = value.authority;
+            disposition = CAPTURE_DISPOSITION_RULE;
+            action = value.actions[probe as usize];
+            desired = value.desired_actions[probe as usize];
+            if value.flags & (CAPTURE_PROFILE_FLAG_AGENT | CAPTURE_PROFILE_FLAG_CONFLICT) != 0
+                && (probe != CAPTURE_PROBE_FILE_READ || action == CAPTURE_ACTION_FULL)
+            {
+                action = CAPTURE_ACTION_FULL;
+                desired = CAPTURE_ACTION_FULL;
+            }
+        }
+    } else {
+        if !protected && !promoted {
+            increment_capture_stat(probe, CAPTURE_STAT_RULE_MISS);
+        }
+    }
+
+    if protected {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        let protected_profile = if probe == CAPTURE_PROBE_SECURITY {
+            CAPTURE_PROFILE_SECURITY_FULL
+        } else {
+            profile
+        };
+        return selected_capture_decision(
+            config.active_epoch,
+            protected_profile,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROTECTED,
+        );
+    }
+    // `file_read` is a default-off signal. Ordinary capture shadow semantics force FULL to expose
+    // would-drop differences, but doing that here would send every node read into the Ring. Shadow
+    // therefore records the desired decision only and preserves the baseline-off transport.
+    if probe == CAPTURE_PROBE_FILE_READ && config.mode == CAPTURE_MODE_SHADOW {
+        let shadow_desired = if promoted {
+            CAPTURE_ACTION_FULL
+        } else {
+            desired
+        };
+        if shadow_desired != CAPTURE_ACTION_NOT_ENABLED {
+            capture_would(probe, shadow_desired);
+        }
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_SHADOW,
+        );
+    }
+
+    if promoted {
+        increment_capture_stat(probe, CAPTURE_STAT_PROMOTION_HIT);
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        let promotion_key = CaptureProcessKey {
+            pid,
+            _reserved: 0,
+            epoch: config.active_epoch,
+        };
+        let promoted_profile = unsafe { CAPTURE_PROMOTED_PROCESSES.get(&promotion_key) }
+            .map(|value| {
+                if value.flags & CAPTURE_PROMOTION_FLAG_INVESTIGATION != 0 {
+                    CAPTURE_PROFILE_INVESTIGATION_FULL
+                } else {
+                    CAPTURE_PROFILE_AGENT_FULL
+                }
+            })
+            .unwrap_or(CAPTURE_PROFILE_AGENT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            promoted_profile,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROMOTED,
+        );
+    }
+
+    if config.mode == CAPTURE_MODE_SHADOW {
+        capture_would(probe, desired);
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_SHADOW,
+        );
+    }
+    if action == CAPTURE_ACTION_NOT_ENABLED {
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            0,
+        );
+    }
+    if action == CAPTURE_ACTION_DROP
+        && (authority != FILE_FILTER_AUTHORITY_AUTHORITATIVE
+            || config.flags & CAPTURE_CONFIG_DESTRUCTIVE_GRANTED == 0)
+    {
+        action = capture_profile_default_actions(profile)[probe as usize];
+        if action == CAPTURE_ACTION_DROP {
+            action = CAPTURE_ACTION_SAMPLE;
+        }
+    }
+
+    match action {
+        CAPTURE_ACTION_FULL => {
+            increment_capture_stat(probe, CAPTURE_STAT_FULL);
+            selected_capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_FULL,
+                authority,
+                disposition,
+                0,
+            )
+        }
+        CAPTURE_ACTION_AGGREGATE | CAPTURE_ACTION_SAMPLE | CAPTURE_ACTION_DROP => {
+            if !capture_aggregate_attempt(
+                cgroup_id,
+                config.active_epoch,
+                probe,
+                action,
+                qualifier,
+                profile,
+                authority,
+                disposition,
+                bytes,
+            ) {
+                increment_capture_stat(probe, CAPTURE_STAT_AGGREGATE_ERROR);
+                // A full aggregate map must not turn a low-value workload back into an unbounded
+                // raw stream. Use the regular global sample partition as a fixed emergency lane.
+                return match capture_emergency_sample_allowed(probe, &config, now) {
+                    1 => {
+                        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                        selected_capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+                        )
+                    }
+                    0 => {
+                        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                        capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        )
+                    }
+                    _ => {
+                        increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+                        capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        )
+                    }
+                };
+            }
+            if action == CAPTURE_ACTION_AGGREGATE {
+                increment_capture_stat(probe, CAPTURE_STAT_AGGREGATE);
+                return capture_decision(
+                    config.active_epoch,
+                    profile,
+                    action,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
+            if action == CAPTURE_ACTION_DROP {
+                increment_capture_stat(probe, CAPTURE_STAT_DROP);
+                return capture_decision(
+                    config.active_epoch,
+                    profile,
+                    action,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
+            let sample_key = CaptureSampleKey {
+                cgroup_id,
+                epoch: config.active_epoch,
+                probe,
+                _reserved: [0; 7],
+            };
+            match capture_sample_allowed(&sample_key, &config, now) {
+                1 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                    selected_capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+                0 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                    capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+                _ => {
+                    increment_capture_stat(probe, CAPTURE_STAT_PROBE_ERROR);
+                    match capture_emergency_sample_allowed(probe, &config, now) {
+                        1 => {
+                            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                            selected_capture_decision(
+                                config.active_epoch,
+                                profile,
+                                CAPTURE_ACTION_SAMPLE,
+                                authority,
+                                disposition,
+                                CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+                            )
+                        }
+                        0 => {
+                            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                            capture_decision(
+                                config.active_epoch,
+                                profile,
+                                CAPTURE_ACTION_SAMPLE,
+                                authority,
+                                disposition,
+                                0,
+                            )
+                        }
+                        _ => {
+                            increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+                            capture_decision(
+                                config.active_epoch,
+                                profile,
+                                CAPTURE_ACTION_SAMPLE,
+                                authority,
+                                disposition,
+                                0,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            increment_capture_stat(probe, CAPTURE_STAT_PROBE_ERROR);
+            match capture_emergency_sample_allowed(probe, &config, now) {
+                1 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                    selected_capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+                    )
+                }
+                0 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                    capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+                _ => {
+                    increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+                    capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+            }
+        }
+    }
+}
+
+const FILE_STAT_ACCESS_KEPT: u8 = 1;
+const FILE_STAT_ACCESS_UNKNOWN_KEPT: u8 = 2;
+const FILE_STAT_ACCESS_SAMPLED: u8 = 3;
+const FILE_STAT_ACCESS_DROPPED: u8 = 4;
+const FILE_STAT_ACCESS_SUPPRESSED: u8 = 5;
+const FILE_STAT_DELETE_KEPT: u8 = 6;
+const FILE_STAT_DELETE_UNKNOWN_KEPT: u8 = 7;
+const FILE_STAT_DELETE_DROPPED: u8 = 8;
+const FILE_STAT_RULE_HIT: u8 = 9;
+const FILE_STAT_RULE_MISS: u8 = 10;
+const FILE_STAT_STALE_RULE: u8 = 11;
+const FILE_STAT_ACCESS_RING_DROP: u8 = 12;
+const FILE_STAT_DELETE_RING_DROP: u8 = 13;
+
+const DEFAULT_FILE_SAMPLE_WINDOW_NS: u64 = 1_000_000_000;
+const DEFAULT_FILE_SAMPLE_PER_CGROUP: u32 = 20;
+const DEFAULT_FILE_SAMPLE_PER_CPU: u32 = 64;
+
+#[inline(always)]
+fn increment_file_stat(kind: u8) {
+    unsafe {
+        let Some(stats) = FILE_FILTER_STATS.get_ptr_mut(0) else {
+            return;
+        };
+        match kind {
+            FILE_STAT_ACCESS_KEPT => (*stats).access_kept = (*stats).access_kept.wrapping_add(1),
+            FILE_STAT_ACCESS_UNKNOWN_KEPT => {
+                (*stats).access_unknown_kept = (*stats).access_unknown_kept.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_SAMPLED => {
+                (*stats).access_sampled = (*stats).access_sampled.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_DROPPED => {
+                (*stats).access_dropped = (*stats).access_dropped.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_SUPPRESSED => {
+                (*stats).access_sample_suppressed =
+                    (*stats).access_sample_suppressed.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_KEPT => (*stats).delete_kept = (*stats).delete_kept.wrapping_add(1),
+            FILE_STAT_DELETE_UNKNOWN_KEPT => {
+                (*stats).delete_unknown_kept = (*stats).delete_unknown_kept.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_DROPPED => {
+                (*stats).delete_dropped = (*stats).delete_dropped.wrapping_add(1)
+            }
+            FILE_STAT_RULE_HIT => (*stats).rule_hits = (*stats).rule_hits.wrapping_add(1),
+            FILE_STAT_RULE_MISS => (*stats).rule_misses = (*stats).rule_misses.wrapping_add(1),
+            FILE_STAT_STALE_RULE => (*stats).stale_rules = (*stats).stale_rules.wrapping_add(1),
+            FILE_STAT_ACCESS_RING_DROP => {
+                (*stats).access_ring_dropped = (*stats).access_ring_dropped.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_RING_DROP => {
+                (*stats).delete_ring_dropped = (*stats).delete_ring_dropped.wrapping_add(1)
+            }
+            _ => {}
+        }
+    }
+}
+
+#[inline(always)]
+fn reserve_file_or_drop(ring: &RingBuf, delete: bool) -> Option<RingBufEntry<FileEvent>> {
+    let entry = reserve_or_drop::<FileEvent>(
+        ring,
+        if delete {
+            PIPELINE_RING_FILE_DELETE
+        } else {
+            PIPELINE_RING_FILE_ACCESS
+        },
+    );
+    if entry.is_none() {
+        increment_file_stat(if delete {
+            FILE_STAT_DELETE_RING_DROP
+        } else {
+            FILE_STAT_ACCESS_RING_DROP
+        });
+    }
+    entry
+}
+
+#[inline(always)]
+unsafe fn sample_window_allows(
+    state: *mut FileFilterSampleWindow,
+    now: u64,
+    window_ns: u64,
+    limit: u32,
+) -> bool {
+    if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+        (*state).started_at_boot_ns = now;
+        (*state).count = 0;
+    }
+    if (*state).count >= limit {
+        return false;
+    }
+    (*state).count = (*state).count.saturating_add(1);
+    true
+}
+
+#[inline(always)]
+fn unknown_sample_allowed(cgroup_id: u64, config: &FileFilterConfig, now: u64) -> bool {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let cgroup_limit = if config.unknown_per_cgroup_limit == 0 {
+        DEFAULT_FILE_SAMPLE_PER_CGROUP
+    } else {
+        config.unknown_per_cgroup_limit
+    };
+    let per_cpu_limit = if config.unknown_per_cpu_limit == 0 {
+        DEFAULT_FILE_SAMPLE_PER_CPU
+    } else {
+        config.unknown_per_cpu_limit
+    };
+
+    let cgroup_allowed = unsafe {
+        if let Some(state) = UNKNOWN_FILE_WINDOWS.get_ptr_mut(&cgroup_id) {
+            sample_window_allows(state, now, window_ns, cgroup_limit)
+        } else {
+            let initial = FileFilterSampleWindow {
+                started_at_boot_ns: now,
+                count: 1,
+                _reserved: 0,
+            };
+            UNKNOWN_FILE_WINDOWS.insert(&cgroup_id, &initial, 0).is_ok()
+        }
+    };
+    if !cgroup_allowed {
+        return false;
+    }
+    unsafe {
+        UNKNOWN_FILE_GLOBAL_WINDOW
+            .get_ptr_mut(0)
+            .is_some_and(|state| sample_window_allows(state, now, window_ns, per_cpu_limit))
+    }
+}
+
+#[inline(always)]
+fn active_file_rule(
+    cgroup_id: u64,
+    config: &FileFilterConfig,
+    now: u64,
+) -> Option<FileFilterValue> {
+    let key = FileFilterKey {
+        cgroup_id,
+        epoch: config.active_epoch,
+    };
+    let value = unsafe { FILE_FILTER_RULES.get(&key).copied() };
+    let Some(value) = value else {
+        increment_file_stat(FILE_STAT_RULE_MISS);
+        return None;
+    };
+    if value.epoch != config.active_epoch
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        increment_file_stat(FILE_STAT_STALE_RULE);
+        return None;
+    }
+    increment_file_stat(FILE_STAT_RULE_HIT);
+    Some(value)
+}
+
+#[inline(always)]
+fn legacy_file_access_decision(cgroup_id: u64) -> CaptureDecisionContext {
+    let config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_KEPT);
+        return legacy_selected_capture_decision();
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let rule = active_file_rule(cgroup_id, &config, now);
+    if let Some(rule) = rule {
+        if rule.action == FILE_FILTER_ACTION_KEEP {
+            increment_file_stat(FILE_STAT_ACCESS_KEPT);
+            return selected_capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_FULL,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        if rule.action == FILE_FILTER_ACTION_DROP
+            && rule.authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE
+        {
+            increment_file_stat(FILE_STAT_ACCESS_DROPPED);
+            return capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_DROP,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        // SAMPLE, an unknown action, or a candidate DROP all use the configured Unknown policy.
+    }
+    let authority = rule.map(|value| value.authority).unwrap_or(0);
+    let disposition = if rule.is_some() {
+        CAPTURE_DISPOSITION_RULE
+    } else {
+        CAPTURE_DISPOSITION_MISS
+    };
+    if !config.unknown_sampling_enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_KEPT);
+        increment_file_stat(FILE_STAT_ACCESS_UNKNOWN_KEPT);
+        return selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
+    if unknown_sample_allowed(cgroup_id, &config, now) {
+        increment_file_stat(FILE_STAT_ACCESS_SAMPLED);
+        selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        )
+    } else {
+        increment_file_stat(FILE_STAT_ACCESS_SUPPRESSED);
+        capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        )
+    }
+}
+
+#[inline(always)]
+fn legacy_file_delete_decision(cgroup_id: u64) -> CaptureDecisionContext {
+    let config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        increment_file_stat(FILE_STAT_DELETE_KEPT);
+        return legacy_selected_capture_decision();
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let rule = active_file_rule(cgroup_id, &config, now);
+    if let Some(rule) = rule {
+        if rule.action == FILE_FILTER_ACTION_DROP
+            && rule.authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE
+        {
+            increment_file_stat(FILE_STAT_DELETE_DROPPED);
+            return capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_DROP,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        if rule.action == FILE_FILTER_ACTION_KEEP {
+            increment_file_stat(FILE_STAT_DELETE_KEPT);
+            return selected_capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_FULL,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+    }
+    // FileDelete is fail-open for KEEP, SAMPLE, candidate DROP, misses, and stale rules.
+    increment_file_stat(FILE_STAT_DELETE_KEPT);
+    increment_file_stat(FILE_STAT_DELETE_UNKNOWN_KEPT);
+    let authority = rule.map(|value| value.authority).unwrap_or(0);
+    let disposition = if rule.is_some() {
+        CAPTURE_DISPOSITION_RULE
+    } else {
+        CAPTURE_DISPOSITION_MISS
+    };
+    selected_capture_decision(
+        config.active_epoch,
+        CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+        CAPTURE_ACTION_FULL,
+        authority,
+        disposition,
+        CAPTURE_DECISION_FLAG_LEGACY,
+    )
 }
 
 /// Read a `u64` (e.g. a pointer or length) from a user-space address.
@@ -133,6 +1444,8 @@ unsafe fn init_exec_record(
     ppid: u32,
     uid: u32,
     comm: [u8; 16],
+    captured_at_boot_ns: u64,
+    capture_decision: CaptureDecisionContext,
 ) {
     (*record).exec_id = exec_id;
     (*record).cgroup_id = cgroup_id;
@@ -149,6 +1462,9 @@ unsafe fn init_exec_record(
     (*record)._pad = [0; 2];
     (*record).comm = comm;
     zero_exec_data(record);
+    (*record)._event_time_pad = [0; 4];
+    (*record).captured_at_boot_ns = captured_at_boot_ns;
+    (*record).capture_decision = capture_decision;
 }
 
 #[inline(always)]
@@ -181,6 +1497,8 @@ struct ExecLoopContext {
     argv: u64,
     exec_id: u64,
     cgroup_id: u64,
+    captured_at_boot_ns: u64,
+    capture_decision: CaptureDecisionContext,
     argp: u64,
     arg_offset: u32,
     captured_bytes: u32,
@@ -226,7 +1544,7 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         state.captured_argc += 1;
     }
 
-    let Some(mut chunk_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+    let Some(mut chunk_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
         state.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
         state.done = 1;
         return 1;
@@ -240,6 +1558,8 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         state.ppid,
         state.uid,
         state.comm,
+        state.captured_at_boot_ns,
+        state.capture_decision,
     );
     (*chunk).kind = EXEC_RECORD_ARG_CHUNK;
     (*chunk).arg_index = state.arg_index;
@@ -258,7 +1578,7 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         }
     };
     (*chunk).data_len = len as u16;
-    chunk_entry.submit(0);
+    submit_accounted(chunk_entry, PIPELINE_RING_EXEC);
     state.captured_bytes += len as u32;
 
     if len < EXEC_ARG_CHUNK_PAYLOAD {
@@ -286,6 +1606,7 @@ pub fn track_process_fork(ctx: TracePointContext) -> u32 {
     };
     if parent > 0 && child > 0 {
         let _ = PARENTS.insert(&(child as u32), &(parent as u32), 0);
+        inherit_capture_promotion(parent as u32, child as u32);
     }
     0
 }
@@ -320,6 +1641,7 @@ fn track_child(ctx: &TracePointContext) -> u32 {
     }
     let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
     let _ = PARENTS.insert(&(child as u32), &parent, 0);
+    inherit_capture_promotion(parent, child as u32);
     0
 }
 
@@ -335,16 +1657,51 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
-    let exec_id = unsafe { bpf_ktime_get_ns() } ^ pid_tgid;
+    // Every syscall-entry fragment shares one timestamp. This lets userspace reassemble a logical
+    // exec without manufacturing order from the time each physical ring record was drained.
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let exec_id = captured_at_boot_ns ^ pid_tgid;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_EXEC, cgroup_id, pid, 0, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_EXEC);
     let mut flags = 0u8;
-    let _ = EXEC_IDS.insert(&pid, &exec_id, 0);
+    if EXEC_IDS
+        .insert(
+            &pid,
+            &PendingExecState {
+                exec_id,
+                capture_decision,
+            },
+            0,
+        )
+        .is_err()
+    {
+        // Never leave an older pending/committed generation behind under this PID. Losing
+        // attribution is safe; attributing the next exit to a stale generation is not.
+        let _ = EXEC_IDS.remove(&pid);
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
+        capture_payload_error(CAPTURE_PROBE_EXEC);
+        return Ok(0);
+    }
 
-    let Some(mut header_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+    let Some(mut header_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
         return Ok(0);
     };
     let header = header_entry.as_mut_ptr();
     unsafe {
-        init_exec_record(header, exec_id, cgroup_id, pid, ppid, uid, comm);
+        init_exec_record(
+            header,
+            exec_id,
+            cgroup_id,
+            pid,
+            ppid,
+            uid,
+            comm,
+            captured_at_boot_ns,
+            capture_decision,
+        );
         (*header).kind = EXEC_RECORD_HEADER;
         // sys_enter_execve: `const char *filename` at offset 16.
         if let Ok(filename_ptr) = ctx.read_at::<*const u8>(16) {
@@ -357,7 +1714,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
         }
         (*header).flags = flags;
     }
-    header_entry.submit(0);
+    submit_accounted(header_entry, PIPELINE_RING_EXEC);
 
     let captured_argc: u16;
     let captured_bytes: u32;
@@ -370,6 +1727,8 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
                 argv: argv as u64,
                 exec_id,
                 cgroup_id,
+                captured_at_boot_ns,
+                capture_decision,
                 argp: 0,
                 arg_offset: 0,
                 captured_bytes: 0,
@@ -403,16 +1762,26 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
             captured_bytes = 0;
         }
 
-        let Some(mut end_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+        let Some(mut end_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
             return Ok(0);
         };
         let end = end_entry.as_mut_ptr();
-        init_exec_record(end, exec_id, cgroup_id, pid, ppid, uid, comm);
+        init_exec_record(
+            end,
+            exec_id,
+            cgroup_id,
+            pid,
+            ppid,
+            uid,
+            comm,
+            captured_at_boot_ns,
+            capture_decision,
+        );
         (*end).kind = EXEC_RECORD_END;
         (*end).flags = flags;
         (*end).argc = captured_argc;
         (*end).captured_bytes = captured_bytes;
-        end_entry.submit(0);
+        submit_accounted(end_entry, PIPELINE_RING_EXEC);
     }
     Ok(0)
 }
@@ -422,20 +1791,41 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
 #[tracepoint]
 pub fn track_process_exec(_ctx: TracePointContext) -> u32 {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let Some(exec_id) = (unsafe { EXEC_IDS.get(&pid).copied() }) else {
+    let Some(pending) = (unsafe { EXEC_IDS.get(&pid).copied() }) else {
+        // A commit without its syscall-entry generation (for example after bounded-map loss)
+        // invalidates any older generation for the same PID.
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
         return 0;
     };
+    let exec_id = pending.exec_id;
     let uid = bpf_get_current_uid_gid() as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
-    if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS) {
+    // Commit is a separate kernel fact from syscall entry and therefore carries the time at which
+    // the new image was successfully installed. `exec_id` preserves their generation relation.
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if COMMITTED_EXEC_IDS.insert(&pid, &exec_id, 0).is_err() {
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
+    }
+    commit_capture_promotion(pid, exec_id, cgroup_id);
+    if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) {
         let record = entry.as_mut_ptr();
         unsafe {
-            init_exec_record(record, exec_id, cgroup_id, pid, ppid, uid, comm);
+            init_exec_record(
+                record,
+                exec_id,
+                cgroup_id,
+                pid,
+                ppid,
+                uid,
+                comm,
+                captured_at_boot_ns,
+                pending.capture_decision,
+            );
             (*record).kind = EXEC_RECORD_COMMIT;
         }
-        entry.submit(0);
+        submit_accounted(entry, PIPELINE_RING_EXEC);
     }
     let _ = EXEC_IDS.remove(&pid);
     0
@@ -458,22 +1848,35 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     if (id >> 32) as u32 != id as u32 {
         return Ok(0);
     }
-    let code: u64 = ctx.arg(0).unwrap_or(0);
-    let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS) else {
-        return Ok(0);
-    };
-    let ev = entry.as_mut_ptr();
-    unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (id >> 32) as u32;
-        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        (*ev).exit_code = ((code >> 8) & 0xff) as u32;
-        (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
-    }
-    entry.submit(0);
     let pid = (id >> 32) as u32;
+    let code: u64 = ctx.arg(0).unwrap_or(0);
+    let exec_id = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_EXIT, cgroup_id, pid, 0, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_EXIT);
+    if let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS, PIPELINE_RING_EXIT) {
+        let ev = entry.as_mut_ptr();
+        unsafe {
+            (*ev).cgroup_id = cgroup_id;
+            (*ev).pid = pid;
+            (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+            (*ev).exit_code = ((code >> 8) & 0xff) as u32;
+            (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
+            (*ev)._pad = 0;
+            (*ev).exec_id = exec_id;
+            (*ev).captured_at_boot_ns = captured_at_boot_ns;
+            (*ev).capture_decision = capture_decision;
+        }
+        submit_accounted(entry, PIPELINE_RING_EXIT);
+    }
     let _ = PARENTS.remove(&pid);
     let _ = EXEC_IDS.remove(&pid);
+    let _ = COMMITTED_EXEC_IDS.remove(&pid);
+    remove_capture_promotion(pid);
     Ok(0)
 }
 
@@ -517,23 +1920,30 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     if hdr[0] != 0x16 || hdr[1] != 0x03 || hdr[5] != 0x01 {
         return Ok(0);
     }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
     // New LLM call: start the metrics accumulator and emit the SNI snapshot.
     let _ = LLM_SOCKS.insert(
         &key,
         &LlmStat {
-            start_ns: unsafe { bpf_ktime_get_ns() },
+            start_ns: captured_at_boot_ns,
             first_resp_ns: 0,
             req_bytes: 0,
             resp_bytes: 0,
         },
         0,
     );
-    let Some(mut entry) = reserve_or_drop::<TlsEvent>(&TLS_EVENTS) else {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_TLS, cgroup_id, pid, count, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_TLS);
+    let Some(mut entry) = reserve_or_drop::<TlsEvent>(&TLS_EVENTS, PIPELINE_RING_TLS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
+        (*ev).cgroup_id = cgroup_id;
         (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev)._pad = 0;
@@ -546,13 +1956,21 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; TLS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_TLS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev)._event_time_pad = [0; 4];
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_TLS);
     Ok(0)
 }
 
@@ -600,13 +2018,22 @@ fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
     if buf.is_null() || len == 0 {
         return 0;
     }
-    let Some(mut entry) = reserve_or_drop::<SslEvent>(&SSL_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision =
+        capture_raw_decision(CAPTURE_PROBE_SSL, cgroup_id, pid, len, (is_read != 0) as u8);
+    if !capture_decision.selected() {
+        return 0;
+    }
+    capture_payload_candidate(CAPTURE_PROBE_SSL);
+    let Some(mut entry) = reserve_or_drop::<SslEvent>(&SSL_EVENTS, PIPELINE_RING_SSL) else {
         return 0;
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).is_read = is_read;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         // n <= SSL_SNAP_LEN (data capacity) and n <= len (bytes actually written/read).
@@ -617,13 +2044,21 @@ fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
         };
         (*ev).len = n;
         (*ev).data = [0u8; SSL_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_SSL);
+            entry.discard(0);
+            return 0;
+        }
+        (*ev)._event_time_pad = [0; 4];
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_SSL);
     0
 }
 
@@ -650,29 +2085,57 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     if family != 2 && family != 10 {
         return Ok(0); // only AF_INET / AF_INET6
     }
-    let Some(mut entry) = reserve_or_drop::<ConnectEvent>(&CONNECT_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(
+        CAPTURE_PROBE_CONNECT,
+        cgroup_id,
+        pid,
+        0,
+        (family == 10) as u8,
+    );
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_CONNECT);
+    let Some(mut entry) = reserve_or_drop::<ConnectEvent>(&CONNECT_EVENTS, PIPELINE_RING_CONNECT)
+    else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev).family = family;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let mut port = [0u8; 2];
-        let _ = bpf_probe_read_user_buf(addr_ptr.add(2), &mut port); // sin_port (network order)
+        if bpf_probe_read_user_buf(addr_ptr.add(2), &mut port).is_err() {
+            capture_payload_error(CAPTURE_PROBE_CONNECT);
+            entry.discard(0);
+            return Ok(0);
+        }
         (*ev).port = u16::from_be_bytes(port);
         // Read into a local first to avoid an autoref through the raw event pointer.
         let mut a = [0u8; 16];
         if family == 2 {
-            let _ = bpf_probe_read_user_buf(addr_ptr.add(4), &mut a[..4]); // sin_addr
-        } else {
-            let _ = bpf_probe_read_user_buf(addr_ptr.add(8), &mut a); // sin6_addr
+            if bpf_probe_read_user_buf(addr_ptr.add(4), &mut a[..4]).is_err() {
+                capture_payload_error(CAPTURE_PROBE_CONNECT);
+                entry.discard(0);
+                return Ok(0);
+            }
+        } else if bpf_probe_read_user_buf(addr_ptr.add(8), &mut a).is_err() {
+            capture_payload_error(CAPTURE_PROBE_CONNECT);
+            entry.discard(0);
+            return Ok(0);
         }
         (*ev).addr = a;
+        (*ev)._event_time_pad = [0; 4];
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_CONNECT);
     Ok(0)
 }
 
@@ -682,18 +2145,32 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
 // when one fires it's worth a look — that's the whole point of a separate "rare and loud" tier.
 
 fn emit_sec(kind: u32, detail: u64) {
-    let Some(mut entry) = reserve_or_drop::<SecEvent>(&SEC_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // The Security event itself is hard-FULL, and atomically promotes this runtime to temporary
+    // investigation_full before subsequent file/network events can be evaluated.
+    promote_security_runtime(pid, cgroup_id);
+    let capture_decision =
+        capture_raw_decision(CAPTURE_PROBE_SECURITY, cgroup_id, pid, 0, kind as u8);
+    if !capture_decision.selected() {
+        return;
+    }
+    capture_payload_candidate(CAPTURE_PROBE_SECURITY);
+    let Some(mut entry) = reserve_or_drop::<SecEvent>(&SEC_EVENTS, PIPELINE_RING_SECURITY) else {
         return;
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).kind = kind;
         (*ev).detail = detail;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_SECURITY);
 }
 
 // Escalation TO root from a non-root caller — the loud case. Dropping privs (root → nobody, which
@@ -830,13 +2307,21 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
     if count < 13 {
         return Ok(0); // DNS header(12) + >=1 question byte
     }
-    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_DNS, cgroup_id, pid, count, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_DNS);
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS, PIPELINE_RING_DNS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if count > DNS_SNAP_LEN as u64 {
@@ -846,13 +2331,20 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; DNS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_DNS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_DNS);
     Ok(0)
 }
 
@@ -907,13 +2399,21 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
     if iov_base == 0 || iov_len < 13 {
         return Ok(0);
     }
-    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_DNS, cgroup_id, pid, iov_len, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_DNS);
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS, PIPELINE_RING_DNS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if iov_len > DNS_SNAP_LEN as u64 {
@@ -923,44 +2423,160 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; DNS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             iov_base as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_DNS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_DNS);
     Ok(0)
 }
 
-// ---- file opened for writing (sys_enter_openat) ----
-// Only write/rw opens are emitted (read opens are far too high-volume); userspace reads
-// the path. This is the "which files did the agent modify" signal.
+// ---- file opened (sys_enter_open/openat/openat2) ----
+// Write/rw opens retain their existing path. Read-only opens are a separate, default-off signal
+// selected only by an exact Agent Runtime/Root capture profile before path copy or Ring reserve.
 
 #[tracepoint]
 pub fn file_open(ctx: TracePointContext) -> u32 {
-    try_open(&ctx).unwrap_or(0)
+    try_openat(&ctx).unwrap_or(0)
 }
 
-fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
+#[tracepoint]
+pub fn file_openat2(ctx: TracePointContext) -> u32 {
+    try_openat2(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_open_legacy(ctx: TracePointContext) -> u32 {
+    try_open_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_openat(ctx: &TracePointContext) -> Result<u32, i64> {
     // sys_enter_openat: dfd @16, filename @24, flags @32, mode @40.
     let flags: u64 = unsafe { ctx.read_at(32)? };
-    if flags & 0x3 == 0 {
-        return Ok(0); // O_RDONLY — skip; keep only O_WRONLY / O_RDWR
-    }
     let filename: *const u8 = unsafe { ctx.read_at(24)? };
-    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
+    try_open_common(flags, filename)
+}
+
+fn try_openat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_openat2: dfd @16, filename @24, open_how* @32, usize @40.
+    // open_how.flags is the first u64. Reading only that fixed field keeps policy selection ahead
+    // of path copy and Ring reservation just like openat.
+    let filename: *const u8 = unsafe { ctx.read_at(24)? };
+    let how: *const u8 = unsafe { ctx.read_at(32)? };
+    if how.is_null() {
+        return Ok(0);
+    }
+    let Some(flags) = read_user_u64(how) else {
+        capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+        return Ok(0);
+    };
+    try_open_common(flags, filename)
+}
+
+fn try_open_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_open: filename @16, flags @24, mode @32. This tracepoint is absent on some
+    // architectures and is therefore attached as a non-fatal compatibility probe.
+    let filename: *const u8 = unsafe { ctx.read_at(16)? };
+    let flags: u64 = unsafe { ctx.read_at(24)? };
+    try_open_common(flags, filename)
+}
+
+fn try_open_common(flags: u64, filename: *const u8) -> Result<u32, i64> {
+    let access_mode = file_access_mode(flags as u32);
+    if access_mode == FILE_ACCESS_MODE_PATH_ONLY
+        || access_mode == FILE_ACCESS_MODE_SPECIAL
+        || access_mode == FILE_ACCESS_MODE_UNKNOWN
+    {
+        return Ok(0);
+    }
+    let read_only = access_mode == FILE_ACCESS_MODE_READ_ONLY;
+    // Legacy capture intentionally keeps the historical global read-off behavior. Selective reads
+    // require an atomically loaded S5 profile/Root map and never fail open on a map miss.
+    if read_only && !capture_profile_enabled() {
+        return Ok(0);
+    }
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // Decide before reserving ring space or copying the userspace path. This is the load-shedding
+    // boundary: explicit non-Agent traffic and over-budget Unknown traffic never enter the ring.
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(
+            if read_only {
+                CAPTURE_PROBE_FILE_READ
+            } else {
+                CAPTURE_PROBE_FILE_ACCESS
+            },
+            cgroup_id,
+            pid,
+            0,
+            access_mode,
+        )
+    } else {
+        legacy_file_access_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(if read_only {
+            CAPTURE_PROBE_FILE_READ
+        } else {
+            CAPTURE_PROBE_FILE_ACCESS
+        });
+    }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if filename.is_null() {
+        capture_payload_error(if read_only {
+            CAPTURE_PROBE_FILE_READ
+        } else {
+            CAPTURE_PROBE_FILE_ACCESS
+        });
+        return Ok(0);
+    }
+    let Some(mut entry) = (if read_only {
+        reserve_or_drop::<FileEvent>(&FILE_READ_EVENTS, PIPELINE_RING_FILE_READ)
+    } else {
+        reserve_file_or_drop(&FILE_EVENTS, false)
+    }) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).flags = flags as u32;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).path = [0u8; PATH_SNAP_LEN];
-        let _ = bpf_probe_read_user_str_bytes(filename, &mut (*ev).path);
+        if bpf_probe_read_user_str_bytes(filename, &mut (*ev).path).is_err() {
+            capture_payload_error(if read_only {
+                CAPTURE_PROBE_FILE_READ
+            } else {
+                CAPTURE_PROBE_FILE_ACCESS
+            });
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(
+        entry,
+        if read_only {
+            PIPELINE_RING_FILE_READ
+        } else {
+            PIPELINE_RING_FILE_ACCESS
+        },
+    );
     Ok(0)
 }
 
@@ -971,21 +2587,91 @@ pub fn file_unlink(ctx: TracePointContext) -> u32 {
     try_unlink(&ctx).unwrap_or(0)
 }
 
+#[tracepoint]
+pub fn file_unlink_legacy(ctx: TracePointContext) -> u32 {
+    try_unlink_legacy(&ctx).unwrap_or(0)
+}
+
 fn try_unlink(ctx: &TracePointContext) -> Result<u32, i64> {
     // sys_enter_unlinkat: dfd @16, pathname @24, flag @32.
-    let pathname: *const u8 = unsafe { ctx.read_at(24)? };
-    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(CAPTURE_PROBE_FILE_DELETE, cgroup_id, pid, 0, 0)
+    } else {
+        legacy_file_delete_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_DELETE);
+    }
+    let pathname: *const u8 = match unsafe { ctx.read_at(24) } {
+        Ok(pathname) => pathname,
+        Err(error) => {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            return Err(error);
+        }
+    };
+    submit_file_delete(cgroup_id, pid, pathname, capture_decision)
+}
+
+fn try_unlink_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_unlink: pathname @16. glibc and language runtimes may use either unlink or
+    // unlinkat, so both tracepoints must feed the same independently sized delete ring.
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(CAPTURE_PROBE_FILE_DELETE, cgroup_id, pid, 0, 0)
+    } else {
+        legacy_file_delete_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_DELETE);
+    }
+    let pathname: *const u8 = match unsafe { ctx.read_at(16) } {
+        Ok(pathname) => pathname,
+        Err(error) => {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            return Err(error);
+        }
+    };
+    submit_file_delete(cgroup_id, pid, pathname, capture_decision)
+}
+
+#[inline(always)]
+fn submit_file_delete(
+    cgroup_id: u64,
+    pid: u32,
+    pathname: *const u8,
+    capture_decision: CaptureDecisionContext,
+) -> Result<u32, i64> {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let Some(mut entry) = reserve_file_or_drop(&FILE_DELETE_EVENTS, true) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*ev).flags = FILE_DELETE_FLAG; // distinguish from an openat on the shared FILE_EVENTS ring
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
+        (*ev).flags = FILE_DELETE_FLAG;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).path = [0u8; PATH_SNAP_LEN];
-        let _ = bpf_probe_read_user_str_bytes(pathname, &mut (*ev).path);
+        if bpf_probe_read_user_str_bytes(pathname, &mut (*ev).path).is_err() {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_FILE_DELETE);
     Ok(0)
 }
 
@@ -1064,11 +2750,18 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         return 0; // not an LLM socket
     };
     let _ = LLM_SOCKS.remove(&key);
-    if let Some(mut entry) = reserve_or_drop::<LlmEvent>(&LLM_EVENTS) {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let bytes = stat.req_bytes.saturating_add(stat.resp_bytes);
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_LLM, cgroup_id, pid, bytes, 0);
+    if !capture_decision.selected() {
+        return 0;
+    }
+    capture_payload_candidate(CAPTURE_PROBE_LLM);
+    if let Some(mut entry) = reserve_or_drop::<LlmEvent>(&LLM_EVENTS, PIPELINE_RING_LLM) {
         let now = unsafe { bpf_ktime_get_ns() };
         let ev = entry.as_mut_ptr();
         unsafe {
-            (*ev).cgroup_id = bpf_get_current_cgroup_id();
+            (*ev).cgroup_id = cgroup_id;
             (*ev).pid = pid;
             (*ev).fd = fd as u32;
             (*ev).req_bytes = stat.req_bytes;
@@ -1080,8 +2773,10 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
                 0
             };
             (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+            (*ev).captured_at_boot_ns = now;
+            (*ev).capture_decision = capture_decision;
         }
-        entry.submit(0);
+        submit_accounted(entry, PIPELINE_RING_LLM);
     }
     0
 }
