@@ -141,6 +141,8 @@ impl IdentityResolver for LegacyResolver {
 fn resolver_workload_identity_and_observation_reach_ndjson() {
     let resolver = WorkloadResolver;
     let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
         identity: resolver.resolve(7, 11, 13),
         workload: resolver.resolve_workload(7, 11, 13),
         observation: Some(ObservationMetadata::fresh(1_720_000_015, 1_720_000_014, None).unwrap()),
@@ -167,6 +169,8 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
 #[test]
 fn process_context_serializes_mount_namespace_with_stable_identity() {
     let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
         identity: Identity::default(),
         workload: None,
         observation: None,
@@ -182,6 +186,7 @@ fn process_context_serializes_mount_namespace_with_stable_identity() {
             cwd: None,
             cgroup: None,
             cgroup_id: 73,
+            ..ProcessContext::default()
         }),
         provider: None,
         event: AgentEvent::ProcessExit {
@@ -205,6 +210,8 @@ fn existing_identity_resolvers_default_to_no_workload_identity() {
     assert_eq!(resolver.resolve_workload(1, 2, 3), None);
 
     let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
         identity: resolver.resolve(1, 2, 3),
         workload: resolver.resolve_workload(1, 2, 3),
         observation: None,
