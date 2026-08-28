@@ -16,6 +16,9 @@ tracing-subscriber = "0.3"
 libc = "0.2"
 serde_json = "1"
 sha2 = "0.10"
+httparse = "1.10"
+flate2 = "1"
+base64 = "0.22"
 
 [build-dependencies]
 aya-build = "0.1"

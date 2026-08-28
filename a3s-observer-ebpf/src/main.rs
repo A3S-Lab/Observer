@@ -8,7 +8,8 @@ use a3s_observer_common::{
     CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
     CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
     FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
-    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, SslEvent, TlsEvent, ARGV_SLOTS,
+    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
+    TlsPlaintextEventLarge, TlsPlaintextEventMedium, TlsPlaintextEventSmall, ARGV_SLOTS,
     CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
     CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
     CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
@@ -29,8 +30,12 @@ use a3s_observer_common::{
     FILE_FILTER_AUTHORITY_AUTHORITATIVE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
-    PIPELINE_RING_SSL, PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, SSL_SNAP_LEN,
-    TLS_SNAP_LEN,
+    PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
+    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
+    TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
+    TLS_PLAINTEXT_FLAG_TOOL_ROUTE, TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE,
+    TLS_PLAINTEXT_TIER_MEDIUM, TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     cty::c_void,
@@ -203,14 +208,90 @@ static LLM_SOCKS: HashMap<u64, LlmStat> = HashMap::with_max_entries(4096, 0);
 #[map]
 static READ_FD: HashMap<u64, u32> = HashMap::with_max_entries(10240, 0);
 
-// Opt-in OpenSSL content (uprobe). Bigger ring — payloads are up to SSL_SNAP_LEN each.
+// Opt-in TLS plaintext (uprobes). Tiered records capture common small calls without padding every
+// reservation to the 512 KiB ceiling while retaining bounded large request/response bodies.
 #[map]
-static SSL_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+static SSL_EVENTS: RingBuf = RingBuf::with_byte_size(32 * 1024 * 1024, 0);
 
-// SSL_read entry saves the caller's buffer ptr by tid so the uretprobe (which knows how many
-// bytes were decrypted into it) can snapshot the plaintext.
 #[map]
-static SSL_READ_BUF: HashMap<u64, u64> = HashMap::with_max_entries(10240, 0);
+static SSL_CALL_ARGS: HashMap<u64, SslCallArgs> = HashMap::with_max_entries(10240, 0);
+
+#[map]
+static SSL_CALL_SEQUENCES: LruHashMap<u64, u64> = LruHashMap::with_max_entries(16_384, 0);
+
+// Userspace inserts only verified Agent PIDs after a PID-scoped TLS attach succeeds. Both the
+// global plaintext-HTTP tracepoints and TLS return probes consult this map before reading content,
+// so legacy capture-profile mode cannot accidentally become node-wide plaintext capture.
+#[map]
+static PLAINTEXT_AGENT_PROCESSES: LruHashMap<PlaintextProcessKey, u8> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+// A TLS uprobe is attached only to a selected Agent PID, but one Agent can still call unrelated
+// HTTPS services (RAG stores, source control, telemetry). Keep plaintext disabled until the first
+// application write is recognizably an LLM HTTP request, then admit reads/writes for that TLS
+// session. LRU bounds stale SSL pointers; a later non-LLM HTTP request revokes a reused pointer.
+#[map]
+static PLAINTEXT_SSL_SESSIONS: LruHashMap<SslSessionKey, u64> =
+    LruHashMap::with_max_entries(8_192, 0);
+
+// Plain HTTP connections are admitted only after a selected process writes an HTTP request line.
+// The key is `(pid,fd)` and survives keep-alive requests until close or LRU eviction.
+#[map]
+static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
+
+// FNV-1a hash of an exact HTTP path (without query) -> LLM/tool route class. Userspace installs
+// the closed defaults and explicitly configured custom routes before plaintext capture starts.
+#[map]
+static PLAINTEXT_HTTP_ROUTES: HashMap<u64, u8> = HashMap::with_max_entries(512, 0);
+
+#[map]
+static HTTP_READ_ARGS: HashMap<u64, HttpReadArgs> = HashMap::with_max_entries(10_240, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SslCallArgs {
+    ssl_ptr: u64,
+    buf: u64,
+    requested_len: u64,
+    result_len_ptr: u64,
+    started_at_boot_ns: u64,
+    direction: u8,
+    api_kind: u8,
+    route_kind: u8,
+    _pad: [u8; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SslSessionKey {
+    pid: u32,
+    _pad: u32,
+    ssl_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextProcessKey {
+    cgroup_id: u64,
+    pid: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HttpReadArgs {
+    fd: u32,
+    _pad: u32,
+    buf: u64,
+    started_at_boot_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserIovec {
+    base: u64,
+    len: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1902,6 +1983,7 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let fd: u64 = unsafe { ctx.read_at(16)? };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let key = sock_key(pid, fd);
+    try_plain_http_write(pid, fd, buf, count);
     // Already tracking this LLM socket → this write is request payload; accumulate + done.
     if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
         unsafe {
@@ -1974,91 +2056,515 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-// ---- OPT-IN OpenSSL content (uprobes on SSL_write / SSL_read) ----
+// ---- OPT-IN TLS plaintext (OpenSSL/BoringSSL-compatible uprobes) ----
 //
-// NOT language-agnostic (a uprobe binds to OpenSSL symbols) and captures real plaintext, so the
-// collector only attaches these when A3S_OBSERVER_SSL=1. SSL_write(ssl, buf, num): the request
-// plaintext is in `buf` at entry. SSL_read(ssl, buf, num): `buf` is filled during the call, so
-// snapshot it at return, with the byte count from the return value.
+// Entry probes remember pointers only. Return probes use the API's actual successful byte count,
+// then copy into the smallest fixed ring-record tier. This handles partial writes and the OpenSSL
+// 3 `_ex` ABI without blocking the Agent on userspace parsing or storage.
+
+fn remember_ssl_call(ctx: &ProbeContext, direction: u8, api_kind: u8, result_len_ptr: u64) -> u32 {
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    let buf = ctx.arg::<u64>(1).unwrap_or(0);
+    let requested_len = ctx.arg::<u64>(2).unwrap_or(0);
+    if buf == 0 || requested_len == 0 {
+        return 0;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = SslCallArgs {
+        ssl_ptr,
+        buf,
+        requested_len,
+        result_len_ptr,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction,
+        api_kind,
+        route_kind: 0,
+        _pad: [0; 5],
+    };
+    let _ = SSL_CALL_ARGS.insert(&pid_tgid, &args, 0);
+    0
+}
 
 #[uprobe]
-pub fn ssl_write(ctx: ProbeContext) -> u32 {
-    // SSL_write(ssl, buf, num): read args as raw register values (pointers carried as u64).
-    let buf = ctx.arg::<u64>(1).unwrap_or(0);
-    let num = ctx.arg::<u64>(2).unwrap_or(0);
-    emit_ssl(buf as *const u8, num, 0)
+pub fn ssl_write_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_WRITE,
+        TLS_PLAINTEXT_API_SSL_CLASSIC,
+        0,
+    )
+}
+
+#[uretprobe]
+pub fn ssl_write_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_classic(&ctx, TLS_PLAINTEXT_DIRECTION_WRITE)
 }
 
 #[uprobe]
 pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
-    let buf = ctx.arg::<u64>(1).unwrap_or(0);
-    if buf != 0 {
-        let tid = bpf_get_current_pid_tgid();
-        let _ = SSL_READ_BUF.insert(&tid, &buf, 0);
-    }
-    0
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_READ,
+        TLS_PLAINTEXT_API_SSL_CLASSIC,
+        0,
+    )
 }
 
 #[uretprobe]
 pub fn ssl_read_exit(ctx: RetProbeContext) -> u32 {
-    let tid = bpf_get_current_pid_tgid();
-    let ret = ctx.ret::<i32>().unwrap_or(0) as i64; // SSL_read return value = bytes decrypted
-    let buf = unsafe { SSL_READ_BUF.get(&tid) }.copied();
-    let _ = SSL_READ_BUF.remove(&tid);
-    if ret <= 0 {
+    finish_ssl_classic(&ctx, TLS_PLAINTEXT_DIRECTION_READ)
+}
+
+#[uprobe]
+pub fn ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_WRITE,
+        TLS_PLAINTEXT_API_SSL_EX,
+        ctx.arg::<u64>(3).unwrap_or(0),
+    )
+}
+
+#[uretprobe]
+pub fn ssl_write_ex_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_ex(&ctx, TLS_PLAINTEXT_DIRECTION_WRITE)
+}
+
+#[uprobe]
+pub fn ssl_read_ex_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_READ,
+        TLS_PLAINTEXT_API_SSL_EX,
+        ctx.arg::<u64>(3).unwrap_or(0),
+    )
+}
+
+#[uretprobe]
+pub fn ssl_read_ex_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_ex(&ctx, TLS_PLAINTEXT_DIRECTION_READ)
+}
+
+fn take_ssl_call(expected_direction: u8) -> Option<SslCallArgs> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = unsafe { SSL_CALL_ARGS.get(&pid_tgid) }.copied();
+    let _ = SSL_CALL_ARGS.remove(&pid_tgid);
+    args.filter(|value| value.direction == expected_direction)
+}
+
+fn finish_ssl_classic(ctx: &RetProbeContext, direction: u8) -> u32 {
+    let Some(args) = take_ssl_call(direction) else {
+        return 0;
+    };
+    if args.api_kind != TLS_PLAINTEXT_API_SSL_CLASSIC {
         return 0;
     }
-    match buf {
-        Some(addr) => emit_ssl(addr as *const u8, ret as u64, 1),
-        None => 0,
+    // OpenSSL/BoringSSL classic SSL_read/SSL_write return C `int`. Reading the full 64-bit rax
+    // leaks undefined high bits on x86_64 and can turn a small successful read into the requested
+    // buffer size after clamping, duplicating uninitialized bytes into the HTTP stream.
+    let result = ctx.ret::<i32>().unwrap_or(0) as i64;
+    if result <= 0 {
+        return 0;
+    }
+    let actual = (result as u64).min(args.requested_len);
+    emit_tls_plaintext(args, actual)
+}
+
+fn finish_ssl_ex(ctx: &RetProbeContext, direction: u8) -> u32 {
+    let Some(args) = take_ssl_call(direction) else {
+        return 0;
+    };
+    if args.api_kind != TLS_PLAINTEXT_API_SSL_EX || ctx.ret::<i32>().unwrap_or(0) != 1 {
+        return 0;
+    }
+    if args.result_len_ptr == 0 {
+        return 0;
+    }
+    let mut actual = 0u64;
+    let result = unsafe {
+        bpf_probe_read_user(
+            &mut actual as *mut u64 as *mut c_void,
+            core::mem::size_of::<u64>() as u32,
+            args.result_len_ptr as *const c_void,
+        )
+    };
+    if result < 0 || actual == 0 {
+        return 0;
+    }
+    emit_tls_plaintext(args, actual.min(args.requested_len))
+}
+
+fn next_ssl_call_sequence(pid: u32, connection_id: u64, direction: u8) -> u64 {
+    // Do not XOR the raw `(pid<<32)|fd` TCP connection id with `pid<<32`: that cancels the PID
+    // bits and makes unrelated processes sharing the same fd corrupt each other's sequence.
+    let key = connection_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (pid as u64).rotate_left(23)
+        ^ ((direction as u64) << 63);
+    if let Some(value) = SSL_CALL_SEQUENCES.get_ptr_mut(&key) {
+        unsafe {
+            *value = (*value).wrapping_add(1);
+            *value
+        }
+    } else {
+        let value = 1u64;
+        let _ = SSL_CALL_SEQUENCES.insert(&key, &value, 0);
+        value
     }
 }
 
-fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
-    if buf.is_null() || len == 0 {
+const HTTP_PREFIX_UNKNOWN: u8 = 0;
+const HTTP_PREFIX_LLM: u8 = PLAINTEXT_HTTP_ROUTE_LLM;
+const HTTP_PREFIX_TOOL: u8 = PLAINTEXT_HTTP_ROUTE_TOOL;
+const HTTP_PREFIX_OTHER: u8 = u8::MAX;
+const HTTP_REQUEST_LINE_SNAPSHOT: usize = 64;
+
+#[repr(C)]
+struct HttpRouteHashContext {
+    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    hash: u64,
+    captured: u32,
+    index: u32,
+    complete: u8,
+    _pad: [u8; 7],
+}
+
+unsafe extern "C" fn hash_http_route_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut HttpRouteHashContext);
+    let index = state.index as usize;
+    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
+        return 1;
+    }
+    let byte = state.data[index];
+    if byte == b' ' || byte == b'?' || byte == b'\r' {
+        state.complete = (index > 5) as u8;
+        return 1;
+    }
+    state.hash ^= byte as u64;
+    state.hash = state.hash.wrapping_mul(0x0000_0100_0000_01b3);
+    state.index = state.index.saturating_add(1);
+    0
+}
+
+#[inline(always)]
+fn bytes_at<const N: usize>(
+    data: &[u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    captured: usize,
+    offset: usize,
+    expected: &[u8; N],
+) -> bool {
+    if offset.saturating_add(N) > captured {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < N {
+        if data[offset + index] != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Read only the bounded HTTP request line needed for kernel-side semantic admission. This is not
+/// an HTTP parser: userspace remains authoritative for framing and JSON. It merely prevents an
+/// Agent's unrelated HTTPS calls from entering the plaintext ring.
+#[inline(always)]
+fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
+    if buf == 0 || len < 4 {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+
+    let is_post = bytes_at(&data, captured, 0, b"POST ");
+    let is_http = is_post
+        || bytes_at(&data, captured, 0, b"GET ")
+        || bytes_at(&data, captured, 0, b"PUT ")
+        || bytes_at(&data, captured, 0, b"PATCH ")
+        || bytes_at(&data, captured, 0, b"DELETE ")
+        || bytes_at(&data, captured, 0, b"HEAD ")
+        || bytes_at(&data, captured, 0, b"OPTIONS ");
+    if !is_http {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    if !is_post {
+        return HTTP_PREFIX_OTHER;
+    }
+
+    let mut route = HttpRouteHashContext {
+        data,
+        hash: 0xcbf2_9ce4_8422_2325u64,
+        captured: captured as u32,
+        index: 5,
+        complete: 0,
+        _pad: [0; 7],
+    };
+    let iterations = unsafe {
+        bpf_loop(
+            (HTTP_REQUEST_LINE_SNAPSHOT - 5) as u32,
+            hash_http_route_byte as *mut c_void,
+            &mut route as *mut HttpRouteHashContext as *mut c_void,
+            0,
+        )
+    };
+    if iterations >= 0 && route.complete != 0 {
+        if let Some(route_kind) = unsafe { PLAINTEXT_HTTP_ROUTES.get(&route.hash) } {
+            if *route_kind == HTTP_PREFIX_LLM || *route_kind == HTTP_PREFIX_TOOL {
+                return *route_kind;
+            }
+        }
+    }
+
+    HTTP_PREFIX_OTHER
+}
+
+#[inline(always)]
+fn ssl_plaintext_route(args: &SslCallArgs, pid: u32) -> u8 {
+    if args.api_kind == TLS_PLAINTEXT_API_TCP {
+        return args.route_kind;
+    }
+    if args.ssl_ptr == 0 {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let key = SslSessionKey {
+        pid,
+        _pad: 0,
+        ssl_ptr: args.ssl_ptr,
+    };
+    if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
+        match http_request_prefix_kind(args.buf, args.requested_len) {
+            route_kind @ (HTTP_PREFIX_LLM | HTTP_PREFIX_TOOL) => {
+                let route_kind_value = route_kind as u64;
+                let _ = PLAINTEXT_SSL_SESSIONS.insert(&key, &route_kind_value, 0);
+                route_kind
+            }
+            HTTP_PREFIX_OTHER => {
+                let _ = PLAINTEXT_SSL_SESSIONS.remove(&key);
+                HTTP_PREFIX_UNKNOWN
+            }
+            _ => unsafe { PLAINTEXT_SSL_SESSIONS.get(&key) }
+                .map(|value| *value as u8)
+                .unwrap_or(HTTP_PREFIX_UNKNOWN),
+        }
+    } else {
+        unsafe { PLAINTEXT_SSL_SESSIONS.get(&key) }
+            .map(|value| *value as u8)
+            .unwrap_or(HTTP_PREFIX_UNKNOWN)
+    }
+}
+
+#[inline(always)]
+fn plaintext_process_selected(pid: u32, cgroup_id: u64) -> bool {
+    let key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    unsafe { PLAINTEXT_AGENT_PROCESSES.get(&key) }.is_some()
+}
+
+fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
+    if args.buf == 0 || actual_len == 0 {
         return 0;
     }
     let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let capture_decision =
-        capture_raw_decision(CAPTURE_PROBE_SSL, cgroup_id, pid, len, (is_read != 0) as u8);
+    if !plaintext_process_selected(pid, cgroup_id) {
+        return 0;
+    }
+    let route_kind = ssl_plaintext_route(&args, pid);
+    if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+        return 0;
+    }
+    let capture_decision = capture_raw_decision(
+        CAPTURE_PROBE_SSL,
+        cgroup_id,
+        pid,
+        actual_len,
+        (args.direction == TLS_PLAINTEXT_DIRECTION_READ) as u8,
+    );
     if !capture_decision.selected() {
         return 0;
     }
     capture_payload_candidate(CAPTURE_PROBE_SSL);
-    let Some(mut entry) = reserve_or_drop::<SslEvent>(&SSL_EVENTS, PIPELINE_RING_SSL) else {
+    let connection_id = if args.ssl_ptr != 0 {
+        args.ssl_ptr
+    } else {
+        pid_tgid
+    };
+    let call_seq = next_ssl_call_sequence(pid, connection_id, args.direction);
+    let original_len = if actual_len > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        actual_len as u32
+    };
+
+    macro_rules! emit_tier {
+        ($event_type:ty, $capacity:expr) => {{
+            let Some(mut entry) = reserve_or_drop::<$event_type>(&SSL_EVENTS, PIPELINE_RING_SSL)
+            else {
+                return 0;
+            };
+            let captured_len = if actual_len > $capacity as u64 {
+                $capacity as u32
+            } else {
+                actual_len as u32
+            };
+            let mut flags = 0u16;
+            if actual_len > $capacity as u64 {
+                flags |= TLS_PLAINTEXT_FLAG_TRUNCATED;
+            }
+            if args.ssl_ptr == 0 {
+                flags |= TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND;
+            }
+            if route_kind == HTTP_PREFIX_TOOL {
+                flags |= TLS_PLAINTEXT_FLAG_TOOL_ROUTE;
+            }
+            let ev = entry.as_mut_ptr();
+            unsafe {
+                (*ev).header = TlsPlaintextEventHeader {
+                    abi_version: TLS_PLAINTEXT_ABI_V1,
+                    header_len: core::mem::size_of::<TlsPlaintextEventHeader>() as u16,
+                    flags,
+                    _pad0: 0,
+                    cgroup_id,
+                    pid,
+                    tid,
+                    connection_id,
+                    call_seq,
+                    original_len,
+                    captured_len,
+                    direction: args.direction,
+                    api_kind: args.api_kind,
+                    _pad1: [0; 6],
+                    call_started_at_boot_ns: args.started_at_boot_ns,
+                    captured_at_boot_ns,
+                    comm: bpf_get_current_comm().unwrap_or_default(),
+                    capture_decision,
+                };
+                if bpf_probe_read_user(
+                    (*ev).data.as_mut_ptr() as *mut c_void,
+                    captured_len,
+                    args.buf as *const c_void,
+                ) < 0
+                {
+                    capture_payload_error(CAPTURE_PROBE_SSL);
+                    entry.discard(0);
+                    return 0;
+                }
+            }
+            submit_accounted(entry, PIPELINE_RING_SSL);
+            return 0;
+        }};
+    }
+
+    if actual_len <= TLS_PLAINTEXT_TIER_SMALL as u64 {
+        emit_tier!(TlsPlaintextEventSmall, TLS_PLAINTEXT_TIER_SMALL);
+    }
+    if actual_len <= TLS_PLAINTEXT_TIER_MEDIUM as u64 {
+        emit_tier!(TlsPlaintextEventMedium, TLS_PLAINTEXT_TIER_MEDIUM);
+    }
+    emit_tier!(TlsPlaintextEventLarge, TLS_PLAINTEXT_TIER_LARGE);
+}
+
+fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
+    if buf.is_null() || len == 0 {
+        return;
+    }
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !plaintext_process_selected(pid, cgroup_id) {
+        return;
+    }
+    let key = sock_key(pid, fd);
+    let mut route_kind = unsafe { HTTP_SOCKS.get(&key) }
+        .copied()
+        .unwrap_or(HTTP_PREFIX_UNKNOWN);
+    match http_request_prefix_kind(buf as u64, len) {
+        next @ (HTTP_PREFIX_LLM | HTTP_PREFIX_TOOL) => {
+            route_kind = next;
+            let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
+        }
+        HTTP_PREFIX_OTHER => {
+            let _ = HTTP_SOCKS.remove(&key);
+            return;
+        }
+        _ => {
+            if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+                return;
+            }
+        }
+    }
+    if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+        return;
+    }
+
+    let args = SslCallArgs {
+        ssl_ptr: key,
+        buf: buf as u64,
+        requested_len: len,
+        result_len_ptr: 0,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction: TLS_PLAINTEXT_DIRECTION_WRITE,
+        api_kind: TLS_PLAINTEXT_API_TCP,
+        route_kind,
+        _pad: [0; 5],
+    };
+    let _ = emit_tls_plaintext(args, len);
+}
+
+#[tracepoint]
+pub fn http_writev(ctx: TracePointContext) -> u32 {
+    // sys_enter_writev: fd @16, iovec* @24, iovcnt @32. The first entries normally hold the HTTP
+    // header and JSON body separately (notably Node/libuv). Four fixed iterations keep verifier
+    // and copy cost bounded; the HTTP reassembler exposes missing bytes as partial/timeout.
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
         return 0;
     };
-    let ev = entry.as_mut_ptr();
-    unsafe {
-        (*ev).cgroup_id = cgroup_id;
-        (*ev).pid = pid;
-        (*ev).is_read = is_read;
-        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        // n <= SSL_SNAP_LEN (data capacity) and n <= len (bytes actually written/read).
-        let n: u32 = if len > SSL_SNAP_LEN as u64 {
-            SSL_SNAP_LEN as u32
-        } else {
-            len as u32
-        };
-        (*ev).len = n;
-        (*ev).data = [0u8; SSL_SNAP_LEN];
-        if bpf_probe_read_user(
-            (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
-            n,
-            buf as *const core::ffi::c_void,
-        ) < 0
-        {
-            capture_payload_error(CAPTURE_PROBE_SSL);
-            entry.discard(0);
-            return 0;
-        }
-        (*ev)._event_time_pad = [0; 4];
-        (*ev).captured_at_boot_ns = captured_at_boot_ns;
-        (*ev).capture_decision = capture_decision;
+    let Ok(iov_ptr) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(iov_count) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    if iov_ptr == 0 || iov_count == 0 {
+        return 0;
     }
-    submit_accounted(entry, PIPELINE_RING_SSL);
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    for index in 0..4u64 {
+        if index >= iov_count {
+            break;
+        }
+        let mut iov = UserIovec { base: 0, len: 0 };
+        let address = iov_ptr.saturating_add(index * core::mem::size_of::<UserIovec>() as u64);
+        if unsafe {
+            bpf_probe_read_user(
+                &mut iov as *mut UserIovec as *mut c_void,
+                core::mem::size_of::<UserIovec>() as u32,
+                address as *const c_void,
+            )
+        } < 0
+        {
+            break;
+        }
+        try_plain_http_write(pid, fd, iov.base as *const u8, iov.len);
+    }
     0
 }
 
@@ -2700,7 +3206,7 @@ pub fn recv_exit(ctx: TracePointContext) -> u32 {
 }
 
 fn on_read_enter(ctx: &TracePointContext) -> u32 {
-    // sys_enter_read / sys_enter_recvfrom: fd @16.
+    // sys_enter_read / sys_enter_recvfrom: fd @16, destination buffer @24.
     let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
         return 0;
     };
@@ -2710,31 +3216,71 @@ fn on_read_enter(ctx: &TracePointContext) -> u32 {
     if unsafe { LLM_SOCKS.get(&key) }.is_some() {
         let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
     }
+    if unsafe { HTTP_SOCKS.get(&key) }.is_some() {
+        if let Ok(buf) = unsafe { ctx.read_at::<u64>(24) } {
+            if buf != 0 {
+                let args = HttpReadArgs {
+                    fd: fd as u32,
+                    _pad: 0,
+                    buf,
+                    started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+                };
+                let _ = HTTP_READ_ARGS.insert(&tgid, &args, 0);
+            }
+        }
+    }
     0
 }
 
 fn on_read_exit(ctx: &TracePointContext) -> u32 {
     let tgid = bpf_get_current_pid_tgid();
-    let Some(&fd) = (unsafe { READ_FD.get(&tgid) }) else {
-        return 0;
-    };
-    let _ = READ_FD.remove(&tgid);
     // sys_exit_*: long ret @16 (bytes read; <=0 means error/EOF).
     let Ok(ret) = (unsafe { ctx.read_at::<i64>(16) }) else {
         return 0;
     };
     if ret <= 0 {
+        let _ = READ_FD.remove(&tgid);
+        let _ = HTTP_READ_ARGS.remove(&tgid);
         return 0;
     }
-    let key = sock_key((tgid >> 32) as u32, fd as u64);
-    if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
-        unsafe {
-            (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
-            if (*stat).first_resp_ns == 0 {
-                (*stat).first_resp_ns = bpf_ktime_get_ns();
+    let pid = (tgid >> 32) as u32;
+    if let Some(value) = unsafe { READ_FD.get(&tgid) } {
+        let fd = *value;
+        let key = sock_key(pid, fd as u64);
+        if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
+            unsafe {
+                (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
+                if (*stat).first_resp_ns == 0 {
+                    (*stat).first_resp_ns = bpf_ktime_get_ns();
+                }
             }
         }
     }
+    let _ = READ_FD.remove(&tgid);
+    if let Some(value) = unsafe { HTTP_READ_ARGS.get(&tgid) } {
+        let http_args = *value;
+        let key = sock_key(pid, http_args.fd as u64);
+        let route_kind = unsafe { HTTP_SOCKS.get(&key) }
+            .copied()
+            .unwrap_or(HTTP_PREFIX_UNKNOWN);
+        if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+            let _ = HTTP_READ_ARGS.remove(&tgid);
+            return 0;
+        }
+        let args = SslCallArgs {
+            ssl_ptr: key,
+            buf: http_args.buf,
+            requested_len: ret as u64,
+            result_len_ptr: 0,
+            started_at_boot_ns: http_args.started_at_boot_ns,
+            direction: TLS_PLAINTEXT_DIRECTION_READ,
+            api_kind: TLS_PLAINTEXT_API_TCP,
+            route_kind,
+            _pad: [0; 5],
+        };
+        let _ = emit_tls_plaintext(args, ret as u64);
+    }
+    let _ = HTTP_READ_ARGS.remove(&tgid);
     0
 }
 
@@ -2746,6 +3292,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let key = sock_key(pid, fd);
+    let _ = HTTP_SOCKS.remove(&key);
     let Some(&stat) = (unsafe { LLM_SOCKS.get(&key) }) else {
         return 0; // not an LLM socket
     };

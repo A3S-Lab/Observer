@@ -22,7 +22,8 @@ pub use model::{
     AgentEvent, CollectorCaptureProbeStats, CollectorCaptureProfileStats, CollectorFileFilterStats,
     CollectorIngressAccounting, CollectorPipelineAccounting, CollectorPipelineUnit,
     CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent, EventCaptureDecision,
-    EventTiming, ProcessContext,
+    EventTiming, LlmInteractionContent, LlmInteractionMessage, LlmInteractionToolCall,
+    LlmInteractionToolResult, ProcessContext,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{

@@ -8,8 +8,9 @@ use crate::event_time::EventClock;
 use crate::pipeline::{OwnedPayload, PipelineOrigin, PipelineSender, RawEnvelope, RingOrigin};
 use a3s_observer_common::{
     CaptureDecisionContext, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent,
-    SecEvent, SslEvent, TlsEvent, CAPTURE_ACTION_FULL, CAPTURE_DECISION_FLAG_LEGACY,
+    SecEvent, TlsEvent, TlsPlaintextEventHeader, CAPTURE_ACTION_FULL, CAPTURE_DECISION_FLAG_LEGACY,
     CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DISPOSITION_MISS, CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+    TLS_PLAINTEXT_ABI_V1,
 };
 use aya::maps::{MapData, RingBuf};
 use std::io;
@@ -107,7 +108,7 @@ fn pod_layout(origin: RingOrigin) -> PodLayout {
             layout!(FileEvent)
         }
         RingOrigin::Llm => layout!(LlmEvent),
-        RingOrigin::Ssl => layout!(SslEvent),
+        RingOrigin::Ssl => layout!(TlsPlaintextEventHeader),
         RingOrigin::Security => layout!(SecEvent),
     }
 }
@@ -116,6 +117,15 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(
         bytes
             .get(offset..offset.checked_add(size_of::<u32>())?)?
+            .try_into()
+            .ok()?,
+    ))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_ne_bytes(
+        bytes
+            .get(offset..offset.checked_add(size_of::<u16>())?)?
             .try_into()
             .ok()?,
     ))
@@ -160,6 +170,9 @@ fn envelope_from_pod(
     local_sequence: u64,
     clock: &EventClock,
 ) -> Option<RawEnvelope> {
+    if origin == RingOrigin::Ssl {
+        return envelope_from_tls_plaintext(item, local_sequence, clock);
+    }
     let layout = pod_layout(origin);
     // D1 is an additive tail. A new Collector can still consume the immediately preceding S4
     // record size and marks it as a selected legacy FULL decision; an old Collector naturally
@@ -189,6 +202,48 @@ fn envelope_from_pod(
         pid,
         local_sequence,
         OwnedPayload::from(pod),
+    ))
+}
+
+fn envelope_from_tls_plaintext(
+    item: &[u8],
+    local_sequence: u64,
+    clock: &EventClock,
+) -> Option<RawEnvelope> {
+    let minimum_header = size_of::<TlsPlaintextEventHeader>();
+    if item.len() < minimum_header
+        || read_u16(item, offset_of!(TlsPlaintextEventHeader, abi_version))? != TLS_PLAINTEXT_ABI_V1
+    {
+        return None;
+    }
+    let header_len = read_u16(item, offset_of!(TlsPlaintextEventHeader, header_len))? as usize;
+    if header_len < minimum_header || header_len > item.len() {
+        return None;
+    }
+    let captured_len = read_u32(item, offset_of!(TlsPlaintextEventHeader, captured_len))? as usize;
+    let record_len = header_len.checked_add(captured_len)?;
+    if record_len > item.len() {
+        return None;
+    }
+    let captured_at_boot_ns = read_u64(
+        item,
+        offset_of!(TlsPlaintextEventHeader, captured_at_boot_ns),
+    )?;
+    let cgroup_id = read_u64(item, offset_of!(TlsPlaintextEventHeader, cgroup_id))?;
+    let pid = read_u32(item, offset_of!(TlsPlaintextEventHeader, pid))?;
+    let capture_decision =
+        read_capture_decision(item, offset_of!(TlsPlaintextEventHeader, capture_decision))?;
+    let times = clock.event_times(captured_at_boot_ns).ok()?;
+    Some(RawEnvelope::new(
+        PipelineOrigin::Ring(RingOrigin::Ssl),
+        captured_at_boot_ns,
+        times.event_at_unix_ns,
+        times.received_at_unix_ns,
+        capture_decision,
+        cgroup_id,
+        pid,
+        local_sequence,
+        OwnedPayload::from(&item[..record_len]),
     ))
 }
 
@@ -351,6 +406,14 @@ mod tests {
     fn pod(origin: RingOrigin, captured_at: u64, cgroup_id: u64, pid: u32) -> Vec<u8> {
         let layout = pod_layout(origin);
         let mut bytes = vec![0_u8; layout.len];
+        if origin == RingOrigin::Ssl {
+            bytes[offset_of!(TlsPlaintextEventHeader, abi_version)
+                ..offset_of!(TlsPlaintextEventHeader, abi_version) + 2]
+                .copy_from_slice(&TLS_PLAINTEXT_ABI_V1.to_ne_bytes());
+            bytes[offset_of!(TlsPlaintextEventHeader, header_len)
+                ..offset_of!(TlsPlaintextEventHeader, header_len) + 2]
+                .copy_from_slice(&(layout.len as u16).to_ne_bytes());
+        }
         bytes[layout.captured_at_boot_ns..layout.captured_at_boot_ns + 8]
             .copy_from_slice(&captured_at.to_ne_bytes());
         bytes[layout.cgroup_id..layout.cgroup_id + 8].copy_from_slice(&cgroup_id.to_ne_bytes());

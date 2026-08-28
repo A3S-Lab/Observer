@@ -8,10 +8,12 @@
 
 mod capture_profile;
 mod event_time;
+mod interaction;
 mod pipeline;
 mod process_lifecycle;
 mod process_namespace;
 mod ring_reader;
+mod tls_attach;
 
 use a3s_observer::{
     AgentEvent, CollectorCaptureProbeStats, CollectorCaptureProfileStats, CollectorFileFilterStats,
@@ -23,8 +25,8 @@ use a3s_observer::{
 use a3s_observer_common::{
     file_access_mode, CaptureDecisionContext, CaptureProbeStats, ConnectEvent, DnsEvent,
     ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey, FileFilterStats,
-    FileFilterValue, LlmEvent, RingPipelineStats, SecEvent, SslEvent, TlsEvent, ARGV_SLOTS,
-    CAPTURE_DECISION_FLAG_SELECTED, EXEC_ARG_CHUNK_LEN, EXEC_ARG_CHUNK_PAYLOAD,
+    FileFilterValue, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
+    ARGV_SLOTS, CAPTURE_DECISION_FLAG_SELECTED, EXEC_ARG_CHUNK_LEN, EXEC_ARG_CHUNK_PAYLOAD,
     EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK,
     EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_ACCESS_MODE_PATH_ONLY,
     FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL,
@@ -34,7 +36,9 @@ use a3s_observer_common::{
     PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
     PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
     PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-    PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
+    SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
+    TLS_PLAINTEXT_FLAG_TOOL_ROUTE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -46,6 +50,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -67,6 +72,8 @@ use capture_profile::{
     CollectorGeneration, PreviewReceipt,
 };
 use event_time::{monotonic_now_ns, system_now_unix_ns};
+use interaction::{ChunkDirection, CompletedInteraction, InteractionReassembler, PlaintextChunk};
+use tls_attach::{SymbolFamily, TlsAbi, TlsAttachKind, TlsAttachManager, TlsAttachPlan};
 
 const EXEC_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
 const EXEC_REASSEMBLY_LIMIT: usize = 4096;
@@ -89,6 +96,7 @@ const DEFAULT_REORDER_CAPACITY: usize = 65_536;
 const DEFAULT_REORDER_WINDOW_NS: u64 = 2_000_000;
 const PROCESSOR_TICK: Duration = Duration::from_millis(2);
 const RING_READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_ROUTE_MAX_BYTES: usize = 58;
 const FILE_ACCESS_TRACEPOINTS: [(&str, &str); 3] = [
     ("file_open", "sys_enter_openat"),
     ("file_openat2", "sys_enter_openat2"),
@@ -101,6 +109,131 @@ type FileFilterConfigBytes = [u8; 32];
 type FileFilterStatsBytes = [u8; 104];
 type RingPipelineStatsBytes = [u8; 16];
 type CaptureProbeStatsBytes = [u8; 184];
+type PlaintextProcessKeyBytes = [u8; 16];
+
+struct PlaintextProcessMap {
+    map: BpfHashMap<MapData, PlaintextProcessKeyBytes, u8>,
+    installed: HashSet<PlaintextProcessKeyBytes>,
+}
+
+impl PlaintextProcessMap {
+    fn new(map: BpfHashMap<MapData, PlaintextProcessKeyBytes, u8>) -> Self {
+        Self {
+            map,
+            installed: HashSet::new(),
+        }
+    }
+
+    fn sync(&mut self, pids: impl IntoIterator<Item = i32>) -> anyhow::Result<usize> {
+        let desired = pids
+            .into_iter()
+            .filter_map(plaintext_process_key)
+            .collect::<HashSet<_>>();
+        for key in self.installed.difference(&desired) {
+            let _ = self.map.remove(key);
+        }
+        for key in &desired {
+            self.map.insert(*key, 1, 0)?;
+        }
+        let newly_installed = desired.difference(&self.installed).count();
+        self.installed = desired;
+        Ok(newly_installed)
+    }
+}
+
+fn plaintext_process_key(pid: i32) -> Option<PlaintextProcessKeyBytes> {
+    let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = cgroups.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    })?;
+    let mut cgroup_path = PathBuf::from("/sys/fs/cgroup");
+    for component in Path::new(relative).components() {
+        if let std::path::Component::Normal(value) = component {
+            cgroup_path.push(value);
+        }
+    }
+    // With `--pid=host` and a private cgroup namespace, `/proc/<container-pid>/cgroup` can be
+    // reported as `../docker-<id>.scope`, while the host mount is actually below `system.slice`.
+    // The target process's own cgroup mount root has the exact kernfs inode returned by
+    // `bpf_get_current_cgroup_id`; use it only when the host-root reconstruction is unavailable.
+    let cgroup_id = std::fs::metadata(&cgroup_path)
+        .map(|metadata| metadata.ino())
+        .ok()
+        .or_else(|| {
+            std::fs::metadata(format!("/proc/{pid}/root/sys/fs/cgroup"))
+                .map(|metadata| metadata.ino())
+                .ok()
+                .filter(|inode| *inode > 1)
+        })?;
+    let pid = u32::try_from(pid).ok()?;
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&cgroup_id.to_ne_bytes());
+    key[8..12].copy_from_slice(&pid.to_ne_bytes());
+    Some(key)
+}
+
+fn plaintext_route_hash(path: &str) -> u64 {
+    path.as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn install_plaintext_http_routes(
+    ebpf: &mut Ebpf,
+) -> anyhow::Result<(BpfHashMap<MapData, u64, u8>, usize)> {
+    let mut routes = BpfHashMap::<_, u64, u8>::try_from(
+        ebpf.take_map("PLAINTEXT_HTTP_ROUTES")
+            .context("`PLAINTEXT_HTTP_ROUTES` missing")?,
+    )?;
+    let defaults = [
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1/responses",
+        "/responses",
+        "/v1/messages",
+        "/messages",
+        "/v1/completions",
+        "/completions",
+        "/api/chat",
+        "/api/generate",
+    ];
+    let mut installed = HashMap::<String, u8>::new();
+    for route in defaults {
+        installed.insert(route.to_string(), PLAINTEXT_HTTP_ROUTE_LLM);
+    }
+    for (variable, kind) in [
+        ("A3S_OBSERVER_LLM_HTTP_ROUTES", PLAINTEXT_HTTP_ROUTE_LLM),
+        ("A3S_OBSERVER_TOOL_HTTP_ROUTES", PLAINTEXT_HTTP_ROUTE_TOOL),
+    ] {
+        if let Ok(value) = std::env::var(variable) {
+            for route in value
+                .split(',')
+                .map(str::trim)
+                .filter(|route| !route.is_empty())
+            {
+                anyhow::ensure!(
+                    route.starts_with('/')
+                        && route.len() <= HTTP_ROUTE_MAX_BYTES
+                        && !route
+                            .chars()
+                            .any(|character| matches!(character, '?' | '#' | '\r' | '\n')),
+                    "{variable} contains an invalid route: {route:?}"
+                );
+                installed.insert(route.to_string(), kind);
+            }
+        }
+    }
+    for (route, kind) in &installed {
+        routes.insert(plaintext_route_hash(route), *kind, 0)?;
+    }
+    Ok((routes, installed.len()))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileFeatureFlags {
@@ -1371,6 +1504,13 @@ async fn main() -> anyhow::Result<()> {
         "/probes"
     )))
     .context("load eBPF object")?;
+    // Retain the map FD for the Collector lifetime: PID-scoped TLS programs are lazily loaded
+    // after discovery and still need this relocation target to be valid.
+    let (_plaintext_http_routes, plaintext_route_count) = install_plaintext_http_routes(&mut ebpf)?;
+    tracing::info!(
+        plaintext_route_count,
+        "installed bounded Agent plaintext HTTP route allowlist"
+    );
 
     // The rule maps are initialized before file probes attach. With no rules file configured the
     // config remains disabled and preserves the historical full-capture behavior. Supplying a path
@@ -1479,6 +1619,7 @@ async fn main() -> anyhow::Result<()> {
         ("exec", "sys_enter_execve"),
         ("tls_write", "sys_enter_write"),
         ("tls_sendto", "sys_enter_sendto"),
+        ("http_writev", "sys_enter_writev"),
         ("connect", "sys_enter_connect"),
         ("dns_query", "sys_enter_sendto"),
         ("dns_sendmsg", "sys_enter_sendmsg"),
@@ -1551,33 +1692,24 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no eBPF probes could be attached");
     }
 
-    // Opt-in OpenSSL content capture (uprobes). Off by default — it captures real plaintext
-    // (prompts/completions) and binds to OpenSSL only. A3S_OBSERVER_SSL=1, or set it to a
-    // libssl path on distros where the default below is wrong.
-    if let Some(val) = std::env::var("A3S_OBSERVER_SSL")
+    // Opt-in TLS plaintext capture. `1`/`auto` scans selected Agent processes and resolves their
+    // mapped libraries or main executable; an absolute path preserves the explicit legacy target.
+    let ssl_setting = std::env::var("A3S_OBSERVER_SSL")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && !env_value_disabled(value))
-    {
-        let lib = if val.contains('/') {
-            val
-        } else {
-            "/usr/lib/x86_64-linux-gnu/libssl.so.3".to_string()
-        };
-        let mut ssl_ok = 0;
-        for (prog, sym) in [
-            ("ssl_write", "SSL_write"),
-            ("ssl_read_enter", "SSL_read"),
-            ("ssl_read_exit", "SSL_read"),
-        ] {
-            match attach_uprobe(&mut ebpf, prog, sym, &lib) {
-                Ok(()) => ssl_ok += 1,
-                Err(e) => {
-                    tracing::warn!(probe = prog, lib = %lib, error = %e, "SSL uprobe failed to attach")
-                }
-            }
-        }
-        tracing::info!(lib = %lib, attached = ssl_ok, "A3S_OBSERVER_SSL: OpenSSL content capture (uprobes)");
+        .filter(|value| !value.is_empty() && !env_value_disabled(value));
+    let plaintext_processes = BpfHashMap::try_from(
+        ebpf.take_map("PLAINTEXT_AGENT_PROCESSES")
+            .context("`PLAINTEXT_AGENT_PROCESSES` missing")?,
+    )?;
+    let mut plaintext_process_map = PlaintextProcessMap::new(plaintext_processes);
+    let mut tls_attach_manager = ssl_setting.as_deref().map(TlsAttachManager::from_env);
+    if let Some(manager) = tls_attach_manager.as_mut() {
+        attached = attached.saturating_add(refresh_tls_attachments(
+            manager,
+            &mut plaintext_process_map,
+            &mut ebpf,
+        ));
     }
 
     // A3S_OBSERVER_JSON=1 → NDJSON (pipe to vector/Loki/jq); otherwise human-readable log.
@@ -1844,6 +1976,9 @@ async fn main() -> anyhow::Result<()> {
     let mut filter_reload = tokio::time::interval(FILTER_RULE_RELOAD_INTERVAL);
     filter_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     filter_reload.tick().await;
+    let mut tls_attach_scan = tokio::time::interval(Duration::from_secs(2));
+    tls_attach_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tls_attach_scan.tick().await;
     let mut processor_tick = tokio::time::interval(PROCESSOR_TICK);
     processor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     processor_tick.tick().await;
@@ -1961,6 +2096,7 @@ async fn main() -> anyhow::Result<()> {
                     file_unknown_policy = file_filter.unknown_policy.name(),
                     llm = processor.stats.llm,
                     ssl = processor.stats.ssl,
+                    interaction_connections = processor.interactions.active_connections(),
                     sec = processor.stats.sec,
                     critical_inbox_depth = critical_inbox.depth,
                     critical_inbox_high_water = critical_inbox.high_water,
@@ -2069,6 +2205,20 @@ async fn main() -> anyhow::Result<()> {
                         system_now_unix_ns().unwrap_or_default(),
                         false,
                     );
+                }
+            }
+            _ = tls_attach_scan.tick(), if tls_attach_manager.is_some() => {
+                if let Some(manager) = tls_attach_manager.as_mut() {
+                    let newly_attached = tokio::task::block_in_place(|| {
+                        refresh_tls_attachments(manager, &mut plaintext_process_map, &mut ebpf)
+                    });
+                    if newly_attached > 0 {
+                        tracing::info!(
+                            newly_attached,
+                            attached_targets = manager.attached_count(),
+                            "refreshed Agent TLS plaintext attachments"
+                        );
+                    }
                 }
             }
             _ = exec_expire.tick() => {
@@ -2293,20 +2443,244 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, sym: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn attach_uprobe(ebpf: &mut Ebpf, prog: &str, sym: &str, target: &str) -> anyhow::Result<()> {
+fn attach_uprobe_at(
+    ebpf: &mut Ebpf,
+    prog: &str,
+    symbol: Option<&str>,
+    offset: u64,
+    target: &Path,
+    pid: Option<i32>,
+) -> anyhow::Result<()> {
     let p: &mut UProbe = ebpf
         .program_mut(prog)
         .with_context(|| format!("`{prog}` program not found"))?
         .try_into()?;
-    p.load()?;
-    p.attach(Some(sym), 0, target, None)
-        .with_context(|| format!("attach uprobe {sym} in {target}"))?;
+    if p.fd().is_err() {
+        p.load()?;
+    }
+    p.attach(symbol, offset, target, pid).with_context(|| {
+        format!(
+            "attach {:?} {}+0x{offset:x} in {} for pid {:?}",
+            p.kind(),
+            symbol.unwrap_or("<file-offset>"),
+            target.display(),
+            pid
+        )
+    })?;
     Ok(())
+}
+
+fn attach_tls_pair(
+    ebpf: &mut Ebpf,
+    enter_program: &str,
+    exit_program: &str,
+    symbol: Option<&str>,
+    offset: u64,
+    target: &Path,
+    pid: Option<i32>,
+) -> anyhow::Result<()> {
+    attach_uprobe_at(ebpf, enter_program, symbol, offset, target, pid)?;
+    attach_uprobe_at(ebpf, exit_program, symbol, offset, target, pid)?;
+    Ok(())
+}
+
+fn attach_tls_plan(ebpf: &mut Ebpf, plan: &TlsAttachPlan) -> anyhow::Result<usize> {
+    let mut attached_pairs = 0usize;
+    match plan.kind {
+        TlsAttachKind::Symbols(SymbolFamily::OpenSsl) => {
+            if attach_tls_pair(
+                ebpf,
+                "ssl_write_enter",
+                "ssl_write_exit",
+                Some("SSL_write"),
+                0,
+                &plan.path,
+                plan.pid,
+            )
+            .is_ok()
+            {
+                attached_pairs += 1;
+            }
+            if attach_tls_pair(
+                ebpf,
+                "ssl_read_enter",
+                "ssl_read_exit",
+                Some("SSL_read"),
+                0,
+                &plan.path,
+                plan.pid,
+            )
+            .is_ok()
+            {
+                attached_pairs += 1;
+            }
+            if attach_tls_pair(
+                ebpf,
+                "ssl_write_ex_enter",
+                "ssl_write_ex_exit",
+                Some("SSL_write_ex"),
+                0,
+                &plan.path,
+                plan.pid,
+            )
+            .is_ok()
+            {
+                attached_pairs += 1;
+            }
+            if attach_tls_pair(
+                ebpf,
+                "ssl_read_ex_enter",
+                "ssl_read_ex_exit",
+                Some("SSL_read_ex"),
+                0,
+                &plan.path,
+                plan.pid,
+            )
+            .is_ok()
+            {
+                attached_pairs += 1;
+            }
+            anyhow::ensure!(
+                attached_pairs >= 2,
+                "no complete OpenSSL read/write pair attached"
+            );
+        }
+        TlsAttachKind::Symbols(SymbolFamily::GnuTls) => {
+            attach_tls_pair(
+                ebpf,
+                "ssl_write_enter",
+                "ssl_write_exit",
+                Some("gnutls_record_send"),
+                0,
+                &plan.path,
+                plan.pid,
+            )?;
+            attach_tls_pair(
+                ebpf,
+                "ssl_read_enter",
+                "ssl_read_exit",
+                Some("gnutls_record_recv"),
+                0,
+                &plan.path,
+                plan.pid,
+            )?;
+            attached_pairs = 2;
+        }
+        TlsAttachKind::Symbols(SymbolFamily::Nss) => {
+            attach_tls_pair(
+                ebpf,
+                "ssl_write_enter",
+                "ssl_write_exit",
+                Some("PR_Write"),
+                0,
+                &plan.path,
+                plan.pid,
+            )?;
+            attach_tls_pair(
+                ebpf,
+                "ssl_read_enter",
+                "ssl_read_exit",
+                Some("PR_Read"),
+                0,
+                &plan.path,
+                plan.pid,
+            )?;
+            attached_pairs = 2;
+        }
+        TlsAttachKind::Offsets {
+            read_offset,
+            write_offset,
+            read_abi,
+            write_abi,
+        } => {
+            let (write_enter, write_exit) = match write_abi {
+                TlsAbi::Classic => ("ssl_write_enter", "ssl_write_exit"),
+                TlsAbi::OpenSslEx => ("ssl_write_ex_enter", "ssl_write_ex_exit"),
+            };
+            let (read_enter, read_exit) = match read_abi {
+                TlsAbi::Classic => ("ssl_read_enter", "ssl_read_exit"),
+                TlsAbi::OpenSslEx => ("ssl_read_ex_enter", "ssl_read_ex_exit"),
+            };
+            attach_tls_pair(
+                ebpf,
+                write_enter,
+                write_exit,
+                None,
+                write_offset,
+                &plan.path,
+                plan.pid,
+            )?;
+            attach_tls_pair(
+                ebpf,
+                read_enter,
+                read_exit,
+                None,
+                read_offset,
+                &plan.path,
+                plan.pid,
+            )?;
+            attached_pairs = 2;
+        }
+    }
+    Ok(attached_pairs * 2)
+}
+
+fn refresh_tls_attachments(
+    manager: &mut TlsAttachManager,
+    plaintext_process_map: &mut PlaintextProcessMap,
+    ebpf: &mut Ebpf,
+) -> usize {
+    let mut attached_programs = 0usize;
+    for plan in manager.discover() {
+        match attach_tls_plan(ebpf, &plan) {
+            Ok(count) => {
+                attached_programs = attached_programs.saturating_add(count);
+                tracing::info!(
+                    product = %plan.product,
+                    transport_scope = %plan.transport_scope,
+                    excluded_transport_scope = ?plan.excluded_transport_scope,
+                    path = %plan.path.display(),
+                    pid = ?plan.pid,
+                    programs = count,
+                    "attached verified Agent TLS plaintext probes"
+                );
+                manager.mark_attached(plan.key, plan.pid);
+            }
+            Err(error) => manager.mark_rejected(plan.key, &error.to_string()),
+        }
+    }
+    match plaintext_process_map.sync(manager.plaintext_pids()) {
+        Ok(newly_installed) if newly_installed > 0 => tracing::info!(
+            newly_installed,
+            installed = plaintext_process_map.installed.len(),
+            "synchronized verified Agent plaintext PID allowlist"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed to synchronize verified Agent plaintext PID allowlist"
+        ),
+    }
+    attached_programs
 }
 
 fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
     (item.len() >= core::mem::size_of::<T>())
         .then(|| unsafe { core::ptr::read_unaligned(item.as_ptr() as *const T) })
+}
+
+fn read_tls_plaintext(item: &[u8]) -> Option<(TlsPlaintextEventHeader, &[u8])> {
+    let header = read_pod::<TlsPlaintextEventHeader>(item)?;
+    if header.abi_version != TLS_PLAINTEXT_ABI_V1 {
+        return None;
+    }
+    let minimum = core::mem::size_of::<TlsPlaintextEventHeader>();
+    let header_len = header.header_len as usize;
+    let captured_len = header.captured_len as usize;
+    if header_len < minimum || header_len.checked_add(captured_len)? > item.len() {
+        return None;
+    }
+    Some((header, &item[header_len..header_len + captured_len]))
 }
 
 /// The process's current working directory (≈ exec-time for a fresh process).
@@ -2776,6 +3150,7 @@ fn event_capture_decision(context: CaptureDecisionContext) -> EventCaptureDecisi
 struct CollectorProcessor {
     peers: HashMap<SocketKey, (IpAddr, u16)>,
     llm_meta: HashMap<SocketKey, (Option<String>, Option<Provider>, IpAddr)>,
+    interactions: InteractionReassembler,
     exec_assembler: ExecAssembler,
     process_lifecycles: ProcessLifecycleStore,
     stats: Stats,
@@ -2788,6 +3163,7 @@ impl CollectorProcessor {
         Self {
             peers: HashMap::new(),
             llm_meta: HashMap::new(),
+            interactions: InteractionReassembler::default(),
             exec_assembler: ExecAssembler::new(exec_commit_probe_attached),
             process_lifecycles: ProcessLifecycleStore::default(),
             stats: Stats::default(),
@@ -2811,6 +3187,7 @@ impl CollectorProcessor {
                 completed,
             );
         }
+        self.interactions.expire_idle(now);
     }
 
     fn process(
@@ -3076,58 +3453,69 @@ impl CollectorProcessor {
                 );
             }
             PipelineOrigin::Ring(RingOrigin::Ssl) => {
-                let Some(ev) = read_pod::<SslEvent>(bytes) else {
+                let Some((header, plaintext)) = read_tls_plaintext(bytes) else {
                     return;
                 };
-                let len = (ev.len as usize).min(ev.data.len());
-                let content = String::from_utf8_lossy(&ev.data[..len]).into_owned();
-                if content.is_empty() {
-                    return;
+                self.stats.ssl = self.stats.ssl.saturating_add(1);
+                let mut partial_reasons = Vec::new();
+                if header.flags & TLS_PLAINTEXT_FLAG_TRUNCATED != 0
+                    || header.captured_len < header.original_len
+                {
+                    partial_reasons.push("probe_call_limit".to_string());
                 }
-                let identity = identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm);
-                let workload = resolver.resolve_workload(ev.pid, ev.cgroup_id, 0);
-                if let Some((model, prompt_tokens, completion_tokens)) = parse_llm_meta(&content) {
-                    emit(
-                        exporter,
-                        &mut self.stats,
-                        PipelineRing::Ssl,
-                        EnrichedEvent {
-                            timing: Some(timing.clone()),
-                            capture_decision: Some(capture_decision.clone()),
-                            identity: identity.clone(),
-                            workload: workload.clone(),
-                            observation: None,
-                            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-                            provider: None,
-                            event: AgentEvent::LlmApi {
-                                pid: ev.pid,
-                                is_request: ev.is_read == 0,
-                                model,
-                                prompt_tokens,
-                                completion_tokens,
-                            },
-                        },
+                let tool_route = header.flags & TLS_PLAINTEXT_FLAG_TOOL_ROUTE != 0;
+                let source = if header.api_kind == TLS_PLAINTEXT_API_TCP {
+                    if tool_route {
+                        "tcp_plaintext_tool_route"
+                    } else {
+                        "tcp_plaintext"
+                    }
+                } else if tool_route {
+                    "tls_uprobe_tool_route"
+                } else {
+                    "tls_uprobe"
+                };
+                if tls_diagnostics_enabled() {
+                    tracing::info!(
+                        pid = header.pid,
+                        connection_id = format_args!("{:x}", header.connection_id),
+                        call_seq = header.call_seq,
+                        direction = header.direction,
+                        api_kind = header.api_kind,
+                        original_len = header.original_len,
+                        captured_len = header.captured_len,
+                        flags = header.flags,
+                        source,
+                        "TLS plaintext fragment admitted"
                     );
                 }
-                emit(
-                    exporter,
-                    &mut self.stats,
-                    PipelineRing::Ssl,
-                    EnrichedEvent {
-                        timing: Some(timing),
-                        capture_decision: Some(capture_decision),
-                        identity,
-                        workload,
-                        observation: None,
-                        process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-                        provider: None,
-                        event: AgentEvent::SslContent {
-                            pid: ev.pid,
-                            is_read: ev.is_read != 0,
-                            content,
-                        },
+                let completed = self.interactions.push(PlaintextChunk {
+                    cgroup_id: header.cgroup_id,
+                    pid: header.pid,
+                    connection_id: header.connection_id,
+                    sequence: header.call_seq,
+                    direction: if header.direction == TLS_PLAINTEXT_DIRECTION_READ {
+                        ChunkDirection::Response
+                    } else {
+                        ChunkDirection::Request
                     },
-                );
+                    data: plaintext.to_vec(),
+                    event_at_unix_ns: envelope.event_at_unix_ns,
+                    source: source.to_string(),
+                    partial_reasons,
+                });
+                for interaction in completed {
+                    emit_completed_interaction(
+                        exporter,
+                        &mut self.stats,
+                        resolver,
+                        classifier,
+                        header.comm,
+                        timing.clone(),
+                        capture_decision.clone(),
+                        interaction,
+                    );
+                }
             }
             PipelineOrigin::Ring(RingOrigin::Exit) => {
                 let Some(ev) = read_pod::<ExitEvent>(bytes) else {
@@ -3166,6 +3554,89 @@ impl CollectorProcessor {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_completed_interaction(
+    exporter: &dyn Exporter,
+    stats: &mut Stats,
+    resolver: &impl IdentityResolver,
+    classifier: &impl ServiceClassifier,
+    comm: [u8; 16],
+    timing: EventTiming,
+    capture_decision: EventCaptureDecision,
+    interaction: CompletedInteraction,
+) {
+    let CompletedInteraction {
+        schema_version,
+        interaction_id,
+        interaction_type,
+        cgroup_id,
+        pid,
+        connection_id,
+        transport,
+        protocol,
+        endpoint,
+        method,
+        path,
+        status_code,
+        model,
+        started_at_unix_ns,
+        request_complete_at_unix_ns,
+        first_response_at_unix_ns,
+        ended_at_unix_ns,
+        duration_ns,
+        time_quality,
+        request,
+        response,
+        tool_calls,
+        tool_results,
+        completeness,
+        partial_reasons,
+        capture_source,
+    } = interaction;
+    let provider = classifier.classify(Some(&endpoint), UNKNOWN_PEER);
+    emit(
+        exporter,
+        stats,
+        PipelineRing::Ssl,
+        EnrichedEvent {
+            timing: Some(timing),
+            capture_decision: Some(capture_decision),
+            identity: identity_for(resolver, pid, cgroup_id, &comm),
+            workload: resolver.resolve_workload(pid, cgroup_id, 0),
+            observation: None,
+            process: Some(process_context(pid, cgroup_id, &comm)),
+            provider,
+            event: AgentEvent::LlmInteraction {
+                schema_version,
+                interaction_id,
+                interaction_type,
+                pid,
+                connection_id,
+                transport,
+                protocol,
+                endpoint,
+                method,
+                path,
+                status_code,
+                model,
+                started_at_unix_ns,
+                request_complete_at_unix_ns,
+                first_response_at_unix_ns,
+                ended_at_unix_ns,
+                duration_ns,
+                time_quality,
+                request: Box::new(request),
+                response: Box::new(response),
+                tool_calls,
+                tool_results,
+                completeness,
+                partial_reasons,
+                capture_source,
+            },
+        },
+    );
 }
 
 fn process_ready_envelopes(
@@ -3457,6 +3928,11 @@ fn env_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn tls_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_enabled("A3S_OBSERVER_TLS_DIAGNOSTICS"))
+}
+
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -3564,6 +4040,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, ev: En
             stats.file_delete += 1;
         }
         AgentEvent::LlmCall { .. } => stats.llm += 1,
+        AgentEvent::LlmInteraction { .. } => stats.llm += 1,
         AgentEvent::SslContent { .. } => stats.ssl += 1,
         AgentEvent::LlmApi { .. } => stats.llm += 1,
         AgentEvent::SecurityAction { .. } => stats.sec += 1,
@@ -3652,6 +4129,7 @@ fn parse_dns_qname(buf: &[u8]) -> Option<String> {
 /// Best-effort LLM-API fields from captured TLS plaintext: `"model"` from a request body, token
 /// `usage` from a response. None if absent (not an LLM call, or the bytes weren't captured).
 /// Consumes untrusted plaintext — every index is bounds-checked, must never panic.
+#[cfg(test)]
 fn parse_llm_meta(s: &str) -> Option<(Option<String>, Option<u32>, Option<u32>)> {
     let model = json_str_after(s, "\"model\"");
     let pt = json_num_after(s, "\"prompt_tokens\"");
@@ -3659,12 +4137,14 @@ fn parse_llm_meta(s: &str) -> Option<(Option<String>, Option<u32>, Option<u32>)>
     (model.is_some() || pt.is_some() || ct.is_some()).then_some((model, pt, ct))
 }
 
+#[cfg(test)]
 fn json_str_after(s: &str, key: &str) -> Option<String> {
     let rest = &s[s.find(key)? + key.len()..]; // find() ≤ len, +key.len() ≤ len → in-bounds
     let body = &rest[rest.find('"')? + 1..]; // past the value's opening quote
     Some(body[..body.find('"')?].to_owned())
 }
 
+#[cfg(test)]
 fn json_num_after(s: &str, key: &str) -> Option<u32> {
     let rest = s[s.find(key)? + key.len()..].trim_start_matches([':', ' ', '\t']);
     let end = rest

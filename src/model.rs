@@ -252,6 +252,67 @@ pub struct CollectorCaptureProbeStats {
     pub aggregate_error: u64,
 }
 
+/// One provider-neutral message extracted from the exact HTTP body sent to or received from an
+/// LLM endpoint. `content` deliberately remains structured JSON: text-only flattening would lose
+/// multimodal parts, tool-result blocks, and provider-specific item types.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteractionMessage {
+    pub role: String,
+    pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// A tool instruction visible in an LLM response. The matching execution/result may arrive in a
+/// later model request; downstream correlates them by `tool_call_id`, never by time alone.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteractionToolCall {
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_at_unix_ns: Option<String>,
+}
+
+/// A tool result that the Agent actually included in a subsequent final model request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteractionToolResult {
+    pub tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub content: serde_json::Value,
+    pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_unix_ns: Option<String>,
+}
+
+/// Exact, bounded content for one side of a model HTTP exchange.
+///
+/// `body` is UTF-8 when `encoding=utf8`, otherwise RFC 4648 base64. It contains the decoded HTTP
+/// entity body only; authorization/cookie headers are intentionally never exported.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteractionContent {
+    pub body: String,
+    pub encoding: String,
+    pub content_type: String,
+    pub captured_bytes: u64,
+    pub decoded_bytes: u64,
+    pub sha256: String,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<LlmInteractionMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
+}
+
 /// A raw event captured by an eBPF probe, before identity enrichment.
 #[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
@@ -351,6 +412,52 @@ pub enum AgentEvent {
         model: Option<String>,
         prompt_tokens: Option<u32>,
         completion_tokens: Option<u32>,
+    },
+    /// A complete or explicitly-partial HTTP model exchange reconstructed from plaintext captured
+    /// at a TLS-library or plain-TCP boundary. This is the stable semantic output of the content
+    /// pipeline; raw `SslContent` remains only as a legacy diagnostic signal.
+    LlmInteraction {
+        #[serde(rename = "schemaVersion")]
+        schema_version: String,
+        #[serde(rename = "interactionId")]
+        interaction_id: String,
+        #[serde(rename = "interactionType")]
+        interaction_type: String,
+        pid: u32,
+        #[serde(rename = "connectionId")]
+        connection_id: String,
+        transport: String,
+        protocol: String,
+        endpoint: String,
+        method: String,
+        path: String,
+        #[serde(rename = "statusCode")]
+        status_code: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(rename = "startedAtUnixNs")]
+        started_at_unix_ns: String,
+        #[serde(rename = "requestCompleteAtUnixNs")]
+        request_complete_at_unix_ns: String,
+        #[serde(rename = "firstResponseAtUnixNs")]
+        first_response_at_unix_ns: String,
+        #[serde(rename = "endedAtUnixNs")]
+        ended_at_unix_ns: String,
+        #[serde(rename = "durationNs")]
+        duration_ns: String,
+        #[serde(rename = "timeQuality")]
+        time_quality: String,
+        request: Box<LlmInteractionContent>,
+        response: Box<LlmInteractionContent>,
+        #[serde(rename = "toolCalls", skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<LlmInteractionToolCall>,
+        #[serde(rename = "toolResults", skip_serializing_if = "Vec::is_empty")]
+        tool_results: Vec<LlmInteractionToolResult>,
+        completeness: String,
+        #[serde(rename = "partialReasons", skip_serializing_if = "Vec::is_empty")]
+        partial_reasons: Vec<String>,
+        #[serde(rename = "captureSource")]
+        capture_source: String,
     },
     /// A security-sensitive action — rare and high-signal, filtered in-kernel: privilege escalation
     /// (`setuid`/`setresuid`/`setreuid` → root from non-root — note legitimate `sudo`/`su` also fire

@@ -99,8 +99,9 @@ pub const CAPTURE_PROMOTION_FLAG_DESCENDANT: u32 = 1 << 1;
 pub const CAPTURE_PROMOTION_FLAG_INVESTIGATION: u32 = 1 << 2;
 
 /// Safe closed-set defaults used when the control plane names a profile without overriding every
-/// probe. Protected lifecycle/security probes are always FULL. Unknown keeps LLM metadata in full
-/// for agent discovery and bounds every other high-frequency stream with SAMPLE.
+/// probe. Protected lifecycle/security probes are always FULL. Unknown keeps non-content LLM
+/// metadata for discovery but leaves TLS plaintext disabled; probable/confirmed Agent profiles
+/// explicitly opt into plaintext content capture.
 pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_COUNT] {
     let full = CAPTURE_ACTION_FULL;
     let sample = CAPTURE_ACTION_SAMPLE;
@@ -116,7 +117,7 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
             sample,
             full,
             full,
-            sample,
+            CAPTURE_ACTION_NOT_ENABLED,
             full,
             CAPTURE_ACTION_NOT_ENABLED,
         ],
@@ -131,12 +132,12 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
             aggregate,
             sample,
             aggregate,
-            aggregate,
+            CAPTURE_ACTION_NOT_ENABLED,
             full,
             CAPTURE_ACTION_NOT_ENABLED,
         ],
         CAPTURE_PROFILE_PROBABLE_INVESTIGATION => [
-            full, full, sample, sample, sample, sample, sample, full, sample, full, full,
+            full, full, sample, sample, sample, sample, sample, full, full, full, full,
         ],
         CAPTURE_PROFILE_UNKNOWN_DISCOVERY => [
             full,
@@ -147,7 +148,7 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
             sample,
             sample,
             full,
-            sample,
+            CAPTURE_ACTION_NOT_ENABLED,
             full,
             CAPTURE_ACTION_NOT_ENABLED,
         ],
@@ -160,7 +161,7 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
             sample,
             sample,
             full,
-            sample,
+            CAPTURE_ACTION_NOT_ENABLED,
             full,
             CAPTURE_ACTION_NOT_ENABLED,
         ],
@@ -711,11 +712,11 @@ pub struct LlmEvent {
 /// A plaintext snapshot from a TLS connection, captured by **uprobes** on OpenSSL
 /// `SSL_write` / `SSL_read` — the OPT-IN content extension (LLM prompt / completion bodies).
 ///
-/// Unlike every other probe this is **not** language-agnostic: a uprobe binds to a specific
-/// library symbol, so this covers **OpenSSL only** (Python `requests`/`httpx`, Node, curl, …),
-/// not Go's `crypto/tls` or BoringSSL. It also captures real request/response content, so it is
-/// **off by default** (`A3S_OBSERVER_SSL=1`) and must run where that's acceptable. This is why
-/// it lives outside the universal core — see Rule 2 (minimal core + external extensions).
+/// Legacy fixed-size OpenSSL snapshot. The versioned `TlsPlaintextEvent*` records below are the
+/// authoritative interaction path and can also use exact fingerprinted static profiles (for
+/// example a verified BoringSSL CLI build). Neither path generically covers Go `crypto/tls` or
+/// Rustls. Plaintext remains **off by default** (`A3S_OBSERVER_SSL=1`) because it captures real
+/// request/response content and therefore lives outside the universal core.
 pub const SSL_SNAP_LEN: usize = 1024;
 
 #[repr(C)]
@@ -732,6 +733,75 @@ pub struct SslEvent {
     /// `CLOCK_MONOTONIC` nanoseconds when the plaintext snapshot was captured.
     pub captured_at_boot_ns: u64,
     pub capture_decision: CaptureDecisionContext,
+}
+
+/// Versioned binary plaintext record emitted by TLS-library uprobes and plain-HTTP socket probes.
+/// The common header is followed by one of three fixed-capacity payload tiers. Userspace must use
+/// `captured_len` rather than the ring-record size; bytes beyond it are uninitialized ring memory.
+pub const TLS_PLAINTEXT_ABI_V1: u16 = 1;
+pub const TLS_PLAINTEXT_TIER_SMALL: usize = 16 * 1024;
+pub const TLS_PLAINTEXT_TIER_MEDIUM: usize = 128 * 1024;
+pub const TLS_PLAINTEXT_TIER_LARGE: usize = 512 * 1024;
+
+pub const TLS_PLAINTEXT_DIRECTION_WRITE: u8 = 0;
+pub const TLS_PLAINTEXT_DIRECTION_READ: u8 = 1;
+
+pub const TLS_PLAINTEXT_API_SSL_CLASSIC: u8 = 1;
+pub const TLS_PLAINTEXT_API_SSL_EX: u8 = 2;
+pub const TLS_PLAINTEXT_API_GNUTLS: u8 = 3;
+pub const TLS_PLAINTEXT_API_NSS: u8 = 4;
+pub const TLS_PLAINTEXT_API_TCP: u8 = 5;
+
+pub const TLS_PLAINTEXT_FLAG_TRUNCATED: u16 = 1 << 0;
+pub const TLS_PLAINTEXT_FLAG_COPY_ERROR: u16 = 1 << 1;
+pub const TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND: u16 = 1 << 2;
+pub const TLS_PLAINTEXT_FLAG_TOOL_ROUTE: u16 = 1 << 3;
+pub const PLAINTEXT_HTTP_ROUTE_LLM: u8 = 1;
+pub const PLAINTEXT_HTTP_ROUTE_TOOL: u8 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsPlaintextEventHeader {
+    pub abi_version: u16,
+    pub header_len: u16,
+    pub flags: u16,
+    pub _pad0: u16,
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub tid: u32,
+    /// `SSL*`/TLS-session pointer, or a stable socket-derived key for plain HTTP.
+    pub connection_id: u64,
+    /// Monotonic sequence within `(pid, connection_id, direction)`.
+    pub call_seq: u64,
+    /// Actual successful bytes reported by the TLS/TCP API before the bounded copy.
+    pub original_len: u32,
+    /// Bytes copied into this record's payload tier.
+    pub captured_len: u32,
+    pub direction: u8,
+    pub api_kind: u8,
+    pub _pad1: [u8; 6],
+    pub call_started_at_boot_ns: u64,
+    pub captured_at_boot_ns: u64,
+    pub comm: [u8; 16],
+    pub capture_decision: CaptureDecisionContext,
+}
+
+#[repr(C)]
+pub struct TlsPlaintextEventSmall {
+    pub header: TlsPlaintextEventHeader,
+    pub data: [u8; TLS_PLAINTEXT_TIER_SMALL],
+}
+
+#[repr(C)]
+pub struct TlsPlaintextEventMedium {
+    pub header: TlsPlaintextEventHeader,
+    pub data: [u8; TLS_PLAINTEXT_TIER_MEDIUM],
+}
+
+#[repr(C)]
+pub struct TlsPlaintextEventLarge {
+    pub header: TlsPlaintextEventHeader,
+    pub data: [u8; TLS_PLAINTEXT_TIER_LARGE],
 }
 
 /// A security-sensitive action — rare and high-signal, filtered in-kernel so volume stays near
@@ -889,14 +959,12 @@ mod tests {
             CAPTURE_PROBE_TLS,
             CAPTURE_PROBE_DNS,
             CAPTURE_PROBE_FILE_ACCESS,
-            CAPTURE_PROBE_SSL,
         ] {
             assert_eq!(security[probe as usize], CAPTURE_ACTION_SAMPLE);
         }
-        assert_eq!(
-            security[CAPTURE_PROBE_FILE_READ as usize],
-            CAPTURE_ACTION_NOT_ENABLED,
-        );
+        for probe in [CAPTURE_PROBE_SSL, CAPTURE_PROBE_FILE_READ] {
+            assert_eq!(security[probe as usize], CAPTURE_ACTION_NOT_ENABLED);
+        }
 
         let unknown = capture_profile_default_actions(CAPTURE_PROFILE_UNKNOWN_DISCOVERY);
         let probable = capture_profile_default_actions(CAPTURE_PROFILE_PROBABLE_INVESTIGATION);
@@ -904,7 +972,12 @@ mod tests {
             probable[CAPTURE_PROBE_FILE_READ as usize],
             CAPTURE_ACTION_FULL
         );
+        assert_eq!(probable[CAPTURE_PROBE_SSL as usize], CAPTURE_ACTION_FULL);
         assert_eq!(unknown[CAPTURE_PROBE_LLM as usize], CAPTURE_ACTION_FULL);
+        assert_eq!(
+            unknown[CAPTURE_PROBE_SSL as usize],
+            CAPTURE_ACTION_NOT_ENABLED
+        );
         assert_eq!(
             unknown[CAPTURE_PROBE_FILE_ACCESS as usize],
             CAPTURE_ACTION_SAMPLE

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "anysentry.tls_attach_profiles.v1",
+  "profiles": [
+    {
+      "product": "claude-code",
+      "version": "2.1.170",
+      "arch": "x86_64",
+      "fileSize": 247469776,
+      "head64kSha256": "6ed2ebb1113960548ef1d70f7882c90f7aa2828344e12000889a68c37efdb099",
+      "wholeFileSha256": "849e007277a0442ab27570d3e3d6d43787507946590e8dd1947e5a39b7081f9e",
+      "transportScope": "bun-https-boringssl",
+      "readOffset": 68570592,
+      "readExpectedPrefixHex": "554889e54157415653504883bf980000000074",
+      "writeOffset": 68571504,
+      "writeExpectedPrefixHex": "554889e54157415641554154534883ec184189d74989f64889fb",
+      "readAbi": "classic",
+      "writeAbi": "classic"
+    },
+    {
+      "product": "codex-cli",
+      "version": "0.150.1",
+      "arch": "x86_64",
+      "fileSize": 268330432,
+      "head64kSha256": "31e2e3707ea0a9b73453e0b2514ad3f7375972b1f7ae3db713860b44fb2b28d8",
+      "wholeFileSha256": "abf1bb1643a79f73aa78ee627e111e02d4f8c98f25813a0cf6ce277709664386",
+      "transportScope": "responses-rest-https-openssl-3.6.3",
+      "excludedTransportScope": "responses-websocket-rustls",
+      "readOffset": 210338240,
+      "readExpectedPrefixHex": "554889e5e8c7fbffff31c985c00f4ec1",
+      "writeOffset": 210338832,
+      "writeExpectedPrefixHex": "554889e553504989c831db31c9e8befd",
+      "readAbi": "openssl_ex",
+      "writeAbi": "openssl_ex"
+    }
+  ]
+}

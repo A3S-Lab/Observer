@@ -54,8 +54,8 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | llm metrics | per-socket `read`/`recv` + `close` | `LlmCall` — req/resp wire bytes, latency, TTFT |
 | `file`\* | `sys_enter_openat` (write opens) | `FileAccess` — files written (`A3S_OBSERVER_FILES=1`) |
 | `unlink`\* | `sys_enter_unlink` + `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
-| `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
-| `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
+| `ssl-legacy`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` / `LlmApi` compatibility snapshots (`A3S_OBSERVER_SSL=1`) |
+| `agent-interaction`\* | PID-scoped TLS uprobes or plain-HTTP syscalls + user-space HTTP/SSE reassembly | `LlmInteraction` — final model request, visible response, tool calls/results, hashes, timing and completeness |
 | `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
 | collector heartbeat | userspace timer | `CollectorHeartbeat` — collector id, node/pod, attached probes, feature flags, per-window counts, ring drops, output drops |
 
@@ -221,11 +221,12 @@ let cage = ProviderPolicy::new([Provider::Anthropic]).deny_unclassified(true);
 
 - **Zero-instrumentation, language-agnostic** — observe or guard any agent (Python/Node/Go/Rust)
   without touching its code, including its tool subprocesses.
-- **Kernel hooks only in the always-on core, no uprobes** — so the core gives **no LLM
-  prompt/completion content**. That content is available via an **opt-in** OpenSSL uprobe
-  extension (`A3S_OBSERVER_SSL=1`) — OpenSSL only (Python/Node/curl …, not Go `crypto/tls`),
-  kept out of the universal core because a uprobe binds to a library symbol. (ECH will
-  eventually hide SNI → fall back to IP/DNS.)
+- **Kernel hooks only in the always-on core, opt-in plaintext extension** — the universal core
+  gives no prompt/completion body. `A3S_OBSERVER_SSL=1` enables PID/cgroup-gated TLS-library
+  uprobes plus plain-HTTP syscall capture. The verified content path covers supported dynamic
+  OpenSSL/Node/Python builds and exact static fingerprints such as Claude Code 2.1.170; it does
+  not generically cover Go `crypto/tls`, Rustls, HTTP/2, WebSocket, HTTP/3 or QUIC. The userspace
+  path currently reconstructs HTTP/1.1 JSON/SSE only.
 - **a3s-box** — a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
   flows through the host net path) but not in-guest exec/file — those need an in-guest collector
   (phase 2).
@@ -247,8 +248,19 @@ A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON
 Linux only; needs root (CAP_BPF + CAP_PERFMON). Env knobs: `A3S_OBSERVER_JSON` (NDJSON),
 `A3S_OBSERVER_FILES` (legacy combined FileAccess/FileDelete switch),
 `A3S_OBSERVER_FILE_ACCESS` / `A3S_OBSERVER_FILE_DELETE` (independent overrides),
-`A3S_OBSERVER_SSL` (OpenSSL content), `A3S_OBSERVER_HEARTBEAT` (liveness file path), and
+`A3S_OBSERVER_SSL` (opt-in Agent HTTP/TLS content),
+`A3S_OBSERVER_TLS_PROCESS_PATTERNS` (additional exact runtime-selection fragments),
+`A3S_OBSERVER_LLM_HTTP_ROUTES` / `A3S_OBSERVER_TOOL_HTTP_ROUTES` (comma-separated exact POST
+paths, with tool paths closed by default), `A3S_OBSERVER_HEARTBEAT` (liveness file path), and
 `A3S_OBSERVER_JSON_QUEUE_CAPACITY` (bounded NDJSON burst queue, default 32768; 4096–262144).
+
+Plaintext capture has three gates: a verified Agent PID/cgroup, an admitted POST path, and a
+userspace protocol/semantic check. Only PIDs with a successful TLS attach enter the kernel
+plaintext allow map. Large calls use 16 KiB, 128 KiB, or 512 KiB ring-record tiers; the
+reassembler is bounded to 8 MiB per direction. See the AnySentry
+[PRD](../AnySentry/docs/anysentry-agent-llm-interaction-observability-prd.md) and
+[technical design](../AnySentry/docs/anysentry-agent-llm-interaction-observability-technical-design.md)
+for the exact product/version matrix, timing semantics and security boundary.
 
 Each ring is drained by an event-driven reader into physically independent Critical, Semantic, and
 Bulk inboxes; raw probe evidence maps only to Critical or Semantic. The readers copy fixed PODs and
