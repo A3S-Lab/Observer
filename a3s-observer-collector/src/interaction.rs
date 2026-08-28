@@ -372,7 +372,11 @@ impl InteractionReassembler {
             }
         };
         if interaction_diagnostics_enabled() {
-            tracing::info!(
+            // A streaming response can produce hundreds of TLS fragments in a few
+            // milliseconds. Keep per-fragment state available for targeted debugging,
+            // but never put it on the default operational INFO path: a slow container
+            // log sink must not be able to back-pressure or terminate the collector.
+            tracing::debug!(
                 pid = chunk.pid,
                 connection_id = format_args!("{:x}", chunk.connection_id),
                 direction = ?chunk.direction,

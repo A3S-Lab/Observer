@@ -3684,7 +3684,10 @@ impl CollectorProcessor {
                     "tls_uprobe"
                 };
                 if tls_diagnostics_enabled() {
-                    tracing::info!(
+                    // A streamed model response may cross this path hundreds of times in a
+                    // burst. Keep call-level evidence off the operational INFO stream so a
+                    // slow container log sink cannot back-pressure the collector.
+                    tracing::debug!(
                         pid = header.pid,
                         connection_id = format_args!("{:x}", header.connection_id),
                         call_seq = header.call_seq,
