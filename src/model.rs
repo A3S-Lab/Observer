@@ -435,6 +435,18 @@ pub enum AgentEvent {
         status_code: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(
+            rename = "providerConversationId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_conversation_id: Option<String>,
+        #[serde(rename = "providerResponseId", skip_serializing_if = "Option::is_none")]
+        provider_response_id: Option<String>,
+        #[serde(
+            rename = "providerPreviousResponseId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_previous_response_id: Option<String>,
         #[serde(rename = "startedAtUnixNs")]
         started_at_unix_ns: String,
         #[serde(rename = "requestCompleteAtUnixNs")]

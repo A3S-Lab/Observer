@@ -24,13 +24,44 @@
       "head64kSha256": "31e2e3707ea0a9b73453e0b2514ad3f7375972b1f7ae3db713860b44fb2b28d8",
       "wholeFileSha256": "abf1bb1643a79f73aa78ee627e111e02d4f8c98f25813a0cf6ce277709664386",
       "transportScope": "responses-rest-https-openssl-3.6.3",
-      "excludedTransportScope": "responses-websocket-rustls",
+      "excludedTransportScope": "responses-websocket-rustls;custom-ca-rustls",
       "readOffset": 210338240,
       "readExpectedPrefixHex": "554889e5e8c7fbffff31c985c00f4ec1",
       "writeOffset": 210338832,
       "writeExpectedPrefixHex": "554889e553504989c831db31c9e8befd",
       "readAbi": "openssl_ex",
       "writeAbi": "openssl_ex"
+    },
+    {
+      "product": "codex-cli",
+      "version": "0.149.1",
+      "arch": "x86_64",
+      "fileSize": 258227840,
+      "head64kSha256": "ce3fe63839e18871e2dcaaa6f1f8c12d74e1c1af89b24283e6bf28678a020c5e",
+      "wholeFileSha256": "73dc5888888f411c1f0fa7b81d866e721dcc86b527ce8e3b2cf4708661e823ba",
+      "transportScope": "responses-rest-https-openssl-3.6.3",
+      "excludedTransportScope": "responses-websocket-rustls",
+      "readOffset": 201946432,
+      "readExpectedPrefixHex": "554889e5e8c7fbffff31c985c00f4ec1",
+      "writeOffset": 201947024,
+      "writeExpectedPrefixHex": "554889e553504989c831db31c9e8befd",
+      "readAbi": "openssl_ex",
+      "writeAbi": "openssl_ex"
+    },
+    {
+      "product": "claude-code",
+      "version": "2.1.245",
+      "arch": "x86_64",
+      "fileSize": 391948592,
+      "head64kSha256": "c1c1a931109a06a5c47ae19e536e4ac3350cae80ec2a4684ce9b0bbcdf27d294",
+      "wholeFileSha256": "16ad2b94deaf7b29abed966d981c9991a47af0420f5be8ed4a3f83bea9f678bc",
+      "transportScope": "bun-https-boringssl",
+      "readOffset": 34944448,
+      "readExpectedPrefixHex": "554889e54157415653504883bf980000000074",
+      "writeOffset": 34945456,
+      "writeExpectedPrefixHex": "554889e54157415641554154534883ec184189d74989f64889fb",
+      "readAbi": "classic",
+      "writeAbi": "classic"
     }
   ]
 }

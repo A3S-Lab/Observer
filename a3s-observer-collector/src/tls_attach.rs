@@ -19,6 +19,8 @@ const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 pub enum TlsAbi {
     Classic,
     OpenSslEx,
+    RustlsPayload,
+    RustlsOutboundChunks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +28,29 @@ pub enum SymbolFamily {
     OpenSsl,
     GnuTls,
     Nss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeRole {
+    AgentRoot,
+    NetworkRuntime,
+}
+
+impl RuntimeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentRoot => "agent_root",
+            Self::NetworkRuntime => "network_runtime",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TlsOffsetPair {
+    pub read_offset: u64,
+    pub write_offset: u64,
+    pub read_abi: TlsAbi,
+    pub write_abi: TlsAbi,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +61,7 @@ pub enum TlsAttachKind {
         write_offset: u64,
         read_abi: TlsAbi,
         write_abi: TlsAbi,
+        additional_pairs: Vec<TlsOffsetPair>,
     },
 }
 
@@ -45,6 +71,7 @@ pub struct TlsAttachPlan {
     pub pid: Option<i32>,
     pub path: PathBuf,
     pub product: String,
+    pub runtime_role: RuntimeRole,
     pub transport_scope: String,
     pub excluded_transport_scope: Option<String>,
     pub kind: TlsAttachKind,
@@ -65,15 +92,17 @@ struct StaticProfile {
     write_prefix: Vec<u8>,
     read_abi: TlsAbi,
     write_abi: TlsAbi,
+    additional_pairs: Vec<(TlsOffsetPair, Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug)]
 pub struct TlsAttachManager {
     attached: HashSet<String>,
     rejected: HashSet<String>,
-    plaintext_pids: HashSet<i32>,
+    verified_processes: HashMap<i32, RuntimeRole>,
     static_profile_cache: HashMap<(u64, u64), Option<StaticProfile>>,
     process_patterns: Vec<String>,
+    static_targets: Vec<PathBuf>,
     explicit_target: Option<PathBuf>,
 }
 
@@ -101,12 +130,25 @@ impl TlsAttachManager {
         let explicit_target = ssl_setting
             .contains('/')
             .then(|| PathBuf::from(ssl_setting));
+        let static_targets = std::env::var("A3S_OBSERVER_TLS_STATIC_TARGETS")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Self {
             attached: HashSet::new(),
             rejected: HashSet::new(),
-            plaintext_pids: HashSet::new(),
+            verified_processes: HashMap::new(),
             static_profile_cache: HashMap::new(),
             process_patterns,
+            static_targets,
             explicit_target,
         }
     }
@@ -118,10 +160,16 @@ impl TlsAttachManager {
                 plans.push(plan);
             }
         }
+        for path in self.static_targets.clone() {
+            if let Some(plan) = self.plan_for_static_target(path) {
+                plans.push(plan);
+            }
+        }
 
         let Ok(proc_entries) = fs::read_dir("/proc") else {
             return plans;
         };
+        let mut verified_processes = HashMap::new();
         for entry in proc_entries.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -130,20 +178,32 @@ impl TlsAttachManager {
             else {
                 continue;
             };
-            if !self.is_selected_agent_process(pid) {
+            let Some(runtime_role) = self.runtime_role(pid) else {
                 continue;
-            }
-            plans.extend(self.plans_for_process(pid));
+            };
+            verified_processes.insert(pid, runtime_role);
+            plans.extend(self.plans_for_process(pid, runtime_role));
         }
-        plans.retain(|plan| !self.attached.contains(&plan.key));
+        self.verified_processes = verified_processes;
+        let mut seen = HashSet::new();
+        plans.retain(|plan| !self.attached.contains(&plan.key) && seen.insert(plan.key.clone()));
         plans
     }
 
-    pub fn mark_attached(&mut self, key: String, pid: Option<i32>) {
+    pub fn discover_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
+        let Some(runtime_role) = self.runtime_role(pid) else {
+            self.verified_processes.remove(&pid);
+            return Vec::new();
+        };
+        self.verified_processes.insert(pid, runtime_role);
+        self.plans_for_process(pid, runtime_role)
+            .into_iter()
+            .filter(|plan| !self.attached.contains(&plan.key))
+            .collect()
+    }
+
+    pub fn mark_attached(&mut self, key: String, _pid: Option<i32>) {
         self.attached.insert(key);
-        if let Some(pid) = pid {
-            self.plaintext_pids.insert(pid);
-        }
     }
 
     pub fn mark_rejected(&mut self, key: String, reason: &str) {
@@ -156,26 +216,33 @@ impl TlsAttachManager {
         self.attached.len()
     }
 
-    pub fn plaintext_pids(&mut self) -> Vec<i32> {
-        self.plaintext_pids
-            .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
-        self.plaintext_pids.iter().copied().collect()
+    pub fn verified_pids(&mut self) -> Vec<i32> {
+        self.verified_processes
+            .retain(|pid, _| Path::new(&format!("/proc/{pid}")).exists());
+        self.verified_processes.keys().copied().collect()
     }
 
-    fn is_selected_agent_process(&self, pid: i32) -> bool {
+    fn runtime_role(&self, pid: i32) -> Option<RuntimeRole> {
         if self.process_matches_patterns(pid) {
-            return true;
+            return Some(RuntimeRole::AgentRoot);
         }
         let mut current = pid;
         for _ in 0..6 {
             if current <= 1 {
                 break;
             }
-            // Only Dify's provider-host ancestry is inherited. Treating every descendant of a
-            // Codex/Claude/Pi process as a TLS Agent made ordinary tool subprocesses enter the
-            // expensive resolver and could starve short-lived CLI attachment scans.
+            // Dify provider/tool workers are separate runtimes below the plugin daemon. Their
+            // exact LLM/tool POST route is still required before any plaintext enters the ring.
             if process_contains_pattern(current, "dify-plugin-daemon") {
-                return true;
+                return Some(RuntimeRole::NetworkRuntime);
+            }
+            // Codex may delegate network work to this exact packaged runtime. Do not inherit
+            // trust to arbitrary shell/git/python descendants of the Agent root.
+            if current == pid
+                && process_matches_trusted_network_runtime(pid)
+                && ancestor_contains_pattern(pid, "codex")
+            {
+                return Some(RuntimeRole::NetworkRuntime);
             }
             let Some(parent) = process_parent_pid(current) else {
                 break;
@@ -185,7 +252,7 @@ impl TlsAttachManager {
             }
             current = parent;
         }
-        false
+        None
     }
 
     fn process_matches_patterns(&self, pid: i32) -> bool {
@@ -207,11 +274,13 @@ impl TlsAttachManager {
         matches_selected_agent_text(&comm, &cmdline, &self.process_patterns)
     }
 
-    fn plans_for_process(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
+    fn plans_for_process(&mut self, pid: i32, runtime_role: RuntimeRole) -> Vec<TlsAttachPlan> {
         let mut plans = Vec::new();
         let exe_probe_path = PathBuf::from(format!("/proc/{pid}/exe"));
         if let Ok(real_exe) = fs::read_link(&exe_probe_path) {
-            if let Some(plan) = self.plan_for_executable(pid, &exe_probe_path, &real_exe) {
+            if let Some(plan) =
+                self.plan_for_executable(pid, &exe_probe_path, &real_exe, runtime_role)
+            {
                 plans.push(plan);
             }
         }
@@ -248,6 +317,7 @@ impl TlsAttachManager {
                 pid: Some(pid),
                 path: rooted,
                 product: "mapped-tls-library".to_string(),
+                runtime_role,
                 transport_scope: format!("{family:?}").to_ascii_lowercase(),
                 excluded_transport_scope: None,
                 kind: TlsAttachKind::Symbols(family),
@@ -261,6 +331,7 @@ impl TlsAttachManager {
         pid: i32,
         probe_path: &Path,
         real_exe: &Path,
+        runtime_role: RuntimeRole,
     ) -> Option<TlsAttachPlan> {
         let metadata = fs::metadata(probe_path).ok()?;
         let basename = real_exe.file_name()?.to_string_lossy().to_ascii_lowercase();
@@ -290,20 +361,12 @@ impl TlsAttachManager {
             }
         };
         if let Some(profile) = static_profile {
-            return Some(TlsAttachPlan {
-                key: format!("{identity}:profile:{}:{}", profile.product, profile.version),
-                pid: Some(pid),
-                path: probe_path.to_path_buf(),
-                product: format!("{} {}", profile.product, profile.version),
-                transport_scope: profile.transport_scope,
-                excluded_transport_scope: profile.excluded_transport_scope,
-                kind: TlsAttachKind::Offsets {
-                    read_offset: profile.read_offset,
-                    write_offset: profile.write_offset,
-                    read_abi: profile.read_abi,
-                    write_abi: profile.write_abi,
-                },
-            });
+            return Some(static_profile_plan(
+                probe_path,
+                &metadata,
+                profile,
+                runtime_role,
+            ));
         }
 
         // Node and versioned Python executables commonly export OpenSSL symbols from the main ELF
@@ -318,6 +381,7 @@ impl TlsAttachManager {
                 pid: Some(pid),
                 path: probe_path.to_path_buf(),
                 product: format!("{basename}-main-elf"),
+                runtime_role,
                 transport_scope: "main-executable-exported-openssl".to_string(),
                 excluded_transport_scope: None,
                 kind: TlsAttachKind::Symbols(SymbolFamily::OpenSsl),
@@ -333,6 +397,55 @@ impl TlsAttachManager {
         None
     }
 
+    fn plan_for_static_target(&mut self, path: PathBuf) -> Option<TlsAttachPlan> {
+        let metadata = fs::metadata(&path).ok()?;
+        let cache_key = (metadata.dev(), metadata.ino());
+        let profile = if let Some(cached) = self.static_profile_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            match match_static_profile(&path) {
+                Ok(profile) => {
+                    self.static_profile_cache.insert(cache_key, profile.clone());
+                    profile
+                }
+                Err(error) => {
+                    self.mark_rejected(
+                        format!(
+                            "global:dev:{}:ino:{}:static-target",
+                            metadata.dev(),
+                            metadata.ino()
+                        ),
+                        &format!("fingerprint_validation_failed:{error}"),
+                    );
+                    return None;
+                }
+            }
+        };
+        if let Some(profile) = profile {
+            return Some(static_profile_plan(
+                &path,
+                &metadata,
+                profile,
+                RuntimeRole::AgentRoot,
+            ));
+        }
+        let family = classify_library(path.to_string_lossy().as_ref())?;
+        Some(TlsAttachPlan {
+            key: format!(
+                "global:dev:{}:ino:{}:symbols:{family:?}",
+                metadata.dev(),
+                metadata.ino()
+            ),
+            pid: None,
+            path,
+            product: "static-tls-library".to_string(),
+            runtime_role: RuntimeRole::AgentRoot,
+            transport_scope: format!("{family:?}").to_ascii_lowercase(),
+            excluded_transport_scope: None,
+            kind: TlsAttachKind::Symbols(family),
+        })
+    }
+
     fn plan_for_explicit(&mut self, path: PathBuf) -> Option<TlsAttachPlan> {
         let metadata = fs::metadata(&path).ok()?;
         let family =
@@ -346,10 +459,47 @@ impl TlsAttachManager {
             pid: None,
             path,
             product: "explicit-tls-target".to_string(),
+            runtime_role: RuntimeRole::AgentRoot,
             transport_scope: format!("{family:?}").to_ascii_lowercase(),
             excluded_transport_scope: None,
             kind: TlsAttachKind::Symbols(family),
         })
+    }
+}
+
+fn static_profile_plan(
+    path: &Path,
+    metadata: &fs::Metadata,
+    profile: StaticProfile,
+    runtime_role: RuntimeRole,
+) -> TlsAttachPlan {
+    TlsAttachPlan {
+        // Exact whole-file profiles are safe to attach once per executable inode. The eBPF hot
+        // path still requires an identity-verified PID and exact LLM route before copying bytes.
+        key: format!(
+            "global:dev:{}:ino:{}:profile:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            profile.product,
+            profile.version
+        ),
+        pid: None,
+        path: path.to_path_buf(),
+        product: format!("{} {}", profile.product, profile.version),
+        runtime_role,
+        transport_scope: profile.transport_scope,
+        excluded_transport_scope: profile.excluded_transport_scope,
+        kind: TlsAttachKind::Offsets {
+            read_offset: profile.read_offset,
+            write_offset: profile.write_offset,
+            read_abi: profile.read_abi,
+            write_abi: profile.write_abi,
+            additional_pairs: profile
+                .additional_pairs
+                .into_iter()
+                .map(|(pair, _, _)| pair)
+                .collect(),
+        },
     }
 }
 
@@ -372,6 +522,43 @@ fn process_parent_pid(pid: i32) -> Option<i32> {
         .trim()
         .parse()
         .ok()
+}
+
+fn ancestor_contains_pattern(pid: i32, pattern: &str) -> bool {
+    let mut current = pid;
+    for _ in 0..6 {
+        let Some(parent) = process_parent_pid(current) else {
+            return false;
+        };
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        if process_contains_pattern(parent, pattern) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn process_matches_trusted_network_runtime(pid: i32) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|value| value.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches_trusted_network_runtime_text(&comm, &executable)
+}
+
+fn matches_trusted_network_runtime_text(comm: &str, executable: &str) -> bool {
+    comm == "codex-code-mode" || executable == "codex-code-mode-host"
 }
 
 fn process_contains_pattern(pid: i32, pattern: &str) -> bool {
@@ -416,6 +603,12 @@ fn match_static_profile(path: &Path) -> anyhow::Result<Option<StaticProfile>> {
             .context("read_prefix_mismatch")?;
         verify_prefix(path, profile.write_offset, &profile.write_prefix)
             .context("write_prefix_mismatch")?;
+        for (pair, read_prefix, write_prefix) in &profile.additional_pairs {
+            verify_prefix(path, pair.read_offset, read_prefix)
+                .context("additional_read_prefix_mismatch")?;
+            verify_prefix(path, pair.write_offset, write_prefix)
+                .context("additional_write_prefix_mismatch")?;
+        }
         return Ok(Some(profile.clone()));
     }
     Ok(None)
@@ -444,6 +637,18 @@ fn parse_profile(value: &Value) -> anyhow::Result<StaticProfile> {
             .and_then(Value::as_u64)
             .with_context(|| format!("TLS profile field {name} is missing"))
     };
+    let additional_pairs = value
+        .get("additionalProbePairs")
+        .map(|pairs| {
+            pairs
+                .as_array()
+                .context("TLS profile additionalProbePairs must be an array")?
+                .iter()
+                .map(parse_additional_pair)
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(StaticProfile {
         product: string("product")?,
         version: string("version")?,
@@ -461,13 +666,41 @@ fn parse_profile(value: &Value) -> anyhow::Result<StaticProfile> {
         write_prefix: decode_hex(&string("writeExpectedPrefixHex")?)?,
         read_abi: parse_abi(&string("readAbi")?)?,
         write_abi: parse_abi(&string("writeAbi")?)?,
+        additional_pairs,
     })
+}
+
+fn parse_additional_pair(value: &Value) -> anyhow::Result<(TlsOffsetPair, Vec<u8>, Vec<u8>)> {
+    let string = |name: &str| -> anyhow::Result<&str> {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("TLS additional probe field {name} is missing"))
+    };
+    let integer = |name: &str| -> anyhow::Result<u64> {
+        value
+            .get(name)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("TLS additional probe field {name} is missing"))
+    };
+    Ok((
+        TlsOffsetPair {
+            read_offset: integer("readOffset")?,
+            write_offset: integer("writeOffset")?,
+            read_abi: parse_abi(string("readAbi")?)?,
+            write_abi: parse_abi(string("writeAbi")?)?,
+        },
+        decode_hex(string("readExpectedPrefixHex")?)?,
+        decode_hex(string("writeExpectedPrefixHex")?)?,
+    ))
 }
 
 fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
     match value {
         "classic" => Ok(TlsAbi::Classic),
         "openssl_ex" => Ok(TlsAbi::OpenSslEx),
+        "rustls_payload" => Ok(TlsAbi::RustlsPayload),
+        "rustls_outbound_chunks" => Ok(TlsAbi::RustlsOutboundChunks),
         _ => anyhow::bail!("unsupported TLS ABI {value}"),
     }
 }
@@ -533,8 +766,12 @@ mod tests {
     #[test]
     fn embedded_profiles_are_complete_and_have_distinct_fingerprints() {
         let profiles = static_profiles().unwrap();
-        assert_eq!(profiles.len(), 2);
-        assert_ne!(profiles[0].whole_file_sha256, profiles[1].whole_file_sha256);
+        assert_eq!(profiles.len(), 4);
+        let fingerprints = profiles
+            .iter()
+            .map(|profile| profile.whole_file_sha256.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(fingerprints.len(), profiles.len());
         assert!(profiles.iter().all(|profile| {
             !profile.read_prefix.is_empty()
                 && !profile.write_prefix.is_empty()
@@ -591,5 +828,15 @@ mod tests {
             "python3 pillow_worker.py",
             &patterns
         ));
+    }
+
+    #[test]
+    fn only_the_packaged_codex_network_runtime_signature_is_inherited() {
+        assert!(matches_trusted_network_runtime_text(
+            "codex-code-mode",
+            "codex-code-mode-host"
+        ));
+        assert!(!matches_trusted_network_runtime_text("bash", "bash"));
+        assert!(!matches_trusted_network_runtime_text("python3", "python3"));
     }
 }

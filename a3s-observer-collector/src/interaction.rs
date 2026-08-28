@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 2_048;
@@ -56,6 +57,9 @@ pub struct CompletedInteraction {
     pub path: String,
     pub status_code: u16,
     pub model: Option<String>,
+    pub provider_conversation_id: Option<String>,
+    pub provider_response_id: Option<String>,
+    pub provider_previous_response_id: Option<String>,
     pub started_at_unix_ns: String,
     pub request_complete_at_unix_ns: String,
     pub first_response_at_unix_ns: String,
@@ -103,6 +107,7 @@ struct HttpMessage {
     started_at_unix_ns: u128,
     completed_at_unix_ns: u128,
     partial_reasons: Vec<String>,
+    metadata_inferred: bool,
 }
 
 impl HttpMessage {
@@ -133,6 +138,7 @@ struct HttpStreamDecoder {
     last_at_unix_ns: u128,
     max_bytes: usize,
     partial_reasons: Vec<String>,
+    last_decode_error: Option<String>,
 }
 
 impl HttpStreamDecoder {
@@ -144,6 +150,7 @@ impl HttpStreamDecoder {
             last_at_unix_ns: 0,
             max_bytes,
             partial_reasons: Vec::new(),
+            last_decode_error: None,
         }
     }
 
@@ -174,14 +181,27 @@ impl HttpStreamDecoder {
 
         let mut messages = Vec::new();
         loop {
+            if self.kind == StreamKind::Response {
+                let detached_terminator = detached_chunk_terminator_prefix(&self.buffer);
+                if detached_terminator > 0 {
+                    self.buffer.drain(..detached_terminator);
+                    self.buffer_started_at_unix_ns =
+                        (!self.buffer.is_empty()).then_some(event_at_unix_ns);
+                    if self.buffer.is_empty() {
+                        break;
+                    }
+                }
+            }
             let decoded = match decode_http_message(self.kind, &self.buffer, self.max_bytes) {
                 Ok(Some(decoded)) => decoded,
                 Ok(None) => break,
                 Err(reason) => {
+                    self.last_decode_error = Some(reason.clone());
                     extend_unique(&mut self.partial_reasons, [reason]);
                     break;
                 }
             };
+            self.last_decode_error = None;
             let mut reasons = std::mem::take(&mut self.partial_reasons);
             extend_unique(&mut reasons, decoded.partial_reasons);
             messages.push(HttpMessage {
@@ -192,15 +212,12 @@ impl HttpStreamDecoder {
                 started_at_unix_ns: self.buffer_started_at_unix_ns.unwrap_or(event_at_unix_ns),
                 completed_at_unix_ns: event_at_unix_ns,
                 partial_reasons: reasons,
+                metadata_inferred: false,
             });
             self.buffer.drain(..decoded.consumed);
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
         }
         messages
-    }
-
-    fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
     }
 }
 
@@ -240,11 +257,8 @@ impl ConnectionState {
         }
     }
 
-    fn idle_and_empty(&self, now: Instant, timeout: Duration) -> bool {
+    fn idle(&self, now: Instant, timeout: Duration) -> bool {
         now.saturating_duration_since(self.last_activity) >= timeout
-            && self.pending_requests.is_empty()
-            && self.requests.is_empty()
-            && self.responses.is_empty()
     }
 }
 
@@ -306,14 +320,28 @@ impl InteractionReassembler {
         }
         *previous_sequence = chunk.sequence;
 
-        match chunk.direction {
+        let completed = match chunk.direction {
             ChunkDirection::Request => {
-                for request in
-                    state
-                        .requests
-                        .push(&chunk.data, chunk.event_at_unix_ns, &chunk.partial_reasons)
-                {
+                let body_only =
+                    if chunk.source.contains("rustls") && state.requests.buffer.is_empty() {
+                        body_only_llm_request(
+                            &chunk.data,
+                            chunk.event_at_unix_ns,
+                            &chunk.partial_reasons,
+                        )
+                    } else {
+                        None
+                    };
+                if let Some(request) = body_only {
                     state.pending_requests.push_back(request);
+                } else {
+                    for request in state.requests.push(
+                        &chunk.data,
+                        chunk.event_at_unix_ns,
+                        &chunk.partial_reasons,
+                    ) {
+                        state.pending_requests.push_back(request);
+                    }
                 }
                 Vec::new()
             }
@@ -342,15 +370,46 @@ impl InteractionReassembler {
                 }
                 completed
             }
+        };
+        if interaction_diagnostics_enabled() {
+            tracing::info!(
+                pid = chunk.pid,
+                connection_id = format_args!("{:x}", chunk.connection_id),
+                direction = ?chunk.direction,
+                fragment_kind = plaintext_fragment_kind(&chunk.data),
+                fragment_bytes = chunk.data.len(),
+                request_buffer_bytes = state.requests.buffer.len(),
+                response_buffer_bytes = state.responses.buffer.len(),
+                pending_requests = state.pending_requests.len(),
+                request_decode_error = ?state.requests.last_decode_error,
+                response_decode_error = ?state.responses.last_decode_error,
+                completed_interactions = completed.len(),
+                "Agent interaction reassembly state"
+            );
         }
+        completed
     }
 
-    /// Remove fully idle state. Incomplete requests are deliberately retained until their bounded
-    /// stream buffers reach their own limits; a later phase can emit explicit orphan records.
+    /// Remove idle state even when a request or response is incomplete. Retaining an orphaned
+    /// request across a later keep-alive reuse can pair a new response with the wrong Agent turn,
+    /// which is worse than explicitly losing the incomplete exchange. Coverage/drop telemetry is
+    /// the authority for that missing record; completed evidence is never fabricated.
     pub fn expire_idle(&mut self, now: Instant) {
         let timeout = self.idle_timeout;
-        self.connections
-            .retain(|_, state| !state.idle_and_empty(now, timeout));
+        self.connections.retain(|key, state| {
+            let retain = !state.idle(now, timeout);
+            if !retain && interaction_diagnostics_enabled() {
+                tracing::warn!(
+                    pid = key.pid,
+                    connection_id = format_args!("{:x}", key.connection_id),
+                    pending_requests = state.pending_requests.len(),
+                    request_buffer_bytes = state.requests.buffer.len(),
+                    response_buffer_bytes = state.responses.buffer.len(),
+                    "expired idle Agent interaction reassembly state"
+                );
+            }
+            retain
+        });
     }
 
     pub fn active_connections(&self) -> usize {
@@ -370,6 +429,81 @@ impl InteractionReassembler {
             self.connections.remove(&oldest);
         }
     }
+}
+
+fn interaction_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("A3S_OBSERVER_TLS_DIAGNOSTICS")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+    })
+}
+
+fn plaintext_fragment_kind(data: &[u8]) -> &'static str {
+    if data.starts_with(b"POST ") {
+        "http_request"
+    } else if data.starts_with(b"HTTP/1.") {
+        "http_response"
+    } else if data.starts_with(b"PRI * HTTP/2.0") {
+        "http2_preface"
+    } else if data.starts_with(b"data:") || data.starts_with(b"event:") {
+        "sse"
+    } else if data.starts_with(b"{") || data.starts_with(b"[") {
+        "json"
+    } else if data.len() >= 3 && data[0] == 0x17 && data[1] == 0x03 {
+        "tls_record"
+    } else if data
+        .iter()
+        .take(16)
+        .all(|byte| byte.is_ascii_hexdigit() || matches!(*byte, b'\r' | b'\n' | b';'))
+    {
+        "chunk_framing"
+    } else {
+        "continuation"
+    }
+}
+
+fn body_only_llm_request(
+    body: &[u8],
+    event_at_unix_ns: u128,
+    partial_reasons: &[String],
+) -> Option<HttpMessage> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let path = if object.get("type").and_then(Value::as_str) == Some("response.create")
+        || object.contains_key("input")
+    {
+        "/v1/responses"
+    } else if object.contains_key("messages") {
+        if object.contains_key("max_tokens") || object.contains_key("anthropic_version") {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        }
+    } else if object.get("model").and_then(Value::as_str).is_some() {
+        "/v1/responses"
+    } else {
+        return None;
+    };
+    Some(HttpMessage {
+        start_line: format!("POST {path} HTTP/1.1"),
+        headers: BTreeMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("host".to_string(), "inferred-from-tls-profile".to_string()),
+        ]),
+        body: body.to_vec(),
+        captured_body_bytes: body.len(),
+        started_at_unix_ns: event_at_unix_ns,
+        completed_at_unix_ns: event_at_unix_ns,
+        partial_reasons: partial_reasons.to_vec(),
+        metadata_inferred: true,
+    })
 }
 
 fn build_interaction(
@@ -432,6 +566,20 @@ fn build_interaction(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         });
+    let provider_conversation_id = request_json
+        .as_ref()
+        .and_then(extract_provider_conversation_id)
+        .or_else(|| {
+            response_structured
+                .as_ref()
+                .and_then(extract_provider_conversation_id)
+        });
+    let provider_response_id = response_structured
+        .as_ref()
+        .and_then(extract_provider_response_id);
+    let provider_previous_response_id = request_json
+        .as_ref()
+        .and_then(|value| bounded_provider_id(value.get("previous_response_id")));
 
     let mut partial_reasons = request.partial_reasons.clone();
     extend_unique(&mut partial_reasons, response.partial_reasons.clone());
@@ -529,12 +677,20 @@ fn build_interaction(
             "tls"
         }
         .to_string(),
-        protocol: "http/1.1".to_string(),
+        protocol: if request.metadata_inferred {
+            "http/1.1-body-inferred"
+        } else {
+            "http/1.1"
+        }
+        .to_string(),
         endpoint,
         method,
         path,
         status_code,
         model,
+        provider_conversation_id,
+        provider_response_id,
+        provider_previous_response_id,
         started_at_unix_ns: request.started_at_unix_ns.to_string(),
         request_complete_at_unix_ns: request.completed_at_unix_ns.to_string(),
         first_response_at_unix_ns: response.started_at_unix_ns.to_string(),
@@ -650,13 +806,19 @@ fn decode_http_message(
         .get("content-type")
         .map(String::as_str)
         .unwrap_or_default();
+    let sse_response = matches!(kind, StreamKind::Response)
+        && content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
 
     let mut partial_reasons = Vec::new();
     let (body, body_consumed) = if transfer_encoding
         .split(',')
         .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
     {
-        let Some((decoded, consumed)) = decode_chunked(body_bytes, max_body_bytes)? else {
+        let Some((decoded, consumed)) = decode_chunked(body_bytes, max_body_bytes, sse_response)?
+        else {
             return Ok(None);
         };
         (decoded, consumed)
@@ -723,7 +885,22 @@ fn is_secret_header(name: &str) -> bool {
     )
 }
 
-fn decode_chunked(bytes: &[u8], max_body_bytes: usize) -> Result<Option<(Vec<u8>, usize)>, String> {
+fn detached_chunk_terminator_prefix(bytes: &[u8]) -> usize {
+    let mut consumed = 0usize;
+    while bytes
+        .get(consumed..)
+        .is_some_and(|remaining| remaining.starts_with(b"0\r\n\r\n"))
+    {
+        consumed += 5;
+    }
+    consumed
+}
+
+fn decode_chunked(
+    bytes: &[u8],
+    max_body_bytes: usize,
+    stop_at_sse_terminal: bool,
+) -> Result<Option<(Vec<u8>, usize)>, String> {
     let mut cursor = 0usize;
     let mut body = Vec::new();
     loop {
@@ -761,6 +938,12 @@ fn decode_chunked(bytes: &[u8], max_body_bytes: usize) -> Result<Option<(Vec<u8>
         }
         body.extend_from_slice(&bytes[cursor..chunk_end]);
         cursor = chunk_end + 2;
+        if stop_at_sse_terminal {
+            if let Some(terminal) = sse_terminal_offset(&body) {
+                body.truncate(terminal);
+                return Ok(Some((body, cursor)));
+            }
+        }
     }
 }
 
@@ -847,6 +1030,58 @@ fn looks_like_llm_request(method: &str, path: &str, body: Option<&Value>) -> boo
 
 fn parse_json_body(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(body).ok()
+}
+
+fn bounded_provider_id(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .map(ToOwned::to_owned)
+}
+
+fn extract_provider_conversation_id(value: &Value) -> Option<String> {
+    bounded_provider_id(value.get("conversation_id"))
+        .or_else(|| bounded_provider_id(value.get("session_id")))
+        .or_else(|| bounded_provider_id(value.get("conversation")))
+        .or_else(|| {
+            value
+                .get("conversation")
+                .and_then(|conversation| bounded_provider_id(conversation.get("id")))
+        })
+        .or_else(|| {
+            value.get("metadata").and_then(|metadata| {
+                bounded_provider_id(metadata.get("conversation_id"))
+                    .or_else(|| bounded_provider_id(metadata.get("session_id")))
+            })
+        })
+}
+
+fn extract_provider_response_id(value: &Value) -> Option<String> {
+    if let Some(response) = value.get("response") {
+        if let Some(id) = bounded_provider_id(response.get("id")) {
+            return Some(id);
+        }
+    }
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("response.") || kind == "message_start")
+    {
+        if let Some(id) = bounded_provider_id(value.get("id")) {
+            return Some(id);
+        }
+        if let Some(id) = value
+            .get("message")
+            .and_then(|message| bounded_provider_id(message.get("id")))
+        {
+            return Some(id);
+        }
+    }
+    value
+        .as_array()
+        .and_then(|events| events.iter().rev().find_map(extract_provider_response_id))
+        .or_else(|| bounded_provider_id(value.get("id")))
 }
 
 fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
@@ -1481,6 +1716,34 @@ mod tests {
     }
 
     #[test]
+    fn rustls_body_only_request_is_paired_with_the_http_response() {
+        let request_body =
+            r#"{"model":"fixture-model","input":[{"role":"user","content":"hello"}]}"#;
+        let response_body =
+            r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"world"}]}]}"#;
+        let mut reassembler = InteractionReassembler::default();
+        let mut request = chunk(ChunkDirection::Request, request_body.as_bytes(), 100);
+        request.source = "tls_uprobe_rustls".to_string();
+        assert!(reassembler.push(request).is_empty());
+        let mut response = chunk(ChunkDirection::Response, http_response(response_body), 200);
+        response.source = "tls_uprobe_rustls".to_string();
+        let completed = reassembler.push(response);
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].path, "/v1/responses");
+        assert_eq!(completed[0].protocol, "http/1.1-body-inferred");
+        assert_eq!(completed[0].endpoint, "inferred-from-tls-profile");
+        assert_eq!(completed[0].request.body, request_body);
+        assert_eq!(completed[0].response.text.as_deref(), Some("world"));
+        assert_eq!(completed[0].completeness, "complete");
+    }
+
+    #[test]
+    fn rustls_body_only_gate_rejects_unrelated_json() {
+        assert!(body_only_llm_request(br#"{"operation":"health"}"#, 1, &[]).is_none());
+    }
+
+    #[test]
     fn local_control_plane_http_is_not_misclassified_as_llm() {
         let mut reassembler = InteractionReassembler::default();
         reassembler.push(chunk(
@@ -1627,8 +1890,69 @@ mod tests {
     }
 
     #[test]
+    fn semantic_sse_terminal_completes_before_a_late_zero_chunk() {
+        let first_request =
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"first"}]}"#;
+        let first_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"first reply\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let first_chunk = format!("{:x}\r\n{}\r\n", first_sse.len(), first_sse);
+        let first_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{first_chunk}"
+        );
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(first_request),
+            1,
+        ));
+        let first = reassembler.push(chunk(
+            ChunkDirection::Response,
+            first_response.into_bytes(),
+            2,
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].response.text.as_deref(), Some("first reply"));
+
+        let second_request =
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"second"}]}"#;
+        let second_response =
+            r#"{"choices":[{"message":{"role":"assistant","content":"second reply"}}]}"#;
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(second_request),
+            3,
+        ));
+        assert!(reassembler
+            .push(chunk(ChunkDirection::Response, b"0\r\n\r\n".to_vec(), 4))
+            .is_empty());
+        let second = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(second_response),
+            5,
+        ));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].response.text.as_deref(), Some("second reply"));
+    }
+
+    #[test]
+    fn idle_orphan_request_cannot_poison_a_later_response() {
+        let request = r#"{"model":"gpt-test","messages":[{"role":"user","content":"orphan"}]}"#;
+        let mut reassembler =
+            InteractionReassembler::with_limits(8, 64 * 1024, Duration::from_millis(1));
+        reassembler.push(chunk(ChunkDirection::Request, http_request(request), 1));
+        reassembler.expire_idle(Instant::now() + Duration::from_millis(5));
+        let response =
+            r#"{"choices":[{"message":{"role":"assistant","content":"must not pair"}}]}"#;
+        assert!(reassembler
+            .push(chunk(ChunkDirection::Response, http_response(response), 2))
+            .is_empty());
+    }
+
+    #[test]
     fn responses_output_item_done_exposes_final_assistant_text() {
-        let request_body = r#"{"model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
+        let request_body = r#"{"model":"gpt-test","conversation":"conv-1","previous_response_id":"resp-0","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
         let sse = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"final text\"}]}}\n\n",
@@ -1647,6 +1971,15 @@ mod tests {
         ));
         let completed = reassembler.push(chunk(ChunkDirection::Response, response.into_bytes(), 2));
         assert_eq!(completed[0].response.text.as_deref(), Some("final text"));
+        assert_eq!(
+            completed[0].provider_conversation_id.as_deref(),
+            Some("conv-1")
+        );
+        assert_eq!(completed[0].provider_response_id.as_deref(), Some("resp-1"));
+        assert_eq!(
+            completed[0].provider_previous_response_id.as_deref(),
+            Some("resp-0")
+        );
     }
 
     #[test]

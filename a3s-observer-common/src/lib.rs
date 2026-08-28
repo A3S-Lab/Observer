@@ -751,6 +751,7 @@ pub const TLS_PLAINTEXT_API_SSL_EX: u8 = 2;
 pub const TLS_PLAINTEXT_API_GNUTLS: u8 = 3;
 pub const TLS_PLAINTEXT_API_NSS: u8 = 4;
 pub const TLS_PLAINTEXT_API_TCP: u8 = 5;
+pub const TLS_PLAINTEXT_API_RUSTLS: u8 = 6;
 
 pub const TLS_PLAINTEXT_FLAG_TRUNCATED: u16 = 1 << 0;
 pub const TLS_PLAINTEXT_FLAG_COPY_ERROR: u16 = 1 << 1;
