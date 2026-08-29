@@ -1,0 +1,13 @@
+# Immutable Collector overlay for the AnySentry Observer composite runtime.
+#
+# The base image owns the Node supervisor, Forwarder, durable spool, runtime discovery and
+# control-plane modules. This build changes only the release Collector artifact, so replacing the
+# eBPF/userspace parser cannot silently remove the delivery process or its persisted contracts.
+# Always pass a digest-pinned base:
+#
+#   docker build --build-arg OBSERVER_RUNTIME_BASE=<registry/image@sha256:...> \
+#     -f deploy/Dockerfile.runtime-artifact <artifact-context>
+ARG OBSERVER_RUNTIME_BASE
+FROM ${OBSERVER_RUNTIME_BASE}
+
+COPY a3s-observer-collector /usr/local/bin/a3s-observer-collector
