@@ -102,6 +102,7 @@ pub struct TlsAttachManager {
     attached: HashSet<String>,
     rejected: HashSet<String>,
     verified_processes: HashMap<i32, RuntimeRole>,
+    scope_verified_processes: HashSet<i32>,
     static_discovery_cache: HashMap<(u64, u64), Vec<StaticDiscoveryMatch>>,
     process_patterns: Vec<String>,
     static_targets: Vec<PathBuf>,
@@ -149,6 +150,7 @@ impl TlsAttachManager {
             attached: HashSet::new(),
             rejected: HashSet::new(),
             verified_processes: HashMap::new(),
+            scope_verified_processes: HashSet::new(),
             static_discovery_cache: HashMap::new(),
             process_patterns,
             static_targets,
@@ -184,6 +186,12 @@ impl TlsAttachManager {
             };
             verified_processes.insert(pid, runtime_role);
             plans.extend(self.plans_for_process(pid, runtime_role));
+        }
+        self.scope_verified_processes
+            .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        for pid in self.scope_verified_processes.clone() {
+            verified_processes.insert(pid, RuntimeRole::AgentRoot);
+            plans.extend(self.plans_for_process(pid, RuntimeRole::AgentRoot));
         }
         self.verified_processes = verified_processes;
         let mut seen = HashSet::new();
@@ -237,7 +245,18 @@ impl TlsAttachManager {
         self.attached.len()
     }
 
+    /// Replace the product-neutral Agent Scope membership published by the co-located identity
+    /// forwarder. Named/static discovery remains independent and is merged again by `discover`.
+    pub fn set_scope_verified_pids(&mut self, pids: HashSet<i32>) {
+        self.scope_verified_processes = pids
+            .into_iter()
+            .filter(|pid| *pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
+            .collect();
+    }
+
     pub fn verified_pids(&mut self) -> Vec<i32> {
+        self.scope_verified_processes
+            .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
         self.verified_processes
             .retain(|pid, _| Path::new(&format!("/proc/{pid}")).exists());
         self.verified_processes.keys().copied().collect()
@@ -1172,5 +1191,18 @@ mod tests {
         ));
         assert!(!matches_trusted_network_runtime_text("bash", "bash"));
         assert!(!matches_trusted_network_runtime_text("python3", "python3"));
+    }
+
+    #[test]
+    fn product_neutral_scope_membership_survives_periodic_named_discovery() {
+        let mut manager = TlsAttachManager::from_env("1");
+        let pid = std::process::id() as i32;
+        manager.set_scope_verified_pids(HashSet::from([pid]));
+        let _ = manager.discover();
+        assert!(manager.verified_pids().contains(&pid));
+
+        manager.set_scope_verified_pids(HashSet::new());
+        let _ = manager.discover();
+        assert!(!manager.verified_pids().contains(&pid));
     }
 }

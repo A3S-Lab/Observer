@@ -13,6 +13,7 @@ mod pipeline;
 mod process_lifecycle;
 mod process_namespace;
 mod ring_reader;
+mod tls_agent_scopes;
 mod tls_attach;
 
 use a3s_observer::{
@@ -78,6 +79,7 @@ use interaction::{
     ChunkDirection, CompletedInteraction, CompletedPlaintextEvidence, InteractionReassembler,
     PlaintextChunk,
 };
+use tls_agent_scopes::TlsAgentScopeReloader;
 use tls_attach::{
     SymbolFamily, TlsAbi, TlsAttachKind, TlsAttachManager, TlsAttachPlan, TlsOffsetPair,
 };
@@ -1649,6 +1651,17 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let mut verified_process_map = VerifiedProcessMap::new(verified_processes);
     let mut tls_attach_manager = ssl_setting.as_deref().map(TlsAttachManager::from_env);
+    let tls_agent_scope_path = ssl_setting.as_ref().and_then(|_| {
+        env_any(&["ANYSENTRY_TLS_AGENT_CGROUPS_FILE"])
+            .map(PathBuf::from)
+            .or_else(|| {
+                filter_rules_path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(|parent| parent.join("tls-agent-cgroups.json"))
+            })
+    });
+    let mut tls_agent_scope_reloader = tls_agent_scope_path.map(TlsAgentScopeReloader::new);
     if let Some(manager) = tls_attach_manager.as_mut() {
         attached = attached.saturating_add(refresh_tls_attachments(
             manager,
@@ -1936,6 +1949,7 @@ async fn main() -> anyhow::Result<()> {
     exec_expire.tick().await;
     let mut reader_failure: Option<String> = None;
     let mut last_tls_profile_diagnostics = [0u64; 21];
+    let mut last_tls_agent_scope_error = String::new();
     'collect: loop {
         tokio::select! {
             biased;
@@ -2191,6 +2205,31 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = tls_attach_scan.tick(), if tls_attach_manager.is_some() => {
                 if let Some(manager) = tls_attach_manager.as_mut() {
+                    if let Some(reloader) = tls_agent_scope_reloader.as_mut() {
+                        match tokio::task::block_in_place(|| reloader.refresh()) {
+                            Ok(refresh) => {
+                                manager.set_scope_verified_pids(refresh.pids.clone());
+                                last_tls_agent_scope_error.clear();
+                                if refresh.changed {
+                                    tracing::info!(
+                                        cgroups = refresh.cgroups,
+                                        pids = refresh.pids.len(),
+                                        "reconciled product-neutral TLS Agent cgroup scopes"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                if last_tls_agent_scope_error != message {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "TLS Agent cgroup scope refresh failed; retaining the last valid scope"
+                                    );
+                                    last_tls_agent_scope_error = message;
+                                }
+                            }
+                        }
+                    }
                     let newly_attached = tokio::task::block_in_place(|| {
                         refresh_tls_attachments(manager, &mut verified_process_map, &mut ebpf)
                     });
