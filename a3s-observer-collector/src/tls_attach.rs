@@ -998,10 +998,10 @@ fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
 }
 
 fn decode_hex(value: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(value.len().is_multiple_of(2), "hex string has odd length");
-    value
-        .as_bytes()
-        .chunks_exact(2)
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    anyhow::ensure!(remainder.is_empty(), "hex string has odd length");
+    pairs
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair)?;
             Ok(u8::from_str_radix(text, 16)?)
