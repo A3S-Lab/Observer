@@ -337,14 +337,17 @@ impl TlsAttachManager {
                 continue;
             }
             let key = format!(
-                "pid:{pid}:dev:{}:ino:{}:symbols:{family:?}",
+                "global:dev:{}:ino:{}:symbols:{family:?}",
                 metadata.dev(),
                 metadata.ino()
             );
+            let stable_path =
+                stable_executable_probe_path(pid, &rooted, Path::new(mapped), &metadata)
+                    .unwrap_or(rooted);
             plans.push(TlsAttachPlan {
                 key,
-                pid: Some(pid),
-                path: rooted,
+                pid: None,
+                path: stable_path,
                 product: "mapped-tls-library".to_string(),
                 runtime_role,
                 transport_scope: format!("{family:?}").to_ascii_lowercase(),
@@ -406,9 +409,13 @@ impl TlsAttachManager {
             || basename == "python"
         {
             plans.push(TlsAttachPlan {
-                key: format!("{identity}:main-exported-openssl"),
-                pid: Some(pid),
-                path: probe_path.to_path_buf(),
+                key: format!(
+                    "global:dev:{}:ino:{}:main-exported-openssl",
+                    metadata.dev(),
+                    metadata.ino()
+                ),
+                pid: None,
+                path: static_probe_path,
                 product: format!("{basename}-main-elf"),
                 runtime_role,
                 transport_scope: "main-executable-exported-openssl".to_string(),
