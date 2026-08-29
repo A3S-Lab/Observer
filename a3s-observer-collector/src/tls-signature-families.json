@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "anysentry.tls_signature_families.v2",
+  "families": [
+    {
+      "implementationFamily": "boringssl-classic-x86-64",
+      "readExpectedPrefixHex": "554889e54157415653504883bf980000000074",
+      "writeExpectedPrefixHex": "554889e54157415641554154534883ec184189d74989f64889fb",
+      "readAbi": "classic",
+      "writeAbi": "classic",
+      "writeAfterReadOffsets": [912, 1008]
+    },
+    {
+      "implementationFamily": "openssl-ex-x86-64",
+      "readExpectedPrefixHex": "554889e5e8c7fbffff31c985c00f4ec1",
+      "writeExpectedPrefixHex": "554889e553504989c831db31c9e8befd",
+      "readAbi": "openssl_ex",
+      "writeAbi": "openssl_ex",
+      "writeAfterReadOffsets": [592]
+    },
+    {
+      "implementationFamily": "rustls-common-state-x86-64",
+      "readExpectedPrefixHex": "4157415641554154534989ffc6872e030000204c8b2e4c8b76084c89e848f7d8",
+      "writeExpectedPrefixHex": "554157415641554154534883ec284989d64889f34c8ba708030000",
+      "readAbi": "rustls_payload",
+      "writeAbi": "rustls_outbound_chunks",
+      "writeAfterReadOffsets": [-5248]
+    }
+  ]
+}

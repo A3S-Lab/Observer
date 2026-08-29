@@ -219,9 +219,9 @@ static SSL_CALL_ARGS: HashMap<u64, SslCallArgs> = HashMap::with_max_entries(1024
 #[map]
 static SSL_CALL_SEQUENCES: LruHashMap<u64, u64> = LruHashMap::with_max_entries(16_384, 0);
 
-// Metadata-only diagnostics for exact-profile Rustls probes. No plaintext bytes or pointers leave
-// eBPF through this map; userspace uses the counters to distinguish an unused offset from an ABI
-// layout rejection or route-admission miss.
+// Metadata-only diagnostics for implementation-family Rustls probes. No plaintext bytes or
+// pointers leave eBPF through this map; userspace uses the counters to distinguish an unused
+// boundary from an ABI-layout rejection or process-admission miss.
 #[map]
 static TLS_PROFILE_DIAGNOSTICS: PerCpuArray<u64> = PerCpuArray::with_max_entries(21, 0);
 
@@ -2154,20 +2154,21 @@ pub fn ssl_read_ex_exit(ctx: RetProbeContext) -> u32 {
     finish_ssl_ex(&ctx, TLS_PLAINTEXT_DIRECTION_READ)
 }
 
-// rustls 0.23 keeps decrypted application bytes in two stable internal boundaries:
+// The observed rustls CommonState ABI family keeps application bytes in two internal boundaries:
 // `CommonState::buffer_plaintext` receives an `OutboundChunks` value before encryption, while
 // `CommonState::take_received_plaintext` receives a `Payload` immediately after record
-// decryption. These probes are attached only through an exact whole-binary profile. The Rust enum
-// layouts below are therefore versioned profile ABI, not a claim of a cross-version Rust ABI.
+// decryption. Userspace discovers both anchors and their relative relation in stripped static
+// executables without checking a product, version, provider URL or whole-file fingerprint. The
+// layouts remain part of that implementation-family ABI and are validated before capture.
 //
-// OutboundChunks::Single layout (x86_64 rustls 0.23.41):
+// OutboundChunks::Single layout (observed x86_64 CommonState ABI family):
 //   [0] = zero/niche tag, [1] = byte pointer, [2] = byte length, [3] = unused
 // Payload::{Borrowed,Owned} layout:
 //   [0] = tag/capacity, [1] = byte pointer, [2] = byte length
 
-// Vectored `OutboundChunks::Multiple` intentionally fails closed for this first profile. The
-// common Codex/reqwest HTTP path reaches `Single`; a later profile can add a verifier-bounded
-// scatter/gather decoder without weakening the exact layout contract.
+// Vectored `OutboundChunks::Multiple` is recorded by diagnostics but not dereferenced as a flat
+// slice. A bounded scatter/gather decoder can be added as another ABI adapter without weakening
+// the validated `Single` memory contract.
 #[uprobe]
 pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
     bump_tls_profile_diagnostic(0);

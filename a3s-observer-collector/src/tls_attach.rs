@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-const PROFILE_DOCUMENT: &str = include_str!("tls-profiles.json");
+const SIGNATURE_FAMILY_DOCUMENT: &str = include_str!("tls-signature-families.json");
 const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
 const MAX_ANCHOR_MATCHES: usize = 128;
@@ -79,17 +79,6 @@ pub struct TlsAttachPlan {
     pub transport_scope: String,
     pub excluded_transport_scope: Option<String>,
     pub kind: TlsAttachKind,
-}
-
-#[derive(Clone, Debug)]
-struct StaticBootstrapProfile {
-    read_offset: u64,
-    read_prefix: Vec<u8>,
-    write_offset: u64,
-    write_prefix: Vec<u8>,
-    read_abi: TlsAbi,
-    write_abi: TlsAbi,
-    additional_pairs: Vec<(TlsOffsetPair, Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -680,111 +669,84 @@ fn is_interpreter_or_shell(basename: &str) -> bool {
     ) || basename.starts_with("python3.")
 }
 
-fn static_profiles() -> anyhow::Result<Vec<StaticBootstrapProfile>> {
-    let root: Value = serde_json::from_str(PROFILE_DOCUMENT)?;
-    let profiles = root
-        .get("profiles")
-        .and_then(Value::as_array)
-        .context("TLS profile document has no profiles")?;
-    profiles.iter().map(parse_profile).collect()
-}
-
-fn parse_profile(value: &Value) -> anyhow::Result<StaticBootstrapProfile> {
-    let string = |name: &str| -> anyhow::Result<String> {
-        value
-            .get(name)
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .with_context(|| format!("TLS profile field {name} is missing"))
-    };
-    let integer = |name: &str| -> anyhow::Result<u64> {
-        value
-            .get(name)
-            .and_then(Value::as_u64)
-            .with_context(|| format!("TLS profile field {name} is missing"))
-    };
-    let additional_pairs = value
-        .get("additionalProbePairs")
-        .map(|pairs| {
-            pairs
-                .as_array()
-                .context("TLS profile additionalProbePairs must be an array")?
-                .iter()
-                .map(parse_additional_pair)
-                .collect::<anyhow::Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    Ok(StaticBootstrapProfile {
-        read_offset: integer("readOffset")?,
-        read_prefix: decode_hex(&string("readExpectedPrefixHex")?)?,
-        write_offset: integer("writeOffset")?,
-        write_prefix: decode_hex(&string("writeExpectedPrefixHex")?)?,
-        read_abi: parse_abi(&string("readAbi")?)?,
-        write_abi: parse_abi(&string("writeAbi")?)?,
-        additional_pairs,
-    })
-}
-
 fn static_signature_families() -> anyhow::Result<Vec<StaticSignatureFamily>> {
-    let mut families = Vec::<StaticSignatureFamily>::new();
-    for profile in static_profiles()? {
-        add_signature_observation(
-            &mut families,
-            &TlsOffsetPair {
-                read_offset: profile.read_offset,
-                write_offset: profile.write_offset,
-                read_abi: profile.read_abi,
-                write_abi: profile.write_abi,
-            },
-            &profile.read_prefix,
-            &profile.write_prefix,
-        )?;
-        for (pair, read_prefix, write_prefix) in profile.additional_pairs {
-            add_signature_observation(&mut families, &pair, &read_prefix, &write_prefix)?;
-        }
-    }
-    for family in &mut families {
-        family.write_after_read.sort_unstable();
-        family.write_after_read.dedup();
-    }
+    let root: Value = serde_json::from_str(SIGNATURE_FAMILY_DOCUMENT)?;
+    anyhow::ensure!(
+        root.get("schemaVersion").and_then(Value::as_str)
+            == Some("anysentry.tls_signature_families.v2"),
+        "unsupported TLS signature-family schema"
+    );
+    let values = root
+        .get("families")
+        .and_then(Value::as_array)
+        .context("TLS signature-family document has no families")?;
+    let mut families = values
+        .iter()
+        .map(parse_signature_family)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     families.sort_by(|left, right| left.family_id.cmp(&right.family_id));
+    anyhow::ensure!(
+        families
+            .windows(2)
+            .all(|pair| pair[0].family_id != pair[1].family_id),
+        "TLS signature-family identifiers must be unique"
+    );
     Ok(families)
 }
 
-fn add_signature_observation(
-    families: &mut Vec<StaticSignatureFamily>,
-    pair: &TlsOffsetPair,
-    read_prefix: &[u8],
-    write_prefix: &[u8],
-) -> anyhow::Result<()> {
+fn parse_signature_family(value: &Value) -> anyhow::Result<StaticSignatureFamily> {
+    let string = |name: &str| -> anyhow::Result<&str> {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("TLS signature-family field {name} is missing"))
+    };
+    let implementation_family = string("implementationFamily")?;
+    anyhow::ensure!(
+        !implementation_family.is_empty()
+            && implementation_family
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+        "TLS implementation-family name must be a lowercase slug"
+    );
+    let read_prefix = decode_hex(string("readExpectedPrefixHex")?)?;
+    let write_prefix = decode_hex(string("writeExpectedPrefixHex")?)?;
+    let read_abi = parse_abi(string("readAbi")?)?;
+    let write_abi = parse_abi(string("writeAbi")?)?;
+    let mut write_after_read = value
+        .get("writeAfterReadOffsets")
+        .and_then(Value::as_array)
+        .context("TLS signature-family writeAfterReadOffsets must be an array")?
+        .iter()
+        .map(|offset| {
+            offset
+                .as_i64()
+                .context("TLS signature-family offset must fit i64")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     anyhow::ensure!(
         read_prefix.len() >= 12 && write_prefix.len() >= 12,
         "static TLS anchors must be at least 12 bytes"
     );
-    let delta = i128::from(pair.write_offset) - i128::from(pair.read_offset);
-    let delta = i64::try_from(delta).context("TLS anchor relation exceeds i64")?;
-    if let Some(family) = families.iter_mut().find(|family| {
-        family.read_prefix == read_prefix
-            && family.write_prefix == write_prefix
-            && family.read_abi == pair.read_abi
-            && family.write_abi == pair.write_abi
-    }) {
-        family.write_after_read.push(delta);
-        return Ok(());
-    }
-    families.push(StaticSignatureFamily {
-        family_id: signature_family_id(read_prefix, write_prefix, pair.read_abi, pair.write_abi),
-        read_prefix: read_prefix.to_vec(),
-        write_prefix: write_prefix.to_vec(),
-        read_abi: pair.read_abi,
-        write_abi: pair.write_abi,
-        write_after_read: vec![delta],
-    });
-    Ok(())
+    anyhow::ensure!(
+        !write_after_read.is_empty() && write_after_read.len() <= 8,
+        "TLS signature family must contain between one and eight offset relations"
+    );
+    write_after_read.sort_unstable();
+    write_after_read.dedup();
+    let fingerprint =
+        signature_family_fingerprint(&read_prefix, &write_prefix, read_abi, write_abi);
+    Ok(StaticSignatureFamily {
+        family_id: format!("{implementation_family}-{fingerprint}"),
+        read_prefix,
+        write_prefix,
+        read_abi,
+        write_abi,
+        write_after_read,
+    })
 }
 
-fn signature_family_id(
+fn signature_family_fingerprint(
     read_prefix: &[u8],
     write_prefix: &[u8],
     read_abi: TlsAbi,
@@ -795,12 +757,7 @@ fn signature_family_id(
     hash.update([tls_abi_code(read_abi), tls_abi_code(write_abi)]);
     hash.update(read_prefix);
     hash.update(write_prefix);
-    format!(
-        "{}-{}-{}",
-        tls_abi_name(read_abi),
-        tls_abi_name(write_abi),
-        &hex(&hash.finalize())[..16]
-    )
+    hex(&hash.finalize())[..16].to_string()
 }
 
 fn tls_abi_code(abi: TlsAbi) -> u8 {
@@ -809,15 +766,6 @@ fn tls_abi_code(abi: TlsAbi) -> u8 {
         TlsAbi::OpenSslEx => 2,
         TlsAbi::RustlsPayload => 3,
         TlsAbi::RustlsOutboundChunks => 4,
-    }
-}
-
-fn tls_abi_name(abi: TlsAbi) -> &'static str {
-    match abi {
-        TlsAbi::Classic => "classic",
-        TlsAbi::OpenSslEx => "openssl-ex",
-        TlsAbi::RustlsPayload => "rustls-payload",
-        TlsAbi::RustlsOutboundChunks => "rustls-outbound",
     }
 }
 
@@ -1053,31 +1001,6 @@ fn u64_le(bytes: &[u8], offset: usize) -> anyhow::Result<u64> {
     Ok(u64::from_le_bytes(raw))
 }
 
-fn parse_additional_pair(value: &Value) -> anyhow::Result<(TlsOffsetPair, Vec<u8>, Vec<u8>)> {
-    let string = |name: &str| -> anyhow::Result<&str> {
-        value
-            .get(name)
-            .and_then(Value::as_str)
-            .with_context(|| format!("TLS additional probe field {name} is missing"))
-    };
-    let integer = |name: &str| -> anyhow::Result<u64> {
-        value
-            .get(name)
-            .and_then(Value::as_u64)
-            .with_context(|| format!("TLS additional probe field {name} is missing"))
-    };
-    Ok((
-        TlsOffsetPair {
-            read_offset: integer("readOffset")?,
-            write_offset: integer("writeOffset")?,
-            read_abi: parse_abi(string("readAbi")?)?,
-            write_abi: parse_abi(string("writeAbi")?)?,
-        },
-        decode_hex(string("readExpectedPrefixHex")?)?,
-        decode_hex(string("writeExpectedPrefixHex")?)?,
-    ))
-}
-
 fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
     match value {
         "classic" => Ok(TlsAbi::Classic),
@@ -1115,11 +1038,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_profiles_collapse_into_tls_implementation_families() {
-        let profiles = static_profiles().unwrap();
-        assert_eq!(profiles.len(), 4);
+    fn static_document_contains_only_tls_implementation_families() {
         let families = static_signature_families().unwrap();
-        assert_eq!(families.len(), 2);
+        assert_eq!(families.len(), 3);
         assert!(families.iter().all(|family| family.read_prefix.len() >= 12
             && family.write_prefix.len() >= 12
             && !family.write_after_read.is_empty()));
@@ -1133,6 +1054,12 @@ mod tests {
             .find(|family| family.read_abi == TlsAbi::Classic)
             .unwrap();
         assert_eq!(classic.write_after_read, vec![912, 1008]);
+        let rustls = families
+            .iter()
+            .find(|family| family.read_abi == TlsAbi::RustlsPayload)
+            .unwrap();
+        assert_eq!(rustls.write_after_read, vec![-5248]);
+        assert_eq!(rustls.write_abi, TlsAbi::RustlsOutboundChunks);
     }
 
     #[test]
@@ -1150,6 +1077,32 @@ mod tests {
             assert!(
                 !discover_static_signature_matches(&path).unwrap().is_empty(),
                 "installed target did not match a TLS implementation family: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn configured_rustls_binaries_match_common_state_abi_family() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_RUSTLS_BINARIES") else {
+            return;
+        };
+        for path in candidates
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            let discoveries = discover_static_signature_matches(&path).unwrap();
+            assert!(
+                discoveries
+                    .iter()
+                    .any(|discovery| discovery.pairs.iter().any(|pair| {
+                        pair.read_abi == TlsAbi::RustlsPayload
+                            && pair.write_abi == TlsAbi::RustlsOutboundChunks
+                    })),
+                "installed target did not match the Rustls CommonState ABI family: {}",
                 path.display()
             );
         }
