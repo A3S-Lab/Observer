@@ -9,6 +9,7 @@ use a3s_observer::{
 };
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
+use flate2::{Decompress, FlushDecompress, Status};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -22,6 +23,8 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_HEADERS: usize = 96;
 const MAX_SSE_STRUCTURED_EVENTS: usize = 2_048;
 const MAX_EXPORTED_STRUCTURED_BYTES: usize = 512 * 1024;
+const WEBSOCKET_MAX_FRAME_HEADER_BYTES: usize = 14;
+const WEBSOCKET_DEFLATE_TAIL: &[u8; 4] = b"\x00\x00\xff\xff";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChunkDirection {
@@ -155,6 +158,7 @@ struct HttpMessage {
     completed_at_unix_ns: u128,
     partial_reasons: Vec<String>,
     metadata_inferred: bool,
+    transport_protocol: Option<String>,
 }
 
 impl HttpMessage {
@@ -260,11 +264,20 @@ impl HttpStreamDecoder {
                 completed_at_unix_ns: event_at_unix_ns,
                 partial_reasons: reasons,
                 metadata_inferred: false,
+                transport_protocol: None,
             });
             self.buffer.drain(..decoded.consumed);
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
         }
         messages
+    }
+
+    fn take_unparsed_tail(&mut self) -> Vec<u8> {
+        self.buffer_started_at_unix_ns = None;
+        self.last_at_unix_ns = 0;
+        self.partial_reasons.clear();
+        self.last_decode_error = None;
+        std::mem::take(&mut self.buffer)
     }
 }
 
@@ -279,6 +292,418 @@ struct DecodedHttpMessage {
 }
 
 #[derive(Debug)]
+struct DecodedWebSocketFrame {
+    consumed: usize,
+    fin: bool,
+    compressed: bool,
+    opcode: u8,
+    masked: bool,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DecodedWebSocketMessage {
+    payload: Vec<u8>,
+    started_at_unix_ns: u128,
+    completed_at_unix_ns: u128,
+    partial_reasons: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FragmentedWebSocketMessage {
+    compressed: bool,
+    payload: Vec<u8>,
+    started_at_unix_ns: u128,
+    partial_reasons: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WebSocketFrameDecoder {
+    kind: StreamKind,
+    buffer: Vec<u8>,
+    buffer_started_at_unix_ns: Option<u128>,
+    max_bytes: usize,
+    partial_reasons: Vec<String>,
+    fragmented: Option<FragmentedWebSocketMessage>,
+    compression_enabled: bool,
+    no_context_takeover: bool,
+    inflater: Decompress,
+    last_decode_error: Option<String>,
+}
+
+impl WebSocketFrameDecoder {
+    fn new(kind: StreamKind, max_bytes: usize) -> Self {
+        Self {
+            kind,
+            buffer: Vec::new(),
+            buffer_started_at_unix_ns: None,
+            max_bytes,
+            partial_reasons: Vec::new(),
+            fragmented: None,
+            compression_enabled: false,
+            no_context_takeover: false,
+            inflater: Decompress::new(false),
+            last_decode_error: None,
+        }
+    }
+
+    fn configure_compression(&mut self, enabled: bool, no_context_takeover: bool) {
+        self.compression_enabled = enabled;
+        self.no_context_takeover = no_context_takeover;
+        self.inflater.reset(false);
+    }
+
+    fn push(
+        &mut self,
+        data: &[u8],
+        event_at_unix_ns: u128,
+        reasons: &[String],
+    ) -> Vec<DecodedWebSocketMessage> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        if self.buffer.is_empty() {
+            self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
+        }
+        extend_unique(&mut self.partial_reasons, reasons.iter().cloned());
+        let max_buffer = self
+            .max_bytes
+            .saturating_add(WEBSOCKET_MAX_FRAME_HEADER_BYTES);
+        if self.buffer.len().saturating_add(data.len()) > max_buffer {
+            self.reset_after_error("websocket_frame_limit");
+            return Vec::new();
+        }
+        self.buffer.extend_from_slice(data);
+
+        let mut messages = Vec::new();
+        loop {
+            let frame = match decode_websocket_frame(&self.buffer, self.max_bytes) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(reason) => {
+                    self.reset_after_error(&reason);
+                    break;
+                }
+            };
+            let frame_started_at_unix_ns =
+                self.buffer_started_at_unix_ns.unwrap_or(event_at_unix_ns);
+            self.buffer.drain(..frame.consumed);
+            self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
+            let mut frame_reasons = std::mem::take(&mut self.partial_reasons);
+            let expected_mask = self.kind == StreamKind::Request;
+            if frame.masked != expected_mask {
+                extend_unique(
+                    &mut frame_reasons,
+                    ["websocket_mask_direction_mismatch".to_string()],
+                );
+            }
+
+            match frame.opcode {
+                0x8..=0xA => {
+                    if !frame.fin || frame.payload.len() > 125 {
+                        self.reset_after_error("websocket_invalid_control_frame");
+                        break;
+                    }
+                    continue;
+                }
+                0x1 | 0x2 => {
+                    if self.fragmented.is_some() {
+                        self.reset_after_error("websocket_nested_data_frame");
+                        break;
+                    }
+                    if frame.fin {
+                        if let Some(message) = self.finish_message(
+                            frame.payload,
+                            frame.compressed,
+                            frame_started_at_unix_ns,
+                            event_at_unix_ns,
+                            frame_reasons,
+                        ) {
+                            messages.push(message);
+                        }
+                    } else {
+                        self.fragmented = Some(FragmentedWebSocketMessage {
+                            compressed: frame.compressed,
+                            payload: frame.payload,
+                            started_at_unix_ns: frame_started_at_unix_ns,
+                            partial_reasons: frame_reasons,
+                        });
+                    }
+                }
+                0x0 => {
+                    if frame.compressed {
+                        self.reset_after_error("websocket_compressed_continuation");
+                        break;
+                    }
+                    let Some(mut fragmented) = self.fragmented.take() else {
+                        self.reset_after_error("websocket_orphan_continuation");
+                        break;
+                    };
+                    if fragmented.payload.len().saturating_add(frame.payload.len()) > self.max_bytes
+                    {
+                        self.reset_after_error("websocket_message_limit");
+                        break;
+                    }
+                    fragmented.payload.extend_from_slice(&frame.payload);
+                    extend_unique(&mut fragmented.partial_reasons, frame_reasons);
+                    if frame.fin {
+                        if let Some(message) = self.finish_message(
+                            fragmented.payload,
+                            fragmented.compressed,
+                            fragmented.started_at_unix_ns,
+                            event_at_unix_ns,
+                            fragmented.partial_reasons,
+                        ) {
+                            messages.push(message);
+                        }
+                    } else {
+                        self.fragmented = Some(fragmented);
+                    }
+                }
+                _ => {
+                    self.reset_after_error("websocket_reserved_opcode");
+                    break;
+                }
+            }
+        }
+        messages
+    }
+
+    fn finish_message(
+        &mut self,
+        payload: Vec<u8>,
+        compressed: bool,
+        started_at_unix_ns: u128,
+        completed_at_unix_ns: u128,
+        mut partial_reasons: Vec<String>,
+    ) -> Option<DecodedWebSocketMessage> {
+        let payload = if compressed {
+            if !self.compression_enabled {
+                self.last_decode_error = Some("websocket_unnegotiated_compression".to_string());
+                return None;
+            }
+            match self.inflate_message(&payload) {
+                Ok(payload) => payload,
+                Err(reason) => {
+                    self.last_decode_error = Some(reason.clone());
+                    extend_unique(&mut partial_reasons, [reason]);
+                    return None;
+                }
+            }
+        } else {
+            payload
+        };
+        self.last_decode_error = None;
+        Some(DecodedWebSocketMessage {
+            payload,
+            started_at_unix_ns,
+            completed_at_unix_ns,
+            partial_reasons,
+        })
+    }
+
+    fn inflate_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        if self.no_context_takeover {
+            self.inflater.reset(false);
+        }
+        let mut input = Vec::with_capacity(payload.len().saturating_add(4));
+        input.extend_from_slice(payload);
+        input.extend_from_slice(WEBSOCKET_DEFLATE_TAIL);
+        let initial_capacity = input
+            .len()
+            .saturating_mul(4)
+            .clamp(4 * 1024, self.max_bytes);
+        let mut output = Vec::with_capacity(initial_capacity);
+        let mut cursor = 0usize;
+        loop {
+            if output.len() == output.capacity() {
+                if output.len() >= self.max_bytes {
+                    self.inflater.reset(false);
+                    return Err("websocket_decompressed_limit".to_string());
+                }
+                let additional = output
+                    .capacity()
+                    .max(4 * 1024)
+                    .min(self.max_bytes - output.len());
+                output.reserve_exact(additional);
+            }
+            let before_in = self.inflater.total_in();
+            let before_out = self.inflater.total_out();
+            let status = self
+                .inflater
+                .decompress_vec(&input[cursor..], &mut output, FlushDecompress::Sync)
+                .map_err(|_| "websocket_deflate_decode_failed".to_string())?;
+            let consumed = (self.inflater.total_in() - before_in) as usize;
+            let produced = (self.inflater.total_out() - before_out) as usize;
+            cursor = cursor.saturating_add(consumed);
+            if cursor == input.len() && status != Status::BufError {
+                break;
+            }
+            if consumed == 0 && produced == 0 {
+                if cursor == input.len() {
+                    break;
+                }
+                self.inflater.reset(false);
+                return Err("websocket_deflate_stalled".to_string());
+            }
+        }
+        if self.no_context_takeover {
+            self.inflater.reset(false);
+        }
+        Ok(output)
+    }
+
+    fn reset_after_error(&mut self, reason: &str) {
+        self.buffer.clear();
+        self.buffer_started_at_unix_ns = None;
+        self.partial_reasons.clear();
+        self.fragmented = None;
+        self.inflater.reset(false);
+        self.last_decode_error = Some(reason.to_string());
+    }
+}
+
+fn decode_websocket_frame(
+    bytes: &[u8],
+    max_payload_bytes: usize,
+) -> Result<Option<DecodedWebSocketFrame>, String> {
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    let first = bytes[0];
+    let second = bytes[1];
+    if first & 0x30 != 0 {
+        return Err("websocket_reserved_bits".to_string());
+    }
+    let fin = first & 0x80 != 0;
+    let compressed = first & 0x40 != 0;
+    let opcode = first & 0x0f;
+    let masked = second & 0x80 != 0;
+    let mut cursor = 2usize;
+    let mut payload_len = usize::from(second & 0x7f);
+    if payload_len == 126 {
+        let Some(length) = bytes.get(cursor..cursor + 2) else {
+            return Ok(None);
+        };
+        payload_len = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        cursor += 2;
+    } else if payload_len == 127 {
+        let Some(length) = bytes.get(cursor..cursor + 8) else {
+            return Ok(None);
+        };
+        if length[0] & 0x80 != 0 {
+            return Err("websocket_invalid_64bit_length".to_string());
+        }
+        let length = u64::from_be_bytes(length.try_into().expect("eight bytes checked"));
+        payload_len =
+            usize::try_from(length).map_err(|_| "websocket_frame_length_overflow".to_string())?;
+        cursor += 8;
+    }
+    if payload_len > max_payload_bytes {
+        return Err("websocket_frame_limit".to_string());
+    }
+    let mask = if masked {
+        let Some(mask) = bytes.get(cursor..cursor + 4) else {
+            return Ok(None);
+        };
+        cursor += 4;
+        Some([mask[0], mask[1], mask[2], mask[3]])
+    } else {
+        None
+    };
+    let consumed = cursor
+        .checked_add(payload_len)
+        .ok_or_else(|| "websocket_frame_length_overflow".to_string())?;
+    let Some(raw_payload) = bytes.get(cursor..consumed) else {
+        return Ok(None);
+    };
+    let mut payload = raw_payload.to_vec();
+    if let Some(mask) = mask {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    Ok(Some(DecodedWebSocketFrame {
+        consumed,
+        fin,
+        compressed,
+        opcode,
+        masked,
+        payload,
+    }))
+}
+
+#[derive(Debug)]
+struct WebSocketResponseAccumulator {
+    body: Vec<u8>,
+    captured_body_bytes: usize,
+    started_at_unix_ns: Option<u128>,
+    partial_reasons: Vec<String>,
+    tool_calls: Vec<LlmInteractionToolCall>,
+}
+
+impl WebSocketResponseAccumulator {
+    fn new() -> Self {
+        Self {
+            body: Vec::new(),
+            captured_body_bytes: 0,
+            started_at_unix_ns: None,
+            partial_reasons: Vec::new(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.body.clear();
+        self.captured_body_bytes = 0;
+        self.started_at_unix_ns = None;
+        self.partial_reasons.clear();
+        self.tool_calls.clear();
+    }
+}
+
+#[derive(Debug)]
+struct WebSocketConnectionState {
+    upgrade_requested: bool,
+    active: bool,
+    endpoint: String,
+    path: String,
+    requests: WebSocketFrameDecoder,
+    responses: WebSocketFrameDecoder,
+    response: WebSocketResponseAccumulator,
+}
+
+impl WebSocketConnectionState {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            upgrade_requested: false,
+            active: false,
+            endpoint: "unknown".to_string(),
+            path: "/v1/responses".to_string(),
+            requests: WebSocketFrameDecoder::new(StreamKind::Request, max_bytes),
+            responses: WebSocketFrameDecoder::new(StreamKind::Response, max_bytes),
+            response: WebSocketResponseAccumulator::new(),
+        }
+    }
+
+    fn activate(&mut self, extension: Option<&str>) {
+        let extension = extension.unwrap_or_default().to_ascii_lowercase();
+        let compression_enabled = extension
+            .split(',')
+            .any(|entry| entry.trim_start().starts_with("permessage-deflate"));
+        self.requests.configure_compression(
+            compression_enabled,
+            extension.contains("client_no_context_takeover"),
+        );
+        self.responses.configure_compression(
+            compression_enabled,
+            extension.contains("server_no_context_takeover"),
+        );
+        self.active = true;
+    }
+}
+
+#[derive(Debug)]
 struct ConnectionState {
     requests: HttpStreamDecoder,
     responses: HttpStreamDecoder,
@@ -289,6 +714,7 @@ struct ConnectionState {
     source: String,
     adapter_id: String,
     evidence_fingerprints: HashSet<String>,
+    websocket: WebSocketConnectionState,
     last_activity: Instant,
 }
 
@@ -304,6 +730,7 @@ impl ConnectionState {
             source,
             adapter_id,
             evidence_fingerprints: HashSet::new(),
+            websocket: WebSocketConnectionState::new(max_body_bytes),
             last_activity: Instant::now(),
         }
     }
@@ -385,60 +812,93 @@ impl InteractionReassembler {
         }
         *previous_sequence = chunk.sequence;
 
-        let completed = match chunk.direction {
-            ChunkDirection::Request => {
-                let body_only =
-                    if chunk.source.contains("rustls") && state.requests.buffer.is_empty() {
-                        body_only_llm_request(
+        let completed = if state.websocket.active {
+            process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
+        } else {
+            match chunk.direction {
+                ChunkDirection::Request => {
+                    let body_only =
+                        if chunk.source.contains("rustls") && state.requests.buffer.is_empty() {
+                            body_only_llm_request(
+                                &chunk.data,
+                                chunk.event_at_unix_ns,
+                                &chunk.partial_reasons,
+                            )
+                        } else {
+                            None
+                        };
+                    if let Some(request) = body_only {
+                        state.pending_requests.push_back(request);
+                    } else {
+                        for request in state.requests.push(
                             &chunk.data,
                             chunk.event_at_unix_ns,
                             &chunk.partial_reasons,
-                        )
-                    } else {
-                        None
-                    };
-                if let Some(request) = body_only {
-                    state.pending_requests.push_back(request);
-                } else {
-                    for request in state.requests.push(
+                        ) {
+                            if let Some((endpoint, path)) = websocket_upgrade_metadata(&request) {
+                                state.websocket.upgrade_requested = true;
+                                state.websocket.endpoint = endpoint;
+                                state.websocket.path = path;
+                            } else {
+                                state.pending_requests.push_back(request);
+                            }
+                        }
+                    }
+                    Vec::new()
+                }
+                ChunkDirection::Response => {
+                    let mut completed = Vec::new();
+                    for response in state.responses.push(
                         &chunk.data,
                         chunk.event_at_unix_ns,
                         &chunk.partial_reasons,
                     ) {
-                        state.pending_requests.push_back(request);
+                        if state.websocket.upgrade_requested
+                            && response_status(&response.start_line) == Some(101)
+                        {
+                            let extension = response
+                                .header("sec-websocket-extensions")
+                                .map(str::to_owned);
+                            state.websocket.activate(extension.as_deref());
+                            let tail = state.responses.take_unparsed_tail();
+                            if !tail.is_empty() {
+                                let messages = state.websocket.responses.push(
+                                    &tail,
+                                    chunk.event_at_unix_ns,
+                                    &chunk.partial_reasons,
+                                );
+                                completed.extend(process_websocket_response_messages(
+                                    key,
+                                    state,
+                                    messages,
+                                    self.max_body_bytes,
+                                ));
+                            }
+                            continue;
+                        }
+                        // Informational responses do not consume the request they precede.
+                        if response_status(&response.start_line)
+                            .is_some_and(|status| (100..200).contains(&status))
+                        {
+                            continue;
+                        }
+                        let Some(request) = state.pending_requests.pop_front() else {
+                            continue;
+                        };
+                        state.sequence = state.sequence.wrapping_add(1);
+                        if let Some(interaction) = build_interaction(
+                            key,
+                            state.sequence,
+                            &state.source,
+                            &state.adapter_id,
+                            request,
+                            response,
+                        ) {
+                            completed.push(interaction);
+                        }
                     }
+                    completed
                 }
-                Vec::new()
-            }
-            ChunkDirection::Response => {
-                let mut completed = Vec::new();
-                for response in state.responses.push(
-                    &chunk.data,
-                    chunk.event_at_unix_ns,
-                    &chunk.partial_reasons,
-                ) {
-                    // Informational responses do not consume the request they precede.
-                    if response_status(&response.start_line)
-                        .is_some_and(|status| (100..200).contains(&status))
-                    {
-                        continue;
-                    }
-                    let Some(request) = state.pending_requests.pop_front() else {
-                        continue;
-                    };
-                    state.sequence = state.sequence.wrapping_add(1);
-                    if let Some(interaction) = build_interaction(
-                        key,
-                        state.sequence,
-                        &state.source,
-                        &state.adapter_id,
-                        request,
-                        response,
-                    ) {
-                        completed.push(interaction);
-                    }
-                }
-                completed
             }
         };
         if interaction_diagnostics_enabled() {
@@ -454,9 +914,14 @@ impl InteractionReassembler {
                 fragment_bytes = chunk.data.len(),
                 request_buffer_bytes = state.requests.buffer.len(),
                 response_buffer_bytes = state.responses.buffer.len(),
+                websocket_active = state.websocket.active,
+                websocket_request_buffer_bytes = state.websocket.requests.buffer.len(),
+                websocket_response_buffer_bytes = state.websocket.responses.buffer.len(),
                 pending_requests = state.pending_requests.len(),
                 request_decode_error = ?state.requests.last_decode_error,
                 response_decode_error = ?state.responses.last_decode_error,
+                websocket_request_decode_error = ?state.websocket.requests.last_decode_error,
+                websocket_response_decode_error = ?state.websocket.responses.last_decode_error,
                 completed_interactions = completed.len(),
                 "Agent interaction reassembly state"
             );
@@ -507,6 +972,183 @@ impl InteractionReassembler {
             self.connections.remove(&oldest);
         }
     }
+}
+
+fn websocket_upgrade_metadata(request: &HttpMessage) -> Option<(String, String)> {
+    let (method, path) = request_line(&request.start_line)?;
+    if method != "GET" {
+        return None;
+    }
+    let upgrade = request
+        .header("upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection = request.header("connection").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    if !upgrade && !connection {
+        return None;
+    }
+    let path = path
+        .split('?')
+        .next()
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or("/websocket")
+        .to_string();
+    Some((request.endpoint(), path))
+}
+
+fn process_websocket_chunk(
+    key: ConnectionKey,
+    state: &mut ConnectionState,
+    chunk: &PlaintextChunk,
+    max_body_bytes: usize,
+) -> Vec<CompletedInteraction> {
+    match chunk.direction {
+        ChunkDirection::Request => {
+            let messages = state.websocket.requests.push(
+                &chunk.data,
+                chunk.event_at_unix_ns,
+                &chunk.partial_reasons,
+            );
+            for message in messages {
+                let Some(mut request) = body_only_llm_request(
+                    &message.payload,
+                    message.completed_at_unix_ns,
+                    &message.partial_reasons,
+                ) else {
+                    continue;
+                };
+                request.started_at_unix_ns = message.started_at_unix_ns;
+                request.start_line = format!("POST {} HTTP/1.1", state.websocket.path);
+                request
+                    .headers
+                    .insert("host".to_string(), state.websocket.endpoint.clone());
+                request.transport_protocol = Some("websocket".to_string());
+                state.pending_requests.push_back(request);
+            }
+            Vec::new()
+        }
+        ChunkDirection::Response => {
+            let messages = state.websocket.responses.push(
+                &chunk.data,
+                chunk.event_at_unix_ns,
+                &chunk.partial_reasons,
+            );
+            process_websocket_response_messages(key, state, messages, max_body_bytes)
+        }
+    }
+}
+
+fn process_websocket_response_messages(
+    key: ConnectionKey,
+    state: &mut ConnectionState,
+    messages: Vec<DecodedWebSocketMessage>,
+    max_body_bytes: usize,
+) -> Vec<CompletedInteraction> {
+    let mut completed = Vec::new();
+    for message in messages {
+        let Ok(value) = serde_json::from_slice::<Value>(&message.payload) else {
+            continue;
+        };
+        let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !event_type.starts_with("response.") && event_type != "error" {
+            continue;
+        }
+        if state.pending_requests.is_empty() {
+            state.websocket.response.clear();
+            continue;
+        }
+
+        let response = &mut state.websocket.response;
+        response
+            .started_at_unix_ns
+            .get_or_insert(message.started_at_unix_ns);
+        response.captured_body_bytes = response
+            .captured_body_bytes
+            .saturating_add(message.payload.len());
+        extend_unique(&mut response.partial_reasons, message.partial_reasons);
+        response
+            .tool_calls
+            .extend(extract_tool_calls(&value, message.completed_at_unix_ns));
+
+        let prefix = b"data: ";
+        let suffix = b"\n\n";
+        let needed = prefix
+            .len()
+            .saturating_add(message.payload.len())
+            .saturating_add(suffix.len());
+        if response.body.len().saturating_add(needed) <= max_body_bytes {
+            response.body.extend_from_slice(prefix);
+            response.body.extend_from_slice(&message.payload);
+            response.body.extend_from_slice(suffix);
+        } else {
+            extend_unique(
+                &mut response.partial_reasons,
+                ["websocket_response_body_limit".to_string()],
+            );
+        }
+
+        let status_code = match event_type {
+            "response.completed" => Some(200),
+            "response.failed" | "response.incomplete" | "response.cancelled" | "error" => Some(502),
+            _ => None,
+        };
+        let Some(status_code) = status_code else {
+            continue;
+        };
+        let response = std::mem::replace(
+            &mut state.websocket.response,
+            WebSocketResponseAccumulator::new(),
+        );
+        let Some(request) = state.pending_requests.pop_front() else {
+            continue;
+        };
+        let started_at_unix_ns = response
+            .started_at_unix_ns
+            .unwrap_or(message.started_at_unix_ns);
+        let response_message = HttpMessage {
+            start_line: format!("HTTP/1.1 {status_code} WebSocket"),
+            headers: BTreeMap::from([
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("host".to_string(), state.websocket.endpoint.clone()),
+            ]),
+            captured_body_bytes: response.captured_body_bytes,
+            body: response.body,
+            started_at_unix_ns,
+            completed_at_unix_ns: message.completed_at_unix_ns,
+            partial_reasons: response.partial_reasons,
+            metadata_inferred: true,
+            transport_protocol: Some("websocket".to_string()),
+        };
+        state.sequence = state.sequence.wrapping_add(1);
+        if let Some(mut interaction) = build_interaction(
+            key,
+            state.sequence,
+            &state.source,
+            &state.adapter_id,
+            request,
+            response_message,
+        ) {
+            let mut tool_calls = response.tool_calls;
+            tool_calls.append(&mut interaction.tool_calls);
+            dedup_tool_calls(&mut tool_calls);
+            interaction.tool_calls = tool_calls;
+            if !interaction.tool_calls.is_empty() && interaction.tool_results.is_empty() {
+                interaction.conversation_completeness = "tool_pending".to_string();
+                interaction.completeness = "partial".to_string();
+                extend_unique(
+                    &mut interaction.partial_reasons,
+                    ["tool_result_pending".to_string()],
+                );
+            }
+            completed.push(interaction);
+        }
+    }
+    completed
 }
 
 fn interaction_diagnostics_enabled() -> bool {
@@ -646,6 +1288,7 @@ fn body_only_llm_request(
         completed_at_unix_ns: event_at_unix_ns,
         partial_reasons: partial_reasons.to_vec(),
         metadata_inferred: true,
+        transport_protocol: Some("json-body".to_string()),
     })
 }
 
@@ -890,19 +1533,18 @@ fn build_interaction(
             "tls"
         }
         .to_string(),
-        protocol: if request.metadata_inferred {
-            "http/1.1-body-inferred"
-        } else {
-            "http/1.1"
+        protocol: match request.transport_protocol.as_deref() {
+            Some("websocket") => "websocket-json",
+            Some("json-body") => "http/1.1-body-inferred",
+            _ if request.metadata_inferred => "application-body-inferred",
+            _ => "http/1.1",
         }
         .to_string(),
         tls_adapter_id: adapter_id.to_string(),
-        transport_protocol: if request.metadata_inferred {
-            "json-body"
-        } else {
-            "http/1.1"
-        }
-        .to_string(),
+        transport_protocol: request
+            .transport_protocol
+            .clone()
+            .unwrap_or_else(|| "http/1.1".to_string()),
         wire_template_id: Some(wire_match.template_id.to_string()),
         parse_state: wire_match.parse_state.to_string(),
         llm_likelihood: wire_match.likelihood.to_string(),
@@ -1058,7 +1700,7 @@ fn decode_http_message(
         }
         (body_bytes[..length].to_vec(), length)
     } else if matches!(kind, StreamKind::Request)
-        || status_code.is_some_and(|code| code == 204 || code == 304)
+        || status_code.is_some_and(|code| (100..200).contains(&code) || code == 204 || code == 304)
     {
         (Vec::new(), 0)
     } else if content_type
@@ -1963,6 +2605,12 @@ fn sse_terminal_offset(body: &[u8]) -> Option<usize> {
         consumed += block.len();
         if block.contains("\"type\":\"response.completed\"")
             || block.contains("\"type\": \"response.completed\"")
+            || block.contains("\"type\":\"response.failed\"")
+            || block.contains("\"type\": \"response.failed\"")
+            || block.contains("\"type\":\"response.incomplete\"")
+            || block.contains("\"type\": \"response.incomplete\"")
+            || block.contains("\"type\":\"response.cancelled\"")
+            || block.contains("\"type\": \"response.cancelled\"")
             || block.contains("\"type\":\"message_stop\"")
             || block.contains("\"type\": \"message_stop\"")
         {
@@ -2082,7 +2730,7 @@ fn extend_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = S
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
-    use flate2::Compression;
+    use flate2::{Compress, Compression, FlushCompress};
     use std::io::Write;
 
     fn chunk(direction: ChunkDirection, data: impl Into<Vec<u8>>, at: u128) -> PlaintextChunk {
@@ -2124,6 +2772,60 @@ mod tests {
             body
         )
         .into_bytes()
+    }
+
+    fn rustls_chunk(
+        direction: ChunkDirection,
+        data: impl Into<Vec<u8>>,
+        at: u128,
+    ) -> PlaintextChunk {
+        let mut chunk = chunk(direction, data, at);
+        chunk.source = "tls_uprobe_rustls".to_string();
+        chunk.adapter_id = "rustls-payload".to_string();
+        chunk
+    }
+
+    fn compressed_websocket_frame(
+        compressor: &mut Compress,
+        payload: &[u8],
+        masked: bool,
+    ) -> Vec<u8> {
+        let before_in = compressor.total_in();
+        let mut compressed =
+            Vec::with_capacity(payload.len().saturating_mul(2).saturating_add(128));
+        compressor
+            .compress_vec(payload, &mut compressed, FlushCompress::Sync)
+            .unwrap();
+        assert_eq!((compressor.total_in() - before_in) as usize, payload.len());
+        assert!(compressed.ends_with(WEBSOCKET_DEFLATE_TAIL));
+        compressed.truncate(compressed.len() - WEBSOCKET_DEFLATE_TAIL.len());
+
+        let mut frame = vec![0xC1];
+        let mask_bit = if masked { 0x80 } else { 0 };
+        match compressed.len() {
+            length @ 0..=125 => frame.push(mask_bit | length as u8),
+            length @ 126..=65_535 => {
+                frame.push(mask_bit | 126);
+                frame.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+            length => {
+                frame.push(mask_bit | 127);
+                frame.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        if masked {
+            let mask = [0x12, 0x34, 0x56, 0x78];
+            frame.extend_from_slice(&mask);
+            frame.extend(
+                compressed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+            );
+        } else {
+            frame.extend_from_slice(&compressed);
+        }
+        frame
     }
 
     #[test]
@@ -2622,6 +3324,163 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].transport_protocol, "websocket");
         assert!(evidence[0].redacted_sample.is_none());
+    }
+
+    #[test]
+    fn websocket_permessage_deflate_reassembles_model_tool_and_result_timeline() {
+        let mut reassembler = InteractionReassembler::default();
+        let upgrade = b"GET /custom/responses?credential=must-not-export HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Key: must-not-export\r\n\r\n";
+        assert!(reassembler
+            .push(rustls_chunk(ChunkDirection::Request, upgrade, 10))
+            .is_empty());
+        let switching = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+        assert!(reassembler
+            .push(rustls_chunk(ChunkDirection::Response, switching, 20))
+            .is_empty());
+
+        let mut client_compressor = Compress::new(Compression::fast(), false);
+        let mut server_compressor = Compress::new(Compression::fast(), false);
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "WEBSOCKET_REQUEST_SENTINEL"}]}],
+            "tools": [{"type": "function", "name": "shell"}]
+        })
+        .to_string();
+        let request_frame =
+            compressed_websocket_frame(&mut client_compressor, request.as_bytes(), true);
+        assert!(reassembler
+            .push(rustls_chunk(
+                ChunkDirection::Request,
+                request_frame[..11].to_vec(),
+                100,
+            ))
+            .is_empty());
+        assert!(reassembler
+            .push(rustls_chunk(
+                ChunkDirection::Request,
+                request_frame[11..].to_vec(),
+                110,
+            ))
+            .is_empty());
+
+        for (at, event) in [
+            (
+                200,
+                serde_json::json!({"type": "response.created", "response": {"id": "resp-ws-1"}}),
+            ),
+            (
+                210,
+                serde_json::json!({"type": "response.output_text.delta", "delta": "visible reply"}),
+            ),
+            (
+                220,
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "function_call", "call_id": "call-ws-1", "name": "shell", "arguments": "{\"cmd\":\"pwd\"}"}
+                }),
+            ),
+        ] {
+            let frame = compressed_websocket_frame(
+                &mut server_compressor,
+                event.to_string().as_bytes(),
+                false,
+            );
+            if at == 210 {
+                assert!(reassembler
+                    .push(rustls_chunk(
+                        ChunkDirection::Response,
+                        frame[..7].to_vec(),
+                        at,
+                    ))
+                    .is_empty());
+                assert!(reassembler
+                    .push(rustls_chunk(
+                        ChunkDirection::Response,
+                        frame[7..].to_vec(),
+                        at + 1,
+                    ))
+                    .is_empty());
+            } else {
+                assert!(reassembler
+                    .push(rustls_chunk(ChunkDirection::Response, frame, at))
+                    .is_empty());
+            }
+        }
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp-ws-1"}
+        })
+        .to_string();
+        let completed = reassembler.push(rustls_chunk(
+            ChunkDirection::Response,
+            compressed_websocket_frame(&mut server_compressor, terminal.as_bytes(), false),
+            230,
+        ));
+        assert_eq!(completed.len(), 1);
+        let first = &completed[0];
+        assert_eq!(first.transport_protocol, "websocket");
+        assert_eq!(first.protocol, "websocket-json");
+        assert_eq!(first.tls_adapter_id, "rustls-payload");
+        assert_eq!(first.endpoint, "gateway.invalid");
+        assert_eq!(first.path, "/custom/responses");
+        assert!(first.request.body.contains("WEBSOCKET_REQUEST_SENTINEL"));
+        assert!(!first.request.body.contains("must-not-export"));
+        assert_eq!(first.response.text.as_deref(), Some("visible reply"));
+        assert_eq!(first.started_at_unix_ns, "100");
+        assert_eq!(first.request_complete_at_unix_ns, "110");
+        assert_eq!(first.first_response_at_unix_ns, "200");
+        assert_eq!(first.ended_at_unix_ns, "230");
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].tool_call_id, "call-ws-1");
+        assert_eq!(
+            first.tool_calls[0].issued_at_unix_ns.as_deref(),
+            Some("220")
+        );
+
+        let tool_result_request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "input": [{"type": "function_call_output", "call_id": "call-ws-1", "output": "pwd-result"}]
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk(
+                ChunkDirection::Request,
+                compressed_websocket_frame(
+                    &mut client_compressor,
+                    tool_result_request.as_bytes(),
+                    true,
+                ),
+                300,
+            ))
+            .is_empty());
+        let output = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "tool observed"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk(
+                ChunkDirection::Response,
+                compressed_websocket_frame(&mut server_compressor, output.as_bytes(), false),
+                310,
+            ))
+            .is_empty());
+        let terminal = serde_json::json!({"type": "response.completed"}).to_string();
+        let completed = reassembler.push(rustls_chunk(
+            ChunkDirection::Response,
+            compressed_websocket_frame(&mut server_compressor, terminal.as_bytes(), false),
+            320,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].tool_results.len(), 1);
+        assert_eq!(completed[0].tool_results[0].tool_call_id, "call-ws-1");
+        assert_eq!(
+            completed[0].tool_results[0].observed_at_unix_ns.as_deref(),
+            Some("300")
+        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("tool observed"));
     }
 
     #[test]
