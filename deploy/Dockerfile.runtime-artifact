@@ -7,7 +7,7 @@
 #
 #   docker build --build-arg OBSERVER_RUNTIME_BASE=<registry/image@sha256:...> \
 #     -f deploy/Dockerfile.runtime-artifact <artifact-context>
-ARG OBSERVER_RUNTIME_BASE
+ARG OBSERVER_RUNTIME_BASE=invalid.invalid/anysentry-observer-runtime:must-be-overridden
 FROM ${OBSERVER_RUNTIME_BASE}
 
 COPY a3s-observer-collector /usr/local/bin/a3s-observer-collector

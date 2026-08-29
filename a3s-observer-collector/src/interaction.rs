@@ -2388,9 +2388,13 @@ fn extract_tool_calls(value: &Value, issued_at_unix_ns: u128) -> Vec<LlmInteract
     }
     collect_typed_tool_calls(value.get("output"), issued_at_unix_ns, &mut calls);
     collect_typed_tool_calls(value.get("content"), issued_at_unix_ns, &mut calls);
-    if let Some(item) = value.get("item") {
-        if let Some(call) = typed_tool_call(item, issued_at_unix_ns) {
-            calls.push(call);
+    let provisional_output_item =
+        value.get("type").and_then(Value::as_str) == Some("response.output_item.added");
+    if !provisional_output_item {
+        if let Some(item) = value.get("item") {
+            if let Some(call) = typed_tool_call(item, issued_at_unix_ns) {
+                calls.push(call);
+            }
         }
     }
     if let Some(response) = value.get("response") {
@@ -2417,7 +2421,7 @@ fn collect_typed_tool_calls(
 
 fn typed_tool_call(value: &Value, issued_at_unix_ns: u128) -> Option<LlmInteractionToolCall> {
     let kind = value.get("type").and_then(Value::as_str)?;
-    if !matches!(kind, "function_call" | "tool_use") {
+    if !matches!(kind, "function_call" | "custom_tool_call" | "tool_use") {
         return None;
     }
     let id = value
@@ -2463,7 +2467,10 @@ fn extract_tool_results(value: &Value, observed_at_unix_ns: u128) -> Vec<LlmInte
         .flatten()
     {
         if item.get("role").and_then(Value::as_str) == Some("tool")
-            || item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            || matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
         {
             if let Some(id) = item
                 .get("tool_call_id")
@@ -3481,10 +3488,17 @@ mod tests {
                 serde_json::json!({"type": "response.output_text.delta", "delta": "visible reply"}),
             ),
             (
+                215,
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "custom_tool_call", "call_id": "call-ws-1", "name": "shell", "input": ""}
+                }),
+            ),
+            (
                 220,
                 serde_json::json!({
                     "type": "response.output_item.done",
-                    "item": {"type": "function_call", "call_id": "call-ws-1", "name": "shell", "arguments": "{\"cmd\":\"pwd\"}"}
+                    "item": {"type": "custom_tool_call", "call_id": "call-ws-1", "name": "shell", "input": "{\"cmd\":\"pwd\"}"}
                 }),
             ),
         ] {
@@ -3556,7 +3570,7 @@ mod tests {
         let tool_result_request = serde_json::json!({
             "type": "response.create",
             "model": "fixture-model",
-            "input": [{"type": "function_call_output", "call_id": "call-ws-1", "output": "pwd-result"}]
+            "input": [{"type": "custom_tool_call_output", "call_id": "call-ws-1", "output": "pwd-result"}]
         })
         .to_string();
         assert!(reassembler
