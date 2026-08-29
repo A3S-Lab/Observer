@@ -372,12 +372,14 @@ impl TlsAttachManager {
         let identity = format!("pid:{pid}:dev:{}:ino:{}", metadata.dev(), metadata.ino());
         let mut plans = Vec::new();
         let cache_key = (metadata.dev(), metadata.ino());
+        let static_probe_path = stable_executable_probe_path(pid, probe_path, real_exe, &metadata)
+            .unwrap_or_else(|| probe_path.to_path_buf());
         let static_matches = if is_interpreter_or_shell(&basename) {
             Vec::new()
         } else if let Some(cached) = self.static_discovery_cache.get(&cache_key) {
             cached.clone()
         } else {
-            match discover_static_signature_matches(probe_path) {
+            match discover_static_signature_matches(&static_probe_path) {
                 Ok(matches) => {
                     self.static_discovery_cache
                         .insert(cache_key, matches.clone());
@@ -388,13 +390,12 @@ impl TlsAttachManager {
                         format!("{identity}:static-discovery"),
                         &format!("static_signature_discovery_failed:{error}"),
                     );
-                    self.static_discovery_cache.insert(cache_key, Vec::new());
                     Vec::new()
                 }
             }
         };
         plans.extend(static_matches.into_iter().map(|discovery| {
-            static_discovery_plan(probe_path, &metadata, discovery, runtime_role, Some(pid))
+            static_discovery_plan(&static_probe_path, &metadata, discovery, runtime_role, None)
         }));
 
         // Interpreters commonly export OpenSSL symbols from the main ELF even when no separate
@@ -448,7 +449,6 @@ impl TlsAttachManager {
                         ),
                         &format!("static_signature_discovery_failed:{error}"),
                     );
-                    self.static_discovery_cache.insert(cache_key, Vec::new());
                     Vec::new()
                 }
             }
@@ -553,6 +553,43 @@ fn process_parent_pid(pid: i32) -> Option<i32> {
         .trim()
         .parse()
         .ok()
+}
+
+fn stable_executable_probe_path(
+    pid: i32,
+    probe_path: &Path,
+    real_exe: &Path,
+    expected: &fs::Metadata,
+) -> Option<PathBuf> {
+    let same_inode = |path: &Path| {
+        fs::metadata(path).ok().is_some_and(|metadata| {
+            metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
+        })
+    };
+    if real_exe.is_absolute() && same_inode(real_exe) {
+        return Some(real_exe.to_path_buf());
+    }
+
+    let relative = real_exe.strip_prefix("/").ok()?;
+    let mut current = pid;
+    let mut stable = same_inode(probe_path).then(|| probe_path.to_path_buf());
+    for _ in 0..12 {
+        if current <= 1 {
+            break;
+        }
+        let rooted = PathBuf::from(format!("/proc/{current}/root")).join(relative);
+        if same_inode(&rooted) {
+            stable = Some(rooted);
+        }
+        let Some(parent) = process_parent_pid(current) else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    stable
 }
 
 fn ancestor_contains_pattern(pid: i32, pattern: &str) -> bool {
@@ -779,13 +816,27 @@ fn tls_abi_name(abi: TlsAbi) -> &'static str {
 
 fn discover_static_signature_matches(path: &Path) -> anyhow::Result<Vec<StaticDiscoveryMatch>> {
     let ranges = executable_file_ranges(path)?;
+    let families = static_signature_families()?;
+    let mut patterns = families
+        .iter()
+        .flat_map(|family| [family.read_prefix.clone(), family.write_prefix.clone()])
+        .collect::<Vec<_>>();
+    patterns.sort();
+    patterns.dedup();
+    let anchor_matches = find_pattern_set_offsets(path, &ranges, &patterns, MAX_ANCHOR_MATCHES)?;
     let mut discovered = Vec::new();
-    for family in static_signature_families()? {
-        let reads = find_pattern_offsets(path, &ranges, &family.read_prefix, MAX_ANCHOR_MATCHES)?;
+    for family in families {
+        let reads = anchor_matches
+            .get(&family.read_prefix)
+            .cloned()
+            .unwrap_or_default();
         if reads.is_empty() {
             continue;
         }
-        let writes = find_pattern_offsets(path, &ranges, &family.write_prefix, MAX_ANCHOR_MATCHES)?;
+        let writes = anchor_matches
+            .get(&family.write_prefix)
+            .cloned()
+            .unwrap_or_default();
         if writes.is_empty() {
             continue;
         }
@@ -869,41 +920,74 @@ fn executable_file_ranges(path: &Path) -> anyhow::Result<Vec<(u64, u64)>> {
     Ok(ranges)
 }
 
+#[cfg(test)]
 fn find_pattern_offsets(
     path: &Path,
     ranges: &[(u64, u64)],
     pattern: &[u8],
     limit: usize,
 ) -> anyhow::Result<Vec<u64>> {
-    anyhow::ensure!(!pattern.is_empty(), "empty TLS anchor");
+    Ok(
+        find_pattern_set_offsets(path, ranges, &[pattern.to_vec()], limit)?
+            .remove(pattern)
+            .unwrap_or_default(),
+    )
+}
+
+fn find_pattern_set_offsets(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    patterns: &[Vec<u8>],
+    limit: usize,
+) -> anyhow::Result<HashMap<Vec<u8>, Vec<u64>>> {
+    anyhow::ensure!(
+        !patterns.is_empty() && patterns.iter().all(|pattern| !pattern.is_empty()),
+        "empty TLS anchor set"
+    );
     let mut file = File::open(path)?;
-    let overlap = pattern.len().saturating_sub(1);
-    let mut matches = Vec::new();
+    let overlap = patterns
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let mut matches = patterns
+        .iter()
+        .cloned()
+        .map(|pattern| (pattern, Vec::new()))
+        .collect::<HashMap<_, _>>();
     for (start, end) in ranges {
         let mut cursor = *start;
         let mut carry = Vec::<u8>::new();
-        while cursor < *end && matches.len() < limit {
+        while cursor < *end {
             let requested = (*end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
             let mut window = vec![0u8; carry.len() + requested];
             window[..carry.len()].copy_from_slice(&carry);
             file.seek(SeekFrom::Start(cursor))?;
             file.read_exact(&mut window[carry.len()..])?;
             let window_offset = cursor.saturating_sub(carry.len() as u64);
-            find_pattern_positions(&window, pattern, limit - matches.len(), |position| {
-                matches.push(window_offset + position as u64);
-            });
+            for pattern in patterns {
+                let Some(offsets) = matches.get_mut(pattern) else {
+                    continue;
+                };
+                if offsets.len() >= limit {
+                    continue;
+                }
+                find_pattern_positions(&window, pattern, limit - offsets.len(), |position| {
+                    offsets.push(window_offset + position as u64);
+                });
+            }
             let retained = overlap.min(window.len());
             carry.clear();
             carry.extend_from_slice(&window[window.len() - retained..]);
             cursor += requested as u64;
         }
-        if matches.len() >= limit {
-            break;
-        }
     }
-    matches.sort_unstable();
-    matches.dedup();
-    matches.truncate(limit);
+    for offsets in matches.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.truncate(limit);
+    }
     Ok(matches)
 }
 
