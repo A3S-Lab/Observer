@@ -1439,11 +1439,17 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {}
     }
-    // Logs go to STDERR so STDOUT stays pure NDJSON (the event stream a pipeline parses), at
-    // INFO by default so the operational logs (throughput, drop counter) are actually visible.
+    // Logs go to STDERR so STDOUT stays pure NDJSON (the event stream a pipeline parses). The
+    // explicit TLS diagnostics switch raises only the subscriber ceiling; call-level diagnostics
+    // remain behind their own gate and are never enabled by a generic RUST_LOG value alone.
+    let diagnostic_level = if tls_diagnostics_enabled() {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(diagnostic_level)
         .init();
 
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
