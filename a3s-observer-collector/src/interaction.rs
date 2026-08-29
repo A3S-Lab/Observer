@@ -26,7 +26,7 @@ const MAX_EXPORTED_STRUCTURED_BYTES: usize = 512 * 1024;
 const WEBSOCKET_MAX_FRAME_HEADER_BYTES: usize = 14;
 const WEBSOCKET_DEFLATE_TAIL: &[u8; 4] = b"\x00\x00\xff\xff";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ChunkDirection {
     Request,
     Response,
@@ -709,8 +709,7 @@ struct ConnectionState {
     responses: HttpStreamDecoder,
     pending_requests: VecDeque<HttpMessage>,
     sequence: u64,
-    last_request_sequence: u64,
-    last_response_sequence: u64,
+    fragment_sequences: HashMap<(u64, ChunkDirection), u64>,
     source: String,
     adapter_id: String,
     evidence_fingerprints: HashSet<String>,
@@ -725,8 +724,7 @@ impl ConnectionState {
             responses: HttpStreamDecoder::new(StreamKind::Response, max_body_bytes),
             pending_requests: VecDeque::new(),
             sequence: 0,
-            last_request_sequence: 0,
-            last_response_sequence: 0,
+            fragment_sequences: HashMap::new(),
             source,
             adapter_id,
             evidence_fingerprints: HashSet::new(),
@@ -745,6 +743,7 @@ impl ConnectionState {
 #[derive(Debug)]
 pub struct InteractionReassembler {
     connections: HashMap<ConnectionKey, ConnectionState>,
+    connection_aliases: HashMap<ConnectionKey, ConnectionKey>,
     pending_evidence: VecDeque<CompletedPlaintextEvidence>,
     max_connections: usize,
     max_body_bytes: usize,
@@ -769,6 +768,7 @@ impl InteractionReassembler {
     ) -> Self {
         Self {
             connections: HashMap::new(),
+            connection_aliases: HashMap::new(),
             pending_evidence: VecDeque::new(),
             max_connections: max_connections.max(1),
             max_body_bytes: max_body_bytes.max(4 * 1024),
@@ -778,7 +778,8 @@ impl InteractionReassembler {
 
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
         self.evict_if_needed();
-        let key = ConnectionKey::from(&chunk);
+        let observed_key = ConnectionKey::from(&chunk);
+        let key = self.resolve_connection_key(&chunk);
         let state = self.connections.entry(key).or_insert_with(|| {
             ConnectionState::new(
                 self.max_body_bytes,
@@ -800,10 +801,17 @@ impl InteractionReassembler {
             self.pending_evidence.push_back(evidence);
         }
 
-        let previous_sequence = match chunk.direction {
-            ChunkDirection::Request => &mut state.last_request_sequence,
-            ChunkDirection::Response => &mut state.last_response_sequence,
-        };
+        let sequence_key = (observed_key.connection_id, chunk.direction);
+        if state.fragment_sequences.len() >= 64
+            && !state.fragment_sequences.contains_key(&sequence_key)
+        {
+            state.fragment_sequences.clear();
+            extend_unique(
+                &mut chunk.partial_reasons,
+                ["fragment_sequence_tracker_reset".to_string()],
+            );
+        }
+        let previous_sequence = state.fragment_sequences.entry(sequence_key).or_insert(0);
         if *previous_sequence != 0 && chunk.sequence != previous_sequence.wrapping_add(1) {
             extend_unique(
                 &mut chunk.partial_reasons,
@@ -908,7 +916,8 @@ impl InteractionReassembler {
             // log sink must not be able to back-pressure or terminate the collector.
             tracing::debug!(
                 pid = chunk.pid,
-                connection_id = format_args!("{:x}", chunk.connection_id),
+                observed_connection_id = format_args!("{:x}", chunk.connection_id),
+                canonical_connection_id = format_args!("{:x}", key.connection_id),
                 direction = ?chunk.direction,
                 fragment_kind = plaintext_fragment_kind(&chunk.data),
                 fragment_bytes = chunk.data.len(),
@@ -927,6 +936,56 @@ impl InteractionReassembler {
             );
         }
         completed
+    }
+
+    fn resolve_connection_key(&mut self, chunk: &PlaintextChunk) -> ConnectionKey {
+        let observed = ConnectionKey::from(chunk);
+        if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
+            return canonical;
+        }
+        if self.connections.contains_key(&observed) {
+            return observed;
+        }
+
+        let candidate = if chunk.direction == ChunkDirection::Response
+            && looks_like_websocket_switching_protocols(&chunk.data)
+        {
+            self.unique_websocket_connection(observed, |state| {
+                state.websocket.upgrade_requested && !state.websocket.active
+            })
+        } else if looks_like_websocket_frame_prefix(&chunk.data) {
+            self.unique_websocket_connection(observed, |state| state.websocket.active)
+        } else {
+            None
+        };
+        let Some(canonical) = candidate else {
+            return observed;
+        };
+        self.retain_live_connection_aliases();
+        let alias_limit = self.max_connections.saturating_mul(4).max(4);
+        if self.connection_aliases.len() < alias_limit {
+            self.connection_aliases.insert(observed, canonical);
+        }
+        canonical
+    }
+
+    fn unique_websocket_connection(
+        &self,
+        observed: ConnectionKey,
+        predicate: impl Fn(&ConnectionState) -> bool,
+    ) -> Option<ConnectionKey> {
+        let mut candidates = self.connections.iter().filter_map(|(key, state)| {
+            (key.cgroup_id == observed.cgroup_id && key.pid == observed.pid && predicate(state))
+                .then_some(*key)
+        });
+        let candidate = candidates.next()?;
+        candidates.next().is_none().then_some(candidate)
+    }
+
+    fn retain_live_connection_aliases(&mut self) {
+        let connections = &self.connections;
+        self.connection_aliases
+            .retain(|_, canonical| connections.contains_key(canonical));
     }
 
     /// Remove idle state even when a request or response is incomplete. Retaining an orphaned
@@ -949,6 +1008,7 @@ impl InteractionReassembler {
             }
             retain
         });
+        self.retain_live_connection_aliases();
     }
 
     pub fn active_connections(&self) -> usize {
@@ -970,6 +1030,8 @@ impl InteractionReassembler {
             .map(|(key, _)| *key)
         {
             self.connections.remove(&oldest);
+            self.connection_aliases
+                .retain(|_, canonical| *canonical != oldest);
         }
     }
 }
@@ -1252,6 +1314,34 @@ fn looks_like_websocket_upgrade(data: &[u8]) -> bool {
         .collect::<Vec<_>>();
     find_bytes(&lowercase, b"\r\nupgrade: websocket").is_some()
         || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
+}
+
+fn looks_like_websocket_switching_protocols(data: &[u8]) -> bool {
+    if !data.starts_with(b"HTTP/1.1 101") && !data.starts_with(b"HTTP/1.0 101") {
+        return false;
+    }
+    let captured = &data[..data.len().min(8 * 1024)];
+    let lowercase = captured
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    find_bytes(&lowercase, b"\r\nupgrade: websocket").is_some()
+        || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
+}
+
+fn looks_like_websocket_frame_prefix(data: &[u8]) -> bool {
+    let Some((&first, rest)) = data.split_first() else {
+        return false;
+    };
+    if rest.is_empty() || first & 0x30 != 0 {
+        return false;
+    }
+    let opcode = first & 0x0f;
+    if !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xA) {
+        return false;
+    }
+    let payload_marker = rest[0] & 0x7f;
+    !matches!(opcode, 0x8..=0xA) || (first & 0x80 != 0 && payload_marker <= 125)
 }
 
 fn body_only_llm_request(
@@ -2774,14 +2864,16 @@ mod tests {
         .into_bytes()
     }
 
-    fn rustls_chunk(
+    fn rustls_chunk_on(
         direction: ChunkDirection,
         data: impl Into<Vec<u8>>,
         at: u128,
+        connection_id: u64,
     ) -> PlaintextChunk {
         let mut chunk = chunk(direction, data, at);
         chunk.source = "tls_uprobe_rustls".to_string();
         chunk.adapter_id = "rustls-payload".to_string();
+        chunk.connection_id = connection_id;
         chunk
     }
 
@@ -3329,13 +3421,26 @@ mod tests {
     #[test]
     fn websocket_permessage_deflate_reassembles_model_tool_and_result_timeline() {
         let mut reassembler = InteractionReassembler::default();
+        let handshake_write = 0x1000;
+        let handshake_read = 0x2000;
+        let application_connection = 0x3000;
         let upgrade = b"GET /custom/responses?credential=must-not-export HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Key: must-not-export\r\n\r\n";
         assert!(reassembler
-            .push(rustls_chunk(ChunkDirection::Request, upgrade, 10))
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                upgrade,
+                10,
+                handshake_write,
+            ))
             .is_empty());
         let switching = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
         assert!(reassembler
-            .push(rustls_chunk(ChunkDirection::Response, switching, 20))
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                switching,
+                20,
+                handshake_read,
+            ))
             .is_empty());
 
         let mut client_compressor = Compress::new(Compression::fast(), false);
@@ -3350,17 +3455,19 @@ mod tests {
         let request_frame =
             compressed_websocket_frame(&mut client_compressor, request.as_bytes(), true);
         assert!(reassembler
-            .push(rustls_chunk(
+            .push(rustls_chunk_on(
                 ChunkDirection::Request,
                 request_frame[..11].to_vec(),
                 100,
+                application_connection,
             ))
             .is_empty());
         assert!(reassembler
-            .push(rustls_chunk(
+            .push(rustls_chunk_on(
                 ChunkDirection::Request,
                 request_frame[11..].to_vec(),
                 110,
+                application_connection,
             ))
             .is_empty());
 
@@ -3388,22 +3495,29 @@ mod tests {
             );
             if at == 210 {
                 assert!(reassembler
-                    .push(rustls_chunk(
+                    .push(rustls_chunk_on(
                         ChunkDirection::Response,
                         frame[..7].to_vec(),
                         at,
+                        application_connection,
                     ))
                     .is_empty());
                 assert!(reassembler
-                    .push(rustls_chunk(
+                    .push(rustls_chunk_on(
                         ChunkDirection::Response,
                         frame[7..].to_vec(),
                         at + 1,
+                        application_connection,
                     ))
                     .is_empty());
             } else {
                 assert!(reassembler
-                    .push(rustls_chunk(ChunkDirection::Response, frame, at))
+                    .push(rustls_chunk_on(
+                        ChunkDirection::Response,
+                        frame,
+                        at,
+                        application_connection,
+                    ))
                     .is_empty());
             }
         }
@@ -3412,10 +3526,11 @@ mod tests {
             "response": {"id": "resp-ws-1"}
         })
         .to_string();
-        let completed = reassembler.push(rustls_chunk(
+        let completed = reassembler.push(rustls_chunk_on(
             ChunkDirection::Response,
             compressed_websocket_frame(&mut server_compressor, terminal.as_bytes(), false),
             230,
+            application_connection,
         ));
         assert_eq!(completed.len(), 1);
         let first = &completed[0];
@@ -3445,7 +3560,7 @@ mod tests {
         })
         .to_string();
         assert!(reassembler
-            .push(rustls_chunk(
+            .push(rustls_chunk_on(
                 ChunkDirection::Request,
                 compressed_websocket_frame(
                     &mut client_compressor,
@@ -3453,6 +3568,7 @@ mod tests {
                     true,
                 ),
                 300,
+                application_connection,
             ))
             .is_empty());
         let output = serde_json::json!({
@@ -3461,17 +3577,19 @@ mod tests {
         })
         .to_string();
         assert!(reassembler
-            .push(rustls_chunk(
+            .push(rustls_chunk_on(
                 ChunkDirection::Response,
                 compressed_websocket_frame(&mut server_compressor, output.as_bytes(), false),
                 310,
+                application_connection,
             ))
             .is_empty());
         let terminal = serde_json::json!({"type": "response.completed"}).to_string();
-        let completed = reassembler.push(rustls_chunk(
+        let completed = reassembler.push(rustls_chunk_on(
             ChunkDirection::Response,
             compressed_websocket_frame(&mut server_compressor, terminal.as_bytes(), false),
             320,
+            application_connection,
         ));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].tool_results.len(), 1);
