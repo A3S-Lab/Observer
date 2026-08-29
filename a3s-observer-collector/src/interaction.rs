@@ -1561,31 +1561,72 @@ fn build_interaction(
     if tool_route {
         let rpc_request = request_content.structured.as_ref();
         let rpc_response = response_content.structured.as_ref();
-        let tool_call_id = rpc_request
-            .and_then(|value| value.get("id"))
-            .map(json_scalar_id)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("transport:{interaction_id}"));
-        let name = rpc_request
-            .and_then(|value| value.get("params"))
-            .and_then(|params| params.get("name"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                rpc_request
-                    .and_then(|value| value.get("method"))
+        let (tool_call_id, name, arguments, result, response_error) =
+            if wire_match.template_id == "generic-http-tool" {
+                let tool_call_id = rpc_response
+                    .and_then(|value| value.get("tool_call_id"))
                     .and_then(Value::as_str)
-            })
-            .unwrap_or("mcp.tools.call")
-            .to_string();
-        let arguments = rpc_request
-            .and_then(|value| value.get("params"))
-            .and_then(|params| params.get("arguments").or(Some(params)))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let result = rpc_response
-            .and_then(|value| value.get("result").or_else(|| value.get("error")))
-            .cloned()
-            .unwrap_or(Value::Null);
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        rpc_request
+                            .and_then(|value| value.get("id"))
+                            .map(json_scalar_id)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or_else(|| format!("transport:{interaction_id}"));
+                let name = rpc_request
+                    .and_then(|value| value.get("name").or_else(|| value.get("tool")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("http.request")
+                    .to_string();
+                let arguments = rpc_request.cloned().unwrap_or(Value::Null);
+                let result = rpc_response
+                    .and_then(|value| {
+                        value
+                            .get("result")
+                            .or_else(|| value.get("output"))
+                            .or_else(|| value.get("error"))
+                    })
+                    .cloned()
+                    .or_else(|| rpc_response.cloned())
+                    .unwrap_or(Value::Null);
+                let response_error = rpc_response.is_some_and(|value| {
+                    value.get("error").is_some()
+                        || matches!(
+                            value.get("status").and_then(Value::as_str),
+                            Some("failed" | "error")
+                        )
+                });
+                (tool_call_id, name, arguments, result, response_error)
+            } else {
+                let tool_call_id = rpc_request
+                    .and_then(|value| value.get("id"))
+                    .map(json_scalar_id)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("transport:{interaction_id}"));
+                let name = rpc_request
+                    .and_then(|value| value.get("params"))
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        rpc_request
+                            .and_then(|value| value.get("method"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("mcp.tools.call")
+                    .to_string();
+                let arguments = rpc_request
+                    .and_then(|value| value.get("params"))
+                    .and_then(|params| params.get("arguments").or(Some(params)))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let result = rpc_response
+                    .and_then(|value| value.get("result").or_else(|| value.get("error")))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let response_error = rpc_response.is_some_and(|value| value.get("error").is_some());
+                (tool_call_id, name, arguments, result, response_error)
+            };
         tool_calls = vec![LlmInteractionToolCall {
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
@@ -1596,8 +1637,7 @@ fn build_interaction(
             tool_call_id,
             name: Some(name),
             content: result,
-            is_error: status_code >= 400
-                || rpc_response.is_some_and(|value| value.get("error").is_some()),
+            is_error: status_code >= 400 || response_error,
             observed_at_unix_ns: Some(response.completed_at_unix_ns.to_string()),
         }];
     }
@@ -1972,6 +2012,18 @@ fn match_wire_protocol(
             interaction_kind: WireInteractionKind::Tool,
         });
     }
+    if object.contains_key("instruction")
+        && (object.contains_key("requested_by")
+            || object.contains_key("tool")
+            || object.contains_key("name"))
+    {
+        return Some(WireMatch {
+            template_id: "generic-http-tool",
+            likelihood: "likely",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Tool,
+        });
+    }
     if object.contains_key("contents") {
         return Some(WireMatch {
             template_id: "gemini-generate-content",
@@ -2068,6 +2120,15 @@ fn response_matches_wire_template(
             response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
                 && response.get("id").is_some()
                 && (response.get("result").is_some() || response.get("error").is_some())
+        }
+        "generic-http-tool" => {
+            response
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .is_some()
+                && (response.get("result").is_some()
+                    || response.get("output").is_some()
+                    || response.get("error").is_some())
         }
         "openai-responses" => {
             json_has_key(response, "output", 0)
@@ -3065,6 +3126,57 @@ mod tests {
         assert_eq!(
             completed[0].tool_results[0].observed_at_unix_ns.as_deref(),
             Some("20")
+        );
+    }
+
+    #[test]
+    fn generic_http_tool_template_uses_shape_not_endpoint_and_links_result_time() {
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/custom/tool/path",
+                "changed-gateway.invalid",
+                r#"{"instruction":"execute observed task","requested_by":"workflow-runtime"}"#,
+            ),
+            100,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(
+                r#"{"tool_call_id":"tool-http-1","status":"succeeded","result":"observed result","started_at_unix_ns":101,"finished_at_unix_ns":199}"#,
+            ),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "tool");
+        assert_eq!(interaction.endpoint, "changed-gateway.invalid");
+        assert_eq!(interaction.path, "/custom/tool/path");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("generic-http-tool")
+        );
+        assert_eq!(interaction.parse_state, "parsed");
+        assert_eq!(interaction.tool_calls.len(), 1);
+        assert_eq!(interaction.tool_results.len(), 1);
+        assert_eq!(interaction.tool_calls[0].tool_call_id, "tool-http-1");
+        assert_eq!(interaction.tool_calls[0].name, "http.request");
+        assert_eq!(
+            interaction.tool_calls[0].arguments["instruction"],
+            "execute observed task"
+        );
+        assert_eq!(interaction.tool_results[0].content, "observed result");
+        assert!(!interaction.tool_results[0].is_error);
+        assert_eq!(
+            interaction.tool_calls[0].issued_at_unix_ns.as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            interaction.tool_results[0].observed_at_unix_ns.as_deref(),
+            Some("200")
         );
     }
 
