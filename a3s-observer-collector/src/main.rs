@@ -3651,7 +3651,7 @@ impl CollectorProcessor {
                     TLS_PLAINTEXT_API_SSL_CLASSIC => ("tls_uprobe", "ssl-classic"),
                     _ => ("tls_uprobe", "unknown-tls-abi"),
                 };
-                if tls_diagnostics_enabled() {
+                if tls_diagnostics_enabled() && header.api_kind == TLS_PLAINTEXT_API_RUSTLS {
                     // A streamed model response may cross this path hundreds of times in a
                     // burst. Keep call-level evidence off the operational INFO stream so a
                     // slow container log sink cannot back-pressure the collector.

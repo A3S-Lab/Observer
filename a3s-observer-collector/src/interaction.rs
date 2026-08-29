@@ -909,7 +909,7 @@ impl InteractionReassembler {
                 }
             }
         };
-        if interaction_diagnostics_enabled() {
+        if interaction_diagnostics_enabled() && chunk.source.contains("rustls") {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
             // but never put it on the default operational INFO path: a slow container
