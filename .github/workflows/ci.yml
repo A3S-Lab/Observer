@@ -33,7 +33,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src, rustfmt, clippy
-      - run: cargo install bpf-linker --locked
+      - name: Install pinned bpf-linker release
+        env:
+          BPF_LINKER_SHA256: 10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum --check
+          tar --extract --file /tmp/bpf-linker.tar.zst --directory "${CARGO_HOME}/bin"
+          bpf-linker --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p a3s-observer-collector -- -D warnings
       - run: cargo test -p a3s-observer-collector
