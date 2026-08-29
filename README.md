@@ -223,10 +223,12 @@ let cage = ProviderPolicy::new([Provider::Anthropic]).deny_unclassified(true);
   without touching its code, including its tool subprocesses.
 - **Kernel hooks only in the always-on core, opt-in plaintext extension** — the universal core
   gives no prompt/completion body. `A3S_OBSERVER_SSL=1` enables PID/cgroup-gated TLS-library
-  uprobes plus plain-HTTP syscall capture. The verified content path covers supported dynamic
-  OpenSSL/Node/Python builds and exact static fingerprints such as Claude Code 2.1.170; it does
-  not generically cover Go `crypto/tls`, Rustls, HTTP/2, WebSocket, HTTP/3 or QUIC. The userspace
-  path currently reconstructs HTTP/1.1 JSON/SSE only.
+  uprobes plus plain-HTTP syscall capture. Dynamic libraries resolve exported TLS symbols; stripped
+  static executables use bounded TLS implementation-family anchors and read/write relations rather
+  than product versions or whole-file fingerprints. HTTP/1.1 JSON/SSE is reconstructed today;
+  unsupported HTTP/2/WebSocket streams emit metadata-only discovery evidence instead of fabricated
+  conversations. Additional Go `crypto/tls`, Rustls, HTTP/2, WebSocket, HTTP/3 and QUIC adapters use
+  the same discovery/transport interfaces as real target paths require them.
 - **a3s-box** — a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
   flows through the host net path) but not in-guest exec/file — those need an in-guest collector
   (phase 2).
@@ -249,18 +251,18 @@ Linux only; needs root (CAP_BPF + CAP_PERFMON). Env knobs: `A3S_OBSERVER_JSON` (
 `A3S_OBSERVER_FILES` (legacy combined FileAccess/FileDelete switch),
 `A3S_OBSERVER_FILE_ACCESS` / `A3S_OBSERVER_FILE_DELETE` (independent overrides),
 `A3S_OBSERVER_SSL` (opt-in Agent HTTP/TLS content),
-`A3S_OBSERVER_TLS_PROCESS_PATTERNS` (additional exact runtime-selection fragments),
-`A3S_OBSERVER_LLM_HTTP_ROUTES` / `A3S_OBSERVER_TOOL_HTTP_ROUTES` (comma-separated exact POST
-paths, with tool paths closed by default), `A3S_OBSERVER_HEARTBEAT` (liveness file path), and
+`A3S_OBSERVER_TLS_PROCESS_PATTERNS` (additional runtime-selection fragments),
+`A3S_OBSERVER_HEARTBEAT` (liveness file path), and
 `A3S_OBSERVER_JSON_QUEUE_CAPACITY` (bounded NDJSON burst queue, default 32768; 4096–262144).
 
-Plaintext capture has three gates: a verified Agent PID/cgroup, an admitted POST path, and a
-userspace protocol/semantic check. Only PIDs with a successful TLS attach enter the kernel
-plaintext allow map. Large calls use 16 KiB, 128 KiB, or 512 KiB ring-record tiers; the
-reassembler is bounded to 8 MiB per direction. See the AnySentry
-[PRD](../AnySentry/docs/anysentry-agent-llm-interaction-observability-prd.md) and
-[technical design](../AnySentry/docs/anysentry-agent-llm-interaction-observability-technical-design.md)
-for the exact product/version matrix, timing semantics and security boundary.
+Kernel plaintext admission has only Agent Scope, successful TLS/HTTP boundary discovery, safe API
+return/buffer values and the configured capture budget. URL, Host, route, model, provider and CLI
+version are never kernel gates. Collector-side transport and wire-template matching decides whether
+sanitized content becomes a model/tool interaction, bounded unparsed evidence, or metadata-only
+non-LLM coverage. Large calls use 16 KiB, 128 KiB, or 512 KiB ring-record tiers; the reassembler is
+bounded to 8 MiB per direction. See the AnySentry
+[discovery-first design](../AnySentry/docs/anysentry-discovery-first-agent-tls-observability-v2-design.md)
+for the implementation-family matrix, timing semantics and security boundary.
 
 Each ring is drained by an event-driven reader into physically independent Critical, Semantic, and
 Bulk inboxes; raw probe evidence maps only to Critical or Semantic. The readers copy fixed PODs and

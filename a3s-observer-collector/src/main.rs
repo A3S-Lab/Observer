@@ -16,29 +16,31 @@ mod ring_reader;
 mod tls_attach;
 
 use a3s_observer::{
-    AgentEvent, CollectorCaptureProbeStats, CollectorCaptureProfileStats, CollectorFileFilterStats,
-    CollectorIngressAccounting, CollectorPipelineAccounting, CollectorPipelineUnit,
-    CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent, EventCaptureDecision,
-    EventTiming, ExportOutcome, ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter,
-    KubeResolver, LogExporter, ProcessContext, Provider, ServiceClassifier, SniClassifier,
+    AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
+    CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
+    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
+    EventCaptureDecision, EventTiming, ExportOutcome, ExportPriority, Exporter, Identity,
+    IdentityResolver, JsonExporter, KubeResolver, LlmInteraction, LogExporter, ProcessContext,
+    Provider, ServiceClassifier, SniClassifier,
 };
 use a3s_observer_common::{
     file_access_mode, CaptureDecisionContext, CaptureProbeStats, ConnectEvent, DnsEvent,
     ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey, FileFilterStats,
     FileFilterValue, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
-    ARGV_SLOTS, CAPTURE_DECISION_FLAG_SELECTED, EXEC_ARG_CHUNK_LEN, EXEC_ARG_CHUNK_PAYLOAD,
-    EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK,
-    EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_ACCESS_MODE_PATH_ONLY,
-    FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL,
-    FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
-    FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+    ARGV_SLOTS, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROFILE_AGENT_FULL,
+    CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION, EXEC_ARG_CHUNK_LEN,
+    EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
+    EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
+    FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE,
+    FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_ACTION_DROP,
+    FILE_FILTER_ACTION_KEEP, FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
     FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE,
     PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
     PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
     PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-    PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_TCP,
-    TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_TOOL_ROUTE, TLS_PLAINTEXT_FLAG_TRUNCATED,
+    PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
+    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
+    TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -72,7 +74,10 @@ use capture_profile::{
     CollectorGeneration, PreviewReceipt,
 };
 use event_time::{monotonic_now_ns, system_now_unix_ns};
-use interaction::{ChunkDirection, CompletedInteraction, InteractionReassembler, PlaintextChunk};
+use interaction::{
+    ChunkDirection, CompletedInteraction, CompletedPlaintextEvidence, InteractionReassembler,
+    PlaintextChunk,
+};
 use tls_attach::{
     SymbolFamily, TlsAbi, TlsAttachKind, TlsAttachManager, TlsAttachPlan, TlsOffsetPair,
 };
@@ -98,7 +103,6 @@ const DEFAULT_REORDER_CAPACITY: usize = 65_536;
 const DEFAULT_REORDER_WINDOW_NS: u64 = 2_000_000;
 const PROCESSOR_TICK: Duration = Duration::from_millis(2);
 const RING_READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const HTTP_ROUTE_MAX_BYTES: usize = 58;
 const FILE_ACCESS_TRACEPOINTS: [(&str, &str); 3] = [
     ("file_open", "sys_enter_openat"),
     ("file_openat2", "sys_enter_openat2"),
@@ -176,65 +180,6 @@ fn plaintext_process_key(pid: i32) -> Option<PlaintextProcessKeyBytes> {
     key[..8].copy_from_slice(&cgroup_id.to_ne_bytes());
     key[8..12].copy_from_slice(&pid.to_ne_bytes());
     Some(key)
-}
-
-fn plaintext_route_hash(path: &str) -> u64 {
-    path.as_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-}
-
-fn install_plaintext_http_routes(
-    ebpf: &mut Ebpf,
-) -> anyhow::Result<(BpfHashMap<MapData, u64, u8>, usize)> {
-    let mut routes = BpfHashMap::<_, u64, u8>::try_from(
-        ebpf.take_map("PLAINTEXT_HTTP_ROUTES")
-            .context("`PLAINTEXT_HTTP_ROUTES` missing")?,
-    )?;
-    let defaults = [
-        "/v1/chat/completions",
-        "/chat/completions",
-        "/v1/responses",
-        "/responses",
-        "/v1/messages",
-        "/messages",
-        "/v1/completions",
-        "/completions",
-        "/api/chat",
-        "/api/generate",
-    ];
-    let mut installed = HashMap::<String, u8>::new();
-    for route in defaults {
-        installed.insert(route.to_string(), PLAINTEXT_HTTP_ROUTE_LLM);
-    }
-    for (variable, kind) in [
-        ("A3S_OBSERVER_LLM_HTTP_ROUTES", PLAINTEXT_HTTP_ROUTE_LLM),
-        ("A3S_OBSERVER_TOOL_HTTP_ROUTES", PLAINTEXT_HTTP_ROUTE_TOOL),
-    ] {
-        if let Ok(value) = std::env::var(variable) {
-            for route in value
-                .split(',')
-                .map(str::trim)
-                .filter(|route| !route.is_empty())
-            {
-                anyhow::ensure!(
-                    route.starts_with('/')
-                        && route.len() <= HTTP_ROUTE_MAX_BYTES
-                        && !route
-                            .chars()
-                            .any(|character| matches!(character, '?' | '#' | '\r' | '\n')),
-                    "{variable} contains an invalid route: {route:?}"
-                );
-                installed.insert(route.to_string(), kind);
-            }
-        }
-    }
-    for (route, kind) in &installed {
-        routes.insert(plaintext_route_hash(route), *kind, 0)?;
-    }
-    Ok((routes, installed.len()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1506,14 +1451,6 @@ async fn main() -> anyhow::Result<()> {
         "/probes"
     )))
     .context("load eBPF object")?;
-    // Retain the map FD for the Collector lifetime: PID-scoped TLS programs are lazily loaded
-    // after discovery and still need this relocation target to be valid.
-    let (_plaintext_http_routes, plaintext_route_count) = install_plaintext_http_routes(&mut ebpf)?;
-    tracing::info!(
-        plaintext_route_count,
-        "installed bounded Agent plaintext HTTP route allowlist"
-    );
-
     // The rule maps are initialized before file probes attach. With no rules file configured the
     // config remains disabled and preserves the historical full-capture behavior. Supplying a path
     // enables authoritative decisions; Unknown remains fail-open unless compatibility sampling is
@@ -2774,8 +2711,13 @@ fn refresh_tls_attachment_for_pid(
     verified_process_map: &mut VerifiedProcessMap,
     ebpf: &mut Ebpf,
     pid: i32,
+    identity_verified: bool,
 ) -> usize {
-    let plans = manager.discover_pid(pid);
+    let plans = if identity_verified {
+        manager.discover_verified_pid(pid)
+    } else {
+        manager.discover_pid(pid)
+    };
     attach_tls_plans(manager, verified_process_map, ebpf, plans)
 }
 
@@ -2830,12 +2772,18 @@ fn refresh_exec_tls_candidates(
     let Some(manager) = manager else {
         return;
     };
-    for pid in candidate_pids {
-        let newly_attached =
-            refresh_tls_attachment_for_pid(manager, verified_process_map, ebpf, pid);
+    for (pid, identity_verified) in candidate_pids {
+        let newly_attached = refresh_tls_attachment_for_pid(
+            manager,
+            verified_process_map,
+            ebpf,
+            pid,
+            identity_verified,
+        );
         if newly_attached > 0 {
             tracing::info!(
                 pid,
+                identity_verified,
                 newly_attached,
                 attached_targets = manager.attached_count(),
                 "attached Agent TLS probes from exec lifecycle signal"
@@ -3270,6 +3218,15 @@ fn tls_exec_comm_needs_refresh(value: &str) -> bool {
         || comm.starts_with("dify-plugin-da")
 }
 
+fn tls_capture_profile_needs_refresh(profile: u8) -> bool {
+    matches!(
+        profile,
+        CAPTURE_PROFILE_AGENT_FULL
+            | CAPTURE_PROFILE_INVESTIGATION_FULL
+            | CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+    )
+}
+
 /// Resolve identity, falling back to the in-kernel `comm` when the /proc lookup fails (a
 /// short-lived process that exited before we read it) — so no event is left unattributed.
 fn identity_for(r: &impl IdentityResolver, pid: u32, cgroup_id: u64, comm: &[u8; 16]) -> Identity {
@@ -3341,6 +3298,7 @@ struct CollectorProcessor {
     exec_assembler: ExecAssembler,
     process_lifecycles: ProcessLifecycleStore,
     tls_attach_candidate_pids: HashSet<i32>,
+    tls_verified_candidate_pids: HashSet<i32>,
     stats: Stats,
     reorder_forced_flushes: u64,
     reorder_key_collisions: u64,
@@ -3355,6 +3313,7 @@ impl CollectorProcessor {
             exec_assembler: ExecAssembler::new(exec_commit_probe_attached),
             process_lifecycles: ProcessLifecycleStore::default(),
             tls_attach_candidate_pids: HashSet::new(),
+            tls_verified_candidate_pids: HashSet::new(),
             stats: Stats::default(),
             reorder_forced_flushes: 0,
             reorder_key_collisions: 0,
@@ -3379,10 +3338,20 @@ impl CollectorProcessor {
         self.interactions.expire_idle(now);
     }
 
-    fn take_tls_attach_candidate_pids(&mut self) -> Vec<i32> {
-        std::mem::take(&mut self.tls_attach_candidate_pids)
-            .into_iter()
-            .collect()
+    fn take_tls_attach_candidate_pids(&mut self) -> Vec<(i32, bool)> {
+        let verified = std::mem::take(&mut self.tls_verified_candidate_pids);
+        let mut candidates = verified
+            .iter()
+            .copied()
+            .map(|pid| (pid, true))
+            .collect::<Vec<_>>();
+        candidates.extend(
+            std::mem::take(&mut self.tls_attach_candidate_pids)
+                .into_iter()
+                .filter(|pid| !verified.contains(pid))
+                .map(|pid| (pid, false)),
+        );
+        candidates
     }
 
     fn process(
@@ -3401,11 +3370,15 @@ impl CollectorProcessor {
                 let Some(record) = read_pod::<ExecRecord>(bytes) else {
                     return;
                 };
-                if record.kind == EXEC_RECORD_COMMIT
-                    && tls_exec_comm_needs_refresh(&cstr(&record.comm))
-                {
+                if record.kind == EXEC_RECORD_COMMIT {
                     if let Ok(pid) = i32::try_from(record.pid) {
-                        self.tls_attach_candidate_pids.insert(pid);
+                        if tls_capture_profile_needs_refresh(
+                            record.capture_decision.capture_profile,
+                        ) {
+                            self.tls_verified_candidate_pids.insert(pid);
+                        } else if tls_exec_comm_needs_refresh(&cstr(&record.comm)) {
+                            self.tls_attach_candidate_pids.insert(pid);
+                        }
                     }
                 }
                 let now = Instant::now();
@@ -3665,23 +3638,12 @@ impl CollectorProcessor {
                 {
                     partial_reasons.push("probe_call_limit".to_string());
                 }
-                let tool_route = header.flags & TLS_PLAINTEXT_FLAG_TOOL_ROUTE != 0;
-                let source = if header.api_kind == TLS_PLAINTEXT_API_TCP {
-                    if tool_route {
-                        "tcp_plaintext_tool_route"
-                    } else {
-                        "tcp_plaintext"
-                    }
-                } else if header.api_kind == TLS_PLAINTEXT_API_RUSTLS {
-                    if tool_route {
-                        "tls_uprobe_rustls_tool_route"
-                    } else {
-                        "tls_uprobe_rustls"
-                    }
-                } else if tool_route {
-                    "tls_uprobe_tool_route"
-                } else {
-                    "tls_uprobe"
+                let (source, adapter_id) = match header.api_kind {
+                    TLS_PLAINTEXT_API_TCP => ("tcp_plaintext", "plain-http-syscall"),
+                    TLS_PLAINTEXT_API_RUSTLS => ("tls_uprobe_rustls", "rustls-payload"),
+                    TLS_PLAINTEXT_API_SSL_EX => ("tls_uprobe", "openssl-ex"),
+                    TLS_PLAINTEXT_API_SSL_CLASSIC => ("tls_uprobe", "ssl-classic"),
+                    _ => ("tls_uprobe", "unknown-tls-abi"),
                 };
                 if tls_diagnostics_enabled() {
                     // A streamed model response may cross this path hundreds of times in a
@@ -3713,6 +3675,7 @@ impl CollectorProcessor {
                     data: plaintext.to_vec(),
                     event_at_unix_ns: envelope.event_at_unix_ns,
                     source: source.to_string(),
+                    adapter_id: adapter_id.to_string(),
                     partial_reasons,
                 });
                 for interaction in completed {
@@ -3725,6 +3688,17 @@ impl CollectorProcessor {
                         timing.clone(),
                         capture_decision.clone(),
                         interaction,
+                    );
+                }
+                for evidence in self.interactions.take_evidence() {
+                    emit_plaintext_evidence(
+                        exporter,
+                        &mut self.stats,
+                        resolver,
+                        header.comm,
+                        timing.clone(),
+                        capture_decision.clone(),
+                        evidence,
                     );
                 }
             }
@@ -3787,6 +3761,15 @@ fn emit_completed_interaction(
         connection_id,
         transport,
         protocol,
+        tls_adapter_id,
+        transport_protocol,
+        wire_template_id,
+        parse_state,
+        llm_likelihood,
+        schema_fingerprint,
+        transport_completeness,
+        wire_completeness,
+        conversation_completeness,
         endpoint,
         method,
         path,
@@ -3822,7 +3805,7 @@ fn emit_completed_interaction(
             observation: None,
             process: Some(process_context(pid, cgroup_id, &comm)),
             provider,
-            event: AgentEvent::LlmInteraction {
+            event: AgentEvent::LlmInteraction(Box::new(LlmInteraction {
                 schema_version,
                 interaction_id,
                 interaction_type,
@@ -3830,6 +3813,15 @@ fn emit_completed_interaction(
                 connection_id,
                 transport,
                 protocol,
+                tls_adapter_id,
+                transport_protocol,
+                wire_template_id,
+                parse_state,
+                llm_likelihood,
+                schema_fingerprint,
+                transport_completeness,
+                wire_completeness,
+                conversation_completeness,
                 endpoint,
                 method,
                 path,
@@ -3851,7 +3843,72 @@ fn emit_completed_interaction(
                 completeness,
                 partial_reasons,
                 capture_source,
-            },
+            })),
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_plaintext_evidence(
+    exporter: &dyn Exporter,
+    stats: &mut Stats,
+    resolver: &impl IdentityResolver,
+    comm: [u8; 16],
+    timing: EventTiming,
+    capture_decision: EventCaptureDecision,
+    evidence: CompletedPlaintextEvidence,
+) {
+    let CompletedPlaintextEvidence {
+        schema_version,
+        evidence_id,
+        cgroup_id,
+        pid,
+        connection_id,
+        direction,
+        tls_adapter_id,
+        transport_protocol,
+        parse_state,
+        llm_likelihood,
+        schema_fingerprint,
+        observed_at_unix_ns,
+        captured_bytes,
+        encoding,
+        redacted_sample,
+        sample_sha256,
+        reasons,
+        capture_source,
+    } = evidence;
+    emit(
+        exporter,
+        stats,
+        PipelineRing::Ssl,
+        EnrichedEvent {
+            timing: Some(timing),
+            capture_decision: Some(capture_decision),
+            identity: identity_for(resolver, pid, cgroup_id, &comm),
+            workload: resolver.resolve_workload(pid, cgroup_id, 0),
+            observation: None,
+            process: Some(process_context(pid, cgroup_id, &comm)),
+            provider: None,
+            event: AgentEvent::AgentPlaintextEvidence(Box::new(AgentPlaintextEvidence {
+                schema_version,
+                evidence_id,
+                pid,
+                connection_id,
+                direction,
+                tls_adapter_id,
+                transport_protocol,
+                parse_state,
+                llm_likelihood,
+                schema_fingerprint,
+                observed_at_unix_ns,
+                captured_bytes,
+                encoding,
+                redacted_sample,
+                sample_sha256,
+                reasons,
+                capture_source,
+            })),
         },
     );
 }
@@ -3921,6 +3978,7 @@ fn drain_pipeline(
     count
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_pipeline_cycle(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
@@ -4163,6 +4221,7 @@ fn partial_window_interval_secs(elapsed: Duration) -> u64 {
         .saturating_add(u64::from(elapsed.subsec_nanos() > 0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collector_heartbeat(
     meta: &CollectorMeta,
     interval_secs: u64,
@@ -4257,7 +4316,8 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, ev: En
             stats.file_delete += 1;
         }
         AgentEvent::LlmCall { .. } => stats.llm += 1,
-        AgentEvent::LlmInteraction { .. } => stats.llm += 1,
+        AgentEvent::LlmInteraction(..) => stats.llm += 1,
+        AgentEvent::AgentPlaintextEvidence(..) => {}
         AgentEvent::SslContent { .. } => stats.ssl += 1,
         AgentEvent::LlmApi { .. } => stats.llm += 1,
         AgentEvent::SecurityAction { .. } => stats.sec += 1,
@@ -4378,21 +4438,23 @@ mod tests {
         observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
         parse_unknown_file_policy, partial_window_interval_secs, pod_bytes, pod_from_bytes,
-        supplement_exec_argv_at, tls_exec_comm_needs_refresh, CollectorMeta, CompletedExec,
-        ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, PipelineAccountingState,
-        PipelineRing, ProcessContextCache, ProcessLifecycleStore, RingReaderLedgerSnapshot,
-        RingWindowStats, Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT,
-        FILE_ACCESS_TRACEPOINTS,
+        supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
+        CollectorMeta, CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot,
+        PipelineAccountingState, PipelineRing, ProcessContextCache, ProcessLifecycleStore,
+        RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
+        EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
     };
     use a3s_observer::{AgentEvent, ExportPriority, ProcessContext};
     use a3s_observer_common::{
         CaptureDecisionContext, ExecRecord, FileFilterConfig, FileFilterStats, FileFilterValue,
-        RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED, EXEC_ARG_CHUNK_PAYLOAD,
-        EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END,
-        EXEC_RECORD_HEADER, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_SAMPLE,
-        FILE_FILTER_AUTHORITY_AUTHORITATIVE, FILE_FILTER_AUTHORITY_CANDIDATE,
-        FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_COUNT,
-        PIPELINE_RING_EXEC, PIPELINE_RING_FILE_ACCESS,
+        RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROFILE_AGENT_FULL,
+        CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
+        EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK,
+        EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_FILTER_ACTION_DROP,
+        FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+        FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED,
+        FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_COUNT, PIPELINE_RING_EXEC,
+        PIPELINE_RING_FILE_ACCESS,
     };
     use std::fs;
     use std::time::{Duration, Instant};
@@ -4434,6 +4496,20 @@ mod tests {
         }
         for tool in ["bash", "git", "python3", "node", "curl"] {
             assert!(!tls_exec_comm_needs_refresh(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn identity_verified_capture_profiles_enable_product_neutral_tls_discovery() {
+        for profile in [
+            CAPTURE_PROFILE_AGENT_FULL,
+            CAPTURE_PROFILE_INVESTIGATION_FULL,
+            CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
+        ] {
+            assert!(tls_capture_profile_needs_refresh(profile));
+        }
+        for profile in [0, 1, 4, 5, 6, 7] {
+            assert!(!tls_capture_profile_needs_refresh(profile));
         }
     }
 

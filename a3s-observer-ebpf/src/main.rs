@@ -31,11 +31,10 @@ use a3s_observer_common::{
     PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
     PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
     PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-    PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
-    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
-    TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
-    TLS_PLAINTEXT_FLAG_TOOL_ROUTE, TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE,
+    PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
+    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
+    TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
+    TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND, TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE,
     TLS_PLAINTEXT_TIER_MEDIUM, TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
@@ -234,30 +233,17 @@ fn bump_tls_profile_diagnostic(index: u32) {
 }
 
 // Userspace inserts only identity-verified Agent roots and explicitly trusted network runtimes.
-// TLS success is a separate condition enforced by PID-scoped uprobe attachment; plain HTTP may be
-// captured even when that process has no supported TLS profile. Both lanes still require an exact
-// admitted POST route before bytes enter the plaintext ring.
+// TLS success is a separate condition enforced by PID-scoped uprobe attachment. URL, Host, route,
+// model and provider configuration are deliberately absent from this kernel admission boundary.
 #[map]
 static VERIFIED_AGENT_PROCESSES: LruHashMap<PlaintextProcessKey, u8> =
     LruHashMap::with_max_entries(16_384, 0);
 
-// A TLS uprobe is attached only to a selected Agent PID, but one Agent can still call unrelated
-// HTTPS services (RAG stores, source control, telemetry). Keep plaintext disabled until the first
-// application write is recognizably an LLM HTTP request, then admit reads/writes for that TLS
-// session. LRU bounds stale SSL pointers; a later non-LLM HTTP request revokes a reused pointer.
-#[map]
-static PLAINTEXT_SSL_SESSIONS: LruHashMap<SslSessionKey, u64> =
-    LruHashMap::with_max_entries(8_192, 0);
-
-// Plain HTTP connections are admitted only after a selected process writes an HTTP request line.
-// The key is `(pid,fd)` and survives keep-alive requests until close or LRU eviction.
+// Plain HTTP is different from a TLS-library boundary: generic write/writev also sees stdout and
+// files. Admit a socket only after a selected process writes any syntactically valid HTTP request
+// line. The Collector, not eBPF, decides whether its body is an LLM interaction.
 #[map]
 static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
-
-// FNV-1a hash of an exact HTTP path (without query) -> LLM/tool route class. Userspace installs
-// the closed defaults and explicitly configured custom routes before plaintext capture starts.
-#[map]
-static PLAINTEXT_HTTP_ROUTES: HashMap<u64, u8> = HashMap::with_max_entries(512, 0);
 
 #[map]
 static HTTP_READ_ARGS: HashMap<u64, HttpReadArgs> = HashMap::with_max_entries(10_240, 0);
@@ -274,14 +260,6 @@ struct SslCallArgs {
     api_kind: u8,
     route_kind: u8,
     _pad: [u8; 5],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SslSessionKey {
-    pid: u32,
-    _pad: u32,
-    ssl_ptr: u64,
 }
 
 #[repr(C)]
@@ -2215,10 +2193,6 @@ pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
         return 0;
     }
     bump_tls_profile_diagnostic(3);
-    let route_kind = llm_json_prefix_kind(layout[1], layout[2]);
-    if route_kind == HTTP_PREFIX_LLM || route_kind == HTTP_PREFIX_TOOL {
-        bump_tls_profile_diagnostic(10);
-    }
     let args = SslCallArgs {
         ssl_ptr: ctx.arg::<u64>(0).unwrap_or(0),
         buf: layout[1],
@@ -2227,7 +2201,7 @@ pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
         started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
         direction: TLS_PLAINTEXT_DIRECTION_WRITE,
         api_kind: TLS_PLAINTEXT_API_RUSTLS,
-        route_kind,
+        route_kind: HTTP_PREFIX_UNKNOWN,
         _pad: [0; 5],
     };
     // `buffer_plaintext` may tail-call its encryption implementation. Capturing at this stable
@@ -2358,37 +2332,8 @@ fn next_ssl_call_sequence(pid: u32, connection_id: u64, direction: u8) -> u64 {
 }
 
 const HTTP_PREFIX_UNKNOWN: u8 = 0;
-const HTTP_PREFIX_LLM: u8 = PLAINTEXT_HTTP_ROUTE_LLM;
-const HTTP_PREFIX_TOOL: u8 = PLAINTEXT_HTTP_ROUTE_TOOL;
-const HTTP_PREFIX_OTHER: u8 = u8::MAX;
+const HTTP_PREFIX_HTTP: u8 = 1;
 const HTTP_REQUEST_LINE_SNAPSHOT: usize = 64;
-
-#[repr(C)]
-struct HttpRouteHashContext {
-    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
-    hash: u64,
-    captured: u32,
-    index: u32,
-    complete: u8,
-    _pad: [u8; 7],
-}
-
-unsafe extern "C" fn hash_http_route_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
-    let state = &mut *(raw_ctx as *mut HttpRouteHashContext);
-    let index = state.index as usize;
-    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
-        return 1;
-    }
-    let byte = state.data[index];
-    if byte == b' ' || byte == b'?' || byte == b'\r' {
-        state.complete = (index > 5) as u8;
-        return 1;
-    }
-    state.hash ^= byte as u64;
-    state.hash = state.hash.wrapping_mul(0x0000_0100_0000_01b3);
-    state.index = state.index.saturating_add(1);
-    0
-}
 
 #[inline(always)]
 fn bytes_at<const N: usize>(
@@ -2410,9 +2355,8 @@ fn bytes_at<const N: usize>(
     true
 }
 
-/// Read only the bounded HTTP request line needed for kernel-side semantic admission. This is not
-/// an HTTP parser: userspace remains authoritative for framing and JSON. It merely prevents an
-/// Agent's unrelated HTTPS calls from entering the plaintext ring.
+/// Detect only the HTTP method prefix needed to keep plain-syscall capture away from stdout/files.
+/// URL/path/provider semantics deliberately stay in userspace.
 #[inline(always)]
 fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
     if buf == 0 || len < 4 {
@@ -2435,10 +2379,8 @@ fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
         return HTTP_PREFIX_UNKNOWN;
     }
 
-    let is_post = bytes_at(&data, captured, 0, b"POST ");
-    let is_get = bytes_at(&data, captured, 0, b"GET ");
-    let is_http = is_post
-        || is_get
+    let is_http = bytes_at(&data, captured, 0, b"POST ")
+        || bytes_at(&data, captured, 0, b"GET ")
         || bytes_at(&data, captured, 0, b"PUT ")
         || bytes_at(&data, captured, 0, b"PATCH ")
         || bytes_at(&data, captured, 0, b"DELETE ")
@@ -2447,144 +2389,7 @@ fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
     if !is_http {
         return HTTP_PREFIX_UNKNOWN;
     }
-    // GET is admitted only for the same exact LLM route allowlist. This is required for the
-    // Responses WebSocket upgrade; arbitrary browsing/RAG GETs still fail closed.
-    if !is_post && !is_get {
-        return HTTP_PREFIX_OTHER;
-    }
-
-    let method_len = if is_post { 5usize } else { 4usize };
-
-    let mut route = HttpRouteHashContext {
-        data,
-        hash: 0xcbf2_9ce4_8422_2325u64,
-        captured: captured as u32,
-        index: method_len as u32,
-        complete: 0,
-        _pad: [0; 7],
-    };
-    let iterations = unsafe {
-        bpf_loop(
-            (HTTP_REQUEST_LINE_SNAPSHOT - method_len) as u32,
-            hash_http_route_byte as *mut c_void,
-            &mut route as *mut HttpRouteHashContext as *mut c_void,
-            0,
-        )
-    };
-    if iterations >= 0 && route.complete != 0 {
-        if let Some(route_kind) = unsafe { PLAINTEXT_HTTP_ROUTES.get(&route.hash) } {
-            if *route_kind == HTTP_PREFIX_LLM || *route_kind == HTTP_PREFIX_TOOL {
-                return *route_kind;
-            }
-        }
-    }
-
-    HTTP_PREFIX_OTHER
-}
-
-/// Some statically linked Rust HTTP clients inline the header-writing path but still call the
-/// profiled Rustls boundary for the complete JSON body. Admit only provider-shaped top-level JSON
-/// prefixes. This remains behind exact Agent identity and exact whole-binary TLS profile checks;
-/// arbitrary JSON and internal file/RAG bytes do not pass this gate.
-#[inline(always)]
-fn llm_json_prefix_kind(buf: u64, len: u64) -> u8 {
-    const JSON_PREFIX_BYTES: usize = 32;
-    if buf == 0 || len < 8 {
-        return HTTP_PREFIX_UNKNOWN;
-    }
-    let mut data = [0u8; JSON_PREFIX_BYTES];
-    let captured = if len > JSON_PREFIX_BYTES as u64 {
-        JSON_PREFIX_BYTES
-    } else {
-        len as usize
-    };
-    if unsafe {
-        bpf_probe_read_user(
-            data.as_mut_ptr() as *mut c_void,
-            captured as u32,
-            buf as *const c_void,
-        )
-    } < 0
-    {
-        return HTTP_PREFIX_UNKNOWN;
-    }
-    if json_bytes_at(&data, captured, b"{\"model\"")
-        || json_bytes_at(&data, captured, b"{\"messages\"")
-        || json_bytes_at(&data, captured, b"{\"input\"")
-        || json_bytes_at(&data, captured, b"{\"type\":\"response.create\"")
-    {
-        HTTP_PREFIX_LLM
-    } else {
-        HTTP_PREFIX_UNKNOWN
-    }
-}
-
-#[inline(always)]
-fn json_bytes_at<const N: usize>(data: &[u8; 32], captured: usize, expected: &[u8; N]) -> bool {
-    if N > captured {
-        return false;
-    }
-    let mut index = 0usize;
-    while index < N {
-        if data[index] != expected[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
-#[inline(always)]
-fn ssl_plaintext_route(args: &SslCallArgs, pid: u32) -> u8 {
-    if args.api_kind == TLS_PLAINTEXT_API_TCP {
-        return args.route_kind;
-    }
-    if args.ssl_ptr == 0 {
-        return HTTP_PREFIX_UNKNOWN;
-    }
-    let key = SslSessionKey {
-        pid,
-        _pad: 0,
-        ssl_ptr: args.ssl_ptr,
-    };
-    if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
-        if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE
-            && (args.route_kind == HTTP_PREFIX_LLM || args.route_kind == HTTP_PREFIX_TOOL)
-        {
-            let route_kind_value = args.route_kind as u64;
-            let _ = PLAINTEXT_SSL_SESSIONS.insert(&key, &route_kind_value, 0);
-            return args.route_kind;
-        }
-        return unsafe { PLAINTEXT_SSL_SESSIONS.get(&key) }
-            .map(|value| *value as u8)
-            .unwrap_or(HTTP_PREFIX_UNKNOWN);
-    }
-    if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
-        let prefix_kind =
-            if args.route_kind == HTTP_PREFIX_LLM || args.route_kind == HTTP_PREFIX_TOOL {
-                args.route_kind
-            } else {
-                http_request_prefix_kind(args.buf, args.requested_len)
-            };
-        match prefix_kind {
-            route_kind @ (HTTP_PREFIX_LLM | HTTP_PREFIX_TOOL) => {
-                let route_kind_value = route_kind as u64;
-                let _ = PLAINTEXT_SSL_SESSIONS.insert(&key, &route_kind_value, 0);
-                route_kind
-            }
-            HTTP_PREFIX_OTHER => {
-                let _ = PLAINTEXT_SSL_SESSIONS.remove(&key);
-                HTTP_PREFIX_UNKNOWN
-            }
-            _ => unsafe { PLAINTEXT_SSL_SESSIONS.get(&key) }
-                .map(|value| *value as u8)
-                .unwrap_or(HTTP_PREFIX_UNKNOWN),
-        }
-    } else {
-        unsafe { PLAINTEXT_SSL_SESSIONS.get(&key) }
-            .map(|value| *value as u8)
-            .unwrap_or(HTTP_PREFIX_UNKNOWN)
-    }
+    HTTP_PREFIX_HTTP
 }
 
 #[inline(always)]
@@ -2613,17 +2418,6 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             bump_tls_profile_diagnostic(13);
         } else if args.api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC {
             bump_tls_profile_diagnostic(18);
-        }
-        return 0;
-    }
-    let route_kind = ssl_plaintext_route(&args, pid);
-    if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
-        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
-            bump_tls_profile_diagnostic(9);
-        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
-            bump_tls_profile_diagnostic(14);
-        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC {
-            bump_tls_profile_diagnostic(19);
         }
         return 0;
     }
@@ -2672,9 +2466,6 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             }
             if args.ssl_ptr == 0 {
                 flags |= TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND;
-            }
-            if route_kind == HTTP_PREFIX_TOOL {
-                flags |= TLS_PLAINTEXT_FLAG_TOOL_ROUTE;
             }
             let ev = entry.as_mut_ptr();
             unsafe {
@@ -2736,21 +2527,17 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
         .copied()
         .unwrap_or(HTTP_PREFIX_UNKNOWN);
     match http_request_prefix_kind(buf as u64, len) {
-        next @ (HTTP_PREFIX_LLM | HTTP_PREFIX_TOOL) => {
-            route_kind = next;
+        HTTP_PREFIX_HTTP => {
+            route_kind = HTTP_PREFIX_HTTP;
             let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
         }
-        HTTP_PREFIX_OTHER => {
-            let _ = HTTP_SOCKS.remove(&key);
-            return;
-        }
         _ => {
-            if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+            if route_kind != HTTP_PREFIX_HTTP {
                 return;
             }
         }
     }
-    if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+    if route_kind != HTTP_PREFIX_HTTP {
         return;
     }
 
@@ -3502,7 +3289,7 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
         let route_kind = unsafe { HTTP_SOCKS.get(&key) }
             .copied()
             .unwrap_or(HTTP_PREFIX_UNKNOWN);
-        if route_kind != HTTP_PREFIX_LLM && route_kind != HTTP_PREFIX_TOOL {
+        if route_kind != HTTP_PREFIX_HTTP {
             let _ = HTTP_READ_ARGS.remove(&tgid);
             return 0;
         }

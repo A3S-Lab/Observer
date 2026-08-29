@@ -209,6 +209,7 @@ pub struct RawEnvelope {
 }
 
 impl RawEnvelope {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         origin: PipelineOrigin,
         captured_at_boot_ns: u64,
@@ -839,10 +840,9 @@ impl ReorderCoordinator {
             local_sequence: 0,
         };
         let future = process.events.split_off(&keep_from);
-        let ready = std::mem::replace(&mut process.events, future)
+        std::mem::replace(&mut process.events, future)
             .into_values()
-            .collect();
-        ready
+            .collect()
     }
 }
 

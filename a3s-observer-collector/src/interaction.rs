@@ -11,7 +11,7 @@ use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -39,6 +39,7 @@ pub struct PlaintextChunk {
     pub data: Vec<u8>,
     pub event_at_unix_ns: u128,
     pub source: String,
+    pub adapter_id: String,
     pub partial_reasons: Vec<String>,
 }
 
@@ -52,6 +53,15 @@ pub struct CompletedInteraction {
     pub connection_id: String,
     pub transport: String,
     pub protocol: String,
+    pub tls_adapter_id: String,
+    pub transport_protocol: String,
+    pub wire_template_id: Option<String>,
+    pub parse_state: String,
+    pub llm_likelihood: String,
+    pub schema_fingerprint: Option<String>,
+    pub transport_completeness: String,
+    pub wire_completeness: String,
+    pub conversation_completeness: String,
     pub endpoint: String,
     pub method: String,
     pub path: String,
@@ -72,6 +82,28 @@ pub struct CompletedInteraction {
     pub tool_results: Vec<LlmInteractionToolResult>,
     pub completeness: String,
     pub partial_reasons: Vec<String>,
+    pub capture_source: String,
+}
+
+#[derive(Debug)]
+pub struct CompletedPlaintextEvidence {
+    pub schema_version: String,
+    pub evidence_id: String,
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub connection_id: String,
+    pub direction: String,
+    pub tls_adapter_id: String,
+    pub transport_protocol: String,
+    pub parse_state: String,
+    pub llm_likelihood: String,
+    pub schema_fingerprint: Option<String>,
+    pub observed_at_unix_ns: String,
+    pub captured_bytes: u64,
+    pub encoding: String,
+    pub redacted_sample: Option<String>,
+    pub sample_sha256: String,
+    pub reasons: Vec<String>,
     pub capture_source: String,
 }
 
@@ -96,6 +128,21 @@ impl From<&PlaintextChunk> for ConnectionKey {
 enum StreamKind {
     Request,
     Response,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireInteractionKind {
+    Model,
+    Tool,
+    Unparsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WireMatch {
+    template_id: &'static str,
+    likelihood: &'static str,
+    parse_state: &'static str,
+    interaction_kind: WireInteractionKind,
 }
 
 #[derive(Debug)]
@@ -240,11 +287,13 @@ struct ConnectionState {
     last_request_sequence: u64,
     last_response_sequence: u64,
     source: String,
+    adapter_id: String,
+    evidence_fingerprints: HashSet<String>,
     last_activity: Instant,
 }
 
 impl ConnectionState {
-    fn new(max_body_bytes: usize, source: String) -> Self {
+    fn new(max_body_bytes: usize, source: String, adapter_id: String) -> Self {
         Self {
             requests: HttpStreamDecoder::new(StreamKind::Request, max_body_bytes),
             responses: HttpStreamDecoder::new(StreamKind::Response, max_body_bytes),
@@ -253,6 +302,8 @@ impl ConnectionState {
             last_request_sequence: 0,
             last_response_sequence: 0,
             source,
+            adapter_id,
+            evidence_fingerprints: HashSet::new(),
             last_activity: Instant::now(),
         }
     }
@@ -267,6 +318,7 @@ impl ConnectionState {
 #[derive(Debug)]
 pub struct InteractionReassembler {
     connections: HashMap<ConnectionKey, ConnectionState>,
+    pending_evidence: VecDeque<CompletedPlaintextEvidence>,
     max_connections: usize,
     max_body_bytes: usize,
     idle_timeout: Duration,
@@ -290,6 +342,7 @@ impl InteractionReassembler {
     ) -> Self {
         Self {
             connections: HashMap::new(),
+            pending_evidence: VecDeque::new(),
             max_connections: max_connections.max(1),
             max_body_bytes: max_body_bytes.max(4 * 1024),
             idle_timeout,
@@ -299,13 +352,25 @@ impl InteractionReassembler {
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
         self.evict_if_needed();
         let key = ConnectionKey::from(&chunk);
-        let state = self
-            .connections
-            .entry(key)
-            .or_insert_with(|| ConnectionState::new(self.max_body_bytes, chunk.source.clone()));
+        let state = self.connections.entry(key).or_insert_with(|| {
+            ConnectionState::new(
+                self.max_body_bytes,
+                chunk.source.clone(),
+                chunk.adapter_id.clone(),
+            )
+        });
         state.last_activity = Instant::now();
         if state.source != chunk.source {
             state.source = format!("{}+{}", state.source, chunk.source);
+        }
+        if state.adapter_id != chunk.adapter_id {
+            state.adapter_id = format!("{}+{}", state.adapter_id, chunk.adapter_id);
+        }
+        if let Some(evidence) = plaintext_transport_evidence(key, state, &chunk) {
+            if self.pending_evidence.len() >= self.max_connections {
+                self.pending_evidence.pop_front();
+            }
+            self.pending_evidence.push_back(evidence);
         }
 
         let previous_sequence = match chunk.direction {
@@ -362,9 +427,14 @@ impl InteractionReassembler {
                         continue;
                     };
                     state.sequence = state.sequence.wrapping_add(1);
-                    if let Some(interaction) =
-                        build_interaction(key, state.sequence, &state.source, request, response)
-                    {
+                    if let Some(interaction) = build_interaction(
+                        key,
+                        state.sequence,
+                        &state.source,
+                        &state.adapter_id,
+                        request,
+                        response,
+                    ) {
                         completed.push(interaction);
                     }
                 }
@@ -420,6 +490,10 @@ impl InteractionReassembler {
         self.connections.len()
     }
 
+    pub fn take_evidence(&mut self) -> Vec<CompletedPlaintextEvidence> {
+        self.pending_evidence.drain(..).collect()
+    }
+
     fn evict_if_needed(&mut self) {
         if self.connections.len() < self.max_connections {
             return;
@@ -473,6 +547,71 @@ fn plaintext_fragment_kind(data: &[u8]) -> &'static str {
     }
 }
 
+fn plaintext_transport_evidence(
+    key: ConnectionKey,
+    state: &mut ConnectionState,
+    chunk: &PlaintextChunk,
+) -> Option<CompletedPlaintextEvidence> {
+    let (transport_protocol, reason) =
+        if chunk.data.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+            ("http/2", "transport_decoder_unavailable")
+        } else if looks_like_websocket_upgrade(&chunk.data) {
+            ("websocket", "websocket_upgrade_observed")
+        } else {
+            return None;
+        };
+    let direction = match chunk.direction {
+        ChunkDirection::Request => "write",
+        ChunkDirection::Response => "read",
+    };
+    let fingerprint = format!("{transport_protocol}:{direction}");
+    if !state.evidence_fingerprints.insert(fingerprint.clone()) {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"anysentry.agent_plaintext_evidence.v1");
+    hash.update(key.cgroup_id.to_ne_bytes());
+    hash.update(key.pid.to_ne_bytes());
+    hash.update(key.connection_id.to_ne_bytes());
+    hash.update(chunk.event_at_unix_ns.to_ne_bytes());
+    hash.update(fingerprint.as_bytes());
+    hash.update(&chunk.data);
+    let evidence_id = format!("pe_{}", hex_prefix(&hash.finalize(), 24));
+    Some(CompletedPlaintextEvidence {
+        schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
+        evidence_id,
+        cgroup_id: key.cgroup_id,
+        pid: key.pid,
+        connection_id: format!("tls:{:x}", key.connection_id),
+        direction: direction.to_string(),
+        tls_adapter_id: state.adapter_id.clone(),
+        transport_protocol: transport_protocol.to_string(),
+        parse_state: "unparsed".to_string(),
+        llm_likelihood: "unknown".to_string(),
+        schema_fingerprint: None,
+        observed_at_unix_ns: chunk.event_at_unix_ns.to_string(),
+        captured_bytes: chunk.data.len() as u64,
+        encoding: "metadata_only".to_string(),
+        redacted_sample: None,
+        sample_sha256: sha256_hex(&chunk.data),
+        reasons: vec![reason.to_string()],
+        capture_source: state.source.clone(),
+    })
+}
+
+fn looks_like_websocket_upgrade(data: &[u8]) -> bool {
+    if !data.starts_with(b"GET ") {
+        return false;
+    }
+    let captured = &data[..data.len().min(8 * 1024)];
+    let lowercase = captured
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    find_bytes(&lowercase, b"\r\nupgrade: websocket").is_some()
+        || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
+}
+
 fn body_only_llm_request(
     body: &[u8],
     event_at_unix_ns: u128,
@@ -499,7 +638,7 @@ fn body_only_llm_request(
         start_line: format!("POST {path} HTTP/1.1"),
         headers: BTreeMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("host".to_string(), "inferred-from-tls-profile".to_string()),
+            ("host".to_string(), "unknown".to_string()),
         ]),
         body: body.to_vec(),
         captured_body_bytes: body.len(),
@@ -514,12 +653,12 @@ fn build_interaction(
     key: ConnectionKey,
     sequence: u64,
     source: &str,
+    adapter_id: &str,
     request: HttpMessage,
     response: HttpMessage,
 ) -> Option<CompletedInteraction> {
     let (method, path) = request_line(&request.start_line)?;
     let endpoint = request.endpoint();
-    let tool_route = source.contains("tool_route");
     let status_code = response_status(&response.start_line).unwrap_or_default();
     let request_encoding = request.header("content-encoding").unwrap_or("");
     let response_encoding = response.header("content-encoding").unwrap_or("");
@@ -528,9 +667,7 @@ fn build_interaction(
     let (response_body, response_decode_reason) =
         decode_content_encoding(&response.body, response_encoding, DEFAULT_MAX_STREAM_BYTES);
     let request_json = parse_json_body(&request_body);
-    if !tool_route && !looks_like_llm_request(&method, &path, request_json.as_ref()) {
-        return None;
-    }
+    let mut wire_match = match_wire_protocol(&method, &request.headers, request_json.as_ref())?;
     let response_is_sse = response
         .content_type()
         .eq_ignore_ascii_case("text/event-stream")
@@ -547,6 +684,22 @@ fn build_interaction(
         (structured, text, calls)
     };
     dedup_tool_calls(&mut tool_calls);
+    if status_code < 400
+        && !response_matches_wire_template(
+            wire_match.template_id,
+            response_is_sse,
+            response_structured.as_ref(),
+        )
+    {
+        wire_match = WireMatch {
+            template_id: "unknown-json-exchange",
+            likelihood: "unknown",
+            parse_state: "unparsed",
+            interaction_kind: WireInteractionKind::Unparsed,
+        };
+        tool_calls.clear();
+    }
+    let tool_route = wire_match.interaction_kind == WireInteractionKind::Tool;
 
     let messages = request_json
         .as_ref()
@@ -584,7 +737,10 @@ fn build_interaction(
     let provider_previous_response_id = request_json
         .as_ref()
         .and_then(|value| bounded_provider_id(value.get("previous_response_id")));
+    let request_schema_fingerprint = request_json.as_ref().map(schema_fingerprint);
 
+    let request_decode_complete = request_decode_reason.is_none();
+    let response_decode_complete = response_decode_reason.is_none();
     let mut partial_reasons = request.partial_reasons.clone();
     extend_unique(&mut partial_reasons, response.partial_reasons.clone());
     if let Some(reason) = request_decode_reason {
@@ -593,7 +749,42 @@ fn build_interaction(
     if let Some(reason) = response_decode_reason {
         extend_unique(&mut partial_reasons, [reason]);
     }
-    let completeness = if partial_reasons.is_empty() {
+    if wire_match.parse_state != "parsed" {
+        extend_unique(
+            &mut partial_reasons,
+            [format!("wire_template_{}", wire_match.parse_state)],
+        );
+    }
+    let transport_completeness = if request.partial_reasons.is_empty()
+        && response.partial_reasons.is_empty()
+        && request_decode_complete
+        && response_decode_complete
+    {
+        "complete"
+    } else {
+        "partial"
+    };
+    let wire_completeness = wire_completeness(
+        wire_match,
+        status_code,
+        response_is_sse,
+        &response_body,
+        response_structured.as_ref(),
+    );
+    if wire_completeness != "complete" && wire_completeness != "error" {
+        extend_unique(&mut partial_reasons, [format!("wire_{wire_completeness}")]);
+    }
+    let conversation_completeness = if !tool_calls.is_empty() && tool_results.is_empty() {
+        "tool_pending"
+    } else if wire_completeness == "complete" || wire_completeness == "error" {
+        "complete"
+    } else {
+        "partial"
+    };
+    let completeness = if transport_completeness == "complete"
+        && wire_completeness == "complete"
+        && conversation_completeness == "complete"
+    {
         "complete"
     } else {
         "partial"
@@ -635,32 +826,45 @@ fn build_interaction(
         &request_content.sha256,
     );
     if tool_route {
-        let tool_call_id = format!("transport:{interaction_id}");
-        let name = format!(
-            "http.{}",
-            path.split(['?', '#'])
-                .next()
-                .unwrap_or(&path)
-                .trim_matches('/')
-                .replace('/', ".")
-        );
+        let rpc_request = request_content.structured.as_ref();
+        let rpc_response = response_content.structured.as_ref();
+        let tool_call_id = rpc_request
+            .and_then(|value| value.get("id"))
+            .map(json_scalar_id)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("transport:{interaction_id}"));
+        let name = rpc_request
+            .and_then(|value| value.get("params"))
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                rpc_request
+                    .and_then(|value| value.get("method"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("mcp.tools.call")
+            .to_string();
+        let arguments = rpc_request
+            .and_then(|value| value.get("params"))
+            .and_then(|params| params.get("arguments").or(Some(params)))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let result = rpc_response
+            .and_then(|value| value.get("result").or_else(|| value.get("error")))
+            .cloned()
+            .unwrap_or(Value::Null);
         tool_calls = vec![LlmInteractionToolCall {
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
-            arguments: request_content
-                .structured
-                .clone()
-                .unwrap_or_else(|| Value::String(request_content.body.clone())),
+            arguments,
             issued_at_unix_ns: Some(request.completed_at_unix_ns.to_string()),
         }];
         tool_results = vec![LlmInteractionToolResult {
             tool_call_id,
             name: Some(name),
-            content: response_content
-                .structured
-                .clone()
-                .unwrap_or_else(|| Value::String(response_content.body.clone())),
-            is_error: status_code >= 400,
+            content: result,
+            is_error: status_code >= 400
+                || rpc_response.is_some_and(|value| value.get("error").is_some()),
             observed_at_unix_ns: Some(response.completed_at_unix_ns.to_string()),
         }];
     }
@@ -671,7 +875,12 @@ fn build_interaction(
     Some(CompletedInteraction {
         schema_version: "anysentry.agent_interaction.v1".to_string(),
         interaction_id,
-        interaction_type: if tool_route { "tool" } else { "model" }.to_string(),
+        interaction_type: match wire_match.interaction_kind {
+            WireInteractionKind::Model => "model",
+            WireInteractionKind::Tool => "tool",
+            WireInteractionKind::Unparsed => "unparsed",
+        }
+        .to_string(),
         cgroup_id: key.cgroup_id,
         pid: key.pid,
         connection_id: format!("tls:{:x}", key.connection_id),
@@ -687,6 +896,20 @@ fn build_interaction(
             "http/1.1"
         }
         .to_string(),
+        tls_adapter_id: adapter_id.to_string(),
+        transport_protocol: if request.metadata_inferred {
+            "json-body"
+        } else {
+            "http/1.1"
+        }
+        .to_string(),
+        wire_template_id: Some(wire_match.template_id.to_string()),
+        parse_state: wire_match.parse_state.to_string(),
+        llm_likelihood: wire_match.likelihood.to_string(),
+        schema_fingerprint: request_schema_fingerprint,
+        transport_completeness: transport_completeness.to_string(),
+        wire_completeness: wire_completeness.to_string(),
+        conversation_completeness: conversation_completeness.to_string(),
         endpoint,
         method,
         path,
@@ -992,44 +1215,267 @@ fn response_status(start_line: &str) -> Option<u16> {
     start_line.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn looks_like_llm_request(method: &str, path: &str, body: Option<&Value>) -> bool {
-    // Endpoint names are deliberately not an admission signal. A local gateway may host both an
-    // LLM API and unrelated control APIs (Docker's `api.moby.localhost` is one real example).
-    // Requiring POST + a model-generation route + a matching request shape keeps the semantic
-    // layer fail-closed while still supporting OpenAI-compatible custom domains.
-    if !method.eq_ignore_ascii_case("POST") {
+fn match_wire_protocol(
+    method: &str,
+    headers: &BTreeMap<String, String>,
+    body: Option<&Value>,
+) -> Option<WireMatch> {
+    if !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH"
+    ) {
+        return None;
+    }
+    let value = body?;
+    let object = value.as_object()?;
+
+    if object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && object.get("method").and_then(Value::as_str).is_some()
+        && object.get("id").is_some()
+    {
+        return Some(WireMatch {
+            template_id: "mcp-jsonrpc",
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Tool,
+        });
+    }
+    if object.contains_key("contents") {
+        return Some(WireMatch {
+            template_id: "gemini-generate-content",
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Model,
+        });
+    }
+    if object.get("type").and_then(Value::as_str) == Some("response.create")
+        || (object.contains_key("input")
+            && (object.contains_key("model")
+                || object.contains_key("tools")
+                || object.contains_key("instructions")
+                || object.contains_key("previous_response_id")))
+    {
+        return Some(WireMatch {
+            template_id: "openai-responses",
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Model,
+        });
+    }
+    if object.contains_key("messages") {
+        let anthropic_header =
+            headers.contains_key("anthropic-version") || headers.contains_key("anthropic-beta");
+        let anthropic_shape = object.contains_key("system")
+            || has_nested_type(value, "tool_result", 0)
+            || has_nested_type(value, "tool_use", 0);
+        return Some(WireMatch {
+            template_id: if anthropic_header || anthropic_shape {
+                "anthropic-messages"
+            } else if object.contains_key("model") {
+                "openai-chat-completions"
+            } else {
+                "generic-role-message"
+            },
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Model,
+        });
+    }
+    if object.contains_key("prompt") && object.contains_key("model") {
+        return Some(WireMatch {
+            template_id: "generic-prompt-completion",
+            likelihood: "likely",
+            parse_state: "partial",
+            interaction_kind: WireInteractionKind::Model,
+        });
+    }
+    if object.contains_key("model")
+        && (object.contains_key("tools")
+            || object.contains_key("stream")
+            || object.contains_key("response_format"))
+    {
+        return Some(WireMatch {
+            template_id: "unknown-json-llm",
+            likelihood: "likely",
+            parse_state: "unparsed",
+            interaction_kind: WireInteractionKind::Unparsed,
+        });
+    }
+    None
+}
+
+fn has_nested_type(value: &Value, expected: &str, depth: usize) -> bool {
+    if depth > 6 {
         return false;
     }
-    let path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(path)
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    let known_path = [
-        "/v1/responses",
-        "/v1/chat/completions",
-        "/v1/messages",
-        "/v1/completions",
-        "/responses",
-        "/chat/completions",
-        "/messages",
-        "/completions",
-        "/api/chat",
-        "/api/generate",
-    ]
-    .iter()
-    .any(|needle| path.ends_with(needle))
-        || path.ends_with(":generatecontent")
-        || path.ends_with(":streamgeneratecontent");
-    let semantic_body = body.is_some_and(|value| {
-        (value.get("model").is_some()
-            && (value.get("messages").is_some()
-                || value.get("input").is_some()
-                || value.get("prompt").is_some()))
-            || value.get("contents").is_some()
-    });
-    known_path && semantic_body
+    match value {
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some(expected)
+                || object
+                    .values()
+                    .any(|child| has_nested_type(child, expected, depth + 1))
+        }
+        Value::Array(items) => items
+            .iter()
+            .take(128)
+            .any(|child| has_nested_type(child, expected, depth + 1)),
+        _ => false,
+    }
+}
+
+fn response_matches_wire_template(
+    template_id: &str,
+    response_is_sse: bool,
+    response: Option<&Value>,
+) -> bool {
+    let Some(response) = response else {
+        return false;
+    };
+    match template_id {
+        "mcp-jsonrpc" => {
+            response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && response.get("id").is_some()
+                && (response.get("result").is_some() || response.get("error").is_some())
+        }
+        "openai-responses" => {
+            json_has_key(response, "output", 0)
+                || json_has_key(response, "output_text", 0)
+                || (response_is_sse && has_nested_type_prefix(response, "response.", 0))
+        }
+        "openai-chat-completions" => json_has_key(response, "choices", 0),
+        "anthropic-messages" => {
+            json_has_key(response, "content", 0)
+                || (response_is_sse
+                    && (has_nested_type(response, "message_start", 0)
+                        || has_nested_type(response, "message_stop", 0)))
+        }
+        "gemini-generate-content" => json_has_key(response, "candidates", 0),
+        "generic-role-message" | "generic-prompt-completion" => {
+            json_has_key(response, "choices", 0)
+                || json_has_key(response, "content", 0)
+                || json_has_key(response, "text", 0)
+                || json_has_key(response, "output", 0)
+        }
+        "unknown-json-llm" => true,
+        _ => false,
+    }
+}
+
+fn json_has_key(value: &Value, expected: &str, depth: usize) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    match value {
+        Value::Object(object) => {
+            object.contains_key(expected)
+                || object
+                    .values()
+                    .any(|child| json_has_key(child, expected, depth + 1))
+        }
+        Value::Array(items) => items
+            .iter()
+            .take(256)
+            .any(|child| json_has_key(child, expected, depth + 1)),
+        _ => false,
+    }
+}
+
+fn has_nested_type_prefix(value: &Value, prefix: &str, depth: usize) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    match value {
+        Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with(prefix))
+                || object
+                    .values()
+                    .any(|child| has_nested_type_prefix(child, prefix, depth + 1))
+        }
+        Value::Array(items) => items
+            .iter()
+            .take(256)
+            .any(|child| has_nested_type_prefix(child, prefix, depth + 1)),
+        _ => false,
+    }
+}
+
+fn json_scalar_id(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn wire_completeness(
+    wire_match: WireMatch,
+    status_code: u16,
+    response_is_sse: bool,
+    response_body: &[u8],
+    response_structured: Option<&Value>,
+) -> &'static str {
+    if status_code >= 400 {
+        return "error";
+    }
+    if wire_match.parse_state == "unparsed" {
+        return "unknown";
+    }
+    if response_is_sse {
+        return if sse_terminal_offset(response_body).is_some() {
+            "complete"
+        } else {
+            "partial"
+        };
+    }
+    if response_structured.is_some() {
+        "complete"
+    } else {
+        "unknown"
+    }
+}
+
+fn schema_fingerprint(value: &Value) -> String {
+    let mut descriptor = String::new();
+    append_schema_descriptor(value, 0, &mut descriptor);
+    format!("sf_{}", hex_prefix(&Sha256::digest(descriptor), 24))
+}
+
+fn append_schema_descriptor(value: &Value, depth: usize, output: &mut String) {
+    if depth > 6 || output.len() >= 16 * 1024 {
+        output.push('*');
+        return;
+    }
+    match value {
+        Value::Null => output.push('n'),
+        Value::Bool(_) => output.push('b'),
+        Value::Number(_) => output.push('#'),
+        Value::String(_) => output.push('s'),
+        Value::Array(items) => {
+            output.push('[');
+            for item in items.iter().take(8) {
+                append_schema_descriptor(item, depth + 1, output);
+                output.push(',');
+            }
+            output.push(']');
+        }
+        Value::Object(object) => {
+            output.push('{');
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys.into_iter().take(128) {
+                output.push_str(key);
+                output.push(':');
+                if let Some(child) = object.get(key) {
+                    append_schema_descriptor(child, depth + 1, output);
+                }
+                output.push(',');
+            }
+            output.push('}');
+        }
+    }
 }
 
 fn parse_json_body(body: &[u8]) -> Option<Value> {
@@ -1649,6 +2095,7 @@ mod tests {
             data: data.into(),
             event_at_unix_ns: at,
             source: "openssl_uprobe".to_string(),
+            adapter_id: "openssl-ex".to_string(),
             partial_reasons: Vec::new(),
         }
     }
@@ -1736,7 +2183,7 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].path, "/v1/responses");
         assert_eq!(completed[0].protocol, "http/1.1-body-inferred");
-        assert_eq!(completed[0].endpoint, "inferred-from-tls-profile");
+        assert_eq!(completed[0].endpoint, "unknown");
         assert_eq!(completed[0].request.body, request_body);
         assert_eq!(completed[0].response.text.as_deref(), Some("world"));
         assert_eq!(completed[0].completeness, "complete");
@@ -1765,35 +2212,40 @@ mod tests {
             http_response(r#"{"Id":"container-id"}"#),
             2,
         ));
-        assert!(completed.is_empty());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].interaction_type, "unparsed");
+        assert_eq!(completed[0].parse_state, "unparsed");
+        assert_eq!(completed[0].llm_likelihood, "unknown");
     }
 
     #[test]
-    fn explicitly_admitted_tool_route_emits_instruction_result_and_times() {
+    fn mcp_jsonrpc_template_emits_instruction_result_and_times_without_route_gate() {
         let mut reassembler = InteractionReassembler::default();
-        let mut request = chunk(
+        let request = chunk(
             ChunkDirection::Request,
             custom_http_request(
                 "POST",
-                "/tool/execute",
+                "/arbitrary/gateway/path",
                 "tool.fixture",
-                r#"{"instruction":"run fixture"}"#,
+                r#"{"jsonrpc":"2.0","id":"tool-1","method":"tools/call","params":{"name":"fixture","arguments":{"instruction":"run fixture"}}}"#,
             ),
             10,
         );
-        request.source = "openssl_uprobe_tool_route".to_string();
         reassembler.push(request);
-        let mut response = chunk(
+        let response = chunk(
             ChunkDirection::Response,
-            http_response(r#"{"result":"fixture ok"}"#),
+            http_response(r#"{"jsonrpc":"2.0","id":"tool-1","result":{"result":"fixture ok"}}"#),
             20,
         );
-        response.source = "openssl_uprobe_tool_route".to_string();
         let completed = reassembler.push(response);
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].interaction_type, "tool");
-        assert_eq!(completed[0].path, "/tool/execute");
+        assert_eq!(completed[0].path, "/arbitrary/gateway/path");
+        assert_eq!(
+            completed[0].wire_template_id.as_deref(),
+            Some("mcp-jsonrpc")
+        );
         assert_eq!(completed[0].tool_calls.len(), 1);
         assert_eq!(completed[0].tool_results.len(), 1);
         assert_eq!(
@@ -1816,22 +2268,27 @@ mod tests {
     }
 
     #[test]
-    fn llm_route_requires_post_and_semantic_request_shape() {
-        assert!(!looks_like_llm_request(
+    fn wire_matching_uses_method_and_content_shape_but_not_url() {
+        let headers = BTreeMap::new();
+        assert!(match_wire_protocol(
             "GET",
-            "/v1/chat/completions",
+            &headers,
             Some(&serde_json::json!({"model":"m","messages":[]})),
-        ));
-        assert!(!looks_like_llm_request(
+        )
+        .is_none());
+        assert!(match_wire_protocol(
             "POST",
-            "/v1/chat/completions",
+            &headers,
             Some(&serde_json::json!({"operation":"health"})),
-        ));
-        assert!(looks_like_llm_request(
+        )
+        .is_none());
+        let matched = match_wire_protocol(
             "POST",
-            "/tenant/openai/deployments/demo/chat/completions?api-version=2026-01-01",
+            &headers,
             Some(&serde_json::json!({"model":"m","messages":[]})),
-        ));
+        )
+        .unwrap();
+        assert_eq!(matched.template_id, "openai-chat-completions");
     }
 
     #[test]
@@ -2134,7 +2591,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_http2_does_not_emit_false_interaction() {
+    fn unsupported_http2_emits_metadata_evidence_without_false_interaction() {
         let mut reassembler = InteractionReassembler::default();
         let completed = reassembler.push(chunk(
             ChunkDirection::Request,
@@ -2142,6 +2599,29 @@ mod tests {
             1,
         ));
         assert!(completed.is_empty());
+        let evidence = reassembler.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].transport_protocol, "http/2");
+        assert_eq!(evidence[0].parse_state, "unparsed");
+        assert_eq!(evidence[0].encoding, "metadata_only");
+        assert!(evidence[0].redacted_sample.is_none());
+        assert_eq!(evidence[0].sample_sha256.len(), 64);
+    }
+
+    #[test]
+    fn websocket_upgrade_emits_once_per_connection_without_exporting_headers() {
+        let mut reassembler = InteractionReassembler::default();
+        let request = b"GET /custom/ws HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: must-not-export\r\n\r\n";
+        assert!(reassembler
+            .push(chunk(ChunkDirection::Request, request.to_vec(), 1))
+            .is_empty());
+        assert!(reassembler
+            .push(chunk(ChunkDirection::Request, request.to_vec(), 2))
+            .is_empty());
+        let evidence = reassembler.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].transport_protocol, "websocket");
+        assert!(evidence[0].redacted_sample.is_none());
     }
 
     #[test]

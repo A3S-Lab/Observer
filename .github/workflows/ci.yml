@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
 
@@ -23,3 +23,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p a3s-observer -p a3s-observer-common -- -D warnings
       - run: cargo test -p a3s-observer -p a3s-observer-common
+      - run: bash scripts/verify-repository-hygiene.sh
+
+  collector:
+    name: collector + eBPF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, rustfmt, clippy
+      - run: cargo install bpf-linker --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p a3s-observer-collector -- -D warnings
+      - run: cargo test -p a3s-observer-collector
+      - run: cargo build --release -p a3s-observer-collector

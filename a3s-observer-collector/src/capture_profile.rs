@@ -488,10 +488,8 @@ impl CaptureAggregateReader {
                         self.stats.output_retried = self.stats.output_retried.saturating_add(1);
                     }
                 }
-            } else if old_epoch {
-                if cursor.old_epoch_stable() {
-                    cleanup.push(key);
-                }
+            } else if old_epoch && cursor.old_epoch_stable() {
+                cleanup.push(key);
             }
         }
         self.stats.keys = seen;

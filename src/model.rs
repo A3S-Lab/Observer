@@ -313,6 +313,81 @@ pub struct LlmInteractionContent {
     pub structured: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlaintextEvidence {
+    pub schema_version: String,
+    pub evidence_id: String,
+    pub pid: u32,
+    pub connection_id: String,
+    pub direction: String,
+    pub tls_adapter_id: String,
+    pub transport_protocol: String,
+    pub parse_state: String,
+    pub llm_likelihood: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
+    pub observed_at_unix_ns: String,
+    pub captured_bytes: u64,
+    pub encoding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_sample: Option<String>,
+    pub sample_sha256: String,
+    pub reasons: Vec<String>,
+    pub capture_source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteraction {
+    pub schema_version: String,
+    pub interaction_id: String,
+    pub interaction_type: String,
+    pub pid: u32,
+    pub connection_id: String,
+    pub transport: String,
+    pub protocol: String,
+    pub tls_adapter_id: String,
+    pub transport_protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_template_id: Option<String>,
+    pub parse_state: String,
+    pub llm_likelihood: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
+    pub transport_completeness: String,
+    pub wire_completeness: String,
+    pub conversation_completeness: String,
+    pub endpoint: String,
+    pub method: String,
+    pub path: String,
+    pub status_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_previous_response_id: Option<String>,
+    pub started_at_unix_ns: String,
+    pub request_complete_at_unix_ns: String,
+    pub first_response_at_unix_ns: String,
+    pub ended_at_unix_ns: String,
+    pub duration_ns: String,
+    pub time_quality: String,
+    pub request: Box<LlmInteractionContent>,
+    pub response: Box<LlmInteractionContent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<LlmInteractionToolCall>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<LlmInteractionToolResult>,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+    pub capture_source: String,
+}
+
 /// A raw event captured by an eBPF probe, before identity enrichment.
 #[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
@@ -416,61 +491,11 @@ pub enum AgentEvent {
     /// A complete or explicitly-partial HTTP model exchange reconstructed from plaintext captured
     /// at a TLS-library or plain-TCP boundary. This is the stable semantic output of the content
     /// pipeline; raw `SslContent` remains only as a legacy diagnostic signal.
-    LlmInteraction {
-        #[serde(rename = "schemaVersion")]
-        schema_version: String,
-        #[serde(rename = "interactionId")]
-        interaction_id: String,
-        #[serde(rename = "interactionType")]
-        interaction_type: String,
-        pid: u32,
-        #[serde(rename = "connectionId")]
-        connection_id: String,
-        transport: String,
-        protocol: String,
-        endpoint: String,
-        method: String,
-        path: String,
-        #[serde(rename = "statusCode")]
-        status_code: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-        #[serde(
-            rename = "providerConversationId",
-            skip_serializing_if = "Option::is_none"
-        )]
-        provider_conversation_id: Option<String>,
-        #[serde(rename = "providerResponseId", skip_serializing_if = "Option::is_none")]
-        provider_response_id: Option<String>,
-        #[serde(
-            rename = "providerPreviousResponseId",
-            skip_serializing_if = "Option::is_none"
-        )]
-        provider_previous_response_id: Option<String>,
-        #[serde(rename = "startedAtUnixNs")]
-        started_at_unix_ns: String,
-        #[serde(rename = "requestCompleteAtUnixNs")]
-        request_complete_at_unix_ns: String,
-        #[serde(rename = "firstResponseAtUnixNs")]
-        first_response_at_unix_ns: String,
-        #[serde(rename = "endedAtUnixNs")]
-        ended_at_unix_ns: String,
-        #[serde(rename = "durationNs")]
-        duration_ns: String,
-        #[serde(rename = "timeQuality")]
-        time_quality: String,
-        request: Box<LlmInteractionContent>,
-        response: Box<LlmInteractionContent>,
-        #[serde(rename = "toolCalls", skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<LlmInteractionToolCall>,
-        #[serde(rename = "toolResults", skip_serializing_if = "Vec::is_empty")]
-        tool_results: Vec<LlmInteractionToolResult>,
-        completeness: String,
-        #[serde(rename = "partialReasons", skip_serializing_if = "Vec::is_empty")]
-        partial_reasons: Vec<String>,
-        #[serde(rename = "captureSource")]
-        capture_source: String,
-    },
+    LlmInteraction(Box<LlmInteraction>),
+    /// Bounded metadata for an Agent plaintext stream whose transport or wire template is not yet
+    /// supported. No credential header or unredacted raw payload is exported. This keeps unknown
+    /// protocols discoverable and re-testable without turning them into fabricated conversations.
+    AgentPlaintextEvidence(Box<AgentPlaintextEvidence>),
     /// A security-sensitive action — rare and high-signal, filtered in-kernel: privilege escalation
     /// (`setuid`/`setresuid`/`setreuid` → root from non-root — note legitimate `sudo`/`su` also fire
     /// this; it's a real transition, expected to pair with a `ToolExec`), process injection (`ptrace`

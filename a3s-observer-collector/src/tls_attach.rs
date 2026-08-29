@@ -1,21 +1,25 @@
 //! Runtime TLS-library and static executable discovery for selected Agent processes.
 //!
-//! Discovery is deliberately fail-closed: exported symbols are safe to resolve by name; stripped
-//! static binaries require an exact whole-file fingerprint plus expected instruction prefixes.
+//! Products, CLI versions, provider URLs and whole-file fingerprints are not discovery gates.
+//! Exported TLS symbols are preferred; stripped static binaries are matched against bounded TLS
+//! implementation-family anchors and call-pair relations, then validated by real plaintext framing.
 
 use anyhow::Context as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const PROFILE_DOCUMENT: &str = include_str!("tls-profiles.json");
-const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ELF_PROGRAM_HEADERS: usize = 128;
+const MAX_ANCHOR_MATCHES: usize = 128;
+const MAX_STATIC_CANDIDATES_PER_FAMILY: usize = 4;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TlsAbi {
     Classic,
     OpenSslEx,
@@ -78,14 +82,7 @@ pub struct TlsAttachPlan {
 }
 
 #[derive(Clone, Debug)]
-struct StaticProfile {
-    product: String,
-    version: String,
-    file_size: u64,
-    head64k_sha256: String,
-    whole_file_sha256: String,
-    transport_scope: String,
-    excluded_transport_scope: Option<String>,
+struct StaticBootstrapProfile {
     read_offset: u64,
     read_prefix: Vec<u8>,
     write_offset: u64,
@@ -95,12 +92,28 @@ struct StaticProfile {
     additional_pairs: Vec<(TlsOffsetPair, Vec<u8>, Vec<u8>)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticSignatureFamily {
+    family_id: String,
+    read_prefix: Vec<u8>,
+    write_prefix: Vec<u8>,
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+    write_after_read: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticDiscoveryMatch {
+    family_id: String,
+    pairs: Vec<TlsOffsetPair>,
+}
+
 #[derive(Debug)]
 pub struct TlsAttachManager {
     attached: HashSet<String>,
     rejected: HashSet<String>,
     verified_processes: HashMap<i32, RuntimeRole>,
-    static_profile_cache: HashMap<(u64, u64), Option<StaticProfile>>,
+    static_discovery_cache: HashMap<(u64, u64), Vec<StaticDiscoveryMatch>>,
     process_patterns: Vec<String>,
     static_targets: Vec<PathBuf>,
     explicit_target: Option<PathBuf>,
@@ -112,6 +125,7 @@ impl TlsAttachManager {
             "codex".to_string(),
             "claude".to_string(),
             "dify-plugin-daemon".to_string(),
+            "kimi".to_string(),
             "langchain".to_string(),
             "pi-coding-agent".to_string(),
             "run-pi-".to_string(),
@@ -146,7 +160,7 @@ impl TlsAttachManager {
             attached: HashSet::new(),
             rejected: HashSet::new(),
             verified_processes: HashMap::new(),
-            static_profile_cache: HashMap::new(),
+            static_discovery_cache: HashMap::new(),
             process_patterns,
             static_targets,
             explicit_target,
@@ -161,9 +175,7 @@ impl TlsAttachManager {
             }
         }
         for path in self.static_targets.clone() {
-            if let Some(plan) = self.plan_for_static_target(path) {
-                plans.push(plan);
-            }
+            plans.extend(self.plans_for_static_target(path));
         }
 
         let Ok(proc_entries) = fs::read_dir("/proc") else {
@@ -186,7 +198,11 @@ impl TlsAttachManager {
         }
         self.verified_processes = verified_processes;
         let mut seen = HashSet::new();
-        plans.retain(|plan| !self.attached.contains(&plan.key) && seen.insert(plan.key.clone()));
+        plans.retain(|plan| {
+            !self.attached.contains(&plan.key)
+                && !self.rejected.contains(&plan.key)
+                && seen.insert(plan.key.clone())
+        });
         plans
     }
 
@@ -198,7 +214,23 @@ impl TlsAttachManager {
         self.verified_processes.insert(pid, runtime_role);
         self.plans_for_process(pid, runtime_role)
             .into_iter()
-            .filter(|plan| !self.attached.contains(&plan.key))
+            .filter(|plan| !self.attached.contains(&plan.key) && !self.rejected.contains(&plan.key))
+            .collect()
+    }
+
+    /// Control-plane identity/capture evidence is authoritative for scope membership. This path
+    /// lets any candidate/confirmed Agent runtime enter TLS discovery without adding its product
+    /// name to the Collector. URL and protocol semantics remain userspace-only.
+    pub fn discover_verified_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            self.verified_processes.remove(&pid);
+            return Vec::new();
+        }
+        let runtime_role = RuntimeRole::AgentRoot;
+        self.verified_processes.insert(pid, runtime_role);
+        self.plans_for_process(pid, runtime_role)
+            .into_iter()
+            .filter(|plan| !self.attached.contains(&plan.key) && !self.rejected.contains(&plan.key))
             .collect()
     }
 
@@ -231,8 +263,9 @@ impl TlsAttachManager {
             if current <= 1 {
                 break;
             }
-            // Dify provider/tool workers are separate runtimes below the plugin daemon. Their
-            // exact LLM/tool POST route is still required before any plaintext enters the ring.
+            // Dify provider/tool workers are separate runtimes below the plugin daemon. They stay
+            // in the same bounded Agent Scope; userspace content classification separates model,
+            // tool and unrelated TLS streams without a URL allowlist.
             if process_contains_pattern(current, "dify-plugin-daemon") {
                 return Some(RuntimeRole::NetworkRuntime);
             }
@@ -278,11 +311,7 @@ impl TlsAttachManager {
         let mut plans = Vec::new();
         let exe_probe_path = PathBuf::from(format!("/proc/{pid}/exe"));
         if let Ok(real_exe) = fs::read_link(&exe_probe_path) {
-            if let Some(plan) =
-                self.plan_for_executable(pid, &exe_probe_path, &real_exe, runtime_role)
-            {
-                plans.push(plan);
-            }
+            plans.extend(self.plans_for_executable(pid, &exe_probe_path, &real_exe, runtime_role));
         }
 
         let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
@@ -326,57 +355,56 @@ impl TlsAttachManager {
         plans
     }
 
-    fn plan_for_executable(
+    fn plans_for_executable(
         &mut self,
         pid: i32,
         probe_path: &Path,
         real_exe: &Path,
         runtime_role: RuntimeRole,
-    ) -> Option<TlsAttachPlan> {
-        let metadata = fs::metadata(probe_path).ok()?;
-        let basename = real_exe.file_name()?.to_string_lossy().to_ascii_lowercase();
+    ) -> Vec<TlsAttachPlan> {
+        let Ok(metadata) = fs::metadata(probe_path) else {
+            return Vec::new();
+        };
+        let Some(file_name) = real_exe.file_name() else {
+            return Vec::new();
+        };
+        let basename = file_name.to_string_lossy().to_ascii_lowercase();
         let identity = format!("pid:{pid}:dev:{}:ino:{}", metadata.dev(), metadata.ino());
-        if self.attached.iter().any(|key| key.starts_with(&identity))
-            || self.rejected.iter().any(|key| key.starts_with(&identity))
-        {
-            return None;
-        }
-
+        let mut plans = Vec::new();
         let cache_key = (metadata.dev(), metadata.ino());
-        let static_profile = if let Some(cached) = self.static_profile_cache.get(&cache_key) {
+        let static_matches = if is_interpreter_or_shell(&basename) {
+            Vec::new()
+        } else if let Some(cached) = self.static_discovery_cache.get(&cache_key) {
             cached.clone()
         } else {
-            match match_static_profile(probe_path) {
-                Ok(profile) => {
-                    self.static_profile_cache.insert(cache_key, profile.clone());
-                    profile
+            match discover_static_signature_matches(probe_path) {
+                Ok(matches) => {
+                    self.static_discovery_cache
+                        .insert(cache_key, matches.clone());
+                    matches
                 }
                 Err(error) => {
                     self.mark_rejected(
-                        format!("{identity}:{basename}"),
-                        &format!("fingerprint_validation_failed:{error}"),
+                        format!("{identity}:static-discovery"),
+                        &format!("static_signature_discovery_failed:{error}"),
                     );
-                    return None;
+                    self.static_discovery_cache.insert(cache_key, Vec::new());
+                    Vec::new()
                 }
             }
         };
-        if let Some(profile) = static_profile {
-            return Some(static_profile_plan(
-                probe_path,
-                &metadata,
-                profile,
-                runtime_role,
-            ));
-        }
+        plans.extend(static_matches.into_iter().map(|discovery| {
+            static_discovery_plan(probe_path, &metadata, discovery, runtime_role, Some(pid))
+        }));
 
-        // Node and versioned Python executables commonly export OpenSSL symbols from the main ELF
-        // even when no separate libssl mapping exists. Symbol resolution is exact and needs no
-        // static offset guess.
+        // Interpreters commonly export OpenSSL symbols from the main ELF even when no separate
+        // libssl mapping exists. This low-maintenance lane may coexist with a static-family
+        // candidate; attach failures are isolated by plan key.
         if matches!(basename.as_str(), "node" | "nodejs")
             || basename.starts_with("python3.")
             || basename == "python"
         {
-            return Some(TlsAttachPlan {
+            plans.push(TlsAttachPlan {
                 key: format!("{identity}:main-exported-openssl"),
                 pid: Some(pid),
                 path: probe_path.to_path_buf(),
@@ -388,25 +416,28 @@ impl TlsAttachManager {
             });
         }
 
-        if basename.starts_with("codex") || basename.starts_with("claude") {
+        if plans.is_empty() && !is_interpreter_or_shell(&basename) {
             self.mark_rejected(
-                format!("{identity}:{basename}"),
-                "unsupported_binary_fingerprint",
+                format!("{identity}:static-signature-not-found"),
+                "static_tls_family_not_discovered",
             );
         }
-        None
+        plans
     }
 
-    fn plan_for_static_target(&mut self, path: PathBuf) -> Option<TlsAttachPlan> {
-        let metadata = fs::metadata(&path).ok()?;
+    fn plans_for_static_target(&mut self, path: PathBuf) -> Vec<TlsAttachPlan> {
+        let Ok(metadata) = fs::metadata(&path) else {
+            return Vec::new();
+        };
         let cache_key = (metadata.dev(), metadata.ino());
-        let profile = if let Some(cached) = self.static_profile_cache.get(&cache_key) {
+        let matches = if let Some(cached) = self.static_discovery_cache.get(&cache_key) {
             cached.clone()
         } else {
-            match match_static_profile(&path) {
-                Ok(profile) => {
-                    self.static_profile_cache.insert(cache_key, profile.clone());
-                    profile
+            match discover_static_signature_matches(&path) {
+                Ok(matches) => {
+                    self.static_discovery_cache
+                        .insert(cache_key, matches.clone());
+                    matches
                 }
                 Err(error) => {
                     self.mark_rejected(
@@ -415,35 +446,36 @@ impl TlsAttachManager {
                             metadata.dev(),
                             metadata.ino()
                         ),
-                        &format!("fingerprint_validation_failed:{error}"),
+                        &format!("static_signature_discovery_failed:{error}"),
                     );
-                    return None;
+                    self.static_discovery_cache.insert(cache_key, Vec::new());
+                    Vec::new()
                 }
             }
         };
-        if let Some(profile) = profile {
-            return Some(static_profile_plan(
-                &path,
-                &metadata,
-                profile,
-                RuntimeRole::AgentRoot,
-            ));
+        let mut plans = matches
+            .into_iter()
+            .map(|discovery| {
+                static_discovery_plan(&path, &metadata, discovery, RuntimeRole::AgentRoot, None)
+            })
+            .collect::<Vec<_>>();
+        if let Some(family) = classify_library(path.to_string_lossy().as_ref()) {
+            plans.push(TlsAttachPlan {
+                key: format!(
+                    "global:dev:{}:ino:{}:symbols:{family:?}",
+                    metadata.dev(),
+                    metadata.ino()
+                ),
+                pid: None,
+                path,
+                product: "static-tls-library".to_string(),
+                runtime_role: RuntimeRole::AgentRoot,
+                transport_scope: format!("{family:?}").to_ascii_lowercase(),
+                excluded_transport_scope: None,
+                kind: TlsAttachKind::Symbols(family),
+            });
         }
-        let family = classify_library(path.to_string_lossy().as_ref())?;
-        Some(TlsAttachPlan {
-            key: format!(
-                "global:dev:{}:ino:{}:symbols:{family:?}",
-                metadata.dev(),
-                metadata.ino()
-            ),
-            pid: None,
-            path,
-            product: "static-tls-library".to_string(),
-            runtime_role: RuntimeRole::AgentRoot,
-            transport_scope: format!("{family:?}").to_ascii_lowercase(),
-            excluded_transport_scope: None,
-            kind: TlsAttachKind::Symbols(family),
-        })
+        plans
     }
 
     fn plan_for_explicit(&mut self, path: PathBuf) -> Option<TlsAttachPlan> {
@@ -467,38 +499,37 @@ impl TlsAttachManager {
     }
 }
 
-fn static_profile_plan(
+fn static_discovery_plan(
     path: &Path,
     metadata: &fs::Metadata,
-    profile: StaticProfile,
+    discovery: StaticDiscoveryMatch,
     runtime_role: RuntimeRole,
+    pid: Option<i32>,
 ) -> TlsAttachPlan {
+    let mut pairs = discovery.pairs.into_iter();
+    let primary = pairs
+        .next()
+        .expect("static discovery matches always contain a primary pair");
     TlsAttachPlan {
-        // Exact whole-file profiles are safe to attach once per executable inode. The eBPF hot
-        // path still requires an identity-verified PID and exact LLM route before copying bytes.
         key: format!(
-            "global:dev:{}:ino:{}:profile:{}:{}",
+            "{}dev:{}:ino:{}:static-family:{}",
+            pid.map(|value| format!("pid:{value}:")).unwrap_or_default(),
             metadata.dev(),
             metadata.ino(),
-            profile.product,
-            profile.version
+            discovery.family_id,
         ),
-        pid: None,
+        pid,
         path: path.to_path_buf(),
-        product: format!("{} {}", profile.product, profile.version),
+        product: format!("tls-family:{}", discovery.family_id),
         runtime_role,
-        transport_scope: profile.transport_scope,
-        excluded_transport_scope: profile.excluded_transport_scope,
+        transport_scope: "static-abi-discovery".to_string(),
+        excluded_transport_scope: None,
         kind: TlsAttachKind::Offsets {
-            read_offset: profile.read_offset,
-            write_offset: profile.write_offset,
-            read_abi: profile.read_abi,
-            write_abi: profile.write_abi,
-            additional_pairs: profile
-                .additional_pairs
-                .into_iter()
-                .map(|(pair, _, _)| pair)
-                .collect(),
+            read_offset: primary.read_offset,
+            write_offset: primary.write_offset,
+            read_abi: primary.read_abi,
+            write_abi: primary.write_abi,
+            additional_pairs: pairs.collect(),
         },
     }
 }
@@ -587,34 +618,25 @@ fn classify_library(path: &str) -> Option<SymbolFamily> {
     }
 }
 
-fn match_static_profile(path: &Path) -> anyhow::Result<Option<StaticProfile>> {
-    let metadata = fs::metadata(path)?;
-    let head_hash = hash_prefix(path, 64 * 1024)?;
-    for profile in static_profiles()? {
-        if metadata.len() != profile.file_size || head_hash != profile.head64k_sha256 {
-            continue;
-        }
-        let whole_hash = hash_file(path)?;
-        anyhow::ensure!(
-            whole_hash == profile.whole_file_sha256,
-            "whole_file_sha256_mismatch"
-        );
-        verify_prefix(path, profile.read_offset, &profile.read_prefix)
-            .context("read_prefix_mismatch")?;
-        verify_prefix(path, profile.write_offset, &profile.write_prefix)
-            .context("write_prefix_mismatch")?;
-        for (pair, read_prefix, write_prefix) in &profile.additional_pairs {
-            verify_prefix(path, pair.read_offset, read_prefix)
-                .context("additional_read_prefix_mismatch")?;
-            verify_prefix(path, pair.write_offset, write_prefix)
-                .context("additional_write_prefix_mismatch")?;
-        }
-        return Ok(Some(profile.clone()));
-    }
-    Ok(None)
+fn is_interpreter_or_shell(basename: &str) -> bool {
+    matches!(
+        basename,
+        "node"
+            | "nodejs"
+            | "python"
+            | "python3"
+            | "bash"
+            | "sh"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "java"
+            | "ruby"
+            | "perl"
+    ) || basename.starts_with("python3.")
 }
 
-fn static_profiles() -> anyhow::Result<Vec<StaticProfile>> {
+fn static_profiles() -> anyhow::Result<Vec<StaticBootstrapProfile>> {
     let root: Value = serde_json::from_str(PROFILE_DOCUMENT)?;
     let profiles = root
         .get("profiles")
@@ -623,7 +645,7 @@ fn static_profiles() -> anyhow::Result<Vec<StaticProfile>> {
     profiles.iter().map(parse_profile).collect()
 }
 
-fn parse_profile(value: &Value) -> anyhow::Result<StaticProfile> {
+fn parse_profile(value: &Value) -> anyhow::Result<StaticBootstrapProfile> {
     let string = |name: &str| -> anyhow::Result<String> {
         value
             .get(name)
@@ -649,17 +671,7 @@ fn parse_profile(value: &Value) -> anyhow::Result<StaticProfile> {
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(StaticProfile {
-        product: string("product")?,
-        version: string("version")?,
-        file_size: integer("fileSize")?,
-        head64k_sha256: string("head64kSha256")?,
-        whole_file_sha256: string("wholeFileSha256")?,
-        transport_scope: string("transportScope")?,
-        excluded_transport_scope: value
-            .get("excludedTransportScope")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+    Ok(StaticBootstrapProfile {
         read_offset: integer("readOffset")?,
         read_prefix: decode_hex(&string("readExpectedPrefixHex")?)?,
         write_offset: integer("writeOffset")?,
@@ -668,6 +680,286 @@ fn parse_profile(value: &Value) -> anyhow::Result<StaticProfile> {
         write_abi: parse_abi(&string("writeAbi")?)?,
         additional_pairs,
     })
+}
+
+fn static_signature_families() -> anyhow::Result<Vec<StaticSignatureFamily>> {
+    let mut families = Vec::<StaticSignatureFamily>::new();
+    for profile in static_profiles()? {
+        add_signature_observation(
+            &mut families,
+            &TlsOffsetPair {
+                read_offset: profile.read_offset,
+                write_offset: profile.write_offset,
+                read_abi: profile.read_abi,
+                write_abi: profile.write_abi,
+            },
+            &profile.read_prefix,
+            &profile.write_prefix,
+        )?;
+        for (pair, read_prefix, write_prefix) in profile.additional_pairs {
+            add_signature_observation(&mut families, &pair, &read_prefix, &write_prefix)?;
+        }
+    }
+    for family in &mut families {
+        family.write_after_read.sort_unstable();
+        family.write_after_read.dedup();
+    }
+    families.sort_by(|left, right| left.family_id.cmp(&right.family_id));
+    Ok(families)
+}
+
+fn add_signature_observation(
+    families: &mut Vec<StaticSignatureFamily>,
+    pair: &TlsOffsetPair,
+    read_prefix: &[u8],
+    write_prefix: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read_prefix.len() >= 12 && write_prefix.len() >= 12,
+        "static TLS anchors must be at least 12 bytes"
+    );
+    let delta = i128::from(pair.write_offset) - i128::from(pair.read_offset);
+    let delta = i64::try_from(delta).context("TLS anchor relation exceeds i64")?;
+    if let Some(family) = families.iter_mut().find(|family| {
+        family.read_prefix == read_prefix
+            && family.write_prefix == write_prefix
+            && family.read_abi == pair.read_abi
+            && family.write_abi == pair.write_abi
+    }) {
+        family.write_after_read.push(delta);
+        return Ok(());
+    }
+    families.push(StaticSignatureFamily {
+        family_id: signature_family_id(read_prefix, write_prefix, pair.read_abi, pair.write_abi),
+        read_prefix: read_prefix.to_vec(),
+        write_prefix: write_prefix.to_vec(),
+        read_abi: pair.read_abi,
+        write_abi: pair.write_abi,
+        write_after_read: vec![delta],
+    });
+    Ok(())
+}
+
+fn signature_family_id(
+    read_prefix: &[u8],
+    write_prefix: &[u8],
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"anysentry.static_tls_family.v1");
+    hash.update([tls_abi_code(read_abi), tls_abi_code(write_abi)]);
+    hash.update(read_prefix);
+    hash.update(write_prefix);
+    format!(
+        "{}-{}-{}",
+        tls_abi_name(read_abi),
+        tls_abi_name(write_abi),
+        &hex(&hash.finalize())[..16]
+    )
+}
+
+fn tls_abi_code(abi: TlsAbi) -> u8 {
+    match abi {
+        TlsAbi::Classic => 1,
+        TlsAbi::OpenSslEx => 2,
+        TlsAbi::RustlsPayload => 3,
+        TlsAbi::RustlsOutboundChunks => 4,
+    }
+}
+
+fn tls_abi_name(abi: TlsAbi) -> &'static str {
+    match abi {
+        TlsAbi::Classic => "classic",
+        TlsAbi::OpenSslEx => "openssl-ex",
+        TlsAbi::RustlsPayload => "rustls-payload",
+        TlsAbi::RustlsOutboundChunks => "rustls-outbound",
+    }
+}
+
+fn discover_static_signature_matches(path: &Path) -> anyhow::Result<Vec<StaticDiscoveryMatch>> {
+    let ranges = executable_file_ranges(path)?;
+    let mut discovered = Vec::new();
+    for family in static_signature_families()? {
+        let reads = find_pattern_offsets(path, &ranges, &family.read_prefix, MAX_ANCHOR_MATCHES)?;
+        if reads.is_empty() {
+            continue;
+        }
+        let writes = find_pattern_offsets(path, &ranges, &family.write_prefix, MAX_ANCHOR_MATCHES)?;
+        if writes.is_empty() {
+            continue;
+        }
+        let write_offsets = writes.into_iter().collect::<HashSet<_>>();
+        let mut pairs = Vec::new();
+        for read_offset in reads {
+            for delta in &family.write_after_read {
+                let candidate = i128::from(read_offset) + i128::from(*delta);
+                if !(0..=i128::from(u64::MAX)).contains(&candidate) {
+                    continue;
+                }
+                let write_offset = candidate as u64;
+                if write_offsets.contains(&write_offset) {
+                    pairs.push(TlsOffsetPair {
+                        read_offset,
+                        write_offset,
+                        read_abi: family.read_abi,
+                        write_abi: family.write_abi,
+                    });
+                }
+            }
+        }
+        pairs.sort_by_key(|pair| (pair.read_offset, pair.write_offset));
+        pairs.dedup_by_key(|pair| (pair.read_offset, pair.write_offset));
+        pairs.truncate(MAX_STATIC_CANDIDATES_PER_FAMILY);
+        if !pairs.is_empty() {
+            discovered.push(StaticDiscoveryMatch {
+                family_id: family.family_id,
+                pairs,
+            });
+        }
+    }
+    Ok(discovered)
+}
+
+fn executable_file_ranges(path: &Path) -> anyhow::Result<Vec<(u64, u64)>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    anyhow::ensure!(&header[..4] == b"\x7fELF", "not an ELF file");
+    anyhow::ensure!(header[4] == 2, "static TLS discovery requires ELF64");
+    anyhow::ensure!(
+        header[5] == 1,
+        "static TLS discovery requires little-endian ELF"
+    );
+    anyhow::ensure!(u16_le(&header, 18)? == 62, "unsupported ELF machine");
+    let program_header_offset = u64_le(&header, 32)?;
+    let program_header_size = usize::from(u16_le(&header, 54)?);
+    let program_header_count = usize::from(u16_le(&header, 56)?);
+    anyhow::ensure!(
+        program_header_size >= 56 && program_header_count <= MAX_ELF_PROGRAM_HEADERS,
+        "invalid ELF program-header table"
+    );
+
+    let mut ranges = Vec::new();
+    let mut entry = vec![0u8; program_header_size];
+    for index in 0..program_header_count {
+        let offset = program_header_offset
+            .checked_add((index * program_header_size) as u64)
+            .context("ELF program-header offset overflow")?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut entry)?;
+        let segment_type = u32_le(&entry, 0)?;
+        let flags = u32_le(&entry, 4)?;
+        if segment_type != 1 || flags & 1 == 0 {
+            continue;
+        }
+        let start = u64_le(&entry, 8)?;
+        let length = u64_le(&entry, 32)?;
+        let end = start
+            .checked_add(length)
+            .context("ELF executable segment overflow")?
+            .min(file_len);
+        if start < end {
+            ranges.push((start, end));
+        }
+    }
+    anyhow::ensure!(!ranges.is_empty(), "ELF has no executable load segment");
+    ranges.sort_unstable();
+    Ok(ranges)
+}
+
+fn find_pattern_offsets(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    pattern: &[u8],
+    limit: usize,
+) -> anyhow::Result<Vec<u64>> {
+    anyhow::ensure!(!pattern.is_empty(), "empty TLS anchor");
+    let mut file = File::open(path)?;
+    let overlap = pattern.len().saturating_sub(1);
+    let mut matches = Vec::new();
+    for (start, end) in ranges {
+        let mut cursor = *start;
+        let mut carry = Vec::<u8>::new();
+        while cursor < *end && matches.len() < limit {
+            let requested = (*end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
+            let mut window = vec![0u8; carry.len() + requested];
+            window[..carry.len()].copy_from_slice(&carry);
+            file.seek(SeekFrom::Start(cursor))?;
+            file.read_exact(&mut window[carry.len()..])?;
+            let window_offset = cursor.saturating_sub(carry.len() as u64);
+            find_pattern_positions(&window, pattern, limit - matches.len(), |position| {
+                matches.push(window_offset + position as u64);
+            });
+            let retained = overlap.min(window.len());
+            carry.clear();
+            carry.extend_from_slice(&window[window.len() - retained..]);
+            cursor += requested as u64;
+        }
+        if matches.len() >= limit {
+            break;
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    matches.truncate(limit);
+    Ok(matches)
+}
+
+fn find_pattern_positions(
+    bytes: &[u8],
+    pattern: &[u8],
+    limit: usize,
+    mut found: impl FnMut(usize),
+) {
+    if pattern.is_empty() || bytes.len() < pattern.len() || limit == 0 {
+        return;
+    }
+    let first = pattern[0];
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    while cursor + pattern.len() <= bytes.len() && count < limit {
+        let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == first) else {
+            break;
+        };
+        let position = cursor + relative;
+        if position + pattern.len() > bytes.len() {
+            break;
+        }
+        if &bytes[position..position + pattern.len()] == pattern {
+            found(position);
+            count += 1;
+        }
+        cursor = position + 1;
+    }
+}
+
+fn u16_le(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let raw: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .context("ELF u16 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let raw: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .context("ELF u32 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn u64_le(bytes: &[u8], offset: usize) -> anyhow::Result<u64> {
+    let raw: [u8; 8] = bytes
+        .get(offset..offset + 8)
+        .context("ELF u64 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u64::from_le_bytes(raw))
 }
 
 fn parse_additional_pair(value: &Value) -> anyhow::Result<(TlsOffsetPair, Vec<u8>, Vec<u8>)> {
@@ -705,40 +997,8 @@ fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
     }
 }
 
-fn hash_prefix(path: &Path, limit: usize) -> anyhow::Result<String> {
-    let mut file = File::open(path)?;
-    let mut bytes = vec![0u8; limit];
-    let read = file.read(&mut bytes)?;
-    bytes.truncate(read);
-    Ok(hex(&Sha256::digest(bytes)))
-}
-
-fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(hex(&hash.finalize()))
-}
-
-fn verify_prefix(path: &Path, offset: u64, expected: &[u8]) -> anyhow::Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut actual = vec![0u8; expected.len()];
-    file.read_exact(&mut actual)?;
-    anyhow::ensure!(actual == expected, "instruction prefix differs");
-    Ok(())
-}
-
 fn decode_hex(value: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(value.len() % 2 == 0, "hex string has odd length");
+    anyhow::ensure!(value.len().is_multiple_of(2), "hex string has odd length");
     value
         .as_bytes()
         .chunks_exact(2)
@@ -764,48 +1024,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_profiles_are_complete_and_have_distinct_fingerprints() {
+    fn bootstrap_profiles_collapse_into_tls_implementation_families() {
         let profiles = static_profiles().unwrap();
         assert_eq!(profiles.len(), 4);
-        let fingerprints = profiles
+        let families = static_signature_families().unwrap();
+        assert_eq!(families.len(), 2);
+        assert!(families.iter().all(|family| family.read_prefix.len() >= 12
+            && family.write_prefix.len() >= 12
+            && !family.write_after_read.is_empty()));
+        let openssl = families
             .iter()
-            .map(|profile| profile.whole_file_sha256.as_str())
-            .collect::<HashSet<_>>();
-        assert_eq!(fingerprints.len(), profiles.len());
-        assert!(profiles.iter().all(|profile| {
-            !profile.read_prefix.is_empty()
-                && !profile.write_prefix.is_empty()
-                && profile.read_offset != profile.write_offset
-        }));
+            .find(|family| family.read_abi == TlsAbi::OpenSslEx)
+            .unwrap();
+        assert_eq!(openssl.write_after_read, vec![592]);
+        let classic = families
+            .iter()
+            .find(|family| family.read_abi == TlsAbi::Classic)
+            .unwrap();
+        assert_eq!(classic.write_after_read, vec![912, 1008]);
     }
 
     #[test]
-    fn exact_local_cli_profiles_match_when_installed() {
-        let candidates = [
-            std::env::var("HOME")
-                .ok()
-                .map(|home| {
-                    PathBuf::from(home).join(
-                        ".nvm/versions/node/v24.16.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
-                    )
-                }),
-            std::env::var("HOME").ok().map(|home| {
-                PathBuf::from(home).join(
-                    ".nvm/versions/node/v24.16.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
-                )
-            }),
-        ];
+    fn configured_local_cli_binaries_match_without_version_or_fingerprint() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_BINARIES") else {
+            return;
+        };
         for path in candidates
-            .into_iter()
-            .flatten()
-            .filter(|path| path.exists())
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
         {
             assert!(
-                match_static_profile(&path).unwrap().is_some(),
-                "installed target did not match {}",
+                !discover_static_signature_matches(&path).unwrap().is_empty(),
+                "installed target did not match a TLS implementation family: {}",
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn bounded_stream_scanner_finds_anchors_across_chunk_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "a3s-observer-static-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pattern = b"stable-static-tls-anchor";
+        let offset = STATIC_SCAN_CHUNK_BYTES - 7;
+        let mut bytes = vec![0x90; STATIC_SCAN_CHUNK_BYTES + pattern.len() + 32];
+        bytes[offset..offset + pattern.len()].copy_from_slice(pattern);
+        fs::write(&path, &bytes).unwrap();
+        let matches = find_pattern_offsets(
+            &path,
+            &[(0, bytes.len() as u64)],
+            pattern,
+            MAX_ANCHOR_MATCHES,
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(matches, vec![offset as u64]);
+    }
+
+    #[test]
+    fn current_test_executable_has_bounded_executable_elf_ranges() {
+        let path = std::env::current_exe().unwrap();
+        let ranges = executable_file_ranges(&path).unwrap();
+        assert!(!ranges.is_empty());
+        assert!(ranges.iter().all(|(start, end)| start < end));
     }
 
     #[test]

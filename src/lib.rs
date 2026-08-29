@@ -19,11 +19,11 @@ pub mod traits;
 pub mod workload;
 
 pub use model::{
-    AgentEvent, CollectorCaptureProbeStats, CollectorCaptureProfileStats, CollectorFileFilterStats,
-    CollectorIngressAccounting, CollectorPipelineAccounting, CollectorPipelineUnit,
-    CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent, EventCaptureDecision,
-    EventTiming, LlmInteractionContent, LlmInteractionMessage, LlmInteractionToolCall,
-    LlmInteractionToolResult, ProcessContext,
+    AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
+    CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
+    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
+    EventCaptureDecision, EventTiming, LlmInteraction, LlmInteractionContent,
+    LlmInteractionMessage, LlmInteractionToolCall, LlmInteractionToolResult, ProcessContext,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
