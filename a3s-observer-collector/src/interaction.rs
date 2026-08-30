@@ -353,6 +353,14 @@ impl WebSocketFrameDecoder {
         self.inflater.reset(false);
     }
 
+    fn awaits_more_frame_bytes(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
+    fn awaits_continuation_frame(&self) -> bool {
+        self.fragmented.is_some()
+    }
+
     fn push(
         &mut self,
         data: &[u8],
@@ -701,6 +709,24 @@ impl WebSocketConnectionState {
         );
         self.active = true;
     }
+
+    fn decoder(&self, direction: ChunkDirection) -> &WebSocketFrameDecoder {
+        match direction {
+            ChunkDirection::Request => &self.requests,
+            ChunkDirection::Response => &self.responses,
+        }
+    }
+
+    fn awaits_moved_fragment(&self, chunk: &PlaintextChunk) -> bool {
+        if !self.active {
+            return false;
+        }
+        let decoder = self.decoder(chunk.direction);
+        if looks_like_websocket_continuation_prefix(&chunk.data) {
+            return decoder.awaits_continuation_frame();
+        }
+        !looks_like_websocket_frame_prefix(&chunk.data) && decoder.awaits_more_frame_bytes()
+    }
 }
 
 #[derive(Debug)]
@@ -947,26 +973,52 @@ impl InteractionReassembler {
             return observed;
         }
 
-        let candidate = if chunk.direction == ChunkDirection::Response
-            && looks_like_websocket_switching_protocols(&chunk.data)
-        {
-            self.unique_websocket_connection(observed, |state| {
-                state.websocket.upgrade_requested && !state.websocket.active
+        let candidate = if chunk.source.contains("rustls") {
+            self.most_recent_websocket_connection(observed, |state| {
+                state.websocket.awaits_moved_fragment(chunk)
             })
-        } else if looks_like_websocket_frame_prefix(&chunk.data) {
-            self.unique_websocket_connection(observed, |state| state.websocket.active)
         } else {
             None
         };
+        let candidate = candidate.or_else(|| {
+            if chunk.direction == ChunkDirection::Response
+                && looks_like_websocket_switching_protocols(&chunk.data)
+            {
+                self.unique_websocket_connection(observed, |state| {
+                    state.websocket.upgrade_requested && !state.websocket.active
+                })
+            } else if looks_like_websocket_frame_prefix(&chunk.data) {
+                self.preferred_websocket_connection(observed, chunk)
+            } else {
+                None
+            }
+        });
         let Some(canonical) = candidate else {
             return observed;
         };
+        self.remember_connection_alias(observed, canonical);
+        canonical
+    }
+
+    fn preferred_websocket_connection(
+        &self,
+        observed: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<ConnectionKey> {
+        let response_data = chunk.direction == ChunkDirection::Response
+            && websocket_frame_opcode(&chunk.data)
+                .is_some_and(|opcode| matches!(opcode, 0x0..=0x2));
+        self.most_recent_websocket_connection(observed, |state| {
+            state.websocket.active && (!response_data || !state.pending_requests.is_empty())
+        })
+    }
+
+    fn remember_connection_alias(&mut self, observed: ConnectionKey, canonical: ConnectionKey) {
         self.retain_live_connection_aliases();
         let alias_limit = self.max_connections.saturating_mul(4).max(4);
         if self.connection_aliases.len() < alias_limit {
             self.connection_aliases.insert(observed, canonical);
         }
-        canonical
     }
 
     fn unique_websocket_connection(
@@ -980,6 +1032,25 @@ impl InteractionReassembler {
         });
         let candidate = candidates.next()?;
         candidates.next().is_none().then_some(candidate)
+    }
+
+    fn most_recent_websocket_connection(
+        &self,
+        observed: ConnectionKey,
+        predicate: impl Fn(&ConnectionState) -> bool,
+    ) -> Option<ConnectionKey> {
+        self.connections
+            .iter()
+            .filter(|(key, state)| {
+                key.cgroup_id == observed.cgroup_id && key.pid == observed.pid && predicate(state)
+            })
+            .max_by(|(left_key, left_state), (right_key, right_state)| {
+                left_state
+                    .last_activity
+                    .cmp(&right_state.last_activity)
+                    .then_with(|| left_key.connection_id.cmp(&right_key.connection_id))
+            })
+            .map(|(key, _)| *key)
     }
 
     fn retain_live_connection_aliases(&mut self) {
@@ -1329,19 +1400,29 @@ fn looks_like_websocket_switching_protocols(data: &[u8]) -> bool {
         || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
 }
 
-fn looks_like_websocket_frame_prefix(data: &[u8]) -> bool {
-    let Some((&first, rest)) = data.split_first() else {
-        return false;
-    };
+fn websocket_frame_opcode(data: &[u8]) -> Option<u8> {
+    let (&first, rest) = data.split_first()?;
     if rest.is_empty() || first & 0x30 != 0 {
-        return false;
+        return None;
     }
     let opcode = first & 0x0f;
-    if !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xA) {
+    matches!(opcode, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA).then_some(opcode)
+}
+
+fn looks_like_websocket_frame_prefix(data: &[u8]) -> bool {
+    let Some(opcode) = websocket_frame_opcode(data) else {
+        return false;
+    };
+    if opcode == 0x0 {
         return false;
     }
-    let payload_marker = rest[0] & 0x7f;
+    let first = data[0];
+    let payload_marker = data[1] & 0x7f;
     !matches!(opcode, 0x8..=0xA) || (first & 0x80 != 0 && payload_marker <= 125)
+}
+
+fn looks_like_websocket_continuation_prefix(data: &[u8]) -> bool {
+    websocket_frame_opcode(data) == Some(0x0)
 }
 
 fn body_only_llm_request(
@@ -2960,9 +3041,26 @@ mod tests {
         assert!(compressed.ends_with(WEBSOCKET_DEFLATE_TAIL));
         compressed.truncate(compressed.len() - WEBSOCKET_DEFLATE_TAIL.len());
 
-        let mut frame = vec![0xC1];
+        websocket_frame(&compressed, masked, true, true, 0x1)
+    }
+
+    fn websocket_frame(
+        payload: &[u8],
+        masked: bool,
+        fin: bool,
+        compressed: bool,
+        opcode: u8,
+    ) -> Vec<u8> {
+        let mut first = opcode & 0x0f;
+        if fin {
+            first |= 0x80;
+        }
+        if compressed {
+            first |= 0x40;
+        }
+        let mut frame = vec![first];
         let mask_bit = if masked { 0x80 } else { 0 };
-        match compressed.len() {
+        match payload.len() {
             length @ 0..=125 => frame.push(mask_bit | length as u8),
             length @ 126..=65_535 => {
                 frame.push(mask_bit | 126);
@@ -2977,13 +3075,13 @@ mod tests {
             let mask = [0x12, 0x34, 0x56, 0x78];
             frame.extend_from_slice(&mask);
             frame.extend(
-                compressed
+                payload
                     .iter()
                     .enumerate()
                     .map(|(index, byte)| byte ^ mask[index % mask.len()]),
             );
         } else {
-            frame.extend_from_slice(&compressed);
+            frame.extend_from_slice(payload);
         }
         frame
     }
@@ -3725,6 +3823,114 @@ mod tests {
             Some("300")
         );
         assert_eq!(completed[0].response.text.as_deref(), Some("tool observed"));
+    }
+
+    #[test]
+    fn rustls_moved_pointers_follow_recent_websocket_and_continuations() {
+        let mut reassembler = InteractionReassembler::default();
+        let upgrade = |path: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+            )
+        };
+        let switching = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+        for (at, write_pointer, read_pointer, path) in [
+            (10, 0x1000, 0x1100, "/older"),
+            (20, 0x2000, 0x2100, "/v1/responses"),
+        ] {
+            assert!(reassembler
+                .push(rustls_chunk_on(
+                    ChunkDirection::Request,
+                    upgrade(path),
+                    at,
+                    write_pointer,
+                ))
+                .is_empty());
+            assert!(reassembler
+                .push(rustls_chunk_on(
+                    ChunkDirection::Response,
+                    switching,
+                    at + 1,
+                    read_pointer,
+                ))
+                .is_empty());
+        }
+
+        let mut client_compressor = Compress::new(Compression::fast(), false);
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "MOVED_POINTER_REQUEST"}]}]
+        })
+        .to_string();
+        let request_frame =
+            compressed_websocket_frame(&mut client_compressor, request.as_bytes(), true);
+        let split = request_frame.len() / 2;
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                request_frame[..split].to_vec(),
+                100,
+                0x3000,
+            ))
+            .is_empty());
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                request_frame[split..].to_vec(),
+                101,
+                0x3001,
+            ))
+            .is_empty());
+
+        let text_event = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "MOVED_POINTER_RESPONSE"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(text_event.as_bytes(), false, true, false, 0x1),
+                200,
+                0x4000,
+            ))
+            .is_empty());
+
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp-moved-pointer"}
+        })
+        .to_string();
+        let terminal_bytes = terminal.as_bytes();
+        let terminal_split = terminal_bytes.len() / 2;
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(&terminal_bytes[..terminal_split], false, false, false, 0x1,),
+                210,
+                0x4001,
+            ))
+            .is_empty());
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(&terminal_bytes[terminal_split..], false, true, false, 0x0),
+            211,
+            0x4002,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].connection_id, "tls:2000");
+        assert!(completed[0].request.body.contains("MOVED_POINTER_REQUEST"));
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("MOVED_POINTER_RESPONSE")
+        );
+        assert_eq!(
+            completed[0].provider_response_id.as_deref(),
+            Some("resp-moved-pointer")
+        );
     }
 
     #[test]

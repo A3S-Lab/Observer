@@ -1391,7 +1391,7 @@ mod tests {
             "expiresAt": "2026-08-20T00:10:00.000Z"
         });
         assert_eq!(
-            canonical_digest(&intent_projection(&[entry.clone()], 7).unwrap()),
+            canonical_digest(&intent_projection(std::slice::from_ref(&entry), 7).unwrap()),
             "eabcc170e9ce397ef52fa44fe9fe67f3d23b19198cfd50f0e3236f4bd4f01a8a"
         );
 
@@ -1401,7 +1401,7 @@ mod tests {
         process_churn["rootPid"] = Value::from(42_u64);
         process_churn["rootGeneration"] = Value::String("next-generation".to_string());
         assert_eq!(
-            canonical_digest(&intent_projection(&[entry.clone()], 7).unwrap()),
+            canonical_digest(&intent_projection(std::slice::from_ref(&entry), 7).unwrap()),
             canonical_digest(&intent_projection(&[process_churn], 7).unwrap()),
             "process/materialization bookkeeping is content-bound but not capture intent"
         );
