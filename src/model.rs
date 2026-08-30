@@ -291,6 +291,38 @@ pub struct LlmInteractionToolResult {
     pub observed_at_unix_ns: Option<String>,
 }
 
+/// One provider-neutral semantic item extracted from an LLM HTTP exchange. These items are an
+/// additive, versioned index over the immutable request/response bodies; consumers can reproject
+/// the raw evidence when a newer parser is deployed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInteractionSemanticItem {
+    pub semantic_item_id: String,
+    pub actor: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub origin: String,
+    pub at_unix_ns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u64>,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+}
+
 /// Exact, bounded content for one side of a model HTTP exchange.
 ///
 /// `body` is UTF-8 when `encoding=utf8`, otherwise RFC 4648 base64. It contains the decoded HTTP
@@ -382,6 +414,10 @@ pub struct LlmInteraction {
     pub tool_calls: Vec<LlmInteractionToolCall>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<LlmInteractionToolResult>,
+    pub semantic_parser_id: String,
+    pub semantic_parser_version: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub semantic_items: Vec<LlmInteractionSemanticItem>,
     pub completeness: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partial_reasons: Vec<String>,

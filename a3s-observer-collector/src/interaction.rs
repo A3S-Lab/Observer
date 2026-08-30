@@ -5,7 +5,8 @@
 //! receives no authorization headers in its output contract.
 
 use a3s_observer::{
-    LlmInteractionContent, LlmInteractionMessage, LlmInteractionToolCall, LlmInteractionToolResult,
+    LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
+    LlmInteractionToolCall, LlmInteractionToolResult,
 };
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -23,6 +24,8 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_HEADERS: usize = 96;
 const MAX_SSE_STRUCTURED_EVENTS: usize = 2_048;
 const MAX_EXPORTED_STRUCTURED_BYTES: usize = 512 * 1024;
+const SEMANTIC_PARSER_ID: &str = "observer.agent-interaction";
+const SEMANTIC_PARSER_VERSION: u32 = 1;
 const WEBSOCKET_MAX_FRAME_HEADER_BYTES: usize = 14;
 const WEBSOCKET_DEFLATE_TAIL: &[u8; 4] = b"\x00\x00\xff\xff";
 
@@ -83,6 +86,9 @@ pub struct CompletedInteraction {
     pub response: LlmInteractionContent,
     pub tool_calls: Vec<LlmInteractionToolCall>,
     pub tool_results: Vec<LlmInteractionToolResult>,
+    pub semantic_parser_id: String,
+    pub semantic_parser_version: u32,
+    pub semantic_items: Vec<LlmInteractionSemanticItem>,
     pub completeness: String,
     pub partial_reasons: Vec<String>,
     pub capture_source: String,
@@ -1725,6 +1731,18 @@ fn build_interaction(
     let duration = response
         .completed_at_unix_ns
         .saturating_sub(request.started_at_unix_ns);
+    let semantic_items = build_semantic_items(
+        &interaction_id,
+        &request_content.messages,
+        response_content.text.as_deref(),
+        &tool_calls,
+        &tool_results,
+        [
+            request.started_at_unix_ns,
+            response.started_at_unix_ns,
+            response.completed_at_unix_ns,
+        ],
+    );
 
     Some(CompletedInteraction {
         schema_version: "anysentry.agent_interaction.v1".to_string(),
@@ -1781,10 +1799,156 @@ fn build_interaction(
         response: response_content,
         tool_calls,
         tool_results,
+        semantic_parser_id: SEMANTIC_PARSER_ID.to_string(),
+        semantic_parser_version: SEMANTIC_PARSER_VERSION,
+        semantic_items,
         completeness,
         partial_reasons,
         capture_source: source.to_string(),
     })
+}
+
+fn build_semantic_items(
+    interaction_id: &str,
+    request_messages: &[LlmInteractionMessage],
+    response_text: Option<&str>,
+    tool_calls: &[LlmInteractionToolCall],
+    tool_results: &[LlmInteractionToolResult],
+    times: [u128; 3],
+) -> Vec<LlmInteractionSemanticItem> {
+    let [request_at_unix_ns, first_response_at_unix_ns, response_at_unix_ns] = times;
+    let mut items = Vec::new();
+    let mut push = |actor: &str,
+                    kind: &str,
+                    phase: Option<&str>,
+                    origin: &str,
+                    at_unix_ns: String,
+                    content: Option<Value>,
+                    tool_call_id: Option<String>,
+                    tool_name: Option<String>,
+                    source_item_id: Option<String>| {
+        let sequence_number = items.len() as u64;
+        let semantic_item_id = semantic_item_id(interaction_id, kind, sequence_number);
+        items.push(LlmInteractionSemanticItem {
+            semantic_item_id,
+            actor: actor.to_string(),
+            kind: kind.to_string(),
+            phase: phase.map(ToOwned::to_owned),
+            origin: origin.to_string(),
+            at_unix_ns,
+            content,
+            tool_call_id,
+            tool_name,
+            source_item_id,
+            output_index: None,
+            content_index: None,
+            sequence_number: Some(sequence_number),
+            completeness: "complete".to_string(),
+            partial_reasons: Vec::new(),
+        });
+    };
+
+    for (index, message) in request_messages.iter().enumerate() {
+        if !matches!(message.role.to_ascii_lowercase().as_str(), "user" | "human") {
+            continue;
+        }
+        let Some(content) = semantic_user_content(&message.content) else {
+            continue;
+        };
+        push(
+            "user",
+            "user_message",
+            Some("final"),
+            "request",
+            request_at_unix_ns.to_string(),
+            Some(content),
+            None,
+            None,
+            Some(format!("request.messages[{index}]")),
+        );
+    }
+
+    for result in tool_results {
+        push(
+            "tool",
+            "tool_result",
+            Some("final"),
+            "request",
+            result
+                .observed_at_unix_ns
+                .clone()
+                .unwrap_or_else(|| request_at_unix_ns.to_string()),
+            Some(result.content.clone()),
+            Some(result.tool_call_id.clone()),
+            result.name.clone(),
+            Some(result.tool_call_id.clone()),
+        );
+    }
+
+    if let Some(text) = response_text.filter(|text| !text.trim().is_empty()) {
+        push(
+            "model",
+            if tool_calls.is_empty() {
+                "model_final"
+            } else {
+                "model_progress"
+            },
+            Some(if tool_calls.is_empty() {
+                "final"
+            } else {
+                "progress"
+            }),
+            "response",
+            first_response_at_unix_ns.to_string(),
+            Some(Value::String(text.to_string())),
+            None,
+            None,
+            None,
+        );
+    }
+
+    for call in tool_calls {
+        push(
+            "tool",
+            "tool_call",
+            Some("final"),
+            "response",
+            call.issued_at_unix_ns
+                .clone()
+                .unwrap_or_else(|| response_at_unix_ns.to_string()),
+            Some(call.arguments.clone()),
+            Some(call.tool_call_id.clone()),
+            Some(call.name.clone()),
+            Some(call.tool_call_id.clone()),
+        );
+    }
+
+    items
+}
+
+fn semantic_user_content(content: &Value) -> Option<Value> {
+    match content {
+        Value::Array(parts) => {
+            let visible = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) != Some("tool_result"))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!visible.is_empty()).then_some(Value::Array(visible))
+        }
+        Value::Null => None,
+        value => Some(value.clone()),
+    }
+}
+
+fn semantic_item_id(interaction_id: &str, kind: &str, sequence_number: u64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(interaction_id.as_bytes());
+    hash.update([0]);
+    hash.update(kind.as_bytes());
+    hash.update([0]);
+    hash.update(sequence_number.to_ne_bytes());
+    format!("si_{}", hex_prefix(&hash.finalize(), 24))
 }
 
 fn make_content(
@@ -2675,15 +2839,13 @@ fn normalize_sse_response(
     let mut chat_calls: HashMap<String, (String, String)> = HashMap::new();
     let mut chat_call_ids: HashMap<u64, String> = HashMap::new();
     let mut anthropic_calls: HashMap<String, (String, String)> = HashMap::new();
-    let mut current_anthropic_call: Option<String> = None;
+    let mut anthropic_call_ids: HashMap<u64, String> = HashMap::new();
+    let mut responses_calls: HashMap<String, (String, String)> = HashMap::new();
+    let mut responses_call_ids: HashMap<u64, String> = HashMap::new();
+    let mut responses_item_ids: HashMap<String, String> = HashMap::new();
 
     for event in &events {
-        if let Some(text) = event.get("delta").and_then(Value::as_str).or_else(|| {
-            event
-                .get("delta")
-                .and_then(|delta| delta.get("text"))
-                .and_then(Value::as_str)
-        }) {
+        if let Some(text) = sse_model_text_fragment(event) {
             deltas.push_str(text);
         }
         if let Some(choices) = event.get("choices").and_then(Value::as_array) {
@@ -2735,11 +2897,16 @@ fn normalize_sse_response(
                 }
             }
         }
-        if event.get("type").and_then(Value::as_str) == Some("content_block_start") {
+        let event_type = event.get("type").and_then(Value::as_str);
+        if event_type == Some("content_block_start") {
             if let Some(block) = event.get("content_block") {
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     if let Some(id) = block.get("id").and_then(Value::as_str) {
-                        current_anthropic_call = Some(id.to_string());
+                        let index = event
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default();
+                        anthropic_call_ids.insert(index, id.to_string());
                         anthropic_calls.insert(
                             id.to_string(),
                             (
@@ -2755,21 +2922,101 @@ fn normalize_sse_response(
                 }
             }
         }
-        if event.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+        if event_type == Some("content_block_delta") {
             if let Some(arguments) = event
                 .get("delta")
                 .and_then(|delta| delta.get("partial_json"))
                 .and_then(Value::as_str)
             {
-                if let Some(entry) = current_anthropic_call
-                    .as_ref()
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                if let Some(entry) = anthropic_call_ids
+                    .get(&index)
                     .and_then(|id| anthropic_calls.get_mut(id))
                 {
                     entry.1.push_str(arguments);
                 }
             }
         }
-        if let Some(text) = extract_response_text(event) {
+        if event_type == Some("content_block_stop") {
+            let index = event
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            anthropic_call_ids.remove(&index);
+        }
+
+        if event_type == Some("response.output_item.added") {
+            if let Some(item) = event.get("item") {
+                if matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call" | "custom_tool_call")
+                ) {
+                    if let Some(call_id) = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                    {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let arguments = item
+                            .get("arguments")
+                            .or_else(|| item.get("input"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        responses_calls.insert(call_id.to_string(), (name, arguments));
+                        if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+                            responses_call_ids.insert(index, call_id.to_string());
+                        }
+                        if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                            responses_item_ids.insert(item_id.to_string(), call_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(
+            event_type,
+            Some(
+                "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta"
+            )
+        ) {
+            if let Some(fragment) = event.get("delta").and_then(Value::as_str) {
+                if let Some(call_id) =
+                    responses_event_call_id(event, &responses_call_ids, &responses_item_ids)
+                {
+                    responses_calls
+                        .entry(call_id)
+                        .or_default()
+                        .1
+                        .push_str(fragment);
+                }
+            }
+        }
+        if matches!(
+            event_type,
+            Some("response.function_call_arguments.done" | "response.custom_tool_call_input.done")
+        ) {
+            if let Some(arguments) = event
+                .get("arguments")
+                .or_else(|| event.get("input"))
+                .and_then(Value::as_str)
+            {
+                if let Some(call_id) =
+                    responses_event_call_id(event, &responses_call_ids, &responses_item_ids)
+                {
+                    responses_calls.entry(call_id).or_default().1 = arguments.to_string();
+                }
+            }
+        }
+
+        if let Some(text) = sse_terminal_model_text(event) {
             if !text.is_empty() && text.len() >= deltas.len() {
                 final_text = Some(text);
             }
@@ -2797,12 +3044,90 @@ fn normalize_sse_response(
             issued_at_unix_ns: Some(observed_at_unix_ns.to_string()),
         });
     }
+    for (id, (name, arguments)) in responses_calls {
+        calls.push(LlmInteractionToolCall {
+            tool_call_id: id,
+            name: if name.is_empty() {
+                "unknown".to_string()
+            } else {
+                name
+            },
+            arguments: parse_json_text_or_string(&arguments),
+            issued_at_unix_ns: Some(observed_at_unix_ns.to_string()),
+        });
+    }
     // Streaming deltas are the authoritative assembled text. A per-event extractor can observe
     // only the first chunk and must not replace the longer accumulated stream; use a terminal
     // provider object only when the stream carried no text deltas.
     let text = (!deltas.is_empty()).then_some(deltas).or(final_text);
     let structured = (!events.is_empty()).then_some(Value::Array(events));
     (structured, text, calls)
+}
+
+/// Return only provider events whose schema explicitly identifies assistant text. A generic
+/// top-level `delta` is not enough: OpenAI Responses also uses it for streamed function/custom
+/// tool arguments, and treating those bytes as text makes tool input appear as a model reply.
+fn sse_model_text_fragment(event: &Value) -> Option<&str> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => event.get("delta").and_then(Value::as_str),
+        Some("content_block_start") => event
+            .get("content_block")
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str),
+        Some("content_block_delta") => event
+            .get("delta")
+            .filter(|delta| {
+                matches!(
+                    delta.get("type").and_then(Value::as_str),
+                    Some("text_delta") | None
+                ) && delta.get("partial_json").is_none()
+            })
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn sse_terminal_model_text(event: &Value) -> Option<String> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.done") => event
+            .get("text")
+            .or_else(|| event.get("delta"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("response.output_item.done") => event
+            .get("item")
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+            .and_then(extract_response_text),
+        Some("response.completed" | "response.done") => {
+            event.get("response").and_then(extract_response_text)
+        }
+        _ => None,
+    }
+}
+
+fn responses_event_call_id(
+    event: &Value,
+    by_output_index: &HashMap<u64, String>,
+    by_item_id: &HashMap<String, String>,
+) -> Option<String> {
+    event
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            event
+                .get("item_id")
+                .and_then(Value::as_str)
+                .and_then(|id| by_item_id.get(id).cloned())
+        })
+        .or_else(|| {
+            event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| by_output_index.get(&index).cloned())
+        })
 }
 
 fn parse_sse_json_events(body: &[u8]) -> Vec<Value> {
@@ -3124,6 +3449,15 @@ mod tests {
         assert_eq!(interaction.first_response_at_unix_ns, "200");
         assert_eq!(interaction.ended_at_unix_ns, "250");
         assert_eq!(interaction.completeness, "complete");
+        assert_eq!(interaction.semantic_parser_id, SEMANTIC_PARSER_ID);
+        assert_eq!(
+            interaction
+                .semantic_items
+                .iter()
+                .map(|item| (item.actor.as_str(), item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("user", "user_message"), ("model", "model_final")]
+        );
     }
 
     #[test]
@@ -3455,6 +3789,103 @@ mod tests {
     }
 
     #[test]
+    fn responses_custom_tool_input_delta_never_becomes_model_text() {
+        let request_body = r#"{"model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"run pwd"}]}]}"#;
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item-tool-1\",\"type\":\"custom_tool_call\",\"call_id\":\"call-tool-1\",\"name\":\"exec\",\"input\":\"\"}}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"item_id\":\"item-tool-1\",\"delta\":\"tools.exec_command({\\\"cmd\\\":\\\"pwd\\\"})\"}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"item_id\":\"item-tool-1\",\"input\":\"tools.exec_command({\\\"cmd\\\":\\\"pwd\\\"})\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-tool-1\"}}\n\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            sse.len(),
+            sse
+        );
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(request_body),
+            1,
+        ));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response.into_bytes(), 2));
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].response.text, None);
+        assert_eq!(completed[0].tool_calls.len(), 1);
+        assert_eq!(completed[0].tool_calls[0].tool_call_id, "call-tool-1");
+        assert_eq!(completed[0].tool_calls[0].name, "exec");
+        assert_eq!(
+            completed[0].tool_calls[0].arguments,
+            "tools.exec_command({\"cmd\":\"pwd\"})"
+        );
+        assert_eq!(completed[0].semantic_parser_version, 1);
+        assert_eq!(
+            completed[0]
+                .semantic_items
+                .iter()
+                .map(|item| (item.actor.as_str(), item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("user", "user_message"), ("tool", "tool_call")]
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_keeps_text_separate_from_indexed_tool_arguments() {
+        let request_body = r#"{"model":"claude-test","max_tokens":1024,"messages":[{"role":"user","content":"inspect files"}]}"#;
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"I will inspect. \"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Done.\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            sse.len(),
+            sse
+        );
+        let mut reassembler = InteractionReassembler::default();
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: gateway.invalid\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 1));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response.into_bytes(), 2));
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("I will inspect. Done.")
+        );
+        assert_eq!(completed[0].tool_calls.len(), 2);
+        let calls = completed[0]
+            .tool_calls
+            .iter()
+            .map(|call| (call.tool_call_id.as_str(), &call.arguments))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(calls["toolu_1"]["file_path"], "README.md");
+        assert_eq!(calls["toolu_2"]["command"], "pwd");
+        assert_eq!(
+            completed[0]
+                .semantic_items
+                .iter()
+                .map(|item| (item.actor.as_str(), item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "user_message"),
+                ("model", "model_progress"),
+                ("tool", "tool_call"),
+                ("tool", "tool_call"),
+            ]
+        );
+    }
+
+    #[test]
     fn chat_sse_tool_call_keeps_first_chunk_id_across_argument_deltas() {
         let request_body = r#"{"model":"gpt-test","messages":[{"role":"user","content":"read"}]}"#;
         let sse = concat!(
@@ -3502,6 +3933,38 @@ mod tests {
         assert_eq!(completed[0].tool_results.len(), 1);
         assert_eq!(completed[0].tool_results[0].tool_call_id, "call-1");
         assert_eq!(completed[0].tool_results[0].content, "ok");
+    }
+
+    #[test]
+    fn anthropic_tool_result_is_tool_semantics_not_a_user_message() {
+        let request_body = r#"{"model":"claude-test","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-result-1","content":[{"type":"text","text":"command output"}]}]}]}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: gateway.invalid\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+        let response_body =
+            r#"{"id":"msg-final","content":[{"type":"text","text":"final answer"}]}"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 10));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            20,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].tool_results.len(), 1);
+        assert_eq!(completed[0].tool_results[0].tool_call_id, "toolu-result-1");
+        assert_eq!(completed[0].response.text.as_deref(), Some("final answer"));
+        assert_eq!(
+            completed[0]
+                .semantic_items
+                .iter()
+                .map(|item| (item.actor.as_str(), item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("tool", "tool_result"), ("model", "model_final")]
+        );
     }
 
     #[test]
