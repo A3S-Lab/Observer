@@ -2818,6 +2818,8 @@ fn refresh_exec_tls_candidates(
         return;
     };
     for (pid, identity_verified, retry_attempt) in candidate_pids {
+        let retry_attempt =
+            retry_attempt.or_else(|| manager.is_named_agent_runtime_pid(pid).then_some(0));
         let newly_attached = refresh_tls_attachment_for_pid(
             manager,
             verified_process_map,

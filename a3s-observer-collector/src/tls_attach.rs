@@ -262,6 +262,10 @@ impl TlsAttachManager {
         self.verified_processes.keys().copied().collect()
     }
 
+    pub fn is_named_agent_runtime_pid(&self, pid: i32) -> bool {
+        self.process_matches_patterns(pid)
+    }
+
     fn runtime_role(&self, pid: i32) -> Option<RuntimeRole> {
         if self.process_matches_patterns(pid) {
             return Some(RuntimeRole::AgentRoot);
@@ -553,8 +557,21 @@ fn matches_selected_agent_text(comm: &str, cmdline: &str, process_patterns: &[St
     // Node running as PID 1 can retain `MainThread` in /proc/<pid>/comm even after Pi sets
     // process.title. The title still replaces argv in cmdline, so admit the exact `pi` title
     // without adding a broad `pi` substring pattern that would match unrelated Python processes.
+    let mut argv = cmdline.split_whitespace();
+    let executable = argv
+        .next()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let node_entrypoint = argv
+        .next()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let exact_node_pi = matches!(executable, "node" | "nodejs") && node_entrypoint == "pi";
     matches!(comm, "codex" | "claude" | "claude.exe" | "pi")
         || cmdline.trim() == "pi"
+        || exact_node_pi
         || process_patterns
             .iter()
             .any(|pattern| comm.contains(pattern.as_str()) || cmdline.contains(pattern.as_str()))
@@ -1176,9 +1193,19 @@ mod tests {
             "pi   ",
             &patterns
         ));
+        assert!(matches_selected_agent_text(
+            "node",
+            "node /usr/local/bin/pi --mode json",
+            &patterns
+        ));
         assert!(!matches_selected_agent_text(
             "python3",
             "python3 pillow_worker.py",
+            &patterns
+        ));
+        assert!(!matches_selected_agent_text(
+            "node",
+            "node /app/pillow_worker.js",
             &patterns
         ));
     }
