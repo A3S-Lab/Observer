@@ -1931,14 +1931,32 @@ fn semantic_user_content(content: &Value) -> Option<Value> {
         Value::Array(parts) => {
             let visible = parts
                 .iter()
-                .filter(|part| part.get("type").and_then(Value::as_str) != Some("tool_result"))
+                .filter(|part| {
+                    part.get("type").and_then(Value::as_str) != Some("tool_result")
+                        && !agent_runtime_context_part(part)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             (!visible.is_empty()).then_some(Value::Array(visible))
         }
         Value::Null => None,
+        value if agent_runtime_context_part(value) => None,
         value => Some(value.clone()),
     }
+}
+
+fn agent_runtime_context_part(value: &Value) -> bool {
+    let text = value
+        .as_str()
+        .or_else(|| value.get("text").and_then(Value::as_str))
+        .map(str::trim);
+    text.is_some_and(|text| {
+        ["environment_context", "system-reminder"]
+            .iter()
+            .any(|tag| {
+                text.starts_with(&format!("<{tag}>")) && text.ends_with(&format!("</{tag}>"))
+            })
+    })
 }
 
 fn semantic_item_id(interaction_id: &str, kind: &str, sequence_number: u64) -> String {
@@ -3790,7 +3808,7 @@ mod tests {
 
     #[test]
     fn responses_custom_tool_input_delta_never_becomes_model_text() {
-        let request_body = r#"{"model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"run pwd"}]}]}"#;
+        let request_body = r#"{"model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]},{"role":"user","content":[{"type":"input_text","text":"run pwd"}]}]}"#;
         let sse = concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item-tool-1\",\"type\":\"custom_tool_call\",\"call_id\":\"call-tool-1\",\"name\":\"exec\",\"input\":\"\"}}\n\n",
             "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"item_id\":\"item-tool-1\",\"delta\":\"tools.exec_command({\\\"cmd\\\":\\\"pwd\\\"})\"}\n\n",

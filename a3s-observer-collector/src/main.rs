@@ -2813,11 +2813,11 @@ fn refresh_exec_tls_candidates(
     verified_process_map: &mut VerifiedProcessMap,
     ebpf: &mut Ebpf,
 ) {
-    let candidate_pids = processor.take_tls_attach_candidate_pids();
+    let candidate_pids = processor.take_tls_attach_candidate_pids(Instant::now());
     let Some(manager) = manager else {
         return;
     };
-    for (pid, identity_verified) in candidate_pids {
+    for (pid, identity_verified, retry_attempt) in candidate_pids {
         let newly_attached = refresh_tls_attachment_for_pid(
             manager,
             verified_process_map,
@@ -2826,6 +2826,7 @@ fn refresh_exec_tls_candidates(
             identity_verified,
         );
         if newly_attached > 0 {
+            processor.cancel_tls_attach_retry(pid);
             tracing::info!(
                 pid,
                 identity_verified,
@@ -2833,6 +2834,8 @@ fn refresh_exec_tls_candidates(
                 attached_targets = manager.attached_count(),
                 "attached Agent TLS probes from exec lifecycle signal"
             );
+        } else if let Some(attempt) = retry_attempt {
+            processor.schedule_tls_attach_retry(pid, identity_verified, attempt, Instant::now());
         }
     }
 }
@@ -3336,6 +3339,12 @@ fn event_capture_decision(context: CaptureDecisionContext) -> EventCaptureDecisi
 
 /// Single-writer state for all expensive decoding, `/proc`/workload enrichment, protocol joins,
 /// lifecycle tracking, and semantic export. Ring readers never touch this state.
+struct PendingTlsAttachRetry {
+    identity_verified: bool,
+    attempt: usize,
+    next_at: Instant,
+}
+
 struct CollectorProcessor {
     peers: HashMap<SocketKey, (IpAddr, u16)>,
     llm_meta: HashMap<SocketKey, (Option<String>, Option<Provider>, IpAddr)>,
@@ -3344,6 +3353,8 @@ struct CollectorProcessor {
     process_lifecycles: ProcessLifecycleStore,
     tls_attach_candidate_pids: HashSet<i32>,
     tls_verified_candidate_pids: HashSet<i32>,
+    tls_fast_retry_candidate_pids: HashSet<i32>,
+    tls_attach_retries: HashMap<i32, PendingTlsAttachRetry>,
     stats: Stats,
     reorder_forced_flushes: u64,
     reorder_key_collisions: u64,
@@ -3359,6 +3370,8 @@ impl CollectorProcessor {
             process_lifecycles: ProcessLifecycleStore::default(),
             tls_attach_candidate_pids: HashSet::new(),
             tls_verified_candidate_pids: HashSet::new(),
+            tls_fast_retry_candidate_pids: HashSet::new(),
+            tls_attach_retries: HashMap::new(),
             stats: Stats::default(),
             reorder_forced_flushes: 0,
             reorder_key_collisions: 0,
@@ -3383,20 +3396,78 @@ impl CollectorProcessor {
         self.interactions.expire_idle(now);
     }
 
-    fn take_tls_attach_candidate_pids(&mut self) -> Vec<(i32, bool)> {
+    fn take_tls_attach_candidate_pids(&mut self, now: Instant) -> Vec<(i32, bool, Option<usize>)> {
         let verified = std::mem::take(&mut self.tls_verified_candidate_pids);
-        let mut candidates = verified
+        let named = std::mem::take(&mut self.tls_fast_retry_candidate_pids);
+        let mut candidates = HashMap::<i32, (bool, Option<usize>)>::new();
+        for pid in std::mem::take(&mut self.tls_attach_candidate_pids) {
+            candidates.insert(
+                pid,
+                (verified.contains(&pid), named.contains(&pid).then_some(0)),
+            );
+        }
+        for pid in verified {
+            candidates
+                .entry(pid)
+                .and_modify(|candidate| candidate.0 = true)
+                .or_insert((true, named.contains(&pid).then_some(0)));
+        }
+        let ready_retries = self
+            .tls_attach_retries
             .iter()
-            .copied()
-            .map(|pid| (pid, true))
+            .filter_map(|(pid, retry)| (retry.next_at <= now).then_some(*pid))
             .collect::<Vec<_>>();
-        candidates.extend(
-            std::mem::take(&mut self.tls_attach_candidate_pids)
-                .into_iter()
-                .filter(|pid| !verified.contains(pid))
-                .map(|pid| (pid, false)),
-        );
+        for pid in ready_retries {
+            if let Some(retry) = self.tls_attach_retries.remove(&pid) {
+                candidates
+                    .entry(pid)
+                    .and_modify(|candidate| {
+                        candidate.0 |= retry.identity_verified;
+                        candidate.1 = Some(candidate.1.unwrap_or(retry.attempt).min(retry.attempt));
+                    })
+                    .or_insert((retry.identity_verified, Some(retry.attempt)));
+            }
+        }
         candidates
+            .into_iter()
+            .map(|(pid, (identity_verified, attempt))| (pid, identity_verified, attempt))
+            .collect()
+    }
+
+    fn schedule_tls_attach_retry(
+        &mut self,
+        pid: i32,
+        identity_verified: bool,
+        attempt: usize,
+        now: Instant,
+    ) {
+        const RETRY_DELAYS: [Duration; 7] = [
+            Duration::from_millis(25),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_millis(1_600),
+        ];
+        let Some(delay) = RETRY_DELAYS.get(attempt).copied() else {
+            return;
+        };
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        self.tls_attach_retries.insert(
+            pid,
+            PendingTlsAttachRetry {
+                identity_verified,
+                attempt: attempt + 1,
+                next_at: now + delay,
+            },
+        );
+    }
+
+    fn cancel_tls_attach_retry(&mut self, pid: i32) {
+        self.tls_attach_retries.remove(&pid);
     }
 
     fn process(
@@ -3417,11 +3488,15 @@ impl CollectorProcessor {
                 };
                 if record.kind == EXEC_RECORD_COMMIT {
                     if let Ok(pid) = i32::try_from(record.pid) {
+                        let named_agent_runtime = tls_exec_comm_needs_refresh(&cstr(&record.comm));
+                        if named_agent_runtime {
+                            self.tls_fast_retry_candidate_pids.insert(pid);
+                        }
                         if tls_capture_profile_needs_refresh(
                             record.capture_decision.capture_profile,
                         ) {
                             self.tls_verified_candidate_pids.insert(pid);
-                        } else if tls_exec_comm_needs_refresh(&cstr(&record.comm)) {
+                        } else if named_agent_runtime {
                             self.tls_attach_candidate_pids.insert(pid);
                         }
                     }
@@ -4490,9 +4565,9 @@ mod tests {
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
         parse_unknown_file_policy, partial_window_interval_secs, pod_bytes, pod_from_bytes,
         supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
-        CollectorMeta, CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot,
-        PipelineAccountingState, PipelineRing, ProcessContextCache, ProcessLifecycleStore,
-        RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
+        CollectorMeta, CollectorProcessor, CompletedExec, ExecAssembler, FileFeatureFlags,
+        FileFilterHeartbeatSnapshot, PipelineAccountingState, PipelineRing, ProcessContextCache,
+        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
         EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
     };
     use a3s_observer::{AgentEvent, ExportPriority, ProcessContext};
@@ -5324,6 +5399,30 @@ mod tests {
         let (_, pt, ct) = parse_llm_meta(resp).unwrap();
         assert_eq!((pt, ct), (Some(12), Some(34)));
         assert!(parse_llm_meta("just plaintext, no json fields here").is_none());
+    }
+
+    #[test]
+    fn exact_agent_exec_gets_bounded_fast_tls_attach_retries() {
+        let now = Instant::now();
+        let pid = std::process::id() as i32;
+        let mut processor = CollectorProcessor::new(true);
+        processor.tls_verified_candidate_pids.insert(pid);
+        processor.tls_fast_retry_candidate_pids.insert(pid);
+
+        assert_eq!(
+            processor.take_tls_attach_candidate_pids(now),
+            vec![(pid, true, Some(0))]
+        );
+        processor.schedule_tls_attach_retry(pid, true, 0, now);
+        assert!(processor
+            .take_tls_attach_candidate_pids(now + Duration::from_millis(24))
+            .is_empty());
+        assert_eq!(
+            processor.take_tls_attach_candidate_pids(now + Duration::from_millis(25)),
+            vec![(pid, true, Some(1))]
+        );
+        processor.schedule_tls_attach_retry(pid, true, 7, now);
+        assert!(processor.tls_attach_retries.is_empty());
     }
 
     #[test]
