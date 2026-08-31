@@ -5,8 +5,8 @@
 //! receives no authorization headers in its output contract.
 
 use a3s_observer::{
-    LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
-    LlmInteractionToolCall, LlmInteractionToolResult,
+    LlmConversationAnchor, LlmInteractionContent, LlmInteractionMessage,
+    LlmInteractionSemanticItem, LlmInteractionToolCall, LlmInteractionToolResult,
 };
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -25,7 +25,8 @@ const MAX_HEADERS: usize = 96;
 const MAX_SSE_STRUCTURED_EVENTS: usize = 2_048;
 const MAX_EXPORTED_STRUCTURED_BYTES: usize = 512 * 1024;
 const SEMANTIC_PARSER_ID: &str = "observer.agent-interaction";
-const SEMANTIC_PARSER_VERSION: u32 = 1;
+const SEMANTIC_PARSER_VERSION: u32 = 2;
+const MAX_CONVERSATION_ANCHORS: usize = 512;
 const WEBSOCKET_MAX_FRAME_HEADER_BYTES: usize = 14;
 const WEBSOCKET_DEFLATE_TAIL: &[u8; 4] = b"\x00\x00\xff\xff";
 
@@ -76,6 +77,8 @@ pub struct CompletedInteraction {
     pub provider_conversation_id: Option<String>,
     pub provider_response_id: Option<String>,
     pub provider_previous_response_id: Option<String>,
+    pub traffic_role: String,
+    pub conversation_anchors: Vec<LlmConversationAnchor>,
     pub started_at_unix_ns: String,
     pub request_complete_at_unix_ns: String,
     pub first_response_at_unix_ns: String,
@@ -1728,6 +1731,22 @@ fn build_interaction(
             observed_at_unix_ns: Some(response.completed_at_unix_ns.to_string()),
         }];
     }
+    let traffic_role = classify_traffic_role(
+        wire_match.interaction_kind,
+        request_content.structured.as_ref(),
+        &request_content.messages,
+        &tool_results,
+    )
+    .to_string();
+    let conversation_anchors = extract_conversation_anchors(
+        request_content.structured.as_ref(),
+        provider_conversation_id.as_deref(),
+        provider_response_id.as_deref(),
+        provider_previous_response_id.as_deref(),
+        &request_content.messages,
+        &tool_calls,
+        &tool_results,
+    );
     let duration = response
         .completed_at_unix_ns
         .saturating_sub(request.started_at_unix_ns);
@@ -1789,6 +1808,8 @@ fn build_interaction(
         provider_conversation_id,
         provider_response_id,
         provider_previous_response_id,
+        traffic_role,
+        conversation_anchors,
         started_at_unix_ns: request.started_at_unix_ns.to_string(),
         request_complete_at_unix_ns: request.completed_at_unix_ns.to_string(),
         first_response_at_unix_ns: response.started_at_unix_ns.to_string(),
@@ -1826,7 +1847,10 @@ fn build_semantic_items(
                     content: Option<Value>,
                     tool_call_id: Option<String>,
                     tool_name: Option<String>,
-                    source_item_id: Option<String>| {
+                    source_item_id: Option<String>,
+                    turn_id: Option<String>,
+                    content_item_kinds: Vec<String>,
+                    message_origin: Option<String>| {
         let sequence_number = items.len() as u64;
         let semantic_item_id = semantic_item_id(interaction_id, kind, sequence_number);
         items.push(LlmInteractionSemanticItem {
@@ -1840,6 +1864,9 @@ fn build_semantic_items(
             tool_call_id,
             tool_name,
             source_item_id,
+            turn_id,
+            content_item_kinds,
+            message_origin,
             output_index: None,
             content_index: None,
             sequence_number: Some(sequence_number),
@@ -1850,6 +1877,9 @@ fn build_semantic_items(
 
     for (index, message) in request_messages.iter().enumerate() {
         if !matches!(message.role.to_ascii_lowercase().as_str(), "user" | "human") {
+            continue;
+        }
+        if message.message_origin.as_deref() == Some("agent_context") {
             continue;
         }
         let Some(content) = semantic_user_content(&message.content) else {
@@ -1864,7 +1894,13 @@ fn build_semantic_items(
             Some(content),
             None,
             None,
-            Some(format!("request.messages[{index}]")),
+            message
+                .source_item_id
+                .clone()
+                .or_else(|| Some(format!("request.messages[{index}]"))),
+            message.turn_id.clone(),
+            message.content_item_kinds.clone(),
+            message.message_origin.clone(),
         );
     }
 
@@ -1882,6 +1918,9 @@ fn build_semantic_items(
             Some(result.tool_call_id.clone()),
             result.name.clone(),
             Some(result.tool_call_id.clone()),
+            None,
+            Vec::new(),
+            Some("tool_history".to_string()),
         );
     }
 
@@ -1904,6 +1943,9 @@ fn build_semantic_items(
             None,
             None,
             None,
+            None,
+            Vec::new(),
+            None,
         );
     }
 
@@ -1920,6 +1962,9 @@ fn build_semantic_items(
             Some(call.tool_call_id.clone()),
             Some(call.name.clone()),
             Some(call.tool_call_id.clone()),
+            None,
+            Vec::new(),
+            None,
         );
     }
 
@@ -2548,6 +2593,7 @@ fn bounded_provider_id(value: Option<&Value>) -> Option<String> {
 
 fn extract_provider_conversation_id(value: &Value) -> Option<String> {
     bounded_provider_id(value.get("conversation_id"))
+        .or_else(|| bounded_provider_id(value.get("thread_id")))
         .or_else(|| bounded_provider_id(value.get("session_id")))
         .or_else(|| bounded_provider_id(value.get("conversation")))
         .or_else(|| {
@@ -2558,9 +2604,200 @@ fn extract_provider_conversation_id(value: &Value) -> Option<String> {
         .or_else(|| {
             value.get("metadata").and_then(|metadata| {
                 bounded_provider_id(metadata.get("conversation_id"))
+                    .or_else(|| bounded_provider_id(metadata.get("thread_id")))
                     .or_else(|| bounded_provider_id(metadata.get("session_id")))
             })
         })
+}
+
+fn conversation_anchor_hash(kind: &str, value: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(kind.as_bytes());
+    hash.update([0]);
+    hash.update(value.as_bytes());
+    hex_prefix(&hash.finalize(), 64)
+}
+
+fn push_conversation_anchor(
+    anchors: &mut Vec<LlmConversationAnchor>,
+    seen: &mut HashSet<String>,
+    kind: &str,
+    value: Option<String>,
+    strength: &str,
+    source_path: &str,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if anchors.len() >= MAX_CONVERSATION_ANCHORS {
+        return;
+    }
+    let value_hash = conversation_anchor_hash(kind, &value);
+    let key = format!("{kind}\0{value_hash}");
+    if !seen.insert(key) {
+        return;
+    }
+    anchors.push(LlmConversationAnchor {
+        kind: kind.to_string(),
+        namespace: "provider".to_string(),
+        value_hash,
+        strength: strength.to_string(),
+        source_path: source_path.to_string(),
+    });
+}
+
+fn continuity_value(value: &Value) -> Option<(String, &'static str)> {
+    bounded_provider_id(value.get("prompt_cache_key"))
+        .map(|value| (value, "prompt_cache_key"))
+        .or_else(|| bounded_provider_id(value.get("cache_key")).map(|value| (value, "cache_key")))
+        .or_else(|| {
+            value.get("metadata").and_then(|metadata| {
+                bounded_provider_id(metadata.get("prompt_cache_key"))
+                    .map(|value| (value, "metadata.prompt_cache_key"))
+                    .or_else(|| {
+                        bounded_provider_id(metadata.get("cache_key"))
+                            .map(|value| (value, "metadata.cache_key"))
+                    })
+            })
+        })
+}
+
+fn extract_conversation_anchors(
+    request_json: Option<&Value>,
+    provider_conversation_id: Option<&str>,
+    provider_response_id: Option<&str>,
+    provider_previous_response_id: Option<&str>,
+    messages: &[LlmInteractionMessage],
+    tool_calls: &[LlmInteractionToolCall],
+    tool_results: &[LlmInteractionToolResult],
+) -> Vec<LlmConversationAnchor> {
+    let mut anchors = Vec::new();
+    let mut seen = HashSet::new();
+    push_conversation_anchor(
+        &mut anchors,
+        &mut seen,
+        "provider_conversation",
+        provider_conversation_id.map(ToOwned::to_owned),
+        "exact",
+        "conversation_id|thread_id|session_id",
+    );
+    push_conversation_anchor(
+        &mut anchors,
+        &mut seen,
+        "response_id",
+        provider_response_id.map(ToOwned::to_owned),
+        "exact",
+        "response.id",
+    );
+    push_conversation_anchor(
+        &mut anchors,
+        &mut seen,
+        "previous_response_id",
+        provider_previous_response_id.map(ToOwned::to_owned),
+        "exact",
+        "previous_response_id",
+    );
+    if let Some((value, source_path)) = request_json.and_then(continuity_value) {
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "continuity_key",
+            Some(value),
+            "strong",
+            source_path,
+        );
+    }
+    for message in messages {
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "message_item_id",
+            message.source_item_id.clone(),
+            "strong",
+            "input[].id|messages[].id",
+        );
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "turn_id",
+            message.turn_id.clone(),
+            "strong",
+            "message.metadata.turn_id",
+        );
+    }
+    for call in tool_calls {
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "tool_call_id",
+            Some(call.tool_call_id.clone()),
+            "exact",
+            "response.tool_call.id",
+        );
+    }
+    for result in tool_results {
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "tool_call_id",
+            Some(result.tool_call_id.clone()),
+            "exact",
+            "request.tool_result.call_id",
+        );
+    }
+    anchors
+}
+
+fn control_rpc_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "notifications/initialized"
+            | "ping"
+            | "tools/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "completion/complete"
+            | "logging/setLevel"
+    )
+}
+
+fn classify_traffic_role(
+    interaction_kind: WireInteractionKind,
+    request_json: Option<&Value>,
+    messages: &[LlmInteractionMessage],
+    tool_results: &[LlmInteractionToolResult],
+) -> &'static str {
+    if interaction_kind == WireInteractionKind::Tool {
+        let method = request_json
+            .and_then(|value| value.get("method"))
+            .and_then(Value::as_str);
+        return if method.is_some_and(control_rpc_method) {
+            "control"
+        } else {
+            "conversation"
+        };
+    }
+    if interaction_kind != WireInteractionKind::Model {
+        return "unclassified";
+    }
+    if messages
+        .iter()
+        .any(|message| message.message_origin.as_deref() == Some("human_input"))
+        || !tool_results.is_empty()
+    {
+        return "conversation";
+    }
+    if messages.iter().any(|message| {
+        matches!(
+            message.message_origin.as_deref(),
+            Some("developer_instruction" | "agent_context" | "assistant_history" | "tool_history")
+        )
+    }) {
+        return "bootstrap";
+    }
+    "unclassified"
 }
 
 fn extract_provider_response_id(value: &Value) -> Option<String> {
@@ -2590,6 +2827,65 @@ fn extract_provider_response_id(value: &Value) -> Option<String> {
         .or_else(|| bounded_provider_id(value.get("id")))
 }
 
+fn message_turn_id(item: &Value) -> Option<String> {
+    bounded_provider_id(item.get("turn_id"))
+        .or_else(|| {
+            item.get("internal_chat_message_metadata_passthrough")
+                .and_then(|metadata| bounded_provider_id(metadata.get("turn_id")))
+        })
+        .or_else(|| {
+            item.get("metadata")
+                .and_then(|metadata| bounded_provider_id(metadata.get("turn_id")))
+        })
+}
+
+fn message_content_item_kinds(item: &Value) -> Vec<String> {
+    let kinds = item
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|metadata| metadata.get("content_item_kinds"))
+        .or_else(|| {
+            item.get("metadata")
+                .and_then(|metadata| metadata.get("content_item_kinds"))
+        })
+        .and_then(Value::as_array);
+    let mut output = Vec::new();
+    for kind in kinds.into_iter().flatten().filter_map(Value::as_str) {
+        let kind = kind.trim();
+        if kind.is_empty() || kind.len() > 160 || output.iter().any(|value| value == kind) {
+            continue;
+        }
+        output.push(kind.to_string());
+        if output.len() >= 32 {
+            break;
+        }
+    }
+    output
+}
+
+fn message_origin(role: &str, content_item_kinds: &[String]) -> Option<String> {
+    let role = role.to_ascii_lowercase();
+    if matches!(role.as_str(), "user" | "human") {
+        if content_item_kinds.is_empty()
+            || content_item_kinds
+                .iter()
+                .any(|kind| kind == "user.text" || kind.starts_with("user."))
+        {
+            return Some("human_input".to_string());
+        }
+        return Some("agent_context".to_string());
+    }
+    if matches!(role.as_str(), "developer" | "system") {
+        return Some("developer_instruction".to_string());
+    }
+    if role == "assistant" {
+        return Some("assistant_history".to_string());
+    }
+    if matches!(role.as_str(), "tool" | "function") {
+        return Some("tool_history".to_string());
+    }
+    None
+}
+
 fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
     let mut messages = Vec::new();
     if let Some(instructions) = value.get("instructions") {
@@ -2598,6 +2894,10 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
             content: instructions.clone(),
             name: None,
             tool_call_id: None,
+            source_item_id: None,
+            turn_id: None,
+            content_item_kinds: Vec::new(),
+            message_origin: Some("developer_instruction".to_string()),
         });
     }
     if let Some(system) = value.get("system") {
@@ -2606,6 +2906,10 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
             content: system.clone(),
             name: None,
             tool_call_id: None,
+            source_item_id: None,
+            turn_id: None,
+            content_item_kinds: Vec::new(),
+            message_origin: Some("developer_instruction".to_string()),
         });
     }
     for item in value
@@ -2630,6 +2934,7 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
             .or_else(|| item.get("output"))
             .cloned()
             .unwrap_or_else(|| item.clone());
+        let content_item_kinds = message_content_item_kinds(item);
         messages.push(LlmInteractionMessage {
             role: role.to_string(),
             content,
@@ -2642,6 +2947,10 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
                 .or_else(|| item.get("call_id"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            source_item_id: bounded_provider_id(item.get("id")),
+            turn_id: message_turn_id(item),
+            message_origin: message_origin(role, &content_item_kinds),
+            content_item_kinds,
         });
     }
     messages
@@ -3479,6 +3788,90 @@ mod tests {
     }
 
     #[test]
+    fn conversation_anchor_contract_keeps_human_turn_identity_and_hashes_continuity_keys() {
+        let request_body = r#"{
+          "model":"fixture-model",
+          "prompt_cache_key":"stable-resume-key-must-not-export",
+          "messages":[
+            {
+              "id":"msg-agent-context",
+              "role":"user",
+              "content":[{"type":"input_text","text":"runtime instructions"}],
+              "internal_chat_message_metadata_passthrough":{
+                "turn_id":"turn-bootstrap",
+                "content_item_kinds":["agents_md.instructions"]
+              }
+            },
+            {
+              "id":"msg-human-1",
+              "role":"user",
+              "content":[{"type":"input_text","text":"hello from a human"}],
+              "internal_chat_message_metadata_passthrough":{
+                "turn_id":"turn-human-1",
+                "content_item_kinds":["user.text"]
+              }
+            }
+          ]
+        }"#;
+        let response_body =
+            r#"{"id":"resp-1","choices":[{"message":{"role":"assistant","content":"world"}}]}"#;
+        let mut reassembler = InteractionReassembler::default();
+        assert!(reassembler
+            .push(chunk(
+                ChunkDirection::Request,
+                http_request(request_body),
+                100
+            ))
+            .is_empty());
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.semantic_parser_version, 2);
+        assert_eq!(interaction.traffic_role, "conversation");
+        assert_eq!(interaction.request.messages.len(), 2);
+        assert_eq!(
+            interaction.request.messages[0].message_origin.as_deref(),
+            Some("agent_context")
+        );
+        assert_eq!(
+            interaction.request.messages[1].source_item_id.as_deref(),
+            Some("msg-human-1")
+        );
+        assert_eq!(
+            interaction.request.messages[1].turn_id.as_deref(),
+            Some("turn-human-1")
+        );
+        let user_items = interaction
+            .semantic_items
+            .iter()
+            .filter(|item| item.kind == "user_message")
+            .collect::<Vec<_>>();
+        assert_eq!(user_items.len(), 1);
+        assert_eq!(user_items[0].source_item_id.as_deref(), Some("msg-human-1"));
+        assert_eq!(user_items[0].turn_id.as_deref(), Some("turn-human-1"));
+        assert!(interaction
+            .conversation_anchors
+            .iter()
+            .any(|anchor| anchor.kind == "continuity_key" && anchor.strength == "strong"));
+        assert!(interaction
+            .conversation_anchors
+            .iter()
+            .any(|anchor| anchor.kind == "message_item_id"));
+        assert!(interaction
+            .conversation_anchors
+            .iter()
+            .any(|anchor| anchor.kind == "turn_id"));
+        assert!(!serde_json::to_string(&interaction.conversation_anchors)
+            .unwrap()
+            .contains("stable-resume-key-must-not-export"));
+    }
+
+    #[test]
     fn rustls_body_only_request_is_paired_with_the_http_response() {
         let request_body =
             r#"{"model":"fixture-model","input":[{"role":"user","content":"hello"}]}"#;
@@ -3553,6 +3946,7 @@ mod tests {
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].interaction_type, "tool");
+        assert_eq!(completed[0].traffic_role, "conversation");
         assert_eq!(completed[0].path, "/arbitrary/gateway/path");
         assert_eq!(
             completed[0].wire_template_id.as_deref(),
@@ -3577,6 +3971,35 @@ mod tests {
             completed[0].tool_results[0].observed_at_unix_ns.as_deref(),
             Some("20")
         );
+    }
+
+    #[test]
+    fn mcp_lifecycle_and_discovery_are_control_traffic_not_user_conversations() {
+        for (sequence, method) in ["initialize", "tools/list"].into_iter().enumerate() {
+            let mut reassembler = InteractionReassembler::default();
+            reassembler.push(chunk(
+                ChunkDirection::Request,
+                custom_http_request(
+                    "POST",
+                    "/mcp",
+                    "tool.fixture",
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":{sequence},"method":"{method}","params":{{}}}}"#
+                    ),
+                ),
+                10,
+            ));
+            let completed = reassembler.push(chunk(
+                ChunkDirection::Response,
+                http_response(&format!(
+                    r#"{{"jsonrpc":"2.0","id":{sequence},"result":{{}}}}"#
+                )),
+                20,
+            ));
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].interaction_type, "tool");
+            assert_eq!(completed[0].traffic_role, "control");
+        }
     }
 
     #[test]
@@ -3837,7 +4260,7 @@ mod tests {
             completed[0].tool_calls[0].arguments,
             "tools.exec_command({\"cmd\":\"pwd\"})"
         );
-        assert_eq!(completed[0].semantic_parser_version, 1);
+        assert_eq!(completed[0].semantic_parser_version, 2);
         assert_eq!(
             completed[0]
                 .semantic_items

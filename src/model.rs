@@ -264,6 +264,27 @@ pub struct LlmInteractionMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub content_item_kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_origin: Option<String>,
+}
+
+/// A bounded, provider-neutral identity hint extracted from an exact Agent request or response.
+/// Values are namespaced and hashed before export so the resolver can join interactions without
+/// copying application session identifiers into a secondary index.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmConversationAnchor {
+    pub kind: String,
+    pub namespace: String,
+    pub value_hash: String,
+    pub strength: String,
+    pub source_path: String,
 }
 
 /// A tool instruction visible in an LLM response. The matching execution/result may arrive in a
@@ -312,6 +333,12 @@ pub struct LlmInteractionSemanticItem {
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub content_item_kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +429,9 @@ pub struct LlmInteraction {
     pub provider_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_previous_response_id: Option<String>,
+    pub traffic_role: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversation_anchors: Vec<LlmConversationAnchor>,
     pub started_at_unix_ns: String,
     pub request_complete_at_unix_ns: String,
     pub first_response_at_unix_ns: String,

@@ -22,9 +22,9 @@ pub use model::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
     CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
     CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
-    EventCaptureDecision, EventTiming, LlmInteraction, LlmInteractionContent,
-    LlmInteractionMessage, LlmInteractionSemanticItem, LlmInteractionToolCall,
-    LlmInteractionToolResult, ProcessContext,
+    EventCaptureDecision, EventTiming, LlmConversationAnchor, LlmInteraction,
+    LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
+    LlmInteractionToolCall, LlmInteractionToolResult, ProcessContext,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
