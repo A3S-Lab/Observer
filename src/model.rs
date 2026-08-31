@@ -372,6 +372,30 @@ pub struct LlmInteractionContent {
     pub structured: Option<serde_json::Value>,
 }
 
+/// Provider-reported token accounting for one completed model exchange. Cached and reasoning
+/// counters are subsets of input/output tokens and must never be added to `total_tokens` again.
+/// `total_tokens` may be the provider field or the exact input + output sum when both provider
+/// components are present.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmTokenUsage {
+    pub source: String,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens_derived: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPlaintextEvidence {
@@ -440,6 +464,8 @@ pub struct LlmInteraction {
     pub time_quality: String,
     pub request: Box<LlmInteractionContent>,
     pub response: Box<LlmInteractionContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LlmTokenUsage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<LlmInteractionToolCall>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

@@ -6,7 +6,7 @@
 
 use a3s_observer::{
     LlmConversationAnchor, LlmInteractionContent, LlmInteractionMessage,
-    LlmInteractionSemanticItem, LlmInteractionToolCall, LlmInteractionToolResult,
+    LlmInteractionSemanticItem, LlmInteractionToolCall, LlmInteractionToolResult, LlmTokenUsage,
 };
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_MAX_CONNECTIONS: usize = 2_048;
 const DEFAULT_MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const DEFAULT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_HEADERS: usize = 96;
 const MAX_SSE_STRUCTURED_EVENTS: usize = 2_048;
 const MAX_EXPORTED_STRUCTURED_BYTES: usize = 512 * 1024;
@@ -87,6 +88,7 @@ pub struct CompletedInteraction {
     pub time_quality: String,
     pub request: LlmInteractionContent,
     pub response: LlmInteractionContent,
+    pub usage: Option<LlmTokenUsage>,
     pub tool_calls: Vec<LlmInteractionToolCall>,
     pub tool_results: Vec<LlmInteractionToolResult>,
     pub semantic_parser_id: String,
@@ -683,6 +685,7 @@ impl WebSocketResponseAccumulator {
 struct WebSocketConnectionState {
     upgrade_requested: bool,
     active: bool,
+    recovered_without_handshake: bool,
     endpoint: String,
     path: String,
     requests: WebSocketFrameDecoder,
@@ -695,6 +698,7 @@ impl WebSocketConnectionState {
         Self {
             upgrade_requested: false,
             active: false,
+            recovered_without_handshake: false,
             endpoint: "unknown".to_string(),
             path: "/v1/responses".to_string(),
             requests: WebSocketFrameDecoder::new(StreamKind::Request, max_bytes),
@@ -717,6 +721,23 @@ impl WebSocketConnectionState {
             extension.contains("server_no_context_takeover"),
         );
         self.active = true;
+        self.recovered_without_handshake = false;
+    }
+
+    fn recover_from_frame(&mut self, data: &[u8]) {
+        let compressed = data.first().is_some_and(|byte| byte & 0x40 != 0);
+        self.requests.configure_compression(compressed, false);
+        self.responses.configure_compression(compressed, false);
+        self.active = true;
+        self.recovered_without_handshake = true;
+    }
+
+    fn prepare_recovered_frame(&mut self, data: &[u8]) {
+        if !self.recovered_without_handshake || !data.first().is_some_and(|byte| byte & 0x40 != 0) {
+            return;
+        }
+        self.requests.compression_enabled = true;
+        self.responses.compression_enabled = true;
     }
 
     fn decoder(&self, direction: ChunkDirection) -> &WebSocketFrameDecoder {
@@ -771,6 +792,16 @@ impl ConnectionState {
     fn idle(&self, now: Instant, timeout: Duration) -> bool {
         now.saturating_duration_since(self.last_activity) >= timeout
     }
+
+    fn quiescent_websocket(&self) -> bool {
+        self.websocket.active
+            && self.pending_requests.is_empty()
+            && self.requests.buffer.is_empty()
+            && self.responses.buffer.is_empty()
+            && self.websocket.requests.buffer.is_empty()
+            && self.websocket.responses.buffer.is_empty()
+            && self.websocket.response.body.is_empty()
+    }
 }
 
 /// Single-writer, bounded reassembler. The Collector owns one instance and feeds reordered
@@ -783,6 +814,7 @@ pub struct InteractionReassembler {
     max_connections: usize,
     max_body_bytes: usize,
     idle_timeout: Duration,
+    websocket_idle_timeout: Duration,
 }
 
 impl Default for InteractionReassembler {
@@ -808,6 +840,7 @@ impl InteractionReassembler {
             max_connections: max_connections.max(1),
             max_body_bytes: max_body_bytes.max(4 * 1024),
             idle_timeout,
+            websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT.max(idle_timeout),
         }
     }
 
@@ -828,6 +861,31 @@ impl InteractionReassembler {
         }
         if state.adapter_id != chunk.adapter_id {
             state.adapter_id = format!("{}+{}", state.adapter_id, chunk.adapter_id);
+        }
+        // Rustls connection objects can be reused after a socket closes. A retained WebSocket
+        // state must yield to an unmistakable fresh HTTP request on the same pointer.
+        if state.websocket.active
+            && chunk.direction == ChunkDirection::Request
+            && looks_like_http_request_prefix(&chunk.data)
+        {
+            *state = ConnectionState::new(
+                self.max_body_bytes,
+                chunk.source.clone(),
+                chunk.adapter_id.clone(),
+            );
+            state.last_activity = Instant::now();
+        }
+        // Collector restarts and long historical idle windows can occur while the Agent keeps a
+        // Responses WebSocket alive. Recover from the first strongly framed client/server data
+        // message instead of requiring the already-past HTTP 101 handshake.
+        if !state.websocket.active
+            && recoverable_websocket_frame_prefix(&chunk.data, chunk.direction)
+        {
+            state.websocket.recover_from_frame(&chunk.data);
+            extend_unique(
+                &mut chunk.partial_reasons,
+                ["websocket_handshake_recovered".to_string()],
+            );
         }
         if let Some(evidence) = plaintext_transport_evidence(key, state, &chunk) {
             if self.pending_evidence.len() >= self.max_connections {
@@ -1073,8 +1131,14 @@ impl InteractionReassembler {
     /// which is worse than explicitly losing the incomplete exchange. Coverage/drop telemetry is
     /// the authority for that missing record; completed evidence is never fabricated.
     pub fn expire_idle(&mut self, now: Instant) {
-        let timeout = self.idle_timeout;
+        let idle_timeout = self.idle_timeout;
+        let websocket_idle_timeout = self.websocket_idle_timeout;
         self.connections.retain(|key, state| {
+            let timeout = if state.quiescent_websocket() {
+                websocket_idle_timeout
+            } else {
+                idle_timeout
+            };
             let retain = !state.idle(now, timeout);
             if !retain && interaction_diagnostics_enabled() {
                 tracing::warn!(
@@ -1147,6 +1211,7 @@ fn process_websocket_chunk(
     chunk: &PlaintextChunk,
     max_body_bytes: usize,
 ) -> Vec<CompletedInteraction> {
+    state.websocket.prepare_recovered_frame(&chunk.data);
     match chunk.direction {
         ChunkDirection::Request => {
             let messages = state.websocket.requests.push(
@@ -1341,6 +1406,10 @@ fn plaintext_transport_evidence(
             ("http/2", "transport_decoder_unavailable")
         } else if looks_like_websocket_upgrade(&chunk.data) {
             ("websocket", "websocket_upgrade_observed")
+        } else if state.websocket.recovered_without_handshake
+            && recoverable_websocket_frame_prefix(&chunk.data, chunk.direction)
+        {
+            ("websocket", "websocket_handshake_recovered")
         } else {
             return None;
         };
@@ -1409,6 +1478,19 @@ fn looks_like_websocket_switching_protocols(data: &[u8]) -> bool {
         || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
 }
 
+fn looks_like_http_request_prefix(data: &[u8]) -> bool {
+    [
+        b"GET ".as_slice(),
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"HEAD ",
+    ]
+    .iter()
+    .any(|prefix| data.starts_with(prefix))
+}
+
 fn websocket_frame_opcode(data: &[u8]) -> Option<u8> {
     let (&first, rest) = data.split_first()?;
     if rest.is_empty() || first & 0x30 != 0 {
@@ -1428,6 +1510,48 @@ fn looks_like_websocket_frame_prefix(data: &[u8]) -> bool {
     let first = data[0];
     let payload_marker = data[1] & 0x7f;
     !matches!(opcode, 0x8..=0xA) || (first & 0x80 != 0 && payload_marker <= 125)
+}
+
+fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) -> bool {
+    if direction != ChunkDirection::Request {
+        return false;
+    }
+    let Some(opcode) = websocket_frame_opcode(data) else {
+        return false;
+    };
+    if !matches!(opcode, 0x1 | 0x2) {
+        return false;
+    }
+    if !data.get(1).is_some_and(|byte| byte & 0x80 != 0) {
+        return false;
+    }
+    // A compressed client data frame is already a strong WebSocket signal. For an uncompressed
+    // frame, require the first unmasked application byte to be JSON so arbitrary TLS payloads do
+    // not consume a long-lived reassembly slot.
+    if data[0] & 0x40 != 0 {
+        return true;
+    }
+    let payload_marker = usize::from(data[1] & 0x7f);
+    let length_bytes = if payload_marker == 126 {
+        2
+    } else if payload_marker == 127 {
+        8
+    } else {
+        0
+    };
+    let mask_offset = 2usize.saturating_add(length_bytes);
+    let Some(mask) = data.get(mask_offset..mask_offset + 4) else {
+        return false;
+    };
+    let payload_offset = mask_offset + 4;
+    data.get(payload_offset..)
+        .into_iter()
+        .flatten()
+        .take(16)
+        .enumerate()
+        .map(|(index, byte)| *byte ^ mask[index % 4])
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| matches!(byte, b'{' | b'['))
 }
 
 fn looks_like_websocket_continuation_prefix(data: &[u8]) -> bool {
@@ -1561,6 +1685,9 @@ fn build_interaction(
         .as_ref()
         .and_then(|value| bounded_provider_id(value.get("previous_response_id")));
     let request_schema_fingerprint = request_json.as_ref().map(schema_fingerprint);
+    let usage = response_structured
+        .as_ref()
+        .and_then(extract_provider_token_usage);
 
     let request_decode_complete = request_decode_reason.is_none();
     let response_decode_complete = response_decode_reason.is_none();
@@ -1818,6 +1945,7 @@ fn build_interaction(
         time_quality: "collector_calibrated".to_string(),
         request: request_content,
         response: response_content,
+        usage,
         tool_calls,
         tool_results,
         semantic_parser_id: SEMANTIC_PARSER_ID.to_string(),
@@ -2988,6 +3116,133 @@ fn extract_response_text(value: &Value) -> Option<String> {
     } else {
         Some(output)
     }
+}
+
+#[derive(Default)]
+struct TokenUsageAccumulator {
+    observed: bool,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    reasoning_output_tokens: Option<u64>,
+}
+
+fn merge_max(target: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *target = Some(target.map_or(value, |current| current.max(value)));
+    }
+}
+
+fn usage_counter(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn merge_usage_object(usage: &Value, output: &mut TokenUsageAccumulator) {
+    let Some(object) = usage.as_object() else {
+        return;
+    };
+    output.observed = true;
+    merge_max(
+        &mut output.input_tokens,
+        usage_counter(usage, &["input_tokens", "prompt_tokens"]),
+    );
+    merge_max(
+        &mut output.output_tokens,
+        usage_counter(usage, &["output_tokens", "completion_tokens"]),
+    );
+    merge_max(
+        &mut output.total_tokens,
+        usage_counter(usage, &["total_tokens"]),
+    );
+    merge_max(
+        &mut output.cached_input_tokens,
+        usage_counter(usage, &["cache_read_input_tokens"]),
+    );
+    merge_max(
+        &mut output.cache_creation_input_tokens,
+        usage_counter(usage, &["cache_creation_input_tokens"]),
+    );
+    for details_key in ["input_tokens_details", "prompt_tokens_details"] {
+        if let Some(details) = object.get(details_key) {
+            merge_max(
+                &mut output.cached_input_tokens,
+                usage_counter(details, &["cached_tokens"]),
+            );
+        }
+    }
+    for details_key in ["output_tokens_details", "completion_tokens_details"] {
+        if let Some(details) = object.get(details_key) {
+            merge_max(
+                &mut output.reasoning_output_tokens,
+                usage_counter(details, &["reasoning_tokens"]),
+            );
+        }
+    }
+}
+
+fn collect_usage_objects(value: &Value, depth: usize, output: &mut TokenUsageAccumulator) {
+    if depth > 16 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object {
+                if key == "usage" {
+                    merge_usage_object(nested, output);
+                }
+                collect_usage_objects(nested, depth + 1, output);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
+                collect_usage_objects(item, depth + 1, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract only provider-reported usage. Streaming providers may repeat cumulative counters in
+/// several events, so each counter is merged by maximum rather than summed. This prevents SSE or
+/// WebSocket event replay from inflating one model call.
+fn extract_provider_token_usage(value: &Value) -> Option<LlmTokenUsage> {
+    let mut usage = TokenUsageAccumulator::default();
+    collect_usage_objects(value, 0, &mut usage);
+    if !usage.observed
+        || (usage.input_tokens.is_none()
+            && usage.output_tokens.is_none()
+            && usage.total_tokens.is_none())
+    {
+        return None;
+    }
+    let derived_total = usage.total_tokens.is_none()
+        && usage.input_tokens.is_some()
+        && usage.output_tokens.is_some();
+    let total_tokens = usage.total_tokens.or_else(|| {
+        usage
+            .input_tokens
+            .zip(usage.output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+    });
+    Some(LlmTokenUsage {
+        source: "provider_reported".to_string(),
+        completeness: if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+            "complete"
+        } else {
+            "partial"
+        }
+        .to_string(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        total_tokens_derived: derived_total,
+    })
 }
 
 fn collect_text_parts(value: Option<&Value>, output: &mut String) {
@@ -4537,6 +4792,126 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].transport_protocol, "websocket");
         assert!(evidence[0].redacted_sample.is_none());
+    }
+
+    #[test]
+    fn quiescent_websocket_survives_the_short_http_idle_timeout() {
+        let mut reassembler =
+            InteractionReassembler::with_limits(8, 64 * 1024, Duration::from_millis(1));
+        let upgrade = b"GET /v1/responses HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Request,
+            upgrade,
+            10,
+            0x5100,
+        ));
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            20,
+            0x5200,
+        ));
+        assert_eq!(reassembler.active_connections(), 1);
+        for state in reassembler.connections.values_mut() {
+            state.last_activity = Instant::now() - Duration::from_secs(1);
+            assert!(state.quiescent_websocket());
+        }
+        reassembler.expire_idle(Instant::now());
+        assert_eq!(reassembler.active_connections(), 1);
+    }
+
+    #[test]
+    fn websocket_frames_recover_after_handshake_state_is_missing() {
+        let mut reassembler = InteractionReassembler::default();
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "RECOVERED_WEBSOCKET_REQUEST"}]}]
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                websocket_frame(request.as_bytes(), true, true, false, 0x1),
+                100,
+                0x6100,
+            ))
+            .is_empty());
+        let evidence = reassembler.take_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].reasons, vec!["websocket_handshake_recovered"]);
+
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "RECOVERED_WEBSOCKET_RESPONSE"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(delta.as_bytes(), false, true, false, 0x1),
+                200,
+                0x6200,
+            ))
+            .is_empty());
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-recovered",
+                "usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "total_tokens": 150,
+                    "input_tokens_details": {"cached_tokens": 40},
+                    "output_tokens_details": {"reasoning_tokens": 12}
+                }
+            }
+        })
+        .to_string();
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(terminal.as_bytes(), false, true, false, 0x1),
+            210,
+            0x6201,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0]
+            .request
+            .body
+            .contains("RECOVERED_WEBSOCKET_REQUEST"));
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("RECOVERED_WEBSOCKET_RESPONSE")
+        );
+        let usage = completed[0].usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.total_tokens, Some(150));
+        assert_eq!(usage.cached_input_tokens, Some(40));
+        assert_eq!(usage.reasoning_output_tokens, Some(12));
+        assert!(!usage.total_tokens_derived);
+    }
+
+    #[test]
+    fn streaming_usage_merges_cumulative_provider_counters_without_summing_events() {
+        let value = serde_json::json!([
+            {"type": "message_start", "message": {"usage": {
+                "input_tokens": 80,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 5
+            }}},
+            {"type": "message_delta", "usage": {"output_tokens": 11}},
+            {"type": "message_delta", "usage": {"output_tokens": 19}}
+        ]);
+        let usage = extract_provider_token_usage(&value).unwrap();
+        assert_eq!(usage.input_tokens, Some(80));
+        assert_eq!(usage.output_tokens, Some(19));
+        assert_eq!(usage.total_tokens, Some(99));
+        assert_eq!(usage.cached_input_tokens, Some(20));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
+        assert!(usage.total_tokens_derived);
+        assert_eq!(usage.completeness, "complete");
     }
 
     #[test]

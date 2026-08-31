@@ -24,7 +24,7 @@ pub use model::{
     CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
     EventCaptureDecision, EventTiming, LlmConversationAnchor, LlmInteraction,
     LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
-    LlmInteractionToolCall, LlmInteractionToolResult, ProcessContext,
+    LlmInteractionToolCall, LlmInteractionToolResult, LlmTokenUsage, ProcessContext,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use traits::{
