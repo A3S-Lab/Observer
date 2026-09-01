@@ -250,6 +250,14 @@ impl TlsAttachManager {
     }
 
     pub fn mark_attach_failed(&mut self, key: String, reason: &str) {
+        // The exported-symbol lane is speculative for interpreter main ELFs. Once the loader has
+        // proved that no complete OpenSSL read/write pair exists, repeating the same symbol lookup
+        // for an immutable inode cannot recover; mapped-library and static-family lanes remain
+        // independent. Path/proc-root and uprobe lifecycle failures stay retryable below.
+        if reason == "no complete OpenSSL read/write pair attached" {
+            self.mark_rejected(key, reason);
+            return;
+        }
         let now = Instant::now();
         let attempts = self
             .attach_failures
@@ -1333,6 +1341,16 @@ mod tests {
         manager.mark_attached(key.clone(), None);
         assert!(manager.attached.contains(&key));
         assert!(!manager.attach_failures.contains_key(&key));
+    }
+
+    #[test]
+    fn deterministic_missing_exported_symbol_pair_is_rejected_once() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:3:ino:4:main-exported-openssl".to_string();
+        manager.mark_attach_failed(key.clone(), "no complete OpenSSL read/write pair attached");
+        assert!(manager.rejected.contains(&key));
+        assert!(!manager.attach_failures.contains_key(&key));
+        assert!(!manager.plan_is_available(&key));
     }
 
     #[test]
