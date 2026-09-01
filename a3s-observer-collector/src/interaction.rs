@@ -1366,7 +1366,7 @@ fn process_websocket_response_messages(
             tool_calls.append(&mut interaction.tool_calls);
             dedup_tool_calls(&mut tool_calls);
             interaction.tool_calls = tool_calls;
-            if !interaction.tool_calls.is_empty() && interaction.tool_results.is_empty() {
+            if has_unmatched_tool_calls(&interaction.tool_calls, &interaction.tool_results) {
                 interaction.conversation_completeness = "tool_pending".to_string();
                 interaction.completeness = "partial".to_string();
                 extend_unique(
@@ -1751,7 +1751,7 @@ fn build_interaction(
     if wire_completeness != "complete" && wire_completeness != "error" {
         extend_unique(&mut partial_reasons, [format!("wire_{wire_completeness}")]);
     }
-    let conversation_completeness = if !tool_calls.is_empty() && tool_results.is_empty() {
+    let conversation_completeness = if has_unmatched_tool_calls(&tool_calls, &tool_results) {
         "tool_pending"
     } else if wire_completeness == "complete" || wire_completeness == "error" {
         "complete"
@@ -1887,6 +1887,7 @@ fn build_interaction(
     }
     let traffic_role = classify_traffic_role(
         wire_match.interaction_kind,
+        wire_match.template_id,
         request_content.structured.as_ref(),
         &request_content.messages,
         &tool_results,
@@ -2495,6 +2496,22 @@ fn match_wire_protocol(
             interaction_kind: WireInteractionKind::Model,
         });
     }
+    if object.get("commands").is_some_and(Value::is_array)
+        && object.get("input").is_some_and(Value::is_array)
+        && object.get("settings").is_some_and(Value::is_object)
+        && object.get("model").and_then(Value::as_str).is_some()
+        && object.get("type").is_none()
+    {
+        // Model-assisted search/tool backends may carry the complete conversation as input, but
+        // they do not implement the Responses lifecycle. Match the reusable wire shape before the
+        // broad `input + model` Responses fallback; URL, product and CLI version remain irrelevant.
+        return Some(WireMatch {
+            template_id: "generic-model-search-backend",
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Model,
+        });
+    }
     if object.get("type").and_then(Value::as_str) == Some("response.create")
         || (object.contains_key("input")
             && (object.contains_key("model")
@@ -2597,6 +2614,11 @@ fn response_matches_wire_template(
             json_has_key(response, "output", 0)
                 || json_has_key(response, "output_text", 0)
                 || (response_is_sse && has_nested_type_prefix(response, "response.", 0))
+        }
+        "generic-model-search-backend" => {
+            response.get("results").is_some()
+                && response.get("output").is_some()
+                && response.get("encrypted_output").is_some()
         }
         "openai-chat-completions" => json_has_key(response, "choices", 0),
         "anthropic-messages" => {
@@ -2943,6 +2965,7 @@ fn control_rpc_method(method: &str) -> bool {
 
 fn classify_traffic_role(
     interaction_kind: WireInteractionKind,
+    template_id: &str,
     request_json: Option<&Value>,
     messages: &[LlmInteractionMessage],
     tool_results: &[LlmInteractionToolResult],
@@ -2959,6 +2982,12 @@ fn classify_traffic_role(
     }
     if interaction_kind != WireInteractionKind::Model {
         return "unclassified";
+    }
+    if template_id == "generic-model-search-backend" {
+        return "tool_backend";
+    }
+    if session_title_request(messages, request_json) {
+        return "derived_metadata";
     }
     // Responses WebSocket prewarm requests can carry resumable session metadata and historical
     // input while explicitly asking the server not to generate a turn. Preserve them as technical
@@ -2986,6 +3015,62 @@ fn classify_traffic_role(
         return "bootstrap";
     }
     "unclassified"
+}
+
+fn value_contains_text(value: &Value, expected: &str, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::String(text) => text.to_ascii_lowercase().contains(expected),
+        Value::Array(items) => items
+            .iter()
+            .take(256)
+            .any(|item| value_contains_text(item, expected, depth + 1)),
+        Value::Object(object) => object.iter().take(256).any(|(key, item)| {
+            key.to_ascii_lowercase().contains(expected)
+                || value_contains_text(item, expected, depth + 1)
+        }),
+        _ => false,
+    }
+}
+
+fn session_title_request(messages: &[LlmInteractionMessage], request_json: Option<&Value>) -> bool {
+    let wrapped_session = messages.iter().any(|message| {
+        message.message_origin.as_deref() == Some("human_input")
+            && value_contains_text(&message.content, "<session>", 0)
+            && value_contains_text(&message.content, "</session>", 0)
+    });
+    if !wrapped_session {
+        return false;
+    }
+    let title_instruction = messages.iter().any(|message| {
+        message.message_origin.as_deref() == Some("developer_instruction")
+            && value_contains_text(&message.content, "title", 0)
+            && value_contains_text(&message.content, "<session>", 0)
+            && (value_contains_text(&message.content, "return json", 0)
+                || value_contains_text(&message.content, "single \"title\" field", 0))
+    });
+    title_instruction
+        || request_json
+            .and_then(|request| request.get("output_config"))
+            .is_some_and(|config| value_contains_text(config, "title", 0))
+}
+
+fn has_unmatched_tool_calls(
+    tool_calls: &[LlmInteractionToolCall],
+    tool_results: &[LlmInteractionToolResult],
+) -> bool {
+    if tool_calls.is_empty() {
+        return false;
+    }
+    let result_ids = tool_results
+        .iter()
+        .map(|result| result.tool_call_id.as_str())
+        .collect::<HashSet<_>>();
+    tool_calls
+        .iter()
+        .any(|call| !result_ids.contains(call.tool_call_id.as_str()))
 }
 
 fn extract_provider_response_id(value: &Value) -> Option<String> {
@@ -4451,6 +4536,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(matched.template_id, "openai-chat-completions");
+    }
+
+    #[test]
+    fn model_search_backend_shape_is_technical_without_a_url_or_product_gate() {
+        let request_body = r#"{
+          "id":"search-request",
+          "model":"fixture-model",
+          "commands":[{"name":"search","arguments":{"query":"fixture"}}],
+          "input":[{"role":"user","content":"conversation history copied by the backend"}],
+          "settings":{"mode":"balanced"},
+          "max_output_tokens":128
+        }"#;
+        let response_body = r#"{
+          "encrypted_output":"opaque-fixture",
+          "output":[],
+          "results":[{"title":"fixture result"}]
+        }"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/arbitrary/model-assisted-operation",
+                "changed-gateway.invalid",
+                request_body,
+            ),
+            10,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            20,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "model");
+        assert_eq!(interaction.traffic_role, "tool_backend");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("generic-model-search-backend")
+        );
+        assert_eq!(interaction.provider_response_id, None);
+        assert_eq!(interaction.path, "/arbitrary/model-assisted-operation");
+    }
+
+    #[test]
+    fn anthropic_session_title_request_is_derived_metadata() {
+        let request_body = r#"{
+          "model":"fixture-model",
+          "max_tokens":64,
+          "system":[{
+            "type":"text",
+            "text":"Generate a concise title. The session content is provided inside <session> tags. Return JSON with a single \"title\" field."
+          }],
+          "messages":[{
+            "role":"user",
+            "content":[{"type":"text","text":"<session>debug the fixture</session>"}]
+          }],
+          "output_config":{"format":{"type":"json_schema","schema":{"properties":{"title":{"type":"string"}}}}}
+        }"#;
+        let response_body = r#"{
+          "id":"message-title-fixture",
+          "type":"message",
+          "role":"assistant",
+          "content":[{"type":"text","text":"{\"title\":\"Debug fixture\"}"}],
+          "stop_reason":"end_turn"
+        }"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/arbitrary/messages",
+                "changed-gateway.invalid",
+                request_body,
+            ),
+            10,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            20,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.traffic_role, "derived_metadata");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("anthropic-messages")
+        );
+        assert_eq!(
+            interaction.response.text.as_deref(),
+            Some("{\"title\":\"Debug fixture\"}")
+        );
+    }
+
+    #[test]
+    fn an_old_tool_result_does_not_complete_a_new_tool_call() {
+        let request_body = r#"{
+          "type":"response.create",
+          "model":"fixture-model",
+          "input":[
+            {"type":"function_call_output","call_id":"call-old","output":"old result"},
+            {"type":"message","role":"user","content":"run the next command"}
+          ]
+        }"#;
+        let response_body = r#"{
+          "id":"resp-new-call",
+          "object":"response",
+          "status":"completed",
+          "output":[{
+            "type":"function_call",
+            "call_id":"call-new",
+            "name":"shell",
+            "arguments":"{\"cmd\":\"pwd\"}"
+          }]
+        }"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/arbitrary/responses",
+                "changed-gateway.invalid",
+                request_body,
+            ),
+            10,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            20,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.tool_results[0].tool_call_id, "call-old");
+        assert_eq!(interaction.tool_calls[0].tool_call_id, "call-new");
+        assert_eq!(interaction.conversation_completeness, "tool_pending");
+        assert_eq!(interaction.completeness, "partial");
     }
 
     #[test]
