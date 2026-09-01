@@ -12,12 +12,18 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const SIGNATURE_FAMILY_DOCUMENT: &str = include_str!("tls-signature-families.json");
 const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
 const MAX_ANCHOR_MATCHES: usize = 128;
 const MAX_STATIC_CANDIDATES_PER_FAMILY: usize = 4;
+const MAX_STABLE_MOUNT_ROOTS: usize = 1_024;
+const MAX_ATTACH_FAILURES: usize = 4_096;
+const MAX_PROC_NAMESPACE_SCAN: usize = 32_768;
+const ATTACH_RETRY_DELAYS_MS: [u64; 10] =
+    [25, 50, 100, 200, 400, 800, 1_600, 5_000, 15_000, 30_000];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TlsAbi {
@@ -98,12 +104,21 @@ struct StaticDiscoveryMatch {
 }
 
 #[derive(Debug)]
+struct AttachFailure {
+    attempts: usize,
+    next_retry_at: Instant,
+    last_failed_at: Instant,
+}
+
+#[derive(Debug)]
 pub struct TlsAttachManager {
     attached: HashSet<String>,
     rejected: HashSet<String>,
+    attach_failures: HashMap<String, AttachFailure>,
     verified_processes: HashMap<i32, RuntimeRole>,
     scope_verified_processes: HashSet<i32>,
     static_discovery_cache: HashMap<(u64, u64), Vec<StaticDiscoveryMatch>>,
+    stable_mount_roots: HashMap<u64, i32>,
     process_patterns: Vec<String>,
     static_targets: Vec<PathBuf>,
     explicit_target: Option<PathBuf>,
@@ -149,9 +164,11 @@ impl TlsAttachManager {
         Self {
             attached: HashSet::new(),
             rejected: HashSet::new(),
+            attach_failures: HashMap::new(),
             verified_processes: HashMap::new(),
             scope_verified_processes: HashSet::new(),
             static_discovery_cache: HashMap::new(),
+            stable_mount_roots: HashMap::new(),
             process_patterns,
             static_targets,
             explicit_target,
@@ -195,11 +212,7 @@ impl TlsAttachManager {
         }
         self.verified_processes = verified_processes;
         let mut seen = HashSet::new();
-        plans.retain(|plan| {
-            !self.attached.contains(&plan.key)
-                && !self.rejected.contains(&plan.key)
-                && seen.insert(plan.key.clone())
-        });
+        plans.retain(|plan| self.plan_is_available(&plan.key) && seen.insert(plan.key.clone()));
         plans
     }
 
@@ -211,7 +224,7 @@ impl TlsAttachManager {
         self.verified_processes.insert(pid, runtime_role);
         self.plans_for_process(pid, runtime_role)
             .into_iter()
-            .filter(|plan| !self.attached.contains(&plan.key) && !self.rejected.contains(&plan.key))
+            .filter(|plan| self.plan_is_available(&plan.key))
             .collect()
     }
 
@@ -227,12 +240,51 @@ impl TlsAttachManager {
         self.verified_processes.insert(pid, runtime_role);
         self.plans_for_process(pid, runtime_role)
             .into_iter()
-            .filter(|plan| !self.attached.contains(&plan.key) && !self.rejected.contains(&plan.key))
+            .filter(|plan| self.plan_is_available(&plan.key))
             .collect()
     }
 
     pub fn mark_attached(&mut self, key: String, _pid: Option<i32>) {
+        self.attach_failures.remove(&key);
         self.attached.insert(key);
+    }
+
+    pub fn mark_attach_failed(&mut self, key: String, reason: &str) {
+        let now = Instant::now();
+        let attempts = self
+            .attach_failures
+            .get(&key)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let delay_index = attempts
+            .saturating_sub(1)
+            .min(ATTACH_RETRY_DELAYS_MS.len() - 1);
+        if !self.attach_failures.contains_key(&key)
+            && self.attach_failures.len() >= MAX_ATTACH_FAILURES
+        {
+            if let Some(oldest) = self
+                .attach_failures
+                .iter()
+                .min_by_key(|(_, failure)| failure.last_failed_at)
+                .map(|(failure_key, _)| failure_key.clone())
+            {
+                self.attach_failures.remove(&oldest);
+            }
+        }
+        self.attach_failures.insert(
+            key.clone(),
+            AttachFailure {
+                attempts,
+                next_retry_at: now + Duration::from_millis(ATTACH_RETRY_DELAYS_MS[delay_index]),
+                last_failed_at: now,
+            },
+        );
+        tracing::warn!(
+            target = %key,
+            reason,
+            attempts,
+            retry_ms = ATTACH_RETRY_DELAYS_MS[delay_index],
+            "TLS target attach failed; bounded retry remains eligible"
+        );
     }
 
     pub fn mark_rejected(&mut self, key: String, reason: &str) {
@@ -243,6 +295,15 @@ impl TlsAttachManager {
 
     pub fn attached_count(&self) -> usize {
         self.attached.len()
+    }
+
+    fn plan_is_available(&self, key: &str) -> bool {
+        !self.attached.contains(key)
+            && !self.rejected.contains(key)
+            && self
+                .attach_failures
+                .get(key)
+                .is_none_or(|failure| failure.next_retry_at <= Instant::now())
     }
 
     /// Replace the product-neutral Agent Scope membership published by the co-located identity
@@ -353,9 +414,9 @@ impl TlsAttachManager {
                 metadata.dev(),
                 metadata.ino()
             );
-            let stable_path =
-                stable_executable_probe_path(pid, &rooted, Path::new(mapped), &metadata)
-                    .unwrap_or(rooted);
+            let stable_path = self
+                .stable_executable_probe_path(pid, &rooted, Path::new(mapped), &metadata)
+                .unwrap_or(rooted);
             plans.push(TlsAttachPlan {
                 key,
                 pid: None,
@@ -387,7 +448,8 @@ impl TlsAttachManager {
         let identity = format!("pid:{pid}:dev:{}:ino:{}", metadata.dev(), metadata.ino());
         let mut plans = Vec::new();
         let cache_key = (metadata.dev(), metadata.ino());
-        let static_probe_path = stable_executable_probe_path(pid, probe_path, real_exe, &metadata)
+        let static_probe_path = self
+            .stable_executable_probe_path(pid, probe_path, real_exe, &metadata)
             .unwrap_or_else(|| probe_path.to_path_buf());
         let static_matches = if is_interpreter_or_shell(&basename) {
             Vec::new()
@@ -443,6 +505,43 @@ impl TlsAttachManager {
             );
         }
         plans
+    }
+
+    fn stable_executable_probe_path(
+        &mut self,
+        pid: i32,
+        probe_path: &Path,
+        real_exe: &Path,
+        expected: &fs::Metadata,
+    ) -> Option<PathBuf> {
+        if real_exe.is_absolute() && same_file_identity(real_exe, expected) {
+            return Some(real_exe.to_path_buf());
+        }
+        let relative = real_exe.strip_prefix("/").ok()?;
+        let mount_namespace = fs::metadata(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|metadata| metadata.ino());
+        if let Some(namespace) = mount_namespace {
+            if let Some(root_pid) = self.stable_mount_roots.get(&namespace).copied() {
+                let rooted = PathBuf::from(format!("/proc/{root_pid}/root")).join(relative);
+                if same_file_identity(&rooted, expected) {
+                    return Some(rooted);
+                }
+                self.stable_mount_roots.remove(&namespace);
+            }
+            if let Some(root_pid) = stable_mount_namespace_root(pid, relative, expected) {
+                if !self.stable_mount_roots.contains_key(&namespace)
+                    && self.stable_mount_roots.len() >= MAX_STABLE_MOUNT_ROOTS
+                {
+                    if let Some(oldest_namespace) = self.stable_mount_roots.keys().next().copied() {
+                        self.stable_mount_roots.remove(&oldest_namespace);
+                    }
+                }
+                self.stable_mount_roots.insert(namespace, root_pid);
+                return Some(PathBuf::from(format!("/proc/{root_pid}/root")).join(relative));
+            }
+        }
+        stable_executable_probe_path(pid, probe_path, real_exe, expected)
     }
 
     fn plans_for_static_target(&mut self, path: PathBuf) -> Vec<TlsAttachPlan> {
@@ -593,24 +692,19 @@ fn stable_executable_probe_path(
     real_exe: &Path,
     expected: &fs::Metadata,
 ) -> Option<PathBuf> {
-    let same_inode = |path: &Path| {
-        fs::metadata(path).ok().is_some_and(|metadata| {
-            metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
-        })
-    };
-    if real_exe.is_absolute() && same_inode(real_exe) {
+    if real_exe.is_absolute() && same_file_identity(real_exe, expected) {
         return Some(real_exe.to_path_buf());
     }
 
     let relative = real_exe.strip_prefix("/").ok()?;
     let mut current = pid;
-    let mut stable = same_inode(probe_path).then(|| probe_path.to_path_buf());
+    let mut stable = same_file_identity(probe_path, expected).then(|| probe_path.to_path_buf());
     for _ in 0..12 {
         if current <= 1 {
             break;
         }
         let rooted = PathBuf::from(format!("/proc/{current}/root")).join(relative);
-        if same_inode(&rooted) {
+        if same_file_identity(&rooted, expected) {
             stable = Some(rooted);
         }
         let Some(parent) = process_parent_pid(current) else {
@@ -622,6 +716,41 @@ fn stable_executable_probe_path(
         current = parent;
     }
     stable
+}
+
+fn same_file_identity(path: &Path, expected: &fs::Metadata) -> bool {
+    fs::metadata(path).ok().is_some_and(|metadata| {
+        metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
+    })
+}
+
+/// Find the longest-lived `/proc/<pid>/root` in the same mount namespace that still resolves the
+/// exact executable inode. Container exec processes are often siblings of PID 1 rather than its
+/// descendants, so ancestry alone cannot yield a stable global-uprobe target. The smallest host
+/// PID in one mount namespace is the best bounded proxy for its init process.
+fn stable_mount_namespace_root(
+    pid: i32,
+    executable_relative_path: &Path,
+    expected: &fs::Metadata,
+) -> Option<i32> {
+    let namespace_inode = fs::metadata(format!("/proc/{pid}/ns/mnt")).ok()?.ino();
+    let entries = fs::read_dir("/proc").ok()?;
+    entries
+        .flatten()
+        .take(MAX_PROC_NAMESPACE_SCAN)
+        .filter_map(|entry| {
+            let candidate = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let candidate_namespace = fs::metadata(format!("/proc/{candidate}/ns/mnt"))
+                .ok()?
+                .ino();
+            if candidate_namespace != namespace_inode {
+                return None;
+            }
+            let rooted =
+                PathBuf::from(format!("/proc/{candidate}/root")).join(executable_relative_path);
+            same_file_identity(&rooted, expected).then_some(candidate)
+        })
+        .min()
 }
 
 fn ancestor_contains_pattern(pid: i32, pattern: &str) -> bool {
@@ -1176,6 +1305,34 @@ mod tests {
         let ranges = executable_file_ranges(&path).unwrap();
         assert!(!ranges.is_empty());
         assert!(ranges.iter().all(|(start, end)| start < end));
+    }
+
+    #[test]
+    fn mount_namespace_root_keeps_a_stable_exact_inode_path() {
+        let path = std::env::current_exe().unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let relative = path.strip_prefix("/").unwrap();
+        let root_pid = stable_mount_namespace_root(std::process::id() as i32, relative, &metadata)
+            .expect("the current mount namespace must expose its own executable inode");
+        let rooted = PathBuf::from(format!("/proc/{root_pid}/root")).join(relative);
+        assert!(same_file_identity(&rooted, &metadata));
+        assert!(root_pid > 0);
+    }
+
+    #[test]
+    fn attach_failure_is_backed_off_but_never_permanently_rejected() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:1:ino:2:static-family:test".to_string();
+        assert!(manager.plan_is_available(&key));
+        manager.mark_attach_failed(key.clone(), "transient proc-root race");
+        assert!(!manager.plan_is_available(&key));
+        assert!(!manager.rejected.contains(&key));
+        manager.attach_failures.get_mut(&key).unwrap().next_retry_at =
+            Instant::now() - Duration::from_millis(1);
+        assert!(manager.plan_is_available(&key));
+        manager.mark_attached(key.clone(), None);
+        assert!(manager.attached.contains(&key));
+        assert!(!manager.attach_failures.contains_key(&key));
     }
 
     #[test]

@@ -2789,7 +2789,7 @@ fn attach_tls_plans(
                 );
                 manager.mark_attached(plan.key, plan.pid);
             }
-            Err(error) => manager.mark_rejected(plan.key, &error.to_string()),
+            Err(error) => manager.mark_attach_failed(plan.key, &error.to_string()),
         }
     }
     match verified_process_map.sync(manager.verified_pids()) {
