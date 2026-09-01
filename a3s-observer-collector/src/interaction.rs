@@ -79,6 +79,10 @@ pub struct CompletedInteraction {
     pub provider_response_id: Option<String>,
     pub provider_previous_response_id: Option<String>,
     pub traffic_role: String,
+    pub trace_id: Option<String>,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub invocation_id: Option<String>,
     pub conversation_anchors: Vec<LlmConversationAnchor>,
     pub started_at_unix_ns: String,
     pub request_complete_at_unix_ns: String,
@@ -1646,7 +1650,7 @@ fn build_interaction(
         .content_type()
         .eq_ignore_ascii_case("text/event-stream")
         || looks_like_sse(&response_body);
-    let (response_structured, response_text, mut tool_calls) = if response_is_sse {
+    let (response_structured, mut response_text, mut tool_calls) = if response_is_sse {
         normalize_sse_response(&response_body, response.completed_at_unix_ns)
     } else {
         let structured = parse_json_body(&response_body);
@@ -1673,12 +1677,27 @@ fn build_interaction(
         };
         tool_calls.clear();
     }
+    let structured_output_final = request_json
+        .as_ref()
+        .and_then(|request| forced_structured_output(request, &tool_calls))
+        .map(|(is_final, text)| {
+            response_text = Some(text);
+            tool_calls.clear();
+            is_final
+        });
     let tool_route = wire_match.interaction_kind == WireInteractionKind::Tool;
 
-    let messages = request_json
+    let mut messages = request_json
         .as_ref()
         .map(extract_request_messages)
         .unwrap_or_default();
+    if structured_output_final.is_some() && request.header("x-anysentry-run-id").is_some() {
+        for message in &mut messages {
+            if framework_orchestration_prompt(&message.content) {
+                message.message_origin = Some("agent_context".to_string());
+            }
+        }
+    }
     let mut tool_results = request_json
         .as_ref()
         .map(|value| extract_tool_results(value, request.completed_at_unix_ns))
@@ -1711,6 +1730,13 @@ fn build_interaction(
     let provider_previous_response_id = request_json
         .as_ref()
         .and_then(|value| bounded_provider_id(value.get("previous_response_id")));
+    // Retain only explicit correlation headers. Authorization, cookies and every other HTTP
+    // header remain outside the exported plaintext-content contract.
+    let trace_id = trace_id_from_traceparent(&request);
+    let run_id = bounded_correlation_header(&request, "x-anysentry-run-id");
+    let session_id = bounded_correlation_header(&request, "x-anysentry-session-id");
+    let invocation_id = bounded_correlation_header(&request, "x-anysentry-invocation-id")
+        .or_else(|| run_id.clone());
     let request_schema_fingerprint = request_json.as_ref().map(schema_fingerprint);
     let usage = response_structured
         .as_ref()
@@ -1812,6 +1838,12 @@ fn build_interaction(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
                     .or_else(|| {
+                        rpc_response
+                            .and_then(|value| value.get("execution_id"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .or_else(|| {
                         rpc_request
                             .and_then(|value| value.get("id"))
                             .map(json_scalar_id)
@@ -1821,7 +1853,13 @@ fn build_interaction(
                 let name = rpc_request
                     .and_then(|value| value.get("name").or_else(|| value.get("tool")))
                     .and_then(Value::as_str)
-                    .unwrap_or("http.request")
+                    .unwrap_or_else(|| {
+                        if rpc_request.is_some_and(|value| value.get("code").is_some()) {
+                            "http.code.execute"
+                        } else {
+                            "http.request"
+                        }
+                    })
                     .to_string();
                 let arguments = rpc_request.cloned().unwrap_or(Value::Null);
                 let result = rpc_response
@@ -1836,6 +1874,11 @@ fn build_interaction(
                     .unwrap_or(Value::Null);
                 let response_error = rpc_response.is_some_and(|value| {
                     value.get("error").is_some()
+                        || value
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .is_some_and(|code| code != 0)
+                        || value.get("timed_out").and_then(Value::as_bool) == Some(true)
                         || matches!(
                             value.get("status").and_then(Value::as_str),
                             Some("failed" | "error")
@@ -1885,13 +1928,17 @@ fn build_interaction(
             observed_at_unix_ns: Some(response.completed_at_unix_ns.to_string()),
         }];
     }
-    let traffic_role = classify_traffic_role(
-        wire_match.interaction_kind,
-        wire_match.template_id,
-        request_content.structured.as_ref(),
-        &request_content.messages,
-        &tool_results,
-    )
+    let traffic_role = if run_id.is_some() && structured_output_final.is_some() {
+        "conversation"
+    } else {
+        classify_traffic_role(
+            wire_match.interaction_kind,
+            wire_match.template_id,
+            request_content.structured.as_ref(),
+            &request_content.messages,
+            &tool_results,
+        )
+    }
     .to_string();
     let conversation_anchors = extract_conversation_anchors(
         request_content.structured.as_ref(),
@@ -1911,6 +1958,7 @@ fn build_interaction(
         response_content.text.as_deref(),
         &tool_calls,
         &tool_results,
+        structured_output_final,
         [
             request.started_at_unix_ns,
             response.started_at_unix_ns,
@@ -1964,6 +2012,10 @@ fn build_interaction(
         provider_response_id,
         provider_previous_response_id,
         traffic_role,
+        trace_id,
+        run_id,
+        session_id,
+        invocation_id,
         conversation_anchors,
         started_at_unix_ns: request.started_at_unix_ns.to_string(),
         request_complete_at_unix_ns: request.completed_at_unix_ns.to_string(),
@@ -1991,6 +2043,7 @@ fn build_semantic_items(
     response_text: Option<&str>,
     tool_calls: &[LlmInteractionToolCall],
     tool_results: &[LlmInteractionToolResult],
+    structured_output_final: Option<bool>,
     times: [u128; 3],
 ) -> Vec<LlmInteractionSemanticItem> {
     let [request_at_unix_ns, first_response_at_unix_ns, response_at_unix_ns] = times;
@@ -2081,18 +2134,15 @@ fn build_semantic_items(
     }
 
     if let Some(text) = response_text.filter(|text| !text.trim().is_empty()) {
+        let model_final = structured_output_final.unwrap_or(tool_calls.is_empty());
         push(
             "model",
-            if tool_calls.is_empty() {
+            if model_final {
                 "model_final"
             } else {
                 "model_progress"
             },
-            Some(if tool_calls.is_empty() {
-                "final"
-            } else {
-                "progress"
-            }),
+            Some(if model_final { "final" } else { "progress" }),
             "response",
             first_response_at_unix_ns.to_string(),
             Some(Value::String(text.to_string())),
@@ -2451,6 +2501,34 @@ fn response_status(start_line: &str) -> Option<u16> {
     start_line.split_whitespace().nth(1)?.parse().ok()
 }
 
+fn bounded_correlation_header(message: &HttpMessage, name: &str) -> Option<String> {
+    let value = message.header(name)?.trim();
+    (!value.is_empty() && value.len() <= 512 && !value.bytes().any(|byte| byte.is_ascii_control()))
+        .then(|| value.to_string())
+}
+
+fn trace_id_from_traceparent(message: &HttpMessage) -> Option<String> {
+    let traceparent = bounded_correlation_header(message, "traceparent")?;
+    let mut fields = traceparent.split('-');
+    let version = fields.next()?;
+    let trace_id = fields.next()?;
+    let parent_id = fields.next()?;
+    let flags = fields.next()?;
+    if fields.next().is_some()
+        || version.len() != 2
+        || trace_id.len() != 32
+        || parent_id.len() != 16
+        || flags.len() != 2
+        || trace_id.bytes().all(|byte| byte == b'0')
+        || parent_id.bytes().all(|byte| byte == b'0')
+        || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !parent_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(trace_id.to_ascii_lowercase())
+}
+
 fn match_wire_protocol(
     method: &str,
     headers: &BTreeMap<String, String>,
@@ -2480,6 +2558,18 @@ fn match_wire_protocol(
         && (object.contains_key("requested_by")
             || object.contains_key("tool")
             || object.contains_key("name"))
+    {
+        return Some(WireMatch {
+            template_id: "generic-http-tool",
+            likelihood: "likely",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Tool,
+        });
+    }
+    if object.get("code").and_then(Value::as_str).is_some()
+        && (object.contains_key("timeout_ms")
+            || object.contains_key("language")
+            || object.contains_key("runtime"))
     {
         return Some(WireMatch {
             template_id: "generic-http-tool",
@@ -2602,13 +2692,19 @@ fn response_matches_wire_template(
                 && (response.get("result").is_some() || response.get("error").is_some())
         }
         "generic-http-tool" => {
-            response
+            (response
                 .get("tool_call_id")
                 .and_then(Value::as_str)
                 .is_some()
                 && (response.get("result").is_some()
                     || response.get("output").is_some()
-                    || response.get("error").is_some())
+                    || response.get("error").is_some()))
+                || (response
+                    .get("execution_id")
+                    .and_then(Value::as_str)
+                    .is_some()
+                    && response.get("exit_code").and_then(Value::as_i64).is_some()
+                    && (response.get("stdout").is_some() || response.get("stderr").is_some()))
         }
         "openai-responses" => {
             json_has_key(response, "output", 0)
@@ -3404,6 +3500,64 @@ fn collect_text_parts(value: Option<&Value>, output: &mut String) {
     }
 }
 
+fn forced_structured_output(
+    request: &Value,
+    calls: &[LlmInteractionToolCall],
+) -> Option<(bool, String)> {
+    if calls.len() != 1 {
+        return None;
+    }
+    let forced_name = request
+        .get("tool_choice")?
+        .get("function")?
+        .get("name")?
+        .as_str()?;
+    let tools = request.get("tools")?.as_array()?;
+    if tools.len() != 1 {
+        return None;
+    }
+    let declared_name = tools[0].get("function")?.get("name")?.as_str()?;
+    let call = &calls[0];
+    if forced_name != declared_name || call.name != forced_name {
+        return None;
+    }
+    let normalized_name = forced_name.to_ascii_lowercase();
+    let is_final = normalized_name.contains("final")
+        || normalized_name.ends_with("answer")
+        || normalized_name.ends_with("report");
+    let text = if is_final {
+        call.arguments
+            .get("answer")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| call.arguments.to_string())
+    } else {
+        call.arguments.to_string()
+    };
+    Some((is_final, text))
+}
+
+fn framework_orchestration_prompt(content: &Value) -> bool {
+    let Some(text) = content.as_str() else {
+        return false;
+    };
+    [
+        "Plan card:\n",
+        "Acceptance criteria:\n",
+        "Verifier feedback",
+        "Sandbox stdout:\n",
+        "Sandbox exit code:",
+        "Verification:\n",
+        "Code explanation:\n",
+        "Expected output:\n",
+    ]
+    .iter()
+    .filter(|marker| text.contains(**marker))
+    .take(2)
+    .count()
+        >= 2
+}
+
 fn extract_tool_calls(value: &Value, issued_at_unix_ns: u128) -> Vec<LlmInteractionToolCall> {
     let mut calls = Vec::new();
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
@@ -4065,6 +4219,15 @@ mod tests {
         .into_bytes()
     }
 
+    fn correlated_http_request(path: &str, host: &str, body: &str) -> Vec<u8> {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer must-not-export\r\nContent-Type: application/json\r\ntraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nx-anysentry-run-id: run-fixture-1\r\nx-anysentry-session-id: session-fixture-1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
     fn rustls_chunk_on(
         direction: ChunkDirection,
         data: impl Into<Vec<u8>>,
@@ -4512,6 +4675,115 @@ mod tests {
             interaction.tool_results[0].observed_at_unix_ns.as_deref(),
             Some("200")
         );
+    }
+
+    #[test]
+    fn code_sandbox_http_shape_emits_correlated_tool_call_and_result() {
+        let request_body = r#"{"code":"print('fixture')","timeout_ms":4000}"#;
+        let response_body = r#"{"execution_id":"sandbox-exec-1","exit_code":0,"stdout":"fixture\n","stderr":"","timed_out":false}"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            correlated_http_request("/execute", "python-sandbox:8080", request_body),
+            100,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "tool");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("generic-http-tool")
+        );
+        assert_eq!(
+            interaction.trace_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(interaction.run_id.as_deref(), Some("run-fixture-1"));
+        assert_eq!(interaction.session_id.as_deref(), Some("session-fixture-1"));
+        assert_eq!(interaction.invocation_id.as_deref(), Some("run-fixture-1"));
+        assert_eq!(interaction.tool_calls[0].tool_call_id, "sandbox-exec-1");
+        assert_eq!(interaction.tool_calls[0].name, "http.code.execute");
+        assert_eq!(interaction.tool_calls[0].arguments["timeout_ms"], 4000);
+        assert_eq!(interaction.tool_results[0].content["stdout"], "fixture\n");
+        assert!(!interaction.tool_results[0].is_error);
+        assert!(!interaction.request.body.contains("must-not-export"));
+    }
+
+    #[test]
+    fn forced_single_function_schema_is_model_output_not_a_real_tool() {
+        let progress_request = r#"{
+          "model":"fixture-model",
+          "messages":[{"role":"user","content":"User goal:\ncreate a plan"}],
+          "tools":[{"type":"function","function":{"name":"PlanCard","parameters":{"type":"object"}}}],
+          "tool_choice":{"type":"function","function":{"name":"PlanCard"}}
+        }"#;
+        let progress_response = r#"{
+          "choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"tool_calls":[{
+            "id":"call-plan","type":"function","function":{"name":"PlanCard","arguments":"{\"title\":\"fixture plan\"}"}
+          }]}}]
+        }"#;
+        let mut progress = InteractionReassembler::default();
+        progress.push(chunk(
+            ChunkDirection::Request,
+            correlated_http_request("/v1/chat/completions", "model-gateway", progress_request),
+            100,
+        ));
+        let completed = progress.push(chunk(
+            ChunkDirection::Response,
+            http_response(progress_response),
+            200,
+        ));
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert!(interaction.tool_calls.is_empty());
+        assert_eq!(interaction.conversation_completeness, "complete");
+        assert_eq!(interaction.traffic_role, "conversation");
+        assert_eq!(interaction.semantic_items.len(), 2);
+        assert_eq!(interaction.semantic_items[0].kind, "user_message");
+        assert_eq!(interaction.semantic_items[1].kind, "model_progress");
+        assert_eq!(
+            interaction.response.text.as_deref(),
+            Some("{\"title\":\"fixture plan\"}")
+        );
+
+        let final_request = r#"{
+          "model":"fixture-model",
+          "messages":[{"role":"user","content":"Goal:\nfixture\n\nPlan card:\n{}\n\nSandbox stdout:\nfixture"}],
+          "tools":[{"type":"function","function":{"name":"FinalReport","parameters":{"type":"object"}}}],
+          "tool_choice":{"type":"function","function":{"name":"FinalReport"}}
+        }"#;
+        let final_response = r#"{
+          "choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"tool_calls":[{
+            "id":"call-final","type":"function","function":{"name":"FinalReport","arguments":"{\"answer\":\"fixture final\"}"}
+          }]}}]
+        }"#;
+        let mut final_reassembler = InteractionReassembler::default();
+        final_reassembler.push(chunk(
+            ChunkDirection::Request,
+            correlated_http_request("/v1/chat/completions", "model-gateway", final_request),
+            300,
+        ));
+        let completed = final_reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(final_response),
+            400,
+        ));
+        let interaction = &completed[0];
+        assert_eq!(
+            interaction.request.messages[0].message_origin.as_deref(),
+            Some("agent_context")
+        );
+        assert!(interaction.tool_calls.is_empty());
+        assert_eq!(interaction.semantic_items.len(), 1);
+        assert_eq!(interaction.semantic_items[0].actor, "model");
+        assert_eq!(interaction.semantic_items[0].kind, "model_final");
+        assert_eq!(interaction.response.text.as_deref(), Some("fixture final"));
     }
 
     #[test]
