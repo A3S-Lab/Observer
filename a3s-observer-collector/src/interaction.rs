@@ -771,10 +771,16 @@ struct ConnectionState {
     evidence_fingerprints: HashSet<String>,
     websocket: WebSocketConnectionState,
     last_activity: Instant,
+    // WebSocket ping/pong traffic proves that a connection is alive, but it does not prove that
+    // the next Rustls application pointer belongs to that connection. Keep data recency separate
+    // so an idle older Codex stream cannot steal a resumed Thread's next request merely because it
+    // received the latest control frame.
+    last_data_activity: Instant,
 }
 
 impl ConnectionState {
     fn new(max_body_bytes: usize, source: String, adapter_id: String) -> Self {
+        let now = Instant::now();
         Self {
             requests: HttpStreamDecoder::new(StreamKind::Request, max_body_bytes),
             responses: HttpStreamDecoder::new(StreamKind::Response, max_body_bytes),
@@ -785,7 +791,8 @@ impl ConnectionState {
             adapter_id,
             evidence_fingerprints: HashSet::new(),
             websocket: WebSocketConnectionState::new(max_body_bytes),
-            last_activity: Instant::now(),
+            last_activity: now,
+            last_data_activity: now,
         }
     }
 
@@ -847,6 +854,15 @@ impl InteractionReassembler {
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
         self.evict_if_needed();
         let observed_key = ConnectionKey::from(&chunk);
+        let orphan_control_frame = is_websocket_control_frame(&chunk.data)
+            && !self.connections.contains_key(&observed_key)
+            && !self.connection_aliases.contains_key(&observed_key);
+        // A moved Rustls pointer carrying only ping/pong/close bytes has no application identity.
+        // Ignoring it is lossless for the Agent transcript and avoids creating a false standalone
+        // state that could capture a later data frame if the allocator reuses that pointer.
+        if orphan_control_frame {
+            return Vec::new();
+        }
         let key = self.resolve_connection_key(&chunk);
         let state = self.connections.entry(key).or_insert_with(|| {
             ConnectionState::new(
@@ -855,7 +871,11 @@ impl InteractionReassembler {
                 chunk.adapter_id.clone(),
             )
         });
-        state.last_activity = Instant::now();
+        let now = Instant::now();
+        state.last_activity = now;
+        if !is_websocket_control_frame(&chunk.data) {
+            state.last_data_activity = now;
+        }
         if state.source != chunk.source {
             state.source = format!("{}+{}", state.source, chunk.source);
         }
@@ -1054,7 +1074,9 @@ impl InteractionReassembler {
                 self.unique_websocket_connection(observed, |state| {
                     state.websocket.upgrade_requested && !state.websocket.active
                 })
-            } else if looks_like_websocket_frame_prefix(&chunk.data) {
+            } else if looks_like_websocket_frame_prefix(&chunk.data)
+                && !is_websocket_control_frame(&chunk.data)
+            {
                 self.preferred_websocket_connection(observed, chunk)
             } else {
                 None
@@ -1113,8 +1135,8 @@ impl InteractionReassembler {
             })
             .max_by(|(left_key, left_state), (right_key, right_state)| {
                 left_state
-                    .last_activity
-                    .cmp(&right_state.last_activity)
+                    .last_data_activity
+                    .cmp(&right_state.last_data_activity)
                     .then_with(|| left_key.connection_id.cmp(&right_key.connection_id))
             })
             .map(|(key, _)| *key)
@@ -1510,6 +1532,11 @@ fn looks_like_websocket_frame_prefix(data: &[u8]) -> bool {
     let first = data[0];
     let payload_marker = data[1] & 0x7f;
     !matches!(opcode, 0x8..=0xA) || (first & 0x80 != 0 && payload_marker <= 125)
+}
+
+fn is_websocket_control_frame(data: &[u8]) -> bool {
+    looks_like_websocket_frame_prefix(data)
+        && websocket_frame_opcode(data).is_some_and(|opcode| matches!(opcode, 0x8..=0xA))
 }
 
 fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) -> bool {
@@ -2736,6 +2763,16 @@ fn extract_provider_conversation_id(value: &Value) -> Option<String> {
                     .or_else(|| bounded_provider_id(metadata.get("session_id")))
             })
         })
+        .or_else(|| {
+            // Codex Responses WebSocket prewarm and generated turns carry the resumable Thread
+            // identity in client_metadata. This is protocol evidence, not a product/version gate:
+            // any Responses-compatible client using the same fields receives the same treatment.
+            value.get("client_metadata").and_then(|metadata| {
+                bounded_provider_id(metadata.get("conversation_id"))
+                    .or_else(|| bounded_provider_id(metadata.get("thread_id")))
+                    .or_else(|| bounded_provider_id(metadata.get("session_id")))
+            })
+        })
 }
 
 fn conversation_anchor_hash(kind: &str, value: &str) -> String {
@@ -2835,6 +2872,19 @@ fn extract_conversation_anchors(
             source_path,
         );
     }
+    if let Some(turn_id) = request_json
+        .and_then(|value| value.get("client_metadata"))
+        .and_then(|metadata| bounded_provider_id(metadata.get("turn_id")))
+    {
+        push_conversation_anchor(
+            &mut anchors,
+            &mut seen,
+            "turn_id",
+            Some(turn_id),
+            "exact",
+            "client_metadata.turn_id",
+        );
+    }
     for message in messages {
         push_conversation_anchor(
             &mut anchors,
@@ -2909,6 +2959,16 @@ fn classify_traffic_role(
     }
     if interaction_kind != WireInteractionKind::Model {
         return "unclassified";
+    }
+    // Responses WebSocket prewarm requests can carry resumable session metadata and historical
+    // input while explicitly asking the server not to generate a turn. Preserve them as technical
+    // bootstrap evidence; the first later generate=true request is the observable user boundary.
+    if request_json
+        .and_then(|value| value.get("generate"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return "bootstrap";
     }
     if messages
         .iter()
@@ -4127,6 +4187,67 @@ mod tests {
     }
 
     #[test]
+    fn responses_client_metadata_supplies_resumable_session_and_turn_anchors() {
+        let request_body = r#"{
+          "type":"response.create",
+          "generate":false,
+          "model":"fixture-model",
+          "client_metadata":{
+            "session_id":"session-from-client-metadata",
+            "thread_id":"session-from-client-metadata",
+            "turn_id":"turn-from-client-metadata"
+          },
+          "input":[{
+            "id":"msg-current-turn",
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_text","text":"continue an older session"}],
+            "internal_chat_message_metadata_passthrough":{
+              "content_item_kinds":["user.text"]
+            }
+          }]
+        }"#;
+        let response_body = r#"{
+          "id":"resp-client-metadata",
+          "object":"response",
+          "status":"completed",
+          "output":[{
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"continued"}]
+          }]
+        }"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(request_body),
+            100,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.traffic_role, "bootstrap");
+        assert_eq!(
+            interaction.provider_conversation_id.as_deref(),
+            Some("session-from-client-metadata")
+        );
+        assert!(interaction.conversation_anchors.iter().any(|anchor| {
+            anchor.kind == "provider_conversation"
+                && anchor.source_path == "conversation_id|thread_id|session_id"
+        }));
+        assert!(interaction.conversation_anchors.iter().any(|anchor| {
+            anchor.kind == "turn_id"
+                && anchor.source_path == "client_metadata.turn_id"
+                && anchor.strength == "exact"
+        }));
+    }
+
+    #[test]
     fn rustls_body_only_request_is_paired_with_the_http_response() {
         let request_body =
             r#"{"model":"fixture-model","input":[{"role":"user","content":"hello"}]}"#;
@@ -5209,6 +5330,116 @@ mod tests {
         assert_eq!(
             completed[0].provider_response_id.as_deref(),
             Some("resp-moved-pointer")
+        );
+    }
+
+    #[test]
+    fn websocket_control_frames_do_not_steal_a_resumed_threads_moved_pointer() {
+        let mut reassembler = InteractionReassembler::default();
+        let upgrade = |path: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            )
+        };
+        let switching = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+        for (at, write_pointer, read_pointer, path) in [
+            (10, 0x1000, 0x1100, "/older-thread"),
+            (20, 0x2000, 0x2100, "/resumed-thread"),
+        ] {
+            reassembler.push(rustls_chunk_on(
+                ChunkDirection::Request,
+                upgrade(path),
+                at,
+                write_pointer,
+            ));
+            reassembler.push(rustls_chunk_on(
+                ChunkDirection::Response,
+                switching,
+                at + 1,
+                read_pointer,
+            ));
+        }
+
+        // A server ping on the older idle Thread is transport liveness only. It must not make
+        // that Thread the preferred owner of a later, moved Rustls application pointer.
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(b"ping", false, true, false, 0x9),
+            30,
+            0x1100,
+        ));
+        let connection_count = reassembler.active_connections();
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(b"orphan-ping", false, true, false, 0x9),
+            31,
+            0x9900,
+        ));
+        assert_eq!(reassembler.active_connections(), connection_count);
+
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "client_metadata": {
+                "session_id": "resumed-session",
+                "thread_id": "resumed-session",
+                "turn_id": "resumed-turn"
+            },
+            "input": [{
+                "id": "msg-resumed",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "resumed request"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["user.text"]
+                }
+            }]
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                websocket_frame(request.as_bytes(), true, true, false, 0x1),
+                40,
+                0x3000,
+            ))
+            .is_empty());
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "resumed response"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(delta.as_bytes(), false, true, false, 0x1),
+                50,
+                0x4000,
+            ))
+            .is_empty());
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp-resumed"}
+        })
+        .to_string();
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(terminal.as_bytes(), false, true, false, 0x1),
+            60,
+            0x4001,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].connection_id, "tls:2000");
+        assert_eq!(completed[0].path, "/resumed-thread");
+        assert_eq!(
+            completed[0].provider_conversation_id.as_deref(),
+            Some("resumed-session")
+        );
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("resumed response")
         );
     }
 
