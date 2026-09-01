@@ -1026,7 +1026,7 @@ impl InteractionReassembler {
                 }
             }
         };
-        if interaction_diagnostics_enabled() && chunk.source.contains("rustls") {
+        if interaction_diagnostics_enabled_for(chunk.pid) && chunk.source.contains("rustls") {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
             // but never put it on the default operational INFO path: a slow container
@@ -1166,7 +1166,7 @@ impl InteractionReassembler {
                 idle_timeout
             };
             let retain = !state.idle(now, timeout);
-            if !retain && interaction_diagnostics_enabled() {
+            if !retain && interaction_diagnostics_enabled_for(key.pid) {
                 tracing::warn!(
                     pid = key.pid,
                     connection_id = format_args!("{:x}", key.connection_id),
@@ -1384,9 +1384,9 @@ fn process_websocket_response_messages(
     completed
 }
 
-fn interaction_diagnostics_enabled() -> bool {
+fn interaction_diagnostics_enabled_for(pid: u32) -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    let enabled = *ENABLED.get_or_init(|| {
         std::env::var("A3S_OBSERVER_TLS_DIAGNOSTICS")
             .ok()
             .is_some_and(|value| {
@@ -1395,7 +1395,19 @@ fn interaction_diagnostics_enabled() -> bool {
                     "1" | "true" | "on" | "yes"
                 )
             })
-    })
+    });
+    if !enabled {
+        return false;
+    }
+    static PID_FILTER: OnceLock<Option<u32>> = OnceLock::new();
+    PID_FILTER
+        .get_or_init(|| {
+            std::env::var("A3S_OBSERVER_TLS_DIAGNOSTIC_PID")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        })
+        .is_none_or(|expected| expected == pid)
 }
 
 fn plaintext_fragment_kind(data: &[u8]) -> &'static str {

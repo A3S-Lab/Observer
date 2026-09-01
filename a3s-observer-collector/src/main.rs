@@ -3767,7 +3767,9 @@ impl CollectorProcessor {
                     TLS_PLAINTEXT_API_SSL_CLASSIC => ("tls_uprobe", "ssl-classic"),
                     _ => ("tls_uprobe", "unknown-tls-abi"),
                 };
-                if tls_diagnostics_enabled() && header.api_kind == TLS_PLAINTEXT_API_RUSTLS {
+                if tls_diagnostics_enabled_for(header.pid)
+                    && header.api_kind == TLS_PLAINTEXT_API_RUSTLS
+                {
                     // A streamed model response may cross this path hundreds of times in a
                     // burst. Keep call-level evidence off the operational INFO stream so a
                     // slow container log sink cannot back-pressure the collector.
@@ -4348,6 +4350,21 @@ fn env_enabled(name: &str) -> bool {
 fn tls_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_enabled("A3S_OBSERVER_TLS_DIAGNOSTICS"))
+}
+
+fn tls_diagnostics_enabled_for(pid: u32) -> bool {
+    if !tls_diagnostics_enabled() {
+        return false;
+    }
+    static PID_FILTER: OnceLock<Option<u32>> = OnceLock::new();
+    PID_FILTER
+        .get_or_init(|| {
+            std::env::var("A3S_OBSERVER_TLS_DIAGNOSTIC_PID")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        })
+        .is_none_or(|expected| expected == pid)
 }
 
 fn hostname() -> Option<String> {
