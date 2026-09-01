@@ -1777,7 +1777,9 @@ fn build_interaction(
     if wire_completeness != "complete" && wire_completeness != "error" {
         extend_unique(&mut partial_reasons, [format!("wire_{wire_completeness}")]);
     }
-    let conversation_completeness = if has_unmatched_tool_calls(&tool_calls, &tool_results) {
+    let has_pending_tool_result = has_unmatched_tool_calls(&tool_calls, &tool_results);
+    let conversation_completeness = if has_pending_tool_result {
+        extend_unique(&mut partial_reasons, ["tool_result_pending".to_string()]);
         "tool_pending"
     } else if wire_completeness == "complete" || wire_completeness == "error" {
         "complete"
@@ -4950,6 +4952,10 @@ mod tests {
         assert_eq!(interaction.tool_calls[0].tool_call_id, "call-new");
         assert_eq!(interaction.conversation_completeness, "tool_pending");
         assert_eq!(interaction.completeness, "partial");
+        assert_eq!(
+            interaction.partial_reasons,
+            vec!["tool_result_pending".to_string()]
+        );
     }
 
     #[test]
