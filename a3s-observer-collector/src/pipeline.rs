@@ -331,6 +331,7 @@ fn observation_token(
     token
 }
 
+#[allow(clippy::too_many_arguments)]
 fn raw_observation_for(
     origin: PipelineOrigin,
     captured_at_boot_ns: u64,
@@ -737,6 +738,7 @@ pub struct PipelineSender {
 impl PipelineSender {
     /// Attempts one admission. Only true lane-capacity exhaustion is reported as `Full`; producer
     /// concurrency retries the atomic reservation and cannot create a false drop.
+    #[allow(clippy::result_large_err)]
     pub fn try_send(&self, envelope: RawEnvelope) -> Result<(), PipelineSendError> {
         let class = envelope.origin.service_class();
         let lane = self.ledger.lane(class);
@@ -926,6 +928,7 @@ impl ReorderCoordinator {
 
     /// Adds one event and returns any same-process events made ready by its event-time watermark.
     /// Full and duplicate inputs are returned intact; this API never waits and never evicts facts.
+    #[allow(clippy::result_large_err)]
     pub fn try_push(
         &mut self,
         envelope: RawEnvelope,

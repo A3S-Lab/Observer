@@ -4219,7 +4219,6 @@ fn emit_completed_interaction(
     // The physical ring observation is immutable and may fan out to more than one semantic
     // exchange on a reused connection.  Keep its identity/fingerprint unchanged; semantic
     // records carry their own `derivedFrom`/source reference instead of mutating this clone.
-    let raw_observation = raw_observation;
     let mut coverage_gaps = coverage_gaps;
     if parse_state != "parsed" {
         coverage_gaps.push(coverage_gap(
@@ -4353,7 +4352,6 @@ fn emit_plaintext_evidence(
     } = evidence;
     // Preserve the immutable physical observation when emitting a metadata-only evidence record.
     // The evidence ID is a downstream reference, not a mutation of the raw fact.
-    let raw_observation = raw_observation;
     let mut coverage_gaps = coverage_gaps;
     coverage_gaps.push(coverage_gap(
         format!("gap_{evidence_id}"),
@@ -5061,6 +5059,7 @@ fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coverage_gap(
     gap_id: impl Into<String>,
     stage: impl Into<String>,
@@ -5146,7 +5145,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev
             .take()
             .unwrap_or_else(|| fallback_raw_observation(&ev.event, ev.timing.as_ref()));
         let (raw, mut gaps) = enrich_raw_observation(raw, ev.process.as_ref(), &ev.event, event_at);
-        gaps.extend(ev.coverage_gaps.drain(..));
+        gaps.append(&mut ev.coverage_gaps);
         ev.raw_observation = Some(raw);
         ev.coverage_gaps = gaps;
     }
