@@ -4971,16 +4971,20 @@ fn process_generation_from_context(
         return None;
     }
     let start_time_ticks = process.start_time_ticks.filter(|value| *value > 0)?;
-    let host_id = process.host_id.clone();
-    let boot_id = process.boot_id.clone();
-    // A start marker is the minimum requirement for a non-reusable generation.  Host/boot are
-    // retained when available, but absence of either does not make up a value from PID alone.
+    // A process-generation key is stable only when all three host/boot/start dimensions are
+    // proven. In particular, do not hash an empty host or boot value with PID and expose it as a
+    // reusable identity: restricted /proc access must become a coverage gap instead.
+    let host_id = process
+        .host_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())?;
+    let boot_id = process
+        .boot_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())?;
     let canonical = format!(
         "{}|{}|{}|{}",
-        host_id.as_deref().unwrap_or(""),
-        boot_id.as_deref().unwrap_or(""),
-        process.pid,
-        start_time_ticks
+        host_id, boot_id, process.pid, start_time_ticks
     );
     let process_generation_key = format!("pgk_{}", hash_prefix(canonical));
     let argv_hash = match event {
@@ -4992,8 +4996,8 @@ fn process_generation_from_context(
         pid: process.pid,
         ppid: (process.ppid != 0).then_some(process.ppid),
         parent_process_generation_key: None,
-        host_id,
-        boot_id,
+        host_id: Some(host_id),
+        boot_id: Some(boot_id),
         start_time_ticks: Some(start_time_ticks.to_string()),
         exec_id: match event {
             AgentEvent::ToolExec { exec_id, .. } => Some(exec_id.to_string()),
@@ -5419,13 +5423,13 @@ mod tests {
         observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
         parse_unknown_file_policy, partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes,
-        pod_from_bytes, process_context, socket_key_with_generation, supplement_exec_argv_at,
-        tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh, valid_plaintext_http_route,
-        CollectorMeta, CollectorProcessor, CompletedExec, ExecAssembler, FileFeatureFlags,
-        FileFilterHeartbeatSnapshot, LlmMetaState, PeerState, PipelineAccountingState,
-        PipelineRing, ProcessContextCache, ProcessLifecycleStore, RingReaderLedgerSnapshot,
-        RingWindowStats, Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT,
-        FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
+        pod_from_bytes, process_context, process_generation_from_context,
+        socket_key_with_generation, supplement_exec_argv_at, tls_capture_profile_needs_refresh,
+        tls_exec_comm_needs_refresh, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
+        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
+        PeerState, PipelineAccountingState, PipelineRing, ProcessContextCache,
+        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
+        EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
     };
     use a3s_observer::{
         AgentEvent, AgentPlaintextEvidence, EnrichedEvent, EventTiming, ExportPriority, Exporter,
@@ -6455,6 +6459,46 @@ mod tests {
                 .and_then(|raw| raw.process.as_ref())
                 .map(|process| process.process_generation_key.as_str())
         );
+    }
+
+    #[test]
+    fn process_generation_requires_host_boot_and_start_markers() {
+        let event = AgentEvent::ProcessExit {
+            pid: 42,
+            exit_code: 0,
+            signal: 0,
+        };
+        let complete = ProcessContext {
+            pid: 42,
+            host_id: Some("host-a".to_string()),
+            boot_id: Some("boot-a".to_string()),
+            start_time_ticks: Some(900),
+            ..ProcessContext::default()
+        };
+        assert!(process_generation_from_context(&complete, &event).is_some());
+
+        for incomplete in [
+            ProcessContext {
+                pid: 42,
+                boot_id: Some("boot-a".to_string()),
+                start_time_ticks: Some(900),
+                ..ProcessContext::default()
+            },
+            ProcessContext {
+                pid: 42,
+                host_id: Some("host-a".to_string()),
+                start_time_ticks: Some(900),
+                ..ProcessContext::default()
+            },
+            ProcessContext {
+                pid: 42,
+                host_id: Some("host-a".to_string()),
+                boot_id: Some("boot-a".to_string()),
+                ..ProcessContext::default()
+            },
+        ] {
+            assert!(process_generation_from_context(&incomplete, &event).is_none());
+        }
     }
 
     #[test]
