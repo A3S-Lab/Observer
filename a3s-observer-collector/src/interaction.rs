@@ -3572,6 +3572,7 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .take(MAX_SSE_STRUCTURED_EVENTS)
     {
         let role = item
             .get("role")
@@ -3610,13 +3611,29 @@ fn extract_request_messages(value: &Value) -> Vec<LlmInteractionMessage> {
     messages
 }
 
+fn push_bounded_text(output: &mut String, text: &str, max_bytes: usize) {
+    if output.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes - output.len();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let width = character.len_utf8();
+        if used.saturating_add(width) > remaining {
+            break;
+        }
+        output.push(character);
+        used += width;
+    }
+}
+
 fn extract_response_text(value: &Value) -> Option<String> {
     if let Some(text) = value.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
     }
     let mut output = String::new();
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-        for choice in choices {
+        for choice in choices.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
             if let Some(text) = choice
                 .get("message")
                 .and_then(|message| message.get("content"))
@@ -3628,7 +3645,7 @@ fn extract_response_text(value: &Value) -> Option<String> {
                         .and_then(Value::as_str)
                 })
             {
-                output.push_str(text);
+                push_bounded_text(&mut output, text, MAX_EXPORTED_STRUCTURED_BYTES);
             }
         }
     }
@@ -3775,9 +3792,9 @@ fn collect_text_parts(value: Option<&Value>, output: &mut String) {
     let Some(items) = value.and_then(Value::as_array) else {
         return;
     };
-    for item in items {
+    for item in items.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
         if let Some(text) = item.get("text").and_then(Value::as_str) {
-            output.push_str(text);
+            push_bounded_text(output, text, MAX_EXPORTED_STRUCTURED_BYTES);
         }
         if let Some(content) = item.get("content") {
             collect_text_parts(Some(content), output);
@@ -3848,6 +3865,7 @@ fn extract_tool_calls(value: &Value, issued_at_unix_ns: u128) -> Vec<LlmInteract
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         for tool in choices
             .iter()
+            .take(MAX_SSE_STRUCTURED_EVENTS)
             .filter_map(|choice| choice.get("message"))
             .filter_map(|message| message.get("tool_calls"))
             .filter_map(Value::as_array)
@@ -3883,7 +3901,7 @@ fn collect_typed_tool_calls(
     let Some(items) = value.and_then(Value::as_array) else {
         return;
     };
-    for item in items {
+    for item in items.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
         if let Some(call) = typed_tool_call(item, issued_at_unix_ns) {
             calls.push(call);
         }
@@ -3937,6 +3955,7 @@ fn extract_tool_results(value: &Value, observed_at_unix_ns: u128) -> Vec<LlmInte
         .flatten()
         .filter_map(Value::as_array)
         .flatten()
+        .take(MAX_SSE_STRUCTURED_EVENTS)
     {
         if item.get("role").and_then(Value::as_str) == Some("tool")
             || matches!(
@@ -4012,16 +4031,16 @@ fn normalize_sse_response(
 
     for event in &events {
         if let Some(text) = sse_model_text_fragment(event) {
-            deltas.push_str(text);
+            push_bounded_text(&mut deltas, text, MAX_EXPORTED_STRUCTURED_BYTES);
         }
         if let Some(choices) = event.get("choices").and_then(Value::as_array) {
-            for choice in choices {
+            for choice in choices.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
                 if let Some(text) = choice
                     .get("delta")
                     .and_then(|delta| delta.get("content"))
                     .and_then(Value::as_str)
                 {
-                    deltas.push_str(text);
+                    push_bounded_text(&mut deltas, text, MAX_EXPORTED_STRUCTURED_BYTES);
                 }
                 for tool in choice
                     .get("delta")
@@ -4029,6 +4048,7 @@ fn normalize_sse_response(
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
+                    .take(MAX_SSE_STRUCTURED_EVENTS)
                 {
                     let index = tool
                         .get("index")
@@ -4051,14 +4071,14 @@ fn normalize_sse_response(
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
                     {
-                        entry.0.push_str(name);
+                        push_bounded_text(&mut entry.0, name, 16 * 1024);
                     }
                     if let Some(arguments) = tool
                         .get("function")
                         .and_then(|function| function.get("arguments"))
                         .and_then(Value::as_str)
                     {
-                        entry.1.push_str(arguments);
+                        push_bounded_text(&mut entry.1, arguments, MAX_EXPORTED_STRUCTURED_BYTES);
                     }
                 }
             }
@@ -4102,7 +4122,7 @@ fn normalize_sse_response(
                     .get(&index)
                     .and_then(|id| anthropic_calls.get_mut(id))
                 {
-                    entry.1.push_str(arguments);
+                    push_bounded_text(&mut entry.1, arguments, MAX_EXPORTED_STRUCTURED_BYTES);
                 }
             }
         }
@@ -4157,11 +4177,8 @@ fn normalize_sse_response(
                 if let Some(call_id) =
                     responses_event_call_id(event, &responses_call_ids, &responses_item_ids)
                 {
-                    responses_calls
-                        .entry(call_id)
-                        .or_default()
-                        .1
-                        .push_str(fragment);
+                    let entry = responses_calls.entry(call_id).or_default();
+                    push_bounded_text(&mut entry.1, fragment, MAX_EXPORTED_STRUCTURED_BYTES);
                 }
             }
         }

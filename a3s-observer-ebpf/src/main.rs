@@ -241,6 +241,13 @@ fn bump_tls_profile_diagnostic(index: u32) {
 static VERIFIED_AGENT_PROCESSES: LruHashMap<PlaintextProcessKey, u8> =
     LruHashMap::with_max_entries(16_384, 0);
 
+// Generation fence paired with VERIFIED_AGENT_PROCESSES.  Userspace can only publish PID/cgroup
+// membership, while the kernel records the committed exec generation and removes it on exit; a
+// reused PID therefore cannot inherit a previous Agent plaintext grant.
+#[map]
+static VERIFIED_AGENT_EXEC_IDS: LruHashMap<PlaintextProcessKey, u64> =
+    LruHashMap::with_max_entries(16_384, 0);
+
 // Plain HTTP is different from a TLS-library boundary: generic write/writev also sees stdout and
 // files. Admit a socket only after a selected process writes any syntactically valid HTTP request
 // line. The Collector, not eBPF, decides whether its body is an LLM interaction.
@@ -1958,6 +1965,14 @@ pub fn track_process_exec(_ctx: TracePointContext) -> u32 {
     if COMMITTED_EXEC_IDS.insert(&pid, &exec_id, 0).is_err() {
         let _ = COMMITTED_EXEC_IDS.remove(&pid);
     }
+    let process_key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    if unsafe { VERIFIED_AGENT_PROCESSES.get(&process_key) }.is_some() {
+        let _ = VERIFIED_AGENT_EXEC_IDS.insert(&process_key, &exec_id, 0);
+    }
     commit_capture_promotion(pid, exec_id, cgroup_id);
     if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) {
         let record = entry.as_mut_ptr();
@@ -2026,6 +2041,11 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     let _ = PARENTS.remove(&pid);
     let _ = EXEC_IDS.remove(&pid);
     let _ = COMMITTED_EXEC_IDS.remove(&pid);
+    let _ = VERIFIED_AGENT_EXEC_IDS.remove(&PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    });
     remove_capture_promotion(pid);
     Ok(0)
 }
@@ -2523,7 +2543,17 @@ fn verified_agent_process(pid: u32, cgroup_id: u64) -> bool {
         pid,
         _pad: 0,
     };
-    unsafe { VERIFIED_AGENT_PROCESSES.get(&key) }.is_some()
+    if unsafe { VERIFIED_AGENT_PROCESSES.get(&key) }.is_none() {
+        return false;
+    }
+    // Before the first committed exec, retain the legacy positive scope decision.  Once a commit
+    // marker exists, require it to match the current generation fence.
+    let committed = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let fenced = unsafe { VERIFIED_AGENT_EXEC_IDS.get(&key).copied().unwrap_or(0) };
+    if fenced == 0 {
+        return true;
+    }
+    committed != 0 && fenced == committed
 }
 
 #[inline(always)]

@@ -95,6 +95,7 @@ const PROCESS_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(2);
 const PROCESS_CONTEXT_CACHE_STALE: Duration = Duration::from_secs(30);
 const PROCESS_CONTEXT_CACHE_LIMIT: usize = 65_536;
 const MAX_OBSERVED_AGENTS_PER_WINDOW: usize = 65_536;
+const SOCKET_STATE_TTL: Duration = Duration::from_secs(300);
 const FINAL_HEARTBEAT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const FILTER_RULE_SNAPSHOT_SCHEMA: &str = "anysentry.filter_rule_snapshot.v1";
 const FILTER_RULE_SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -2587,6 +2588,8 @@ async fn main() -> anyhow::Result<()> {
         reorder_key_collisions = processor.reorder_key_collisions,
         peer_evictions = processor.peer_evictions,
         llm_meta_evictions = processor.llm_meta_evictions,
+        peer_expirations = processor.peer_expirations,
+        llm_meta_expirations = processor.llm_meta_expirations,
         reassembly_connection_evictions = reassembly_metrics.connection_evictions,
         reassembly_connection_expirations = reassembly_metrics.connection_expirations,
         reassembly_orphan_chunks = reassembly_metrics.orphan_chunks,
@@ -3535,6 +3538,20 @@ struct SocketKey {
     generation_ticks: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PeerState {
+    peer: IpAddr,
+    port: u16,
+    last_seen: Instant,
+}
+
+struct LlmMetaState {
+    sni: Option<String>,
+    provider: Option<Provider>,
+    peer: IpAddr,
+    last_seen: Instant,
+}
+
 fn event_capture_decision(context: CaptureDecisionContext) -> EventCaptureDecision {
     EventCaptureDecision::new(
         context.capture_epoch,
@@ -3556,8 +3573,8 @@ struct PendingTlsAttachRetry {
 }
 
 struct CollectorProcessor {
-    peers: HashMap<SocketKey, (IpAddr, u16)>,
-    llm_meta: HashMap<SocketKey, (Option<String>, Option<Provider>, IpAddr)>,
+    peers: HashMap<SocketKey, PeerState>,
+    llm_meta: HashMap<SocketKey, LlmMetaState>,
     interactions: InteractionReassembler,
     exec_assembler: ExecAssembler,
     process_lifecycles: ProcessLifecycleStore,
@@ -3570,6 +3587,8 @@ struct CollectorProcessor {
     reorder_key_collisions: u64,
     peer_evictions: u64,
     llm_meta_evictions: u64,
+    peer_expirations: u64,
+    llm_meta_expirations: u64,
 }
 
 impl CollectorProcessor {
@@ -3589,6 +3608,8 @@ impl CollectorProcessor {
             reorder_key_collisions: 0,
             peer_evictions: 0,
             llm_meta_evictions: 0,
+            peer_expirations: 0,
+            llm_meta_expirations: 0,
         }
     }
 
@@ -3686,6 +3707,21 @@ impl CollectorProcessor {
         self.tls_attach_retries.remove(&pid);
     }
 
+    fn expire_socket_state(&mut self, now: Instant) {
+        let before_peers = self.peers.len();
+        self.peers
+            .retain(|_, state| now.saturating_duration_since(state.last_seen) < SOCKET_STATE_TTL);
+        self.peer_expirations = self
+            .peer_expirations
+            .saturating_add((before_peers.saturating_sub(self.peers.len())) as u64);
+        let before_meta = self.llm_meta.len();
+        self.llm_meta
+            .retain(|_, state| now.saturating_duration_since(state.last_seen) < SOCKET_STATE_TTL);
+        self.llm_meta_expirations = self
+            .llm_meta_expirations
+            .saturating_add((before_meta.saturating_sub(self.llm_meta.len())) as u64);
+    }
+
     fn process(
         &mut self,
         envelope: RawEnvelope,
@@ -3693,6 +3729,7 @@ impl CollectorProcessor {
         resolver: &impl IdentityResolver,
         classifier: &impl ServiceClassifier,
     ) {
+        self.expire_socket_state(Instant::now());
         let bytes = envelope.payload.as_bytes();
         let timing =
             EventTiming::from_unix_ns(envelope.event_at_unix_ns, envelope.received_at_unix_ns);
@@ -3804,8 +3841,14 @@ impl CollectorProcessor {
                         self.peer_evictions = self.peer_evictions.saturating_add(1);
                     }
                 }
-                self.peers
-                    .insert(sock_key(ev.cgroup_id, ev.pid, ev.fd), (peer, ev.port));
+                self.peers.insert(
+                    sock_key(ev.cgroup_id, ev.pid, ev.fd),
+                    PeerState {
+                        peer,
+                        port: ev.port,
+                        last_seen: Instant::now(),
+                    },
+                );
                 emit(
                     exporter,
                     &mut self.stats,
@@ -3840,7 +3883,7 @@ impl CollectorProcessor {
                 let (peer, port) = self
                     .peers
                     .get(&socket)
-                    .copied()
+                    .map(|state| (state.peer, state.port))
                     .unwrap_or((UNKNOWN_PEER, 0));
                 let provider = sni
                     .as_deref()
@@ -3851,8 +3894,15 @@ impl CollectorProcessor {
                         self.llm_meta_evictions = self.llm_meta_evictions.saturating_add(1);
                     }
                 }
-                self.llm_meta
-                    .insert(socket, (sni.clone(), provider.clone(), peer));
+                self.llm_meta.insert(
+                    socket,
+                    LlmMetaState {
+                        sni: sni.clone(),
+                        provider: provider.clone(),
+                        peer,
+                        last_seen: Instant::now(),
+                    },
+                );
                 emit(
                     exporter,
                     &mut self.stats,
@@ -3975,12 +4025,11 @@ impl CollectorProcessor {
                 let Some(ev) = read_pod::<LlmEvent>(bytes) else {
                     return;
                 };
-                let Some((sni, provider, peer)) =
-                    self.llm_meta.remove(&sock_key(ev.cgroup_id, ev.pid, ev.fd))
+                let Some(meta) = self.llm_meta.remove(&sock_key(ev.cgroup_id, ev.pid, ev.fd))
                 else {
                     return;
                 };
-                if provider.is_none() {
+                if meta.provider.is_none() {
                     return;
                 }
                 emit(
@@ -3996,11 +4045,11 @@ impl CollectorProcessor {
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-                        provider,
+                        provider: meta.provider,
                         event: AgentEvent::LlmCall {
                             pid: ev.pid,
-                            sni,
-                            peer,
+                            sni: meta.sni,
+                            peer: meta.peer,
                             req_bytes: ev.req_bytes,
                             resp_bytes: ev.resp_bytes,
                             latency: Duration::from_nanos(ev.latency_ns),
@@ -5184,6 +5233,10 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev
             .take()
             .unwrap_or_else(|| fallback_raw_observation(&ev.event, ev.timing.as_ref()));
         let (raw, mut gaps) = enrich_raw_observation(raw, ev.process.as_ref(), &ev.event, event_at);
+        if raw.process.is_some() {
+            ev.coverage_gaps
+                .retain(|gap| gap.reason != "process_generation_unavailable");
+        }
         gaps.append(&mut ev.coverage_gaps);
         ev.raw_observation = Some(raw);
         ev.coverage_gaps = gaps;
@@ -5361,9 +5414,10 @@ mod tests {
         pod_from_bytes, process_context, socket_key_with_generation, supplement_exec_argv_at,
         tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh, valid_plaintext_http_route,
         CollectorMeta, CollectorProcessor, CompletedExec, ExecAssembler, FileFeatureFlags,
-        FileFilterHeartbeatSnapshot, PipelineAccountingState, PipelineRing, ProcessContextCache,
-        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
-        EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
+        FileFilterHeartbeatSnapshot, LlmMetaState, PeerState, PipelineAccountingState,
+        PipelineRing, ProcessContextCache, ProcessLifecycleStore, RingReaderLedgerSnapshot,
+        RingWindowStats, Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT,
+        FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
     };
     use a3s_observer::{
         AgentEvent, AgentPlaintextEvidence, EnrichedEvent, EventTiming, ExportPriority, Exporter,
@@ -6229,6 +6283,35 @@ mod tests {
         assert_ne!(first, other_cgroup);
         assert_eq!(first.pid, second.pid);
         assert_eq!(first.fd, second.fd);
+    }
+
+    #[test]
+    fn socket_join_state_expires_by_ttl_instead_of_global_clear() {
+        let now = Instant::now();
+        let mut processor = CollectorProcessor::new(true);
+        let key = socket_key_with_generation(77, 42, 9, 100);
+        processor.peers.insert(
+            key,
+            PeerState {
+                peer: UNKNOWN_PEER,
+                port: 443,
+                last_seen: now - SOCKET_STATE_TTL - Duration::from_secs(1),
+            },
+        );
+        processor.llm_meta.insert(
+            key,
+            LlmMetaState {
+                sni: Some("fixture.invalid".to_string()),
+                provider: None,
+                peer: UNKNOWN_PEER,
+                last_seen: now - SOCKET_STATE_TTL - Duration::from_secs(1),
+            },
+        );
+        processor.expire_socket_state(now);
+        assert!(processor.peers.is_empty());
+        assert!(processor.llm_meta.is_empty());
+        assert_eq!(processor.peer_expirations, 1);
+        assert_eq!(processor.llm_meta_expirations, 1);
     }
 
     #[test]
