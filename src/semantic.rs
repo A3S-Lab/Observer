@@ -165,7 +165,11 @@ impl<T: ?Sized + 'static> Registry<T> {
         if self.entries.len() >= self.max_entries {
             return Err("registry capacity exceeded".to_string());
         }
-        if self.entries.iter().any(|entry| existing_ids(entry.as_ref()) == id) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| existing_ids(entry.as_ref()) == id)
+        {
             return Err("registry id already registered".to_string());
         }
         self.entries.push(implementation);
@@ -187,7 +191,11 @@ impl HttpTransportManifest {
                 id: "http1-default".to_string(),
                 family: "http1".to_string(),
                 version_policy: "protocol-family".to_string(),
-                capabilities: vec!["http/1.1".to_string(), "chunked".to_string(), "sse".to_string()],
+                capabilities: vec![
+                    "http/1.1".to_string(),
+                    "chunked".to_string(),
+                    "sse".to_string(),
+                ],
                 limitations: vec!["http2-stream-multiplexing".to_string()],
             },
         }
@@ -211,3 +219,147 @@ impl TransportDecoder for HttpTransportManifest {
     }
 }
 
+/// Provider-neutral default format matcher.  It intentionally reports only a shape hint; the
+/// Collector's existing parser remains responsible for decoding the concrete response stream.
+#[derive(Debug, Default)]
+pub struct DefaultLlmFormatAdapter {
+    manifest: AdapterManifest,
+}
+
+impl DefaultLlmFormatAdapter {
+    pub fn new() -> Self {
+        Self {
+            manifest: AdapterManifest {
+                schema_version: LLM_FORMAT_MANIFEST_SCHEMA_V1.to_string(),
+                id: "generic-llm-json".to_string(),
+                family: "llm-wire".to_string(),
+                version_policy: "shape".to_string(),
+                capabilities: vec![
+                    "openai-chat".to_string(),
+                    "openai-responses".to_string(),
+                    "anthropic-messages".to_string(),
+                    "gemini".to_string(),
+                ],
+                limitations: vec!["provider-specific-stream-extensions".to_string()],
+            },
+        }
+    }
+}
+
+impl LlmFormatAdapter for DefaultLlmFormatAdapter {
+    fn manifest(&self) -> &AdapterManifest {
+        &self.manifest
+    }
+
+    fn detect(&self, method: &str, _headers: &[(String, String)], body: &Value) -> RegistryMatch {
+        if !matches!(
+            method.to_ascii_uppercase().as_str(),
+            "POST" | "PUT" | "PATCH"
+        ) {
+            return RegistryMatch::unknown("method is not a generation request");
+        }
+        let Some(object) = body.as_object() else {
+            return RegistryMatch::unknown("body is not a JSON object");
+        };
+        if object.contains_key("messages")
+            || object.contains_key("input")
+            || object.contains_key("contents")
+            || object.contains_key("prompt")
+        {
+            RegistryMatch::confirmed("generation-shaped JSON body")
+        } else {
+            RegistryMatch::unknown("generation fields are absent")
+        }
+    }
+}
+
+/// Product-neutral Agent adapter.  It is useful as an explicit fallback when no product manifest
+/// is installed: KernelFact and transport records remain valid, while identity extraction yields
+/// no fabricated Session/LogicalAgent values.
+#[derive(Debug, Default)]
+pub struct DefaultAgentAdapter {
+    manifest: AdapterManifest,
+}
+
+impl DefaultAgentAdapter {
+    pub fn new() -> Self {
+        Self {
+            manifest: AdapterManifest {
+                schema_version: ADAPTER_MANIFEST_SCHEMA_V1.to_string(),
+                id: "generic-unresolved-agent".to_string(),
+                family: "unknown".to_string(),
+                version_policy: "runtime-evidence".to_string(),
+                capabilities: Vec::new(),
+                limitations: vec!["no-product-session-identity".to_string()],
+            },
+        }
+    }
+}
+
+impl AgentAdapter for DefaultAgentAdapter {
+    fn manifest(&self) -> &AdapterManifest {
+        &self.manifest
+    }
+
+    fn match_runtime(&self, _runtime: &RuntimeContext) -> RegistryMatch {
+        RegistryMatch::unknown("no product manifest registered")
+    }
+
+    fn extract_identity(&self, _exchange: &Value, _runtime: &RuntimeContext) -> Vec<IdentityHint> {
+        Vec::new()
+    }
+
+    fn extract_tool(&self, _exchange: &Value) -> Vec<ToolHint> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_registries_are_orthogonal_and_fail_closed() {
+        let transport = HttpTransportManifest::new();
+        let format = DefaultLlmFormatAdapter::new();
+        let agent = DefaultAgentAdapter::new();
+        assert_eq!(transport.manifest().family, "http1");
+        assert_eq!(format.manifest().family, "llm-wire");
+        assert_eq!(
+            agent.match_runtime(&RuntimeContext::default()).confidence,
+            "unknown"
+        );
+        assert_eq!(
+            agent.extract_identity(&Value::Null, &RuntimeContext::default()),
+            Vec::new()
+        );
+        assert_eq!(agent.extract_tool(&Value::Null), Vec::new());
+        assert_eq!(
+            format
+                .detect("GET", &[], &Value::Object(serde_json::Map::new()))
+                .confidence,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_duplicates_and_bounds_growth() {
+        let mut registry = Registry::<dyn TransportDecoder>::with_limit(1);
+        let first: Arc<dyn TransportDecoder> = Arc::new(HttpTransportManifest::new());
+        registry
+            .register_with_id("http1-default", first, |entry| entry.manifest().id.as_str())
+            .unwrap();
+        let duplicate: Arc<dyn TransportDecoder> = Arc::new(HttpTransportManifest::new());
+        assert!(registry
+            .register_with_id("http1-default", duplicate, |entry| entry
+                .manifest()
+                .id
+                .as_str())
+            .is_err());
+        let second: Arc<dyn TransportDecoder> = Arc::new(HttpTransportManifest::new());
+        assert!(registry
+            .register_with_id("other", second, |entry| entry.manifest().id.as_str())
+            .is_err());
+        assert_eq!(registry.len(), 1);
+    }
+}

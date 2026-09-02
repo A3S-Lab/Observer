@@ -5,9 +5,8 @@
 //! enrichment and serialization can then consume the weighted output separately.
 
 use a3s_observer::{
-    CoverageGap, RawObservation, RawObservationCaptureDecision,
-    RawObservationPayload, RawObservationRuntime, RawObservationSource,
-    RAW_OBSERVATION_SCHEMA_V1,
+    CoverageGap, RawObservation, RawObservationCaptureDecision, RawObservationPayload,
+    RawObservationRuntime, RawObservationSource, RAW_OBSERVATION_SCHEMA_V1,
 };
 use a3s_observer_common::CaptureDecisionContext;
 use sha2::{Digest, Sha256};
@@ -248,7 +247,10 @@ impl RawEnvelope {
         let coverage_gaps = if raw_observation.process.is_none() {
             vec![CoverageGap {
                 schema_version: "anysentry.coverage_gap.v1".to_string(),
-                gap_id: format!("gap_{}", raw_observation.observation_id.trim_start_matches("ro_")),
+                gap_id: format!(
+                    "gap_{}",
+                    raw_observation.observation_id.trim_start_matches("ro_")
+                ),
                 stage: "runtime".to_string(),
                 reason: "process_generation_unavailable".to_string(),
                 scope: format!("pid:{pid}/cgroup:{cgroup_id}"),
@@ -369,6 +371,7 @@ fn raw_observation_for(
         source: RawObservationSource {
             // The source registry assigns sourceId. Do not pretend that an observation ID is a
             // registered source identity.
+            source_domain: Some("observer".to_string()),
             source_id: None,
             collector_id: None,
             source_type: source_type.to_string(),
@@ -402,7 +405,7 @@ fn raw_observation_for(
         payload: RawObservationPayload {
             kind: format!("ring/{:?}", origin),
             encoding: Some("binary".to_string()),
-            payload_ref: None,
+            payload_ref: Some(format!("sha256:{payload_hash}")),
             sha256: payload_hash,
             original_bytes: payload.len() as u64,
             captured_bytes: payload.len() as u64,
@@ -983,11 +986,11 @@ impl ReorderCoordinator {
     /// Flushes all buffered events in deterministic process-key and event-time order.
     pub fn flush_all(&mut self) -> Vec<RawEnvelope> {
         let mut ready = Vec::with_capacity(self.depth);
-        for process in self.processes.values_mut() {
-            ready.extend(std::mem::take(&mut process.events).into_values());
+        let processes = std::mem::take(&mut self.processes);
+        for process in processes.into_values() {
+            ready.extend(process.events.into_values());
         }
-        self.processes.clear();
-        self.wall_clock_order.clear();
+        self.wall_clock_order = BinaryHeap::new();
         self.depth = 0;
         ready
     }

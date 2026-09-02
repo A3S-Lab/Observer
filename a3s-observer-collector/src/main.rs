@@ -19,33 +19,32 @@ mod tls_attach;
 use a3s_observer::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
     CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
-    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
-    ConnectionIdentity, CoverageGap, EventCaptureDecision, EventTiming, ExportOutcome,
-    ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver,
-    LlmInteraction, LogExporter, ProcessContext, ProcessGenerationKey, Provider, RawObservation,
-    ServiceClassifier, SniClassifier,
-    RAW_OBSERVATION_SCHEMA_V1,
+    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, ConnectionIdentity,
+    CoverageGap, EnrichedEvent, EventCaptureDecision, EventTiming, ExportOutcome, ExportPriority,
+    Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LlmInteraction, LogExporter,
+    ProcessContext, ProcessGenerationKey, Provider, RawObservation, ServiceClassifier,
+    SniClassifier, RAW_OBSERVATION_SCHEMA_V1,
 };
 use a3s_observer_common::{
-    file_access_mode, CaptureDecisionContext, CaptureProbeStats, ConnectEvent, DnsEvent,
-    ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey, FileFilterStats,
-    FileFilterValue, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
-    ARGV_SLOTS, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROFILE_AGENT_FULL,
-    CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION, EXEC_ARG_CHUNK_LEN,
-    EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
-    EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
-    FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE,
-    FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_ACTION_DROP,
-    FILE_FILTER_ACTION_KEEP, FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+    file_access_mode, plaintext_http_route_hash, CaptureDecisionContext, CaptureProbeStats,
+    ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey,
+    FileFilterStats, FileFilterValue, LlmEvent, RingPipelineStats, SecEvent, TlsEvent,
+    TlsPlaintextEventHeader, ARGV_SLOTS, CAPTURE_DECISION_FLAG_SELECTED,
+    CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_INVESTIGATION_FULL,
+    CAPTURE_PROFILE_PROBABLE_INVESTIGATION, EXEC_ARG_CHUNK_LEN, EXEC_ARG_CHUNK_PAYLOAD,
+    EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK,
+    EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_ACCESS_MODE_PATH_ONLY,
+    FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL,
+    FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
+    FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
     FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE,
     PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
     PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
     PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-    PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
-    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
-    TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_TRUNCATED,
-    plaintext_http_route_hash, PLAINTEXT_HTTP_ROUTE_LLM,
-    PLAINTEXT_HTTP_ROUTE_TOOL,
+    PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
+    SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
+    TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -53,13 +52,13 @@ use aya::{
     programs::{KProbe, TracePoint, UProbe},
     Ebpf,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -134,24 +133,36 @@ fn valid_plaintext_http_route(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= a3s_observer_common::PLAINTEXT_HTTP_ROUTE_MAX_LEN
         && path.starts_with('/')
-        && !path.bytes().any(|byte| {
-            byte.is_ascii_control() || matches!(byte, b'?' | b'#' | b' ' | b'\t')
-        })
+        && !path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'?' | b'#' | b' ' | b'\t'))
 }
 
 fn install_plaintext_http_routes(
     mut map: BpfHashMap<MapData, u64, u8>,
 ) -> anyhow::Result<BpfHashMap<MapData, u64, u8>> {
     for route in DEFAULT_LLM_HTTP_ROUTES {
-        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_LLM, 0)?;
+        map.insert(
+            plaintext_http_route_hash(route.as_bytes()),
+            PLAINTEXT_HTTP_ROUTE_LLM,
+            0,
+        )?;
     }
     let configured = std::env::var("A3S_OBSERVER_LLM_HTTP_ROUTES").unwrap_or_default();
-    for route in configured.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+    for route in configured
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if !valid_plaintext_http_route(route) {
             tracing::warn!(route = %route, "ignoring invalid configured LLM HTTP route");
             continue;
         }
-        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_LLM, 0)?;
+        map.insert(
+            plaintext_http_route_hash(route.as_bytes()),
+            PLAINTEXT_HTTP_ROUTE_LLM,
+            0,
+        )?;
     }
     let configured_tools = std::env::var("A3S_OBSERVER_TOOL_HTTP_ROUTES").unwrap_or_default();
     for route in configured_tools
@@ -163,7 +174,11 @@ fn install_plaintext_http_routes(
             tracing::warn!(route = %route, "ignoring invalid configured tool HTTP route");
             continue;
         }
-        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_TOOL, 0)?;
+        map.insert(
+            plaintext_http_route_hash(route.as_bytes()),
+            PLAINTEXT_HTTP_ROUTE_TOOL,
+            0,
+        )?;
     }
     Ok(map)
 }
@@ -2513,9 +2528,23 @@ async fn main() -> anyhow::Result<()> {
     let output_critical_dropped = exporter.output_drops_by_priority(ExportPriority::Critical);
     let output_semantic_dropped = exporter.output_drops_by_priority(ExportPriority::Semantic);
     let output_bulk_dropped = exporter.output_drops_by_priority(ExportPriority::Bulk);
-    let (process_cache_entries, process_cache_hits, process_cache_misses, process_cache_evicted, process_cache_expired) = process_context_cache()
+    let (
+        process_cache_entries,
+        process_cache_hits,
+        process_cache_misses,
+        process_cache_evicted,
+        process_cache_expired,
+    ) = process_context_cache()
         .lock()
-        .map(|cache| (cache.entries.len(), cache.hits, cache.misses, cache.evicted, cache.expired))
+        .map(|cache| {
+            (
+                cache.entries.len(),
+                cache.hits,
+                cache.misses,
+                cache.evicted,
+                cache.expired,
+            )
+        })
         .unwrap_or_default();
     let reassembly_metrics = processor.interactions.metrics();
     tracing::info!(
@@ -3678,7 +3707,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(RingOrigin::Connect) => {
+            PipelineOrigin::Ring(RingOrigin::Connect) => {
                 let Some(ev) = read_pod::<ConnectEvent>(bytes) else {
                     return;
                 };
@@ -3700,7 +3729,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3715,7 +3744,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(RingOrigin::Tls) => {
+            PipelineOrigin::Ring(RingOrigin::Tls) => {
                 let Some(ev) = read_pod::<TlsEvent>(bytes) else {
                     return;
                 };
@@ -3747,7 +3776,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3762,7 +3791,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(RingOrigin::Dns) => {
+            PipelineOrigin::Ring(RingOrigin::Dns) => {
                 let Some(ev) = read_pod::<DnsEvent>(bytes) else {
                     return;
                 };
@@ -3779,7 +3808,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3788,7 +3817,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(RingOrigin::FileDelete) => {
+            PipelineOrigin::Ring(RingOrigin::FileDelete) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
                     return;
                 };
@@ -3805,7 +3834,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3814,7 +3843,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(origin @ (RingOrigin::FileAccess | RingOrigin::FileRead)) => {
+            PipelineOrigin::Ring(origin @ (RingOrigin::FileAccess | RingOrigin::FileRead)) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
                     return;
                 };
@@ -3831,7 +3860,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3856,7 +3885,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-           PipelineOrigin::Ring(RingOrigin::Llm) => {
+            PipelineOrigin::Ring(RingOrigin::Llm) => {
                 let Some(ev) = read_pod::<LlmEvent>(bytes) else {
                     return;
                 };
@@ -3877,7 +3906,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
@@ -3904,9 +3933,8 @@ impl CollectorProcessor {
                 chunk_raw_observation.payload.original_bytes = u64::from(header.original_len);
                 chunk_raw_observation.payload.captured_bytes = u64::from(header.captured_len);
                 chunk_raw_observation.payload.sha256 = sha256_hex(plaintext);
-                chunk_raw_observation.payload.truncated =
-                    header.captured_len < header.original_len
-                        || header.flags & TLS_PLAINTEXT_FLAG_TRUNCATED != 0;
+                chunk_raw_observation.payload.truncated = header.captured_len < header.original_len
+                    || header.flags & TLS_PLAINTEXT_FLAG_TRUNCATED != 0;
                 chunk_raw_observation.payload.redaction_state = "hash_only".to_string();
                 self.stats.ssl = self.stats.ssl.saturating_add(1);
                 let mut partial_reasons = Vec::new();
@@ -3985,7 +4013,7 @@ impl CollectorProcessor {
                     );
                 }
             }
-           PipelineOrigin::Ring(RingOrigin::Exit) => {
+            PipelineOrigin::Ring(RingOrigin::Exit) => {
                 let Some(ev) = read_pod::<ExitEvent>(bytes) else {
                     return;
                 };
@@ -4004,7 +4032,7 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: lifecycle.identity,
                         workload: lifecycle.workload,
-                       observation: None,
+                        observation: None,
                         raw_observation: Some(raw_observation.clone()),
                         coverage_gaps: coverage_gaps.clone(),
                         process: Some(lifecycle.process),
@@ -4101,7 +4129,10 @@ fn emit_completed_interaction(
             "parser_failed",
             format!("interaction:{interaction_id}"),
             timing.event_at_unix_ns.clone(),
-            vec![raw_observation.observation_id.clone(), interaction_id.clone()],
+            vec![
+                raw_observation.observation_id.clone(),
+                interaction_id.clone(),
+            ],
             0,
             1,
         ));
@@ -4113,7 +4144,10 @@ fn emit_completed_interaction(
             partial_reasons.join(","),
             format!("interaction:{interaction_id}"),
             timing.event_at_unix_ns.clone(),
-            vec![raw_observation.observation_id.clone(), interaction_id.clone()],
+            vec![
+                raw_observation.observation_id.clone(),
+                interaction_id.clone(),
+            ],
             0,
             0,
         ));
@@ -4710,8 +4744,7 @@ fn process_generation_from_context(
     );
     let process_generation_key = format!("pgk_{}", hash_prefix(canonical));
     let argv_hash = match event {
-        AgentEvent::ToolExec { argv, .. } =>
-            Some(sha256_hex(&serde_json::to_vec(argv).ok()?)),
+        AgentEvent::ToolExec { argv, .. } => Some(sha256_hex(&serde_json::to_vec(argv).ok()?)),
         _ => None,
     };
     Some(ProcessGenerationKey {
@@ -4750,7 +4783,10 @@ fn connection_from_event(
         ),
         _ => return None,
     };
-    let connection_id = format!("conn_{}", hash_prefix(format!("{process_generation_key}|{connection_id}")));
+    let connection_id = format!(
+        "conn_{}",
+        hash_prefix(format!("{process_generation_key}|{connection_id}"))
+    );
     let transport = match transport.to_ascii_lowercase().as_str() {
         "tcp" => "tcp",
         "tls" => "tls",
@@ -4801,6 +4837,7 @@ fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) ->
         observation_id: observation_id.clone(),
         revision: 1,
         source: a3s_observer::RawObservationSource {
+            source_domain: Some("observer".to_string()),
             source_id: None,
             collector_id: None,
             source_type: "unknown".to_string(),
@@ -4822,7 +4859,7 @@ fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) ->
         payload: a3s_observer::RawObservationPayload {
             kind: "normalized_event".to_string(),
             encoding: Some("binary".to_string()),
-            payload_ref: None,
+            payload_ref: Some(format!("sha256:{}", sha256_hex(&bytes))),
             sha256: sha256_hex(&bytes),
             original_bytes: bytes.len() as u64,
             captured_bytes: bytes.len() as u64,
@@ -4832,7 +4869,7 @@ fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) ->
         },
         idempotency_key: format!("idem_{token}"),
         capture_decision: None,
-            source_refs: vec![observation_id],
+        source_refs: vec![observation_id],
         derived_from: Vec::new(),
     }
 }
@@ -4875,16 +4912,16 @@ fn enrich_raw_observation(
             generation.first_seen_at_unix_ns = event_at_unix_ns
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| raw.event_at_unix_ns.clone());
-            generation
-                .source_refs
-                .push(raw.observation_id.clone());
+            generation.source_refs.push(raw.observation_id.clone());
             // Without a runtime adapter we can prove only host-level process facts.  Do not
             // invent a container/Kubernetes environment from a cgroup path alone.
             raw.runtime.environment = "host".to_string();
             raw.runtime.host_id = process.host_id.clone();
             raw.runtime.boot_id = process.boot_id.clone();
             raw.process = Some(generation.clone());
-            if let Some(mut connection) = connection_from_event(event, Some(&generation.process_generation_key)) {
+            if let Some(mut connection) =
+                connection_from_event(event, Some(&generation.process_generation_key))
+            {
                 connection.source_refs.push(raw.observation_id.clone());
                 raw.connection = Some(connection);
             }
@@ -4921,8 +4958,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev
             .raw_observation
             .take()
             .unwrap_or_else(|| fallback_raw_observation(&ev.event, ev.timing.as_ref()));
-        let (raw, mut gaps) =
-            enrich_raw_observation(raw, ev.process.as_ref(), &ev.event, event_at);
+        let (raw, mut gaps) = enrich_raw_observation(raw, ev.process.as_ref(), &ev.event, event_at);
         gaps.extend(ev.coverage_gaps.drain(..));
         ev.raw_observation = Some(raw);
         ev.coverage_gaps = gaps;

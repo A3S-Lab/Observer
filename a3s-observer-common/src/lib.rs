@@ -950,24 +950,26 @@ pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a
 mod tests {
     use super::{
         capture_cpu_sample_quota, capture_profile_default_actions, capture_sample_partitions,
-        file_access_mode, CaptureAggregateKey, CaptureAggregateValue, CaptureDecisionContext,
-        CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig, CaptureProfileKey,
-        CaptureProfileValue, CapturePromotionValue, CaptureSampleKey, CaptureSampleWindow,
-        ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, FileFilterConfig, LlmEvent,
-        RingPipelineStats, SecEvent, SslEvent, TlsEvent, CAPTURE_ACTION_FULL,
-        CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE, CAPTURE_DECISION_FLAG_SELECTED,
-        CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT,
-        CAPTURE_PROBE_FILE_ACCESS, CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ,
-        CAPTURE_PROBE_LLM, CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS,
-        CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_BUSINESS_CONTEXT,
-        CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
-        CAPTURE_PROFILE_SECURITY_FULL, CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
-        FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE,
-        FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_CONFIG_ENABLED,
-        FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
-        PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
-        PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM,
-        PIPELINE_RING_SECURITY, PIPELINE_RING_SSL, PIPELINE_RING_TLS,
+        file_access_mode, plaintext_http_route_hash, CaptureAggregateKey, CaptureAggregateValue,
+        CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+        CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+        CaptureSampleWindow, ConnectEvent, ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord,
+        ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
+        RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
+        CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
+        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
+        CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
+        CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM,
+        CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS, CAPTURE_PROFILE_AGENT_FULL,
+        CAPTURE_PROFILE_BUSINESS_CONTEXT, CAPTURE_PROFILE_INVESTIGATION_FULL,
+        CAPTURE_PROFILE_PROBABLE_INVESTIGATION, CAPTURE_PROFILE_SECURITY_FULL,
+        CAPTURE_PROFILE_UNKNOWN_DISCOVERY, FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY,
+        FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY,
+        FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_CONNECT,
+        PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT,
+        PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ,
+        PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL, PIPELINE_RING_TLS,
+        RAW_OBSERVATION_ABI_V1,
     };
 
     macro_rules! assert_additive_event_time_abi {
@@ -1166,6 +1168,24 @@ mod tests {
         assert!(admitted_by_probe
             .iter()
             .all(|admitted| *admitted <= node_limit));
+    }
+
+    #[test]
+    fn raw_observation_abi_and_route_hash_are_stable() {
+        assert_eq!(RAW_OBSERVATION_ABI_V1, 1);
+        assert_eq!(core::mem::size_of::<ProcessGenerationKey>(), 40);
+        assert_eq!(core::mem::size_of::<ConnectionIdentity>(), 56);
+        assert_eq!(core::mem::size_of::<SourceRef>(), 32);
+        assert_eq!(core::mem::size_of::<CoverageGap>(), 40);
+        assert_eq!(core::mem::size_of::<RawObservationHeader>(), 80);
+        assert_eq!(
+            plaintext_http_route_hash(b"/v1/chat/completions"),
+            0x0d2c_9083_7fca_d8a6
+        );
+        assert_ne!(
+            plaintext_http_route_hash(b"/v1/chat/completions"),
+            plaintext_http_route_hash(b"/v1/responses")
+        );
     }
 
     #[test]

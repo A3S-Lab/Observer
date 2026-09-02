@@ -5,8 +5,9 @@
 //! receives no authorization headers in its output contract.
 
 use a3s_observer::{
-    LlmConversationAnchor, LlmInteractionContent, LlmInteractionMessage,
-    LlmInteractionSemanticItem, LlmInteractionToolCall, LlmInteractionToolResult, LlmTokenUsage,
+    DefaultLlmFormatAdapter, LlmConversationAnchor, LlmFormatAdapter, LlmInteractionContent,
+    LlmInteractionMessage, LlmInteractionSemanticItem, LlmInteractionToolCall,
+    LlmInteractionToolResult, LlmTokenUsage,
 };
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -844,6 +845,7 @@ pub struct InteractionReassembler {
     idle_timeout: Duration,
     websocket_idle_timeout: Duration,
     metrics: ReassemblyMetrics,
+    gap_evidence_fingerprints: HashSet<String>,
 }
 
 impl Default for InteractionReassembler {
@@ -871,6 +873,7 @@ impl InteractionReassembler {
             idle_timeout,
             websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT.max(idle_timeout),
             metrics: ReassemblyMetrics::default(),
+            gap_evidence_fingerprints: HashSet::new(),
         }
     }
 
@@ -885,9 +888,31 @@ impl InteractionReassembler {
         // state that could capture a later data frame if the allocator reuses that pointer.
         if orphan_control_frame {
             self.metrics.orphan_chunks = self.metrics.orphan_chunks.saturating_add(1);
+            self.enqueue_gap_evidence(observed_key, &chunk, "orphan_control_frame", "websocket");
             return Vec::new();
         }
         let key = self.resolve_connection_key(&chunk);
+        // A decoder error from a previous fragment means the stream can no longer prove a complete
+        // exchange. Emit one bounded metadata-only evidence record before attempting recovery;
+        // the next valid KernelFact is still processed normally.
+        let prior_decode_gap = self.connections.get(&key).and_then(|state| {
+            state
+                .requests
+                .last_decode_error
+                .clone()
+                .or_else(|| state.responses.last_decode_error.clone())
+                .or_else(|| state.websocket.requests.last_decode_error.clone())
+                .or_else(|| state.websocket.responses.last_decode_error.clone())
+        });
+        if let Some(reason) = prior_decode_gap {
+            self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
+        }
+        for reason in chunk.partial_reasons.clone() {
+            if reason.contains("gap") || reason.contains("limit") || reason.contains("truncat") {
+                self.enqueue_gap_evidence(key, &chunk, &reason, "unknown");
+            }
+        }
+        let mut sequence_gap_detected = false;
         let state = self.connections.entry(key).or_insert_with(|| {
             ConnectionState::new(
                 self.max_body_bytes,
@@ -956,6 +981,7 @@ impl InteractionReassembler {
         let previous_sequence = state.fragment_sequences.entry(sequence_key).or_insert(0);
         if *previous_sequence != 0 && chunk.sequence != previous_sequence.wrapping_add(1) {
             self.metrics.sequence_gaps = self.metrics.sequence_gaps.saturating_add(1);
+            sequence_gap_detected = true;
             extend_unique(
                 &mut chunk.partial_reasons,
                 ["fragment_sequence_gap".to_string()],
@@ -1073,6 +1099,13 @@ impl InteractionReassembler {
         {
             self.metrics.parser_failures = self.metrics.parser_failures.saturating_add(1);
         }
+        let current_decode_gap = state
+            .requests
+            .last_decode_error
+            .clone()
+            .or_else(|| state.responses.last_decode_error.clone())
+            .or_else(|| state.websocket.requests.last_decode_error.clone())
+            .or_else(|| state.websocket.responses.last_decode_error.clone());
         if interaction_diagnostics_enabled_for(chunk.pid) && chunk.source.contains("rustls") {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
@@ -1098,6 +1131,12 @@ impl InteractionReassembler {
                 completed_interactions = completed.len(),
                 "Agent interaction reassembly state"
             );
+        }
+        if let Some(reason) = current_decode_gap {
+            self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
+        }
+        if sequence_gap_detected {
+            self.enqueue_gap_evidence(key, &chunk, "fragment_sequence_gap", "unknown");
         }
         completed
     }
@@ -1243,6 +1282,75 @@ impl InteractionReassembler {
 
     pub fn take_evidence(&mut self) -> Vec<CompletedPlaintextEvidence> {
         self.pending_evidence.drain(..).collect()
+    }
+
+    fn enqueue_gap_evidence(
+        &mut self,
+        key: ConnectionKey,
+        chunk: &PlaintextChunk,
+        reason: &str,
+        transport_protocol: &str,
+    ) {
+        let direction = match chunk.direction {
+            ChunkDirection::Request => "write",
+            ChunkDirection::Response => "read",
+        };
+        // HTTP/2/WebSocket upgrade evidence is already emitted by the transport detector.  Do
+        // not duplicate that canonical record when the decoder also reports its parse error.
+        if reason == "unsupported_http2"
+            && self.connections.get(&key).is_some_and(|state| {
+                state
+                    .evidence_fingerprints
+                    .contains(&format!("http/2:{direction}"))
+            })
+        {
+            return;
+        }
+        let fingerprint = format!(
+            "{}:{}:{}:{}:{}",
+            key.cgroup_id, key.pid, key.connection_id, direction, reason
+        );
+        if self.gap_evidence_fingerprints.len() >= self.max_connections.saturating_mul(4).max(4)
+            && !self.gap_evidence_fingerprints.contains(&fingerprint)
+        {
+            if let Some(oldest) = self.gap_evidence_fingerprints.iter().next().cloned() {
+                self.gap_evidence_fingerprints.remove(&oldest);
+                self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
+            }
+        }
+        if !self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
+            return;
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"anysentry.agent_plaintext_evidence.v1");
+        hash.update(fingerprint.as_bytes());
+        hash.update(chunk.event_at_unix_ns.to_ne_bytes());
+        hash.update(&chunk.data);
+        let evidence = CompletedPlaintextEvidence {
+            schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
+            evidence_id: format!("pe_{}", hex_prefix(&hash.finalize(), 24)),
+            cgroup_id: key.cgroup_id,
+            pid: key.pid,
+            connection_id: format!("tls:{:x}", key.connection_id),
+            direction: direction.to_string(),
+            tls_adapter_id: chunk.adapter_id.clone(),
+            transport_protocol: transport_protocol.to_string(),
+            parse_state: "unparsed".to_string(),
+            llm_likelihood: "unknown".to_string(),
+            schema_fingerprint: None,
+            observed_at_unix_ns: chunk.event_at_unix_ns.to_string(),
+            captured_bytes: chunk.data.len() as u64,
+            encoding: "metadata_only".to_string(),
+            redacted_sample: None,
+            sample_sha256: sha256_hex(&chunk.data),
+            reasons: vec![reason.to_string()],
+            capture_source: chunk.source.clone(),
+        };
+        if self.pending_evidence.len() >= self.max_connections {
+            self.pending_evidence.pop_front();
+            self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
+        }
+        self.pending_evidence.push_back(evidence);
     }
 
     fn evict_if_needed(&mut self) {
@@ -1722,6 +1830,23 @@ fn build_interaction(
     // downstream can emit a coverage gap and retain the KernelFact/raw provenance instead of
     // silently dropping the exchange when no provider adapter is registered.
     let mut wire_match = match_wire_protocol(&method, &request.headers, request_json.as_ref())
+        .or_else(|| {
+            let body = request_json.as_ref()?;
+            let headers = request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            let adapter = DefaultLlmFormatAdapter::new();
+            (adapter.detect(&method, &headers, body).confidence == "confirmed").then_some(
+                WireMatch {
+                    template_id: "generic-llm-json",
+                    likelihood: "likely",
+                    parse_state: "partial",
+                    interaction_kind: WireInteractionKind::Model,
+                },
+            )
+        })
         .unwrap_or(WireMatch {
             template_id: "unknown-json-exchange",
             likelihood: "unknown",
@@ -2813,6 +2938,12 @@ fn response_matches_wire_template(
                 || json_has_key(response, "content", 0)
                 || json_has_key(response, "text", 0)
                 || json_has_key(response, "output", 0)
+        }
+        "generic-llm-json" => {
+            json_has_key(response, "choices", 0)
+                || json_has_key(response, "content", 0)
+                || json_has_key(response, "output", 0)
+                || json_has_key(response, "text", 0)
         }
         "unknown-json-llm" => true,
         _ => false,
@@ -4736,6 +4867,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_wire_shape_is_retained_as_unparsed_with_explicit_gap_reason() {
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/vendor/unknown",
+                "agent.local",
+                r#"{"opaque":true}"#,
+            ),
+            10,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(r#"{"status":"ok"}"#),
+            20,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].interaction_type, "unparsed");
+        assert_eq!(completed[0].parse_state, "unparsed");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason.contains("wire_template_unparsed")));
+    }
+
+    #[test]
     fn mcp_jsonrpc_template_emits_instruction_result_and_times_without_route_gate() {
         let mut reassembler = InteractionReassembler::default();
         let request = chunk(
@@ -6152,5 +6310,75 @@ mod tests {
                 .unwrap(),
             vec![0xff, 0x00, 0x7f]
         );
+    }
+
+    #[test]
+    fn reassembly_eviction_and_sequence_gap_are_counted_without_global_clear() {
+        let mut reassembler =
+            InteractionReassembler::with_limits(3, 64 * 1024, Duration::from_secs(1));
+        let mut first = chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/v1/chat/completions",
+                "one.local",
+                r#"{"model":"m","messages":[{"role":"user","content":"a"}]}"#,
+            ),
+            1,
+        );
+        first.connection_id = 1;
+        reassembler.push(first);
+        let mut second = chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/v1/chat/completions",
+                "two.local",
+                r#"{"model":"m","messages":[{"role":"user","content":"b"}]}"#,
+            ),
+            2,
+        );
+        second.connection_id = 2;
+        reassembler.push(second);
+
+        let mut third = chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/v1/chat/completions",
+                "three.local",
+                r#"{"model":"m","messages":[{"role":"user","content":"c"}]}"#,
+            ),
+            3,
+        );
+        third.connection_id = 3;
+        reassembler.push(third);
+        let mut fourth = chunk(
+            ChunkDirection::Request,
+            custom_http_request(
+                "POST",
+                "/v1/chat/completions",
+                "four.local",
+                r#"{"model":"m","messages":[{"role":"user","content":"d"}]}"#,
+            ),
+            4,
+        );
+        fourth.connection_id = 4;
+        reassembler.push(fourth);
+        assert!(reassembler.metrics().connection_evictions >= 1);
+        let mut response1 = chunk(
+            ChunkDirection::Response,
+            http_response(r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+            5,
+        );
+        response1.connection_id = 3;
+        response1.sequence = 4;
+        reassembler.push(response1);
+        let mut gap2 = chunk(ChunkDirection::Response, b"\r\n".to_vec(), 6);
+        gap2.connection_id = 3;
+        gap2.sequence = 9;
+        reassembler.push(gap2);
+        assert!(reassembler.metrics().sequence_gaps >= 1);
+        assert!(!reassembler.take_evidence().is_empty());
     }
 }

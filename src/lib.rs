@@ -22,18 +22,19 @@ pub mod workload;
 pub use model::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
     CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
-    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
-    CoverageGap, ConnectionIdentity, EventCaptureDecision, EventTiming, LlmConversationAnchor,
-    LlmInteraction, ProcessGenerationKey, RawObservation, RawObservationCaptureDecision,
-    RawObservationPayload, RawObservationRuntime, RawObservationSource, SourceRef,
-    COVERAGE_GAP_SCHEMA_V1, RAW_OBSERVATION_SCHEMA_V1,
-    LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
+    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, ConnectionIdentity,
+    CoverageGap, EnrichedEvent, EventCaptureDecision, EventTiming, LlmConversationAnchor,
+    LlmInteraction, LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
     LlmInteractionToolCall, LlmInteractionToolResult, LlmTokenUsage, ProcessContext,
+    ProcessGenerationKey, RawObservation, RawObservationCaptureDecision, RawObservationPayload,
+    RawObservationRuntime, RawObservationSource, SourceRef, COVERAGE_GAP_SCHEMA_V1,
+    RAW_OBSERVATION_SCHEMA_V1,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
 pub use semantic::{
-    AdapterManifest, AgentAdapter, HttpTransportManifest, IdentityHint, LlmFormatAdapter,
-    Registry, RegistryMatch, RuntimeContext, ToolHint, TransportDecoder,
+    AdapterManifest, AgentAdapter, DefaultAgentAdapter, DefaultLlmFormatAdapter,
+    HttpTransportManifest, IdentityHint, LlmFormatAdapter, Registry, RegistryMatch, RuntimeContext,
+    ToolHint, TransportDecoder,
 };
 pub use traits::{
     read_ppid, ExportOutcome, ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter,

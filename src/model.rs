@@ -3,7 +3,7 @@
 
 use crate::traits::{Identity, Provider};
 use crate::workload::{ObservationMetadata, WorkloadIdentity};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -76,9 +76,11 @@ impl EventCaptureDecision {
 pub const RAW_OBSERVATION_SCHEMA_V1: &str = "anysentry.raw_observation.v1";
 pub const COVERAGE_GAP_SCHEMA_V1: &str = "anysentry.coverage_gap.v1";
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawObservationSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,7 +92,7 @@ pub struct RawObservationSource {
     pub source_sequence: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawObservationRuntime {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,7 +131,7 @@ pub struct RawObservationRuntime {
 /// Canonical process generation identity.  `key` is a server-safe opaque value derived from
 /// host/boot/pid/start marker (and exec generation when available); the individual hints remain
 /// additive so old consumers can continue to use `process.pid`.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessGenerationKey {
     pub process_generation_key: String,
@@ -161,7 +163,7 @@ pub struct ProcessGenerationKey {
 
 /// Canonical connection identity.  File descriptors and raw TLS pointers are event-time hints;
 /// callers should prefer `socket_cookie`/`tls_context_id` plus the process generation and stream.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionIdentity {
     pub schema_version: String,
@@ -190,7 +192,7 @@ pub struct ConnectionIdentity {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawObservationPayload {
     pub kind: String,
@@ -213,7 +215,7 @@ pub struct RawObservationPayload {
 /// cross-repository contract; the referenced object carries its own authority and algorithm
 /// metadata.  Keeping this as a transparent newtype prevents accidental object-shaped refs from
 /// being rejected by the AnySentry validator.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct SourceRef(pub String);
 
@@ -237,7 +239,7 @@ impl AsRef<str> for SourceRef {
 
 /// Explicit observability degradation.  A gap never replaces the KernelFact/raw event; it tells
 /// downstream readers why a semantic/transport projection is partial or unavailable.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverageGap {
     pub schema_version: String,
@@ -254,7 +256,7 @@ pub struct CoverageGap {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawObservation {
     pub schema_version: String,
@@ -278,7 +280,7 @@ pub struct RawObservation {
     pub derived_from: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawObservationCaptureDecision {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1251,5 +1253,101 @@ mod tests {
                     + ring["collectorDropped"].as_u64().unwrap()
             )
         );
+    }
+
+    #[test]
+    fn raw_observation_contract_is_versioned_hash_only_and_connection_scoped() {
+        let observation = RawObservation {
+            schema_version: RAW_OBSERVATION_SCHEMA_V1.to_string(),
+            observation_id: "ro_0123456789abcdef0123456789abcdef".to_string(),
+            revision: 1,
+            source: RawObservationSource {
+                source_domain: None,
+                source_id: None,
+                collector_id: Some("collector-test".to_string()),
+                source_type: "socket_payload".to_string(),
+                probe_id: Some("ring/ssl".to_string()),
+                source_sequence: Some("7".to_string()),
+            },
+            event_at_unix_ns: "1720000000000000000".to_string(),
+            received_at_unix_ns: "1720000000000000100".to_string(),
+            runtime: RawObservationRuntime {
+                environment: "host".to_string(),
+                source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
+                ..RawObservationRuntime::default()
+            },
+            process: Some(ProcessGenerationKey {
+                process_generation_key: "pgk_0123456789abcdef01234567".to_string(),
+                pid: 42,
+                first_seen_at_unix_ns: "1720000000000000000".to_string(),
+                source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
+                ..ProcessGenerationKey::default()
+            }),
+            connection: Some(ConnectionIdentity {
+                schema_version: "anysentry.connection_identity.v1".to_string(),
+                connection_id: "conn_0123456789abcdef01234567".to_string(),
+                process_generation_key: Some("pgk_0123456789abcdef01234567".to_string()),
+                transport: "tls".to_string(),
+                quality: "strong".to_string(),
+                source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
+                ..ConnectionIdentity::default()
+            }),
+            payload: RawObservationPayload {
+                kind: "tls_plaintext_chunk".to_string(),
+                encoding: Some("binary".to_string()),
+                payload_ref: Some(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                original_bytes: 4,
+                captured_bytes: 4,
+                truncated: false,
+                redaction_state: "hash_only".to_string(),
+                body: None,
+            },
+            idempotency_key: "idem_local_7".to_string(),
+            capture_decision: None,
+            source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
+            derived_from: Vec::new(),
+        };
+        let value = serde_json::to_value(observation).unwrap();
+        assert_eq!(value["schemaVersion"], RAW_OBSERVATION_SCHEMA_V1);
+        assert_eq!(value["source"]["sourceType"], "socket_payload");
+        assert_eq!(value["runtime"]["environment"], "host");
+        assert_eq!(
+            value["process"]["processGenerationKey"],
+            "pgk_0123456789abcdef01234567"
+        );
+        assert_eq!(
+            value["connection"]["connectionId"],
+            "conn_0123456789abcdef01234567"
+        );
+        assert_eq!(value["payload"]["redactionState"], "hash_only");
+        assert!(value["payload"].get("body").is_none());
+        assert!(value["sourceRefs"][0].is_string());
+    }
+
+    #[test]
+    fn coverage_gap_contract_keeps_scope_and_drop_counts_explicit() {
+        let gap = CoverageGap {
+            schema_version: COVERAGE_GAP_SCHEMA_V1.to_string(),
+            gap_id: "gap_0123456789abcdef01234567".to_string(),
+            stage: "llm_format".to_string(),
+            reason: "parser_failed".to_string(),
+            scope: "connection:conn_0123456789abcdef01234567".to_string(),
+            first_seen_at_unix_ns: "1720000000000000000".to_string(),
+            last_seen_at_unix_ns: "1720000000000000100".to_string(),
+            dropped_count: 0,
+            orphaned_count: 1,
+            revision: 1,
+            source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
+        };
+        let value = serde_json::to_value(gap).unwrap();
+        assert_eq!(value["schemaVersion"], COVERAGE_GAP_SCHEMA_V1);
+        assert_eq!(value["scope"], "connection:conn_0123456789abcdef01234567");
+        assert_eq!(value["orphanedCount"], 1);
+        assert!(value["sourceRefs"][0].is_string());
     }
 }
