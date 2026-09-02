@@ -4,13 +4,15 @@
 //! non-waiting inbox admission, and immediately continues draining its ring. It deliberately does
 //! no `/proc` access, path parsing, classification, enrichment, serialization, or export.
 
-use crate::event_time::EventClock;
+use crate::event_time::{system_now_unix_ns, CalibratedEventTimes, EventClock};
 use crate::pipeline::{OwnedPayload, PipelineOrigin, PipelineSender, RawEnvelope, RingOrigin};
+use a3s_observer::{CoverageGap, COVERAGE_GAP_SCHEMA_V1};
 use a3s_observer_common::{
     CaptureDecisionContext, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent,
-    SecEvent, TlsEvent, TlsPlaintextEventHeader, CAPTURE_ACTION_FULL, CAPTURE_DECISION_FLAG_LEGACY,
-    CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DISPOSITION_MISS, CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
-    TLS_PLAINTEXT_ABI_V1,
+    SecEvent, TlsEvent, TlsPlaintextEventHeader, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
+    CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
+    CAPTURE_DECISION_FLAG_LEGACY, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DISPOSITION_MISS,
+    CAPTURE_PROFILE_UNKNOWN_DISCOVERY, TLS_PLAINTEXT_ABI_V1,
 };
 use aya::maps::{MapData, RingBuf};
 use std::io;
@@ -21,6 +23,22 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{watch, Notify};
 
 const RING_DRAIN_BUDGET: usize = 1_024;
+/// A malformed ring item is still a bounded kernel fact. Keep enough bytes to hash and diagnose
+/// it, but never let a corrupt producer length turn the reader into an unbounded allocator.
+const MALFORMED_PAYLOAD_MAX_BYTES: usize = 512 * 1024;
+
+fn event_times_or_receipt(clock: &EventClock, captured_at_boot_ns: u64) -> CalibratedEventTimes {
+    clock.event_times(captured_at_boot_ns).unwrap_or_else(|_| {
+        // A clock failure must not turn an already-received kernel item into a silent drop. The
+        // calibrated monotonic timestamp is unavailable in this exceptional path, so use one
+        // bounded realtime receipt marker and let the ingest gap explain the degraded ordering.
+        let now = system_now_unix_ns().unwrap_or(1).max(1);
+        CalibratedEventTimes {
+            event_at_unix_ns: now,
+            received_at_unix_ns: now,
+        }
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DrainState {
@@ -164,6 +182,70 @@ const fn legacy_capture_decision() -> CaptureDecisionContext {
     }
 }
 
+fn read_capture_decision_or_legacy(bytes: &[u8], offset: usize) -> CaptureDecisionContext {
+    read_capture_decision(bytes, offset)
+        .filter(|value| {
+            matches!(
+                value.capture_action,
+                CAPTURE_ACTION_FULL
+                    | CAPTURE_ACTION_SAMPLE
+                    | CAPTURE_ACTION_AGGREGATE
+                    | CAPTURE_ACTION_DROP
+                    | CAPTURE_ACTION_NOT_ENABLED
+            )
+        })
+        .unwrap_or_else(legacy_capture_decision)
+}
+
+/// Preserve a physical item whose fixed ABI cannot be decoded. The normal reader path remains
+/// allocation- and branch-minimal; this helper is reached only on malformed/unsupported input.
+/// Metadata fields are copied when their offsets are available, while missing values stay unknown
+/// and are represented by a downstream runtime/coverage gap rather than a fabricated identity.
+fn malformed_envelope(
+    origin: RingOrigin,
+    item: &[u8],
+    local_sequence: u64,
+    clock: &EventClock,
+    reason: &str,
+) -> Option<RawEnvelope> {
+    let layout = pod_layout(origin);
+    let captured_at_boot_ns = read_u64(item, layout.captured_at_boot_ns).unwrap_or(0);
+    let cgroup_id = read_u64(item, layout.cgroup_id).unwrap_or(0);
+    let pid = read_u32(item, layout.pid).unwrap_or(0);
+    let capture_decision = read_capture_decision_or_legacy(item, layout.capture_decision);
+    let times = event_times_or_receipt(clock, captured_at_boot_ns);
+    let captured_len = item.len().min(MALFORMED_PAYLOAD_MAX_BYTES);
+    let mut envelope = RawEnvelope::new(
+        PipelineOrigin::Ring(origin),
+        captured_at_boot_ns,
+        times.event_at_unix_ns,
+        times.received_at_unix_ns,
+        capture_decision,
+        cgroup_id,
+        pid,
+        local_sequence,
+        OwnedPayload::from(&item[..captured_len]),
+    );
+    envelope.raw_observation.payload.kind = format!("malformed/ring/{origin:?}");
+    envelope.raw_observation.payload.original_bytes = item.len() as u64;
+    envelope.raw_observation.payload.captured_bytes = captured_len as u64;
+    envelope.raw_observation.payload.truncated = captured_len < item.len();
+    envelope.coverage_gaps.push(CoverageGap {
+        schema_version: COVERAGE_GAP_SCHEMA_V1.to_string(),
+        gap_id: format!("gap_{}_{}", envelope.raw_observation.observation_id, reason),
+        stage: "ingest".to_string(),
+        reason: reason.to_string(),
+        scope: format!("ring:{origin:?}"),
+        first_seen_at_unix_ns: times.event_at_unix_ns.to_string(),
+        last_seen_at_unix_ns: times.event_at_unix_ns.to_string(),
+        dropped_count: 0,
+        orphaned_count: 1,
+        revision: 1,
+        source_refs: vec![envelope.raw_observation.observation_id.clone()],
+    });
+    Some(envelope)
+}
+
 fn envelope_from_pod(
     origin: RingOrigin,
     item: &[u8],
@@ -171,27 +253,44 @@ fn envelope_from_pod(
     clock: &EventClock,
 ) -> Option<RawEnvelope> {
     if origin == RingOrigin::Ssl {
-        return envelope_from_tls_plaintext(item, local_sequence, clock);
+        return envelope_from_tls_plaintext(item, local_sequence, clock).or_else(|| {
+            malformed_envelope(origin, item, local_sequence, clock, "invalid_plaintext_abi")
+        });
     }
     let layout = pod_layout(origin);
     // D1 is an additive tail. A new Collector can still consume the immediately preceding S4
     // record size and marks it as a selected legacy FULL decision; an old Collector naturally
     // copies only its known prefix from a new record.
     if item.len() < layout.capture_decision {
-        return None;
+        return malformed_envelope(origin, item, local_sequence, clock, "malformed_ring_record");
     }
     let mut pod = vec![0_u8; layout.len];
     let copied = item.len().min(layout.len);
     pod[..copied].copy_from_slice(&item[..copied]);
-    let captured_at_boot_ns = read_u64(&pod, layout.captured_at_boot_ns)?;
-    let cgroup_id = read_u64(&pod, layout.cgroup_id)?;
-    let pid = read_u32(&pod, layout.pid)?;
+    let captured_at_boot_ns = match read_u64(&pod, layout.captured_at_boot_ns) {
+        Some(value) => value,
+        None => {
+            return malformed_envelope(origin, item, local_sequence, clock, "malformed_ring_record")
+        }
+    };
+    let cgroup_id = match read_u64(&pod, layout.cgroup_id) {
+        Some(value) => value,
+        None => {
+            return malformed_envelope(origin, item, local_sequence, clock, "malformed_ring_record")
+        }
+    };
+    let pid = match read_u32(&pod, layout.pid) {
+        Some(value) => value,
+        None => {
+            return malformed_envelope(origin, item, local_sequence, clock, "malformed_ring_record")
+        }
+    };
     let capture_decision = if copied >= layout.capture_decision + 16 {
-        read_capture_decision(&pod, layout.capture_decision)?
+        read_capture_decision_or_legacy(&pod, layout.capture_decision)
     } else {
         legacy_capture_decision()
     };
-    let times = clock.event_times(captured_at_boot_ns).ok()?;
+    let times = event_times_or_receipt(clock, captured_at_boot_ns);
     Some(RawEnvelope::new(
         PipelineOrigin::Ring(origin),
         captured_at_boot_ns,
@@ -231,9 +330,11 @@ fn envelope_from_tls_plaintext(
     )?;
     let cgroup_id = read_u64(item, offset_of!(TlsPlaintextEventHeader, cgroup_id))?;
     let pid = read_u32(item, offset_of!(TlsPlaintextEventHeader, pid))?;
-    let capture_decision =
-        read_capture_decision(item, offset_of!(TlsPlaintextEventHeader, capture_decision))?;
-    let times = clock.event_times(captured_at_boot_ns).ok()?;
+    let capture_decision = read_capture_decision_or_legacy(
+        item,
+        offset_of!(TlsPlaintextEventHeader, capture_decision),
+    );
+    let times = event_times_or_receipt(clock, captured_at_boot_ns);
     Some(RawEnvelope::new(
         PipelineOrigin::Ring(RingOrigin::Ssl),
         captured_at_boot_ns,
@@ -474,6 +575,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tls_record_is_retained_as_hash_only_gap_envelope() {
+        let clock = event_clock();
+        let bytes = vec![0_u8; 16];
+        let envelope = envelope_from_pod(RingOrigin::Ssl, &bytes, 9, &clock)
+            .expect("malformed TLS must remain observable");
+        assert_eq!(envelope.payload.as_bytes(), bytes.as_slice());
+        assert_eq!(
+            envelope.raw_observation.payload.redaction_state,
+            "hash_only"
+        );
+        assert!(envelope
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == "invalid_plaintext_abi"));
+        assert_eq!(envelope.raw_observation.payload.original_bytes, 16);
+        assert_eq!(
+            envelope.raw_observation.payload.captured_bytes,
+            envelope.raw_observation.payload.original_bytes
+        );
+    }
+
+    #[test]
     fn previous_event_time_only_tail_is_read_as_selected_legacy_full() {
         let clock = event_clock();
         let origin = RingOrigin::Exit;
@@ -488,13 +611,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_full_items_drop_without_stopping_later_admission() {
-        let (sender, mut receiver) = pipeline_channel(InboxCapacities::new(1, 1, 0));
+    fn malformed_items_are_enveloped_and_full_queue_still_accounts_drops() {
+        let (sender, mut receiver) = pipeline_channel(InboxCapacities::new(2, 1, 0));
         let ledger = RingReaderLedger::default();
         let mut sequence = 0;
         let clock = event_clock();
 
-        assert!(!admit_item(
+        assert!(admit_item(
             RingOrigin::Exec,
             &[0; 8],
             &mut sequence,
@@ -519,9 +642,13 @@ mod tests {
             &clock,
         ));
 
-        // Free Critical and prove the reader can continue admitting a later record.
+        // Free one Critical slot and prove the reader can continue admitting a later record.
         let drained = receiver.try_drain_weighted(1);
-        assert_eq!(drained[0].local_sequence, 1);
+        assert_eq!(drained[0].local_sequence, 0);
+        assert!(drained[0]
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == "malformed_ring_record"));
         assert!(admit_item(
             RingOrigin::Exec,
             &pod(RingOrigin::Exec, 4, 3, 4),
@@ -536,8 +663,8 @@ mod tests {
             ledger.snapshot(),
             RingReaderLedgerSnapshot {
                 received: 4,
-                enqueued: 2,
-                dropped: 2,
+                enqueued: 3,
+                dropped: 1,
             }
         );
     }
