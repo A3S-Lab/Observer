@@ -4780,9 +4780,7 @@ fn monotonic_delta(current: u64, previous: u64) -> u64 {
 }
 
 fn unix_now_ms_u64() -> u64 {
-    (safe_unix_now_ns() / 1_000_000)
-        .max(1)
-        .min(u128::from(u64::MAX)) as u64
+    unix_ms_from_ns(safe_unix_now_ns())
 }
 
 fn safe_unix_now_ns() -> u128 {
@@ -4791,6 +4789,14 @@ fn safe_unix_now_ns() -> u128 {
 
 fn nonzero_unix_ns(value: u128) -> u128 {
     value.max(1)
+}
+
+fn unix_ms_from_ns(value: u128) -> u64 {
+    value
+        .max(1)
+        .saturating_div(1_000_000)
+        .max(1)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 impl CollectorMeta {
@@ -5534,9 +5540,9 @@ mod tests {
         partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes, pod_from_bytes,
         process_context, process_generation_from_context, socket_key_with_generation,
         supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
-        valid_plaintext_http_route, CollectorMeta, CollectorProcessor, CompletedExec,
-        ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState, PeerState,
-        PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
+        unix_ms_from_ns, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
+        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
+        PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
         ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
         Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
         SOCKET_STATE_TTL, UNKNOWN_PEER,
@@ -5995,6 +6001,9 @@ mod tests {
     fn canonical_timestamps_never_use_zero_fallback() {
         assert_eq!(nonzero_unix_ns(0), 1);
         assert_eq!(nonzero_unix_ns(42), 42);
+        assert_eq!(unix_ms_from_ns(0), 1);
+        assert_eq!(unix_ms_from_ns(999_999), 1);
+        assert_eq!(unix_ms_from_ns(2_000_000), 2);
     }
 
     #[test]
