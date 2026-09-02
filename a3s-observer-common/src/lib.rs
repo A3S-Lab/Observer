@@ -305,6 +305,9 @@ pub const CAPTURE_DECISION_FLAG_SHADOW: u8 = 1 << 3;
 pub const CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE: u8 = 1 << 4;
 /// S5 capture profiles were disabled and the legacy/default FULL path admitted the payload.
 pub const CAPTURE_DECISION_FLAG_LEGACY: u8 = 1 << 5;
+/// A generation-fenced Agent process forced the TLS plaintext probe to FULL while a cgroup
+/// profile was absent, stale, or still converging.
+pub const CAPTURE_DECISION_FLAG_VERIFIED_AGENT: u8 = 1 << 6;
 
 /// Decision metadata captured in-kernel at the same instant as Ring admission.
 ///
