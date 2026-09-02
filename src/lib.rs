@@ -15,6 +15,7 @@
 
 pub mod model;
 pub mod policy;
+pub mod semantic;
 pub mod traits;
 pub mod workload;
 
@@ -22,11 +23,18 @@ pub use model::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
     CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
     CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
-    EventCaptureDecision, EventTiming, LlmConversationAnchor, LlmInteraction,
+    CoverageGap, ConnectionIdentity, EventCaptureDecision, EventTiming, LlmConversationAnchor,
+    LlmInteraction, ProcessGenerationKey, RawObservation, RawObservationCaptureDecision,
+    RawObservationPayload, RawObservationRuntime, RawObservationSource, SourceRef,
+    COVERAGE_GAP_SCHEMA_V1, RAW_OBSERVATION_SCHEMA_V1,
     LlmInteractionContent, LlmInteractionMessage, LlmInteractionSemanticItem,
     LlmInteractionToolCall, LlmInteractionToolResult, LlmTokenUsage, ProcessContext,
 };
 pub use policy::{parse_egress_policy, AllowAll, Policy, ProviderPolicy, Verdict};
+pub use semantic::{
+    AdapterManifest, AgentAdapter, HttpTransportManifest, IdentityHint, LlmFormatAdapter,
+    Registry, RegistryMatch, RuntimeContext, ToolHint, TransportDecoder,
+};
 pub use traits::{
     read_ppid, ExportOutcome, ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter,
     KubeResolver, LogExporter, ProcResolver, Provider, ServiceClassifier, SniClassifier,

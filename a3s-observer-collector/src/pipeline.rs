@@ -4,7 +4,13 @@
 //! needs to copy an owned payload into one of three physically independent inboxes. Expensive
 //! enrichment and serialization can then consume the weighted output separately.
 
+use a3s_observer::{
+    CoverageGap, RawObservation, RawObservationCaptureDecision,
+    RawObservationPayload, RawObservationRuntime, RawObservationSource,
+    RAW_OBSERVATION_SCHEMA_V1,
+};
 use a3s_observer_common::CaptureDecisionContext;
+use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -206,6 +212,12 @@ pub struct RawEnvelope {
     /// Monotonic within one physical producer/ring. It is only a deterministic tie-breaker.
     pub local_sequence: u64,
     pub payload: OwnedPayload,
+    /// Immutable provenance created at ring admission.  The processor may add richer connection
+    /// hints, but it must never rewrite the payload hash/length or observation ID.
+    pub raw_observation: RawObservation,
+    /// Decode/transport gaps discovered before semantic processing.  These are additive and do
+    /// not make the underlying envelope disappear.
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
 impl RawEnvelope {
@@ -221,6 +233,35 @@ impl RawEnvelope {
         local_sequence: u64,
         payload: impl Into<OwnedPayload>,
     ) -> Self {
+        let payload = payload.into();
+        let raw_observation = raw_observation_for(
+            origin,
+            captured_at_boot_ns,
+            event_at_unix_ns,
+            received_at_unix_ns,
+            capture_decision,
+            cgroup_id,
+            pid,
+            local_sequence,
+            payload.as_bytes(),
+        );
+        let coverage_gaps = if raw_observation.process.is_none() {
+            vec![CoverageGap {
+                schema_version: "anysentry.coverage_gap.v1".to_string(),
+                gap_id: format!("gap_{}", raw_observation.observation_id.trim_start_matches("ro_")),
+                stage: "runtime".to_string(),
+                reason: "process_generation_unavailable".to_string(),
+                scope: format!("pid:{pid}/cgroup:{cgroup_id}"),
+                first_seen_at_unix_ns: event_at_unix_ns.to_string(),
+                last_seen_at_unix_ns: event_at_unix_ns.to_string(),
+                dropped_count: 0,
+                orphaned_count: 0,
+                revision: 1,
+                source_refs: raw_observation.source_refs.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
         Self {
             origin,
             captured_at_boot_ns,
@@ -230,7 +271,9 @@ impl RawEnvelope {
             cgroup_id,
             pid,
             local_sequence,
-            payload: payload.into(),
+            payload,
+            raw_observation,
+            coverage_gaps,
         }
     }
 
@@ -246,6 +289,163 @@ impl RawEnvelope {
 
     pub const fn process_key(&self) -> ProcessKey {
         ProcessKey::new(self.cgroup_id, self.pid)
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn observation_token(
+    origin: PipelineOrigin,
+    captured_at_boot_ns: u64,
+    cgroup_id: u64,
+    pid: u32,
+    local_sequence: u64,
+    payload_hash: &str,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"anysentry.raw_observation.v1");
+    hash.update([origin.tie_break_rank().0, origin.tie_break_rank().1]);
+    hash.update(captured_at_boot_ns.to_ne_bytes());
+    hash.update(cgroup_id.to_ne_bytes());
+    hash.update(pid.to_ne_bytes());
+    hash.update(local_sequence.to_ne_bytes());
+    hash.update(payload_hash.as_bytes());
+    let digest = hash.finalize();
+    let mut token = String::with_capacity(24);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest.iter().take(12) {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    token
+}
+
+fn raw_observation_for(
+    origin: PipelineOrigin,
+    captured_at_boot_ns: u64,
+    event_at_unix_ns: u128,
+    received_at_unix_ns: u128,
+    capture_decision: CaptureDecisionContext,
+    cgroup_id: u64,
+    pid: u32,
+    local_sequence: u64,
+    payload: &[u8],
+) -> RawObservation {
+    let payload_hash = sha256_hex(payload);
+    let token = observation_token(
+        origin,
+        captured_at_boot_ns,
+        cgroup_id,
+        pid,
+        local_sequence,
+        &payload_hash,
+    );
+    let observation_id = format!("ro_{token}");
+    let source_type = match origin {
+        PipelineOrigin::Ring(RingOrigin::Ssl) => "socket_payload",
+        PipelineOrigin::Ring(RingOrigin::Tls) => "kernel",
+        PipelineOrigin::Ring(_) => "kernel",
+        PipelineOrigin::Bulk(_) => "forwarder",
+    };
+    let capture_decision = RawObservationCaptureDecision {
+        profile: Some(capture_profile_name(capture_decision.capture_profile).to_string()),
+        action: capture_action_name(capture_decision.capture_action).to_string(),
+        epoch: Some(capture_decision.capture_epoch.to_string()),
+        authority: Some(capture_authority_name(capture_decision.capture_authority).to_string()),
+    };
+    RawObservation {
+        schema_version: RAW_OBSERVATION_SCHEMA_V1.to_string(),
+        observation_id: observation_id.clone(),
+        revision: 1,
+        source: RawObservationSource {
+            // The source registry assigns sourceId. Do not pretend that an observation ID is a
+            // registered source identity.
+            source_id: None,
+            collector_id: None,
+            source_type: source_type.to_string(),
+            probe_id: Some(format!("ring/{:?}", origin)),
+            source_sequence: Some(local_sequence.to_string()),
+        },
+        event_at_unix_ns: event_at_unix_ns.to_string(),
+        received_at_unix_ns: received_at_unix_ns.to_string(),
+        runtime: RawObservationRuntime {
+            runtime_instance_id: None,
+            environment: "unknown".to_string(),
+            host_id: None,
+            boot_id: None,
+            cluster_id: None,
+            namespace: None,
+            pod_uid: None,
+            pod_name: None,
+            container_id: None,
+            container_name: None,
+            image_digest: None,
+            deployment_id: None,
+            revision: None,
+            terminal_context_id: None,
+            ssh_connection_id: None,
+            source_refs: Vec::new(),
+        },
+        // A process-generation key requires a boot/start marker. The ring ABI only has pid and
+        // cgroup, so leave it absent until Collector /proc enrichment proves the generation.
+        process: None,
+        connection: None,
+        payload: RawObservationPayload {
+            kind: format!("ring/{:?}", origin),
+            encoding: Some("binary".to_string()),
+            payload_ref: None,
+            sha256: payload_hash,
+            original_bytes: payload.len() as u64,
+            captured_bytes: payload.len() as u64,
+            truncated: false,
+            redaction_state: "hash_only".to_string(),
+            body: None,
+        },
+        idempotency_key: format!("idem_{token}"),
+        capture_decision: Some(capture_decision),
+        source_refs: vec![observation_id],
+        derived_from: Vec::new(),
+    }
+}
+
+fn capture_profile_name(value: u8) -> &'static str {
+    match value {
+        2 => "agent_full",
+        3 => "investigation_full",
+        4 => "security_full",
+        5 => "business_context",
+        6 => "infrastructure_aggregate",
+        7 => "self_health",
+        8 => "probable_investigation",
+        _ => "unknown_discovery",
+    }
+}
+
+fn capture_action_name(value: u8) -> &'static str {
+    match value {
+        1 => "full",
+        2 => "aggregate",
+        3 => "sample",
+        4 => "drop",
+        5 => "not_enabled",
+        _ => "full",
+    }
+}
+
+fn capture_authority_name(value: u8) -> &'static str {
+    match value {
+        1 => "candidate",
+        2 => "authoritative",
+        _ => "unspecified",
     }
 }
 

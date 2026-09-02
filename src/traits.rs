@@ -678,7 +678,16 @@ impl IdentityResolver for KubeResolver {
             let parsed = parse_cgroup(&cgroup);
             if let Ok(mut cache) = kube_identity_cache().lock() {
                 if cache.len() >= KUBE_IDENTITY_CACHE_LIMIT {
-                    cache.clear();
+                    // Evict the oldest cgroup entry one at a time.  Clearing the whole cache at
+                    // capacity would discard still-live workload identities and make subsequent
+                    // events look like fresh unknown processes.
+                    if let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, value)| value.refreshed_at)
+                        .map(|(key, _)| *key)
+                    {
+                        cache.remove(&oldest);
+                    }
                 }
                 cache.insert(
                     cache_key,
@@ -814,6 +823,8 @@ mod tests {
             },
             workload: None,
             observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
             process: None,
             provider: None,
             event: crate::model::AgentEvent::ProcessExit {

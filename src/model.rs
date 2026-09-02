@@ -67,6 +67,229 @@ impl EventCaptureDecision {
     }
 }
 
+/// Versioned provenance for one immutable observation emitted by an Observer/Forwarder.
+///
+/// The nested shape intentionally mirrors the AnySentry canonical contract: source, runtime and
+/// process/connection identity are separate from the payload accounting.  Values that may carry
+/// secrets (for example a raw body) are represented by a reference/hash only; this object itself
+/// never contains credentials or an unbounded payload copy.
+pub const RAW_OBSERVATION_SCHEMA_V1: &str = "anysentry.raw_observation.v1";
+pub const COVERAGE_GAP_SCHEMA_V1: &str = "anysentry.coverage_gap.v1";
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawObservationSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_id: Option<String>,
+    pub source_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawObservationRuntime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_instance_id: Option<String>,
+    pub environment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_connection_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+}
+
+/// Canonical process generation identity.  `key` is a server-safe opaque value derived from
+/// host/boot/pid/start marker (and exec generation when available); the individual hints remain
+/// additive so old consumers can continue to use `process.pid`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessGenerationKey {
+    pub process_generation_key: String,
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_process_generation_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub first_seen_at_unix_ns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exited_at_unix_ns: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+}
+
+/// Canonical connection identity.  File descriptors and raw TLS pointers are event-time hints;
+/// callers should prefer `socket_cookie`/`tls_context_id` plus the process generation and stream.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionIdentity {
+    pub schema_version: String,
+    pub connection_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_generation_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_cookie: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub netns_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    pub transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<String>,
+    pub quality: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawObservationPayload {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<String>,
+    pub sha256: String,
+    pub original_bytes: u64,
+    pub captured_bytes: u64,
+    pub truncated: bool,
+    pub redaction_state: String,
+    /// Kept for schema compatibility only.  Observer never populates this field with captured
+    /// plaintext; content stays in the separately protected interaction payload path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// A bounded reference to another immutable fact.  Source references are opaque strings in the
+/// cross-repository contract; the referenced object carries its own authority and algorithm
+/// metadata.  Keeping this as a transparent newtype prevents accidental object-shaped refs from
+/// being rejected by the AnySentry validator.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct SourceRef(pub String);
+
+impl From<String> for SourceRef {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SourceRef {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl AsRef<str> for SourceRef {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Explicit observability degradation.  A gap never replaces the KernelFact/raw event; it tells
+/// downstream readers why a semantic/transport projection is partial or unavailable.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageGap {
+    pub schema_version: String,
+    pub gap_id: String,
+    pub stage: String,
+    pub reason: String,
+    pub scope: String,
+    pub first_seen_at_unix_ns: String,
+    pub last_seen_at_unix_ns: String,
+    pub dropped_count: u64,
+    pub orphaned_count: u64,
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawObservation {
+    pub schema_version: String,
+    pub observation_id: String,
+    pub revision: u64,
+    pub source: RawObservationSource,
+    pub event_at_unix_ns: String,
+    pub received_at_unix_ns: String,
+    pub runtime: RawObservationRuntime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessGenerationKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionIdentity>,
+    pub payload: RawObservationPayload,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_decision: Option<RawObservationCaptureDecision>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawObservationCaptureDecision {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+}
+
 /// Kernel-observed process context used by downstream attribution engines.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProcessContext {
@@ -693,6 +916,14 @@ pub struct EnrichedEvent {
     /// Explicit timing and freshness for sampled signals. Consumers must not infer zero when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation: Option<ObservationMetadata>,
+    /// Immutable Observer/Forwarder provenance.  This is additive so legacy consumers can keep
+    /// reading `timing`, `process`, and `event` while newer consumers join raw facts by ID.
+    #[serde(rename = "rawObservation", skip_serializing_if = "Option::is_none")]
+    pub raw_observation: Option<RawObservation>,
+    /// Explicit parser/transport/attachment degradation.  Kernel facts remain in `event` even
+    /// when this list is non-empty.
+    #[serde(rename = "coverageGaps", skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<CoverageGap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessContext>,
     pub provider: Option<Provider>,
@@ -892,6 +1123,8 @@ mod tests {
             identity: Identity::default(),
             workload: None,
             observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
             process: None,
             provider: None,
             event: AgentEvent::ProcessExit {
@@ -910,6 +1143,8 @@ mod tests {
             identity: Identity::default(),
             workload: None,
             observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
             process: None,
             provider: None,
             event: AgentEvent::ProcessExit {
@@ -932,6 +1167,8 @@ mod tests {
             identity: Identity::default(),
             workload: None,
             observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
             process: None,
             provider: None,
             event: AgentEvent::ProcessExit {

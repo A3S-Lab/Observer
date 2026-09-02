@@ -439,6 +439,8 @@ impl CaptureAggregateReader {
                     identity: a3s_observer::Identity::default(),
                     workload: None,
                     observation: None,
+                    raw_observation: None,
+                    coverage_gaps: Vec::new(),
                     process: Some(a3s_observer::ProcessContext {
                         cgroup_id: key.cgroup_id,
                         ..a3s_observer::ProcessContext::default()

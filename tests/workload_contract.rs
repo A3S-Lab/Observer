@@ -146,6 +146,8 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
         identity: resolver.resolve(7, 11, 13),
         workload: resolver.resolve_workload(7, 11, 13),
         observation: Some(ObservationMetadata::fresh(1_720_000_015, 1_720_000_014, None).unwrap()),
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: None,
         provider: None,
         event: AgentEvent::ProcessExit {
@@ -174,6 +176,8 @@ fn process_context_serializes_mount_namespace_with_stable_identity() {
         identity: Identity::default(),
         workload: None,
         observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: Some(ProcessContext {
             host_id: Some("host-1".into()),
             boot_id: Some("boot-1".into()),
@@ -215,6 +219,8 @@ fn existing_identity_resolvers_default_to_no_workload_identity() {
         identity: resolver.resolve(1, 2, 3),
         workload: resolver.resolve_workload(1, 2, 3),
         observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: None,
         provider: None,
         event: AgentEvent::ProcessExit {

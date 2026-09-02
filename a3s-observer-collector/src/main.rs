@@ -20,9 +20,11 @@ use a3s_observer::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
     CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
     CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, EnrichedEvent,
-    EventCaptureDecision, EventTiming, ExportOutcome, ExportPriority, Exporter, Identity,
-    IdentityResolver, JsonExporter, KubeResolver, LlmInteraction, LogExporter, ProcessContext,
-    Provider, ServiceClassifier, SniClassifier,
+    ConnectionIdentity, CoverageGap, EventCaptureDecision, EventTiming, ExportOutcome,
+    ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver,
+    LlmInteraction, LogExporter, ProcessContext, ProcessGenerationKey, Provider, RawObservation,
+    ServiceClassifier, SniClassifier,
+    RAW_OBSERVATION_SCHEMA_V1,
 };
 use a3s_observer_common::{
     file_access_mode, CaptureDecisionContext, CaptureProbeStats, ConnectEvent, DnsEvent,
@@ -42,6 +44,8 @@ use a3s_observer_common::{
     PIPELINE_RING_TLS, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
     TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
     TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_TRUNCATED,
+    plaintext_http_route_hash, PLAINTEXT_HTTP_ROUTE_LLM,
+    PLAINTEXT_HTTP_ROUTE_TOOL,
 };
 use anyhow::Context as _;
 use aya::{
@@ -55,6 +59,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -110,6 +115,58 @@ const FILE_ACCESS_TRACEPOINTS: [(&str, &str); 3] = [
     ("file_openat2", "sys_enter_openat2"),
     ("file_open_legacy", "sys_enter_open"),
 ];
+
+const DEFAULT_LLM_HTTP_ROUTES: &[&str] = &[
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/v1/responses",
+    "/responses",
+    "/v1/messages",
+    "/messages",
+    "/v1/completions",
+    "/completions",
+    "/api/chat",
+    "/api/generate",
+];
+
+fn valid_plaintext_http_route(path: &str) -> bool {
+    let path = path.trim();
+    !path.is_empty()
+        && path.len() <= a3s_observer_common::PLAINTEXT_HTTP_ROUTE_MAX_LEN
+        && path.starts_with('/')
+        && !path.bytes().any(|byte| {
+            byte.is_ascii_control() || matches!(byte, b'?' | b'#' | b' ' | b'\t')
+        })
+}
+
+fn install_plaintext_http_routes(
+    mut map: BpfHashMap<MapData, u64, u8>,
+) -> anyhow::Result<BpfHashMap<MapData, u64, u8>> {
+    for route in DEFAULT_LLM_HTTP_ROUTES {
+        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_LLM, 0)?;
+    }
+    let configured = std::env::var("A3S_OBSERVER_LLM_HTTP_ROUTES").unwrap_or_default();
+    for route in configured.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        if !valid_plaintext_http_route(route) {
+            tracing::warn!(route = %route, "ignoring invalid configured LLM HTTP route");
+            continue;
+        }
+        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_LLM, 0)?;
+    }
+    let configured_tools = std::env::var("A3S_OBSERVER_TOOL_HTTP_ROUTES").unwrap_or_default();
+    for route in configured_tools
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !valid_plaintext_http_route(route) {
+            tracing::warn!(route = %route, "ignoring invalid configured tool HTTP route");
+            continue;
+        }
+        map.insert(plaintext_http_route_hash(route.as_bytes()), PLAINTEXT_HTTP_ROUTE_TOOL, 0)?;
+    }
+    Ok(map)
+}
 
 type FileFilterKeyBytes = [u8; 16];
 type FileFilterValueBytes = [u8; 24];
@@ -1048,6 +1105,8 @@ struct ProcessContextCache {
     entries: HashMap<u32, CachedProcessContext>,
     hits: u64,
     misses: u64,
+    evicted: u64,
+    expired: u64,
 }
 
 impl ProcessContextCache {
@@ -1066,6 +1125,7 @@ impl ProcessContextCache {
             self.hits += 1;
             Some(cached.context.clone())
         } else {
+            self.expired = self.expired.saturating_add(1);
             self.entries.remove(&pid);
             None
         }
@@ -1073,11 +1133,32 @@ impl ProcessContextCache {
 
     fn insert(&mut self, context: ProcessContext, now: Instant) {
         if self.entries.len() >= PROCESS_CONTEXT_CACHE_LIMIT {
-            self.entries.retain(|_, cached| {
-                now.duration_since(cached.refreshed_at) <= PROCESS_CONTEXT_CACHE_STALE
-            });
-            if self.entries.len() >= PROCESS_CONTEXT_CACHE_LIMIT {
-                self.entries.clear();
+            let stale = self
+                .entries
+                .iter()
+                .filter_map(|(pid, cached)| {
+                    (now.duration_since(cached.refreshed_at) > PROCESS_CONTEXT_CACHE_STALE)
+                        .then_some(*pid)
+                })
+                .collect::<Vec<_>>();
+            for pid in stale {
+                if self.entries.remove(&pid).is_some() {
+                    self.expired = self.expired.saturating_add(1);
+                }
+            }
+            // Evict oldest entries one-by-one when the hard bound is still reached.  A whole-map
+            // clear would hide which observations lost enrichment and could erase hot identities.
+            while self.entries.len() >= PROCESS_CONTEXT_CACHE_LIMIT {
+                let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.refreshed_at)
+                    .map(|(pid, _)| *pid)
+                else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+                self.evicted = self.evicted.saturating_add(1);
             }
         }
         self.entries.insert(
@@ -1650,6 +1731,12 @@ async fn main() -> anyhow::Result<()> {
             .context("`VERIFIED_AGENT_PROCESSES` missing")?,
     )?;
     let mut verified_process_map = VerifiedProcessMap::new(verified_processes);
+    // Install only exact, operator-auditable POST routes.  The map stores a closed route kind;
+    // path/body/provider semantics remain in userspace and no product name enters eBPF.
+    let _plaintext_http_routes = install_plaintext_http_routes(BpfHashMap::try_from(
+        ebpf.take_map("PLAINTEXT_HTTP_ROUTES")
+            .context("`PLAINTEXT_HTTP_ROUTES` missing")?,
+    )?)?;
     let mut tls_attach_manager = ssl_setting.as_deref().map(TlsAttachManager::from_env);
     let tls_agent_scope_path = ssl_setting.as_ref().and_then(|_| {
         env_any(&["ANYSENTRY_TLS_AGENT_CGROUPS_FILE"])
@@ -2045,6 +2132,7 @@ async fn main() -> anyhow::Result<()> {
                     unix_now_ms_u64(),
                 );
                 let interval_secs = partial_window_interval_secs(stats_window_started.elapsed());
+                let reassembly_metrics = processor.interactions.metrics();
                 let _ = exporter.export_with_priority(
                     &collector_heartbeat(
                         &collector,
@@ -2107,6 +2195,12 @@ async fn main() -> anyhow::Result<()> {
                     reorder_processes = reorder.process_count(),
                     reorder_forced_flushes = processor.reorder_forced_flushes,
                     reorder_key_collisions = processor.reorder_key_collisions,
+                    reassembly_connection_evictions = reassembly_metrics.connection_evictions,
+                    reassembly_connection_expirations = reassembly_metrics.connection_expirations,
+                    reassembly_orphan_chunks = reassembly_metrics.orphan_chunks,
+                    reassembly_sequence_gaps = reassembly_metrics.sequence_gaps,
+                    reassembly_parser_failures = reassembly_metrics.parser_failures,
+                    reassembly_body_limit_drops = reassembly_metrics.body_limit_drops,
                     dropped,
                     output_dropped,
                     output_critical_dropped,
@@ -2419,10 +2513,11 @@ async fn main() -> anyhow::Result<()> {
     let output_critical_dropped = exporter.output_drops_by_priority(ExportPriority::Critical);
     let output_semantic_dropped = exporter.output_drops_by_priority(ExportPriority::Semantic);
     let output_bulk_dropped = exporter.output_drops_by_priority(ExportPriority::Bulk);
-    let (process_cache_entries, process_cache_hits, process_cache_misses) = process_context_cache()
+    let (process_cache_entries, process_cache_hits, process_cache_misses, process_cache_evicted, process_cache_expired) = process_context_cache()
         .lock()
-        .map(|cache| (cache.entries.len(), cache.hits, cache.misses))
+        .map(|cache| (cache.entries.len(), cache.hits, cache.misses, cache.evicted, cache.expired))
         .unwrap_or_default();
+    let reassembly_metrics = processor.interactions.metrics();
     tracing::info!(
         exec = processor.stats.exec,
         exec_truncated = processor.stats.exec_truncated,
@@ -2439,6 +2534,14 @@ async fn main() -> anyhow::Result<()> {
         sec = processor.stats.sec,
         reorder_forced_flushes = processor.reorder_forced_flushes,
         reorder_key_collisions = processor.reorder_key_collisions,
+        peer_evictions = processor.peer_evictions,
+        llm_meta_evictions = processor.llm_meta_evictions,
+        reassembly_connection_evictions = reassembly_metrics.connection_evictions,
+        reassembly_connection_expirations = reassembly_metrics.connection_expirations,
+        reassembly_orphan_chunks = reassembly_metrics.orphan_chunks,
+        reassembly_sequence_gaps = reassembly_metrics.sequence_gaps,
+        reassembly_parser_failures = reassembly_metrics.parser_failures,
+        reassembly_body_limit_drops = reassembly_metrics.body_limit_drops,
         dropped,
         output_dropped,
         output_critical_dropped,
@@ -2447,6 +2550,8 @@ async fn main() -> anyhow::Result<()> {
         process_cache_entries,
         process_cache_hits,
         process_cache_misses,
+        process_cache_evicted,
+        process_cache_expired,
         "a3s-observer-collector: stopped (final window)"
     );
     if let Some(failure) = reader_failure {
@@ -3200,6 +3305,8 @@ fn emit_completed_exec(
     stats: &mut Stats,
     resolver: &impl IdentityResolver,
     process_lifecycles: &mut ProcessLifecycleStore,
+    raw_observation: Option<RawObservation>,
+    coverage_gaps: Vec<CoverageGap>,
     ev: CompletedExec,
 ) {
     if ev.reassembly_timed_out {
@@ -3232,6 +3339,8 @@ fn emit_completed_exec(
             identity,
             workload,
             observation: None,
+            raw_observation,
+            coverage_gaps,
             process: Some(process),
             provider: None,
             event: AgentEvent::ToolExec {
@@ -3325,6 +3434,10 @@ struct SocketKey {
     cgroup_id: u64,
     pid: u32,
     fd: u32,
+    /// `/proc/<pid>/stat` start ticks fence FD reuse within one cgroup.  Zero is an explicit
+    /// unknown value and never proves identity; events with a zero generation remain joinable
+    /// only within the current process lifetime.
+    generation_ticks: u64,
 }
 
 fn event_capture_decision(context: CaptureDecisionContext) -> EventCaptureDecision {
@@ -3360,6 +3473,8 @@ struct CollectorProcessor {
     stats: Stats,
     reorder_forced_flushes: u64,
     reorder_key_collisions: u64,
+    peer_evictions: u64,
+    llm_meta_evictions: u64,
 }
 
 impl CollectorProcessor {
@@ -3377,6 +3492,8 @@ impl CollectorProcessor {
             stats: Stats::default(),
             reorder_forced_flushes: 0,
             reorder_key_collisions: 0,
+            peer_evictions: 0,
+            llm_meta_evictions: 0,
         }
     }
 
@@ -3392,6 +3509,8 @@ impl CollectorProcessor {
                 &mut self.stats,
                 resolver,
                 &mut self.process_lifecycles,
+                None,
+                Vec::new(),
                 completed,
             );
         }
@@ -3483,6 +3602,10 @@ impl CollectorProcessor {
         let timing =
             EventTiming::from_unix_ns(envelope.event_at_unix_ns, envelope.received_at_unix_ns);
         let capture_decision = event_capture_decision(envelope.capture_decision);
+        // Every ring admission already owns an immutable provenance record.  Branches below may
+        // add connection/process hints, but never replace its payload hash or observation ID.
+        let raw_observation = envelope.raw_observation.clone();
+        let coverage_gaps = envelope.coverage_gaps.clone();
         match envelope.origin {
             PipelineOrigin::Ring(RingOrigin::Exec) => {
                 let Some(record) = read_pod::<ExecRecord>(bytes) else {
@@ -3517,6 +3640,8 @@ impl CollectorProcessor {
                         &mut self.stats,
                         resolver,
                         &mut self.process_lifecycles,
+                        Some(raw_observation.clone()),
+                        coverage_gaps.clone(),
                         completed,
                     );
                 }
@@ -3541,6 +3666,8 @@ impl CollectorProcessor {
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                         observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: None,
                         event: AgentEvent::SecurityAction {
@@ -3551,13 +3678,16 @@ impl CollectorProcessor {
                     },
                 );
             }
-            PipelineOrigin::Ring(RingOrigin::Connect) => {
+           PipelineOrigin::Ring(RingOrigin::Connect) => {
                 let Some(ev) = read_pod::<ConnectEvent>(bytes) else {
                     return;
                 };
                 let peer = peer_ip(&ev);
-                if self.peers.len() > 8_192 {
-                    self.peers.clear();
+                if self.peers.len() >= 8_192 {
+                    if let Some(oldest) = self.peers.keys().next().copied() {
+                        self.peers.remove(&oldest);
+                        self.peer_evictions = self.peer_evictions.saturating_add(1);
+                    }
                 }
                 self.peers
                     .insert(sock_key(ev.cgroup_id, ev.pid, ev.fd), (peer, ev.port));
@@ -3570,7 +3700,9 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: None,
                         event: AgentEvent::Egress {
@@ -3583,7 +3715,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-            PipelineOrigin::Ring(RingOrigin::Tls) => {
+           PipelineOrigin::Ring(RingOrigin::Tls) => {
                 let Some(ev) = read_pod::<TlsEvent>(bytes) else {
                     return;
                 };
@@ -3598,8 +3730,11 @@ impl CollectorProcessor {
                 let provider = sni
                     .as_deref()
                     .and_then(|hostname| classifier.classify(Some(hostname), peer));
-                if self.llm_meta.len() > 16_384 {
-                    self.llm_meta.clear();
+                if self.llm_meta.len() >= 16_384 {
+                    if let Some(oldest) = self.llm_meta.keys().next().copied() {
+                        self.llm_meta.remove(&oldest);
+                        self.llm_meta_evictions = self.llm_meta_evictions.saturating_add(1);
+                    }
                 }
                 self.llm_meta
                     .insert(socket, (sni.clone(), provider.clone(), peer));
@@ -3612,7 +3747,9 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider,
                         event: AgentEvent::Egress {
@@ -3625,7 +3762,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-            PipelineOrigin::Ring(RingOrigin::Dns) => {
+           PipelineOrigin::Ring(RingOrigin::Dns) => {
                 let Some(ev) = read_pod::<DnsEvent>(bytes) else {
                     return;
                 };
@@ -3642,14 +3779,16 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: None,
                         event: AgentEvent::Dns { pid: ev.pid, query },
                     },
                 );
             }
-            PipelineOrigin::Ring(RingOrigin::FileDelete) => {
+           PipelineOrigin::Ring(RingOrigin::FileDelete) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
                     return;
                 };
@@ -3666,14 +3805,16 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: None,
                         event: AgentEvent::FileDelete { pid: ev.pid, path },
                     },
                 );
             }
-            PipelineOrigin::Ring(origin @ (RingOrigin::FileAccess | RingOrigin::FileRead)) => {
+           PipelineOrigin::Ring(origin @ (RingOrigin::FileAccess | RingOrigin::FileRead)) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
                     return;
                 };
@@ -3690,7 +3831,9 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: None,
                         event: AgentEvent::FileAccess {
@@ -3713,7 +3856,7 @@ impl CollectorProcessor {
                     },
                 );
             }
-            PipelineOrigin::Ring(RingOrigin::Llm) => {
+           PipelineOrigin::Ring(RingOrigin::Llm) => {
                 let Some(ev) = read_pod::<LlmEvent>(bytes) else {
                     return;
                 };
@@ -3734,7 +3877,9 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider,
                         event: AgentEvent::LlmCall {
@@ -3753,6 +3898,16 @@ impl CollectorProcessor {
                 let Some((header, plaintext)) = read_tls_plaintext(bytes) else {
                     return;
                 };
+                let mut chunk_raw_observation = raw_observation.clone();
+                chunk_raw_observation.payload.kind = "tls_plaintext_chunk".to_string();
+                chunk_raw_observation.payload.encoding = Some("binary".to_string());
+                chunk_raw_observation.payload.original_bytes = u64::from(header.original_len);
+                chunk_raw_observation.payload.captured_bytes = u64::from(header.captured_len);
+                chunk_raw_observation.payload.sha256 = sha256_hex(plaintext);
+                chunk_raw_observation.payload.truncated =
+                    header.captured_len < header.original_len
+                        || header.flags & TLS_PLAINTEXT_FLAG_TRUNCATED != 0;
+                chunk_raw_observation.payload.redaction_state = "hash_only".to_string();
                 self.stats.ssl = self.stats.ssl.saturating_add(1);
                 let mut partial_reasons = Vec::new();
                 if header.flags & TLS_PLAINTEXT_FLAG_TRUNCATED != 0
@@ -3811,6 +3966,8 @@ impl CollectorProcessor {
                         header.comm,
                         timing.clone(),
                         capture_decision.clone(),
+                        chunk_raw_observation.clone(),
+                        coverage_gaps.clone(),
                         interaction,
                     );
                 }
@@ -3822,11 +3979,13 @@ impl CollectorProcessor {
                         header.comm,
                         timing.clone(),
                         capture_decision.clone(),
+                        chunk_raw_observation.clone(),
+                        coverage_gaps.clone(),
                         evidence,
                     );
                 }
             }
-            PipelineOrigin::Ring(RingOrigin::Exit) => {
+           PipelineOrigin::Ring(RingOrigin::Exit) => {
                 let Some(ev) = read_pod::<ExitEvent>(bytes) else {
                     return;
                 };
@@ -3845,7 +4004,9 @@ impl CollectorProcessor {
                         capture_decision: Some(capture_decision),
                         identity: lifecycle.identity,
                         workload: lifecycle.workload,
-                        observation: None,
+                       observation: None,
+                        raw_observation: Some(raw_observation.clone()),
+                        coverage_gaps: coverage_gaps.clone(),
                         process: Some(lifecycle.process),
                         provider: None,
                         event: AgentEvent::ProcessExit {
@@ -3874,6 +4035,8 @@ fn emit_completed_interaction(
     comm: [u8; 16],
     timing: EventTiming,
     capture_decision: EventCaptureDecision,
+    raw_observation: RawObservation,
+    coverage_gaps: Vec<CoverageGap>,
     interaction: CompletedInteraction,
 ) {
     let CompletedInteraction {
@@ -3926,6 +4089,35 @@ fn emit_completed_interaction(
         partial_reasons,
         capture_source,
     } = interaction;
+    let mut raw_observation = raw_observation;
+    raw_observation
+        .derived_from
+        .push(format!("interaction:{interaction_id}"));
+    let mut coverage_gaps = coverage_gaps;
+    if parse_state != "parsed" {
+        coverage_gaps.push(coverage_gap(
+            format!("gap_{interaction_id}"),
+            "llm_format",
+            "parser_failed",
+            format!("interaction:{interaction_id}"),
+            timing.event_at_unix_ns.clone(),
+            vec![raw_observation.observation_id.clone(), interaction_id.clone()],
+            0,
+            1,
+        ));
+    }
+    if !partial_reasons.is_empty() {
+        coverage_gaps.push(coverage_gap(
+            format!("gap_{}_transport", interaction_id),
+            "transport",
+            partial_reasons.join(","),
+            format!("interaction:{interaction_id}"),
+            timing.event_at_unix_ns.clone(),
+            vec![raw_observation.observation_id.clone(), interaction_id.clone()],
+            0,
+            0,
+        ));
+    }
     let provider = classifier.classify(Some(&endpoint), UNKNOWN_PEER);
     emit(
         exporter,
@@ -3937,6 +4129,8 @@ fn emit_completed_interaction(
             identity: identity_for(resolver, pid, cgroup_id, &comm),
             workload: resolver.resolve_workload(pid, cgroup_id, 0),
             observation: None,
+            raw_observation: Some(raw_observation),
+            coverage_gaps,
             process: Some(process_context(pid, cgroup_id, &comm)),
             provider,
             event: AgentEvent::LlmInteraction(Box::new(LlmInteraction {
@@ -4000,6 +4194,8 @@ fn emit_plaintext_evidence(
     comm: [u8; 16],
     timing: EventTiming,
     capture_decision: EventCaptureDecision,
+    raw_observation: RawObservation,
+    coverage_gaps: Vec<CoverageGap>,
     evidence: CompletedPlaintextEvidence,
 ) {
     let CompletedPlaintextEvidence {
@@ -4022,6 +4218,25 @@ fn emit_plaintext_evidence(
         reasons,
         capture_source,
     } = evidence;
+    let mut raw_observation = raw_observation;
+    raw_observation
+        .derived_from
+        .push(format!("plaintext_evidence:{evidence_id}"));
+    let mut coverage_gaps = coverage_gaps;
+    coverage_gaps.push(coverage_gap(
+        format!("gap_{evidence_id}"),
+        "transport",
+        if reasons.is_empty() {
+            "unsupported_protocol".to_string()
+        } else {
+            reasons.join(",")
+        },
+        format!("plaintext:{evidence_id}"),
+        timing.event_at_unix_ns.clone(),
+        vec![raw_observation.observation_id.clone(), evidence_id.clone()],
+        0,
+        1,
+    ));
     emit(
         exporter,
         stats,
@@ -4032,6 +4247,8 @@ fn emit_plaintext_evidence(
             identity: identity_for(resolver, pid, cgroup_id, &comm),
             workload: resolver.resolve_workload(pid, cgroup_id, 0),
             observation: None,
+            raw_observation: Some(raw_observation),
+            coverage_gaps,
             process: Some(process_context(pid, cgroup_id, &comm)),
             provider: None,
             event: AgentEvent::AgentPlaintextEvidence(Box::new(AgentPlaintextEvidence {
@@ -4398,6 +4615,8 @@ fn collector_heartbeat(
         identity: Identity::default(),
         workload: None,
         observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: None,
         provider: None,
         event: AgentEvent::CollectorHeartbeat {
@@ -4451,8 +4670,263 @@ fn collector_heartbeat(
     }
 }
 
-/// Export an event and count it by kind for the throughput report.
-fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, ev: EnrichedEvent) {
+fn hash_prefix(value: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(value.as_ref());
+    let mut output = String::with_capacity(24);
+    for byte in digest.iter().take(12) {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(value);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn process_generation_from_context(
+    process: &ProcessContext,
+    event: &AgentEvent,
+) -> Option<ProcessGenerationKey> {
+    let start_time_ticks = process.start_time_ticks?;
+    let host_id = process.host_id.clone();
+    let boot_id = process.boot_id.clone();
+    // A start marker is the minimum requirement for a non-reusable generation.  Host/boot are
+    // retained when available, but absence of either does not make up a value from PID alone.
+    let canonical = format!(
+        "{}|{}|{}|{}",
+        host_id.as_deref().unwrap_or(""),
+        boot_id.as_deref().unwrap_or(""),
+        process.pid,
+        start_time_ticks
+    );
+    let process_generation_key = format!("pgk_{}", hash_prefix(canonical));
+    let argv_hash = match event {
+        AgentEvent::ToolExec { argv, .. } =>
+            Some(sha256_hex(&serde_json::to_vec(argv).ok()?)),
+        _ => None,
+    };
+    Some(ProcessGenerationKey {
+        process_generation_key,
+        pid: process.pid,
+        ppid: (process.ppid != 0).then_some(process.ppid),
+        parent_process_generation_key: None,
+        host_id,
+        boot_id,
+        pid_namespace: process.pid_namespace.clone(),
+        namespace_pid: process.namespace_pid,
+        executable: process.exe.clone(),
+        argv_hash,
+        cwd: process.cwd.clone(),
+        first_seen_at_unix_ns: "0".to_string(),
+        exited_at_unix_ns: None,
+        source_refs: Vec::new(),
+    })
+}
+
+fn connection_from_event(
+    event: &AgentEvent,
+    process_generation_key: Option<&str>,
+) -> Option<ConnectionIdentity> {
+    let process_generation_key = process_generation_key?;
+    let (connection_id, transport, direction) = match event {
+        AgentEvent::LlmInteraction(interaction) => (
+            interaction.connection_id.clone(),
+            interaction.transport.clone(),
+            None,
+        ),
+        AgentEvent::AgentPlaintextEvidence(evidence) => (
+            evidence.connection_id.clone(),
+            evidence.transport_protocol.clone(),
+            Some(evidence.direction.clone()),
+        ),
+        _ => return None,
+    };
+    let connection_id = format!("conn_{}", hash_prefix(format!("{process_generation_key}|{connection_id}")));
+    let transport = match transport.to_ascii_lowercase().as_str() {
+        "tcp" => "tcp",
+        "tls" => "tls",
+        "http" | "http/1.1" | "http/1.1-body-inferred" => "http",
+        "sse" | "text/event-stream" => "sse",
+        "websocket" | "websocket-json" => "websocket",
+        "quic" => "quic",
+        _ => "unknown",
+    }
+    .to_string();
+    Some(ConnectionIdentity {
+        schema_version: "anysentry.connection_identity.v1".to_string(),
+        connection_id,
+        process_generation_key: Some(process_generation_key.to_string()),
+        socket_cookie: None,
+        fd: None,
+        fd_generation: None,
+        tls_context_id: None,
+        netns_id: None,
+        stream_id: None,
+        transport,
+        direction,
+        sequence: None,
+        quality: "strong".to_string(),
+        source_refs: Vec::new(),
+    })
+}
+
+fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) -> RawObservation {
+    let bytes = serde_json::to_vec(event).unwrap_or_default();
+    let fallback_time = system_now_unix_ns().unwrap_or(1).max(1).to_string();
+    let token = hash_prefix(
+        format!(
+            "{}|{}|{}",
+            timing
+                .map(|value| value.event_at_unix_ns.as_str())
+                .unwrap_or(fallback_time.as_str()),
+            timing
+                .map(|value| value.received_at_unix_ns.as_str())
+                .unwrap_or(fallback_time.as_str()),
+            sha256_hex(&bytes)
+        )
+        .as_bytes(),
+    );
+    let observation_id = format!("ro_{token}");
+    RawObservation {
+        schema_version: RAW_OBSERVATION_SCHEMA_V1.to_string(),
+        observation_id: observation_id.clone(),
+        revision: 1,
+        source: a3s_observer::RawObservationSource {
+            source_id: None,
+            collector_id: None,
+            source_type: "unknown".to_string(),
+            probe_id: Some("normalized_event".to_string()),
+            source_sequence: None,
+        },
+        event_at_unix_ns: timing
+            .map(|value| value.event_at_unix_ns.clone())
+            .unwrap_or_else(|| fallback_time.clone()),
+        received_at_unix_ns: timing
+            .map(|value| value.received_at_unix_ns.clone())
+            .unwrap_or_else(|| fallback_time.clone()),
+        runtime: a3s_observer::RawObservationRuntime {
+            environment: "unknown".to_string(),
+            ..a3s_observer::RawObservationRuntime::default()
+        },
+        process: None,
+        connection: None,
+        payload: a3s_observer::RawObservationPayload {
+            kind: "normalized_event".to_string(),
+            encoding: Some("binary".to_string()),
+            payload_ref: None,
+            sha256: sha256_hex(&bytes),
+            original_bytes: bytes.len() as u64,
+            captured_bytes: bytes.len() as u64,
+            truncated: false,
+            redaction_state: "hash_only".to_string(),
+            body: None,
+        },
+        idempotency_key: format!("idem_{token}"),
+        capture_decision: None,
+            source_refs: vec![observation_id],
+        derived_from: Vec::new(),
+    }
+}
+
+fn coverage_gap(
+    gap_id: impl Into<String>,
+    stage: impl Into<String>,
+    reason: impl Into<String>,
+    scope: impl Into<String>,
+    at_unix_ns: impl Into<String>,
+    source_refs: Vec<String>,
+    dropped_count: u64,
+    orphaned_count: u64,
+) -> CoverageGap {
+    let at_unix_ns = at_unix_ns.into();
+    CoverageGap {
+        schema_version: "anysentry.coverage_gap.v1".to_string(),
+        gap_id: gap_id.into(),
+        stage: stage.into(),
+        reason: reason.into(),
+        scope: scope.into(),
+        first_seen_at_unix_ns: at_unix_ns.clone(),
+        last_seen_at_unix_ns: at_unix_ns,
+        dropped_count,
+        orphaned_count,
+        revision: 1,
+        source_refs,
+    }
+}
+
+fn enrich_raw_observation(
+    mut raw: RawObservation,
+    process: Option<&ProcessContext>,
+    event: &AgentEvent,
+    event_at_unix_ns: Option<&str>,
+) -> (RawObservation, Vec<CoverageGap>) {
+    let mut gaps = Vec::new();
+    if let Some(process) = process {
+        if let Some(mut generation) = process_generation_from_context(process, event) {
+            generation.first_seen_at_unix_ns = event_at_unix_ns
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| raw.event_at_unix_ns.clone());
+            generation
+                .source_refs
+                .push(raw.observation_id.clone());
+            // Without a runtime adapter we can prove only host-level process facts.  Do not
+            // invent a container/Kubernetes environment from a cgroup path alone.
+            raw.runtime.environment = "host".to_string();
+            raw.runtime.host_id = process.host_id.clone();
+            raw.runtime.boot_id = process.boot_id.clone();
+            raw.process = Some(generation.clone());
+            if let Some(mut connection) = connection_from_event(event, Some(&generation.process_generation_key)) {
+                connection.source_refs.push(raw.observation_id.clone());
+                raw.connection = Some(connection);
+            }
+        }
+    }
+    if raw.process.is_none() {
+        gaps.push(CoverageGap {
+            schema_version: "anysentry.coverage_gap.v1".to_string(),
+            gap_id: format!("gap_{}", raw.observation_id.trim_start_matches("ro_")),
+            stage: "runtime".to_string(),
+            reason: "process_generation_unavailable".to_string(),
+            scope: format!("pid:{}", process.map(|value| value.pid).unwrap_or_default()),
+            first_seen_at_unix_ns: raw.event_at_unix_ns.clone(),
+            last_seen_at_unix_ns: raw.event_at_unix_ns.clone(),
+            dropped_count: 0,
+            orphaned_count: 0,
+            revision: 1,
+            source_refs: raw.source_refs.clone(),
+        });
+    }
+    (raw, gaps)
+}
+
+/// Export an event and count it by kind for the throughput report.  Provenance is attached at the
+/// final boundary so legacy event fields remain unchanged while every normalized event has an
+/// immutable raw-observation pointer and explicit coverage status.
+fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev: EnrichedEvent) {
+    let event_at = ev
+        .timing
+        .as_ref()
+        .map(|timing| timing.event_at_unix_ns.as_str());
+    if !matches!(ev.event, AgentEvent::CollectorHeartbeat { .. }) {
+        let raw = ev
+            .raw_observation
+            .take()
+            .unwrap_or_else(|| fallback_raw_observation(&ev.event, ev.timing.as_ref()));
+        let (raw, mut gaps) =
+            enrich_raw_observation(raw, ev.process.as_ref(), &ev.event, event_at);
+        gaps.extend(ev.coverage_gaps.drain(..));
+        ev.raw_observation = Some(raw);
+        ev.coverage_gaps = gaps;
+    }
     match &ev.event {
         AgentEvent::ToolExec {
             argv_truncated,
@@ -4503,7 +4977,14 @@ fn peer_ip(ev: &ConnectEvent) -> IpAddr {
 }
 
 fn sock_key(cgroup_id: u64, pid: u32, fd: u32) -> SocketKey {
-    SocketKey { cgroup_id, pid, fd }
+    SocketKey {
+        cgroup_id,
+        pid,
+        fd,
+        generation_ticks: read_process_stat(pid)
+            .map(|(_, start_time_ticks)| start_time_ticks)
+            .unwrap_or(0),
+    }
 }
 
 /// Extract the SNI `server_name` from a TLS ClientHello record. Fully bounds-checked

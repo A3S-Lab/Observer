@@ -125,6 +125,23 @@ pub struct CompletedPlaintextEvidence {
     pub capture_source: String,
 }
 
+/// Bounded reassembly health counters.  They are cumulative and intentionally separate from
+/// semantic interaction counts: an eviction/timeout is an observability gap, not evidence that an
+/// Agent did nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReassemblyMetrics {
+    pub connection_evictions: u64,
+    pub connection_expirations: u64,
+    pub alias_evictions: u64,
+    pub evidence_evictions: u64,
+    pub fragment_tracker_evictions: u64,
+    pub orphan_chunks: u64,
+    pub sequence_gaps: u64,
+    pub parser_failures: u64,
+    pub body_limit_drops: u64,
+    pub truncated_chunks: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ConnectionKey {
     cgroup_id: u64,
@@ -826,6 +843,7 @@ pub struct InteractionReassembler {
     max_body_bytes: usize,
     idle_timeout: Duration,
     websocket_idle_timeout: Duration,
+    metrics: ReassemblyMetrics,
 }
 
 impl Default for InteractionReassembler {
@@ -852,6 +870,7 @@ impl InteractionReassembler {
             max_body_bytes: max_body_bytes.max(4 * 1024),
             idle_timeout,
             websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT.max(idle_timeout),
+            metrics: ReassemblyMetrics::default(),
         }
     }
 
@@ -865,6 +884,7 @@ impl InteractionReassembler {
         // Ignoring it is lossless for the Agent transcript and avoids creating a false standalone
         // state that could capture a later data frame if the allocator reuses that pointer.
         if orphan_control_frame {
+            self.metrics.orphan_chunks = self.metrics.orphan_chunks.saturating_add(1);
             return Vec::new();
         }
         let key = self.resolve_connection_key(&chunk);
@@ -914,6 +934,7 @@ impl InteractionReassembler {
         if let Some(evidence) = plaintext_transport_evidence(key, state, &chunk) {
             if self.pending_evidence.len() >= self.max_connections {
                 self.pending_evidence.pop_front();
+                self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
             }
             self.pending_evidence.push_back(evidence);
         }
@@ -922,7 +943,11 @@ impl InteractionReassembler {
         if state.fragment_sequences.len() >= 64
             && !state.fragment_sequences.contains_key(&sequence_key)
         {
-            state.fragment_sequences.clear();
+            if let Some(oldest) = state.fragment_sequences.keys().next().copied() {
+                state.fragment_sequences.remove(&oldest);
+                self.metrics.fragment_tracker_evictions =
+                    self.metrics.fragment_tracker_evictions.saturating_add(1);
+            }
             extend_unique(
                 &mut chunk.partial_reasons,
                 ["fragment_sequence_tracker_reset".to_string()],
@@ -930,12 +955,27 @@ impl InteractionReassembler {
         }
         let previous_sequence = state.fragment_sequences.entry(sequence_key).or_insert(0);
         if *previous_sequence != 0 && chunk.sequence != previous_sequence.wrapping_add(1) {
+            self.metrics.sequence_gaps = self.metrics.sequence_gaps.saturating_add(1);
             extend_unique(
                 &mut chunk.partial_reasons,
                 ["fragment_sequence_gap".to_string()],
             );
         }
         *previous_sequence = chunk.sequence;
+        if chunk
+            .partial_reasons
+            .iter()
+            .any(|reason| reason.contains("limit") || reason.contains("truncat"))
+        {
+            self.metrics.body_limit_drops = self.metrics.body_limit_drops.saturating_add(1);
+            if chunk
+                .partial_reasons
+                .iter()
+                .any(|reason| reason.contains("truncat"))
+            {
+                self.metrics.truncated_chunks = self.metrics.truncated_chunks.saturating_add(1);
+            }
+        }
 
         let completed = if state.websocket.active {
             process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
@@ -1026,6 +1066,13 @@ impl InteractionReassembler {
                 }
             }
         };
+        if state.requests.last_decode_error.is_some()
+            || state.responses.last_decode_error.is_some()
+            || state.websocket.requests.last_decode_error.is_some()
+            || state.websocket.responses.last_decode_error.is_some()
+        {
+            self.metrics.parser_failures = self.metrics.parser_failures.saturating_add(1);
+        }
         if interaction_diagnostics_enabled_for(chunk.pid) && chunk.source.contains("rustls") {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
@@ -1109,9 +1156,13 @@ impl InteractionReassembler {
     fn remember_connection_alias(&mut self, observed: ConnectionKey, canonical: ConnectionKey) {
         self.retain_live_connection_aliases();
         let alias_limit = self.max_connections.saturating_mul(4).max(4);
-        if self.connection_aliases.len() < alias_limit {
-            self.connection_aliases.insert(observed, canonical);
+        if self.connection_aliases.len() >= alias_limit {
+            if let Some(oldest) = self.connection_aliases.keys().next().copied() {
+                self.connection_aliases.remove(&oldest);
+                self.metrics.alias_evictions = self.metrics.alias_evictions.saturating_add(1);
+            }
         }
+        self.connection_aliases.insert(observed, canonical);
     }
 
     fn unique_websocket_connection(
@@ -1159,6 +1210,7 @@ impl InteractionReassembler {
     pub fn expire_idle(&mut self, now: Instant) {
         let idle_timeout = self.idle_timeout;
         let websocket_idle_timeout = self.websocket_idle_timeout;
+        let before = self.connections.len();
         self.connections.retain(|key, state| {
             let timeout = if state.quiescent_websocket() {
                 websocket_idle_timeout
@@ -1178,6 +1230,10 @@ impl InteractionReassembler {
             }
             retain
         });
+        self.metrics.connection_expirations = self
+            .metrics
+            .connection_expirations
+            .saturating_add((before.saturating_sub(self.connections.len())) as u64);
         self.retain_live_connection_aliases();
     }
 
@@ -1200,9 +1256,14 @@ impl InteractionReassembler {
             .map(|(key, _)| *key)
         {
             self.connections.remove(&oldest);
+            self.metrics.connection_evictions = self.metrics.connection_evictions.saturating_add(1);
             self.connection_aliases
                 .retain(|_, canonical| *canonical != oldest);
         }
+    }
+
+    pub fn metrics(&self) -> ReassemblyMetrics {
+        self.metrics
     }
 }
 
@@ -1657,7 +1718,16 @@ fn build_interaction(
     let (response_body, response_decode_reason) =
         decode_content_encoding(&response.body, response_encoding, DEFAULT_MAX_STREAM_BYTES);
     let request_json = parse_json_body(&request_body);
-    let mut wire_match = match_wire_protocol(&method, &request.headers, request_json.as_ref())?;
+    // Unknown wire shapes are still transport facts.  Keep an explicit `unparsed` interaction so
+    // downstream can emit a coverage gap and retain the KernelFact/raw provenance instead of
+    // silently dropping the exchange when no provider adapter is registered.
+    let mut wire_match = match_wire_protocol(&method, &request.headers, request_json.as_ref())
+        .unwrap_or(WireMatch {
+            template_id: "unknown-json-exchange",
+            likelihood: "unknown",
+            parse_state: "unparsed",
+            interaction_kind: WireInteractionKind::Unparsed,
+        });
     let response_is_sse = response
         .content_type()
         .eq_ignore_ascii_case("text/event-stream")

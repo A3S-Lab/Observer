@@ -36,6 +36,8 @@ use a3s_observer_common::{
     TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
     TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND, TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE,
     TLS_PLAINTEXT_TIER_MEDIUM, TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
+    PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, plaintext_http_route_hash,
+    PLAINTEXT_HTTP_ROUTE_MAX_LEN,
 };
 use aya_ebpf::{
     cty::c_void,
@@ -245,6 +247,12 @@ static VERIFIED_AGENT_PROCESSES: LruHashMap<PlaintextProcessKey, u8> =
 #[map]
 static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
 
+// Exact POST path admission for the generic plain-HTTP lane.  Userspace installs the default
+// model routes and any explicitly authorised tool routes; the kernel stores only FNV-1a hashes and
+// a closed route kind, never product names or JSON.
+#[map]
+static PLAINTEXT_HTTP_ROUTES: HashMap<u64, u8> = HashMap::with_max_entries(512, 0);
+
 #[map]
 static HTTP_READ_ARGS: HashMap<u64, HttpReadArgs> = HashMap::with_max_entries(10_240, 0);
 
@@ -295,8 +303,13 @@ struct LlmStat {
     resp_bytes: u64,
 }
 
-fn sock_key(pid: u32, fd: u64) -> u64 {
-    ((pid as u64) << 32) | (fd & 0xffff_ffff)
+fn sock_key(cgroup_id: u64, pid: u32, fd: u64) -> u64 {
+    // Include the event-time cgroup in the opaque map key.  PID/FD values can be reused across
+    // containers; retaining only `(pid,fd)` lets a stale socket summary bleed into a new runtime.
+    let mut key = cgroup_id ^ (cgroup_id.rotate_left(17));
+    key ^= (pid as u64).rotate_left(31);
+    key ^= fd & 0xffff_ffff;
+    key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// Reserve a ring-buffer slot, counting a drop if the ring is full (so userspace can report
@@ -2021,7 +2034,8 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let count: u64 = unsafe { ctx.read_at(32)? };
     let fd: u64 = unsafe { ctx.read_at(16)? };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let key = sock_key(pid, fd);
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, pid, fd);
     try_plain_http_write(pid, fd, buf, count);
     // Already tracking this LLM socket → this write is request payload; accumulate + done.
     if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
@@ -2053,7 +2067,6 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
         },
         0,
     );
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let capture_decision = capture_raw_decision(CAPTURE_PROBE_TLS, cgroup_id, pid, count, 0);
     if !capture_decision.selected() {
         return Ok(0);
@@ -2349,10 +2362,11 @@ fn finish_ssl_ex(ctx: &RetProbeContext, direction: u8) -> u32 {
     emit_tls_plaintext(args, actual.min(args.requested_len))
 }
 
-fn next_ssl_call_sequence(pid: u32, connection_id: u64, direction: u8) -> u64 {
+fn next_ssl_call_sequence(cgroup_id: u64, pid: u32, connection_id: u64, direction: u8) -> u64 {
     // Do not XOR the raw `(pid<<32)|fd` TCP connection id with `pid<<32`: that cancels the PID
     // bits and makes unrelated processes sharing the same fd corrupt each other's sequence.
-    let key = connection_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    let key = cgroup_id.rotate_left(17)
+        ^ connection_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ (pid as u64).rotate_left(23)
         ^ ((direction as u64) << 63);
     if let Some(value) = SSL_CALL_SEQUENCES.get_ptr_mut(&key) {
@@ -2368,7 +2382,6 @@ fn next_ssl_call_sequence(pid: u32, connection_id: u64, direction: u8) -> u64 {
 }
 
 const HTTP_PREFIX_UNKNOWN: u8 = 0;
-const HTTP_PREFIX_HTTP: u8 = 1;
 const HTTP_REQUEST_LINE_SNAPSHOT: usize = 64;
 
 #[inline(always)]
@@ -2391,11 +2404,12 @@ fn bytes_at<const N: usize>(
     true
 }
 
-/// Detect only the HTTP method prefix needed to keep plain-syscall capture away from stdout/files.
-/// URL/path/provider semantics deliberately stay in userspace.
+/// Detect an exact, configured POST route while keeping plain-syscall capture away from
+/// stdout/files.  The kernel only hashes the bounded path; body/provider semantics remain in
+/// userspace.
 #[inline(always)]
-fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
-    if buf == 0 || len < 4 {
+fn http_request_route_kind(buf: u64, len: u64) -> u8 {
+    if buf == 0 || len < 6 {
         return HTTP_PREFIX_UNKNOWN;
     }
     let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
@@ -2415,17 +2429,33 @@ fn http_request_prefix_kind(buf: u64, len: u64) -> u8 {
         return HTTP_PREFIX_UNKNOWN;
     }
 
-    let is_http = bytes_at(&data, captured, 0, b"POST ")
-        || bytes_at(&data, captured, 0, b"GET ")
-        || bytes_at(&data, captured, 0, b"PUT ")
-        || bytes_at(&data, captured, 0, b"PATCH ")
-        || bytes_at(&data, captured, 0, b"DELETE ")
-        || bytes_at(&data, captured, 0, b"HEAD ")
-        || bytes_at(&data, captured, 0, b"OPTIONS ");
-    if !is_http {
+    if !bytes_at(&data, captured, 0, b"POST ") {
         return HTTP_PREFIX_UNKNOWN;
     }
-    HTTP_PREFIX_HTTP
+    let path_start = 5usize;
+    let mut path_end = path_start;
+    while path_end < captured {
+        let byte = data[path_end];
+        if byte == b' ' || byte == b'?' || byte == b'#' || byte == b'\r' || byte == b'\n' {
+            break;
+        }
+        path_end += 1;
+    }
+    if path_end <= path_start || data[path_start] != b'/' {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    if path_end.saturating_sub(path_start) > PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let hash = plaintext_http_route_hash(&data[path_start..path_end]);
+    let route = unsafe { PLAINTEXT_HTTP_ROUTES.get(&hash) }
+        .copied()
+        .unwrap_or(HTTP_PREFIX_UNKNOWN);
+    if route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL {
+        route
+    } else {
+        HTTP_PREFIX_UNKNOWN
+    }
 }
 
 #[inline(always)]
@@ -2478,7 +2508,7 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
     } else {
         pid_tgid
     };
-    let call_seq = next_ssl_call_sequence(pid, connection_id, args.direction);
+    let call_seq = next_ssl_call_sequence(cgroup_id, pid, connection_id, args.direction);
     let original_len = if actual_len > u32::MAX as u64 {
         u32::MAX
     } else {
@@ -2558,22 +2588,22 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
     if !verified_agent_process(pid, cgroup_id) {
         return;
     }
-    let key = sock_key(pid, fd);
+    let key = sock_key(cgroup_id, pid, fd);
     let mut route_kind = unsafe { HTTP_SOCKS.get(&key) }
         .copied()
         .unwrap_or(HTTP_PREFIX_UNKNOWN);
-    match http_request_prefix_kind(buf as u64, len) {
-        HTTP_PREFIX_HTTP => {
-            route_kind = HTTP_PREFIX_HTTP;
+    match http_request_route_kind(buf as u64, len) {
+        PLAINTEXT_HTTP_ROUTE_LLM | PLAINTEXT_HTTP_ROUTE_TOOL => {
+            route_kind = http_request_route_kind(buf as u64, len);
             let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
         }
         _ => {
-            if route_kind != HTTP_PREFIX_HTTP {
+            if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
                 return;
             }
         }
     }
-    if route_kind != HTTP_PREFIX_HTTP {
+    if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
         return;
     }
 
@@ -3273,7 +3303,8 @@ fn on_read_enter(ctx: &TracePointContext) -> u32 {
         return 0;
     };
     let tgid = bpf_get_current_pid_tgid();
-    let key = sock_key((tgid >> 32) as u32, fd);
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, (tgid >> 32) as u32, fd);
     // Stash only for tracked LLM sockets — keeps this node-wide hot path cheap.
     if unsafe { LLM_SOCKS.get(&key) }.is_some() {
         let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
@@ -3306,9 +3337,10 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
         return 0;
     }
     let pid = (tgid >> 32) as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     if let Some(value) = unsafe { READ_FD.get(&tgid) } {
         let fd = *value;
-        let key = sock_key(pid, fd as u64);
+        let key = sock_key(cgroup_id, pid, fd as u64);
         if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
             unsafe {
                 (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
@@ -3321,11 +3353,11 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
     let _ = READ_FD.remove(&tgid);
     if let Some(value) = unsafe { HTTP_READ_ARGS.get(&tgid) } {
         let http_args = *value;
-        let key = sock_key(pid, http_args.fd as u64);
+        let key = sock_key(cgroup_id, pid, http_args.fd as u64);
         let route_kind = unsafe { HTTP_SOCKS.get(&key) }
             .copied()
             .unwrap_or(HTTP_PREFIX_UNKNOWN);
-        if route_kind != HTTP_PREFIX_HTTP {
+        if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
             let _ = HTTP_READ_ARGS.remove(&tgid);
             return 0;
         }
@@ -3353,13 +3385,13 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         return 0;
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let key = sock_key(pid, fd);
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, pid, fd);
     let _ = HTTP_SOCKS.remove(&key);
     let Some(&stat) = (unsafe { LLM_SOCKS.get(&key) }) else {
         return 0; // not an LLM socket
     };
     let _ = LLM_SOCKS.remove(&key);
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let bytes = stat.req_bytes.saturating_add(stat.resp_bytes);
     let capture_decision = capture_raw_decision(CAPTURE_PROBE_LLM, cgroup_id, pid, bytes, 0);
     if !capture_decision.selected() {

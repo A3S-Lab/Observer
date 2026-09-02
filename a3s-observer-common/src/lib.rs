@@ -335,6 +335,107 @@ impl CaptureDecisionContext {
 
 const _: [(); 16] = [(); core::mem::size_of::<CaptureDecisionContext>()];
 
+// ---------------------------------------------------------------------------
+// Versioned raw-observation/provenance ABI
+// ---------------------------------------------------------------------------
+//
+// These records are deliberately numeric/fixed-size because they are shared with the no_std
+// eBPF crate.  The userspace model (`a3s-observer::model`) carries the human-readable/serialized
+// projection.  Keeping the ABI here gives a future probe or a Forwarder WAL a stable place to
+// attach source, generation and connection identity without putting JSON parsing in the kernel
+// hot path.
+pub const RAW_OBSERVATION_ABI_V1: u16 = 1;
+pub const RAW_OBSERVATION_FLAG_TRUNCATED: u32 = 1 << 0;
+pub const RAW_OBSERVATION_FLAG_PARTIAL: u32 = 1 << 1;
+pub const RAW_OBSERVATION_FLAG_REDACTED: u32 = 1 << 2;
+pub const RAW_OBSERVATION_FLAG_METADATA_ONLY: u32 = 1 << 3;
+
+/// Generation-safe process identity.  Hashes are opaque, node-local values; userspace may carry
+/// the corresponding host/boot strings in a protected projection.  `exec_id` is the kernel
+/// generation when available and is zero for observations that predate the exec commit fact.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessGenerationKey {
+    pub host_id_hash: u64,
+    pub boot_id_hash: u64,
+    pub pid: u32,
+    pub _reserved: u32,
+    pub start_time_ticks: u64,
+    pub exec_id: u64,
+}
+
+/// Transport identity carried alongside a raw chunk.  `fd` is an event-time lookup hint only;
+/// `socket_cookie`, `tls_context_id`, `fd_generation` and `stream_id` are the durable candidates.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionIdentity {
+    pub process_generation_hash: u64,
+    pub socket_cookie: u64,
+    pub tls_context_id: u64,
+    pub stream_id: u64,
+    pub fd: u32,
+    pub fd_generation: u32,
+    pub transport: u8,
+    pub direction: u8,
+    pub flags: u16,
+    pub sequence: u64,
+}
+
+/// Fixed-size source reference.  The source and object identifiers are namespaced hashes; the
+/// rich projection can retain a bounded textual label without copying payloads into the index.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceRef {
+    pub kind: u8,
+    pub authority: u8,
+    pub flags: u16,
+    pub source_hash: u64,
+    pub object_hash: u64,
+    pub sequence: u64,
+}
+
+/// A bounded, machine-readable coverage gap emitted when framing, parsing, attachment or export
+/// cannot produce a complete semantic record.  Gaps are facts about observability, not a reason to
+/// delete the underlying KernelFact.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoverageGap {
+    pub abi_version: u16,
+    pub stage: u8,
+    pub reason: u8,
+    pub flags: u32,
+    pub first_seen_at_boot_ns: u64,
+    pub last_seen_at_boot_ns: u64,
+    pub affected_records: u64,
+    pub source_hash: u64,
+}
+
+/// Optional fixed header for a WAL/raw-observation record.  A producer can append its payload
+/// after this header; `payload_len`/`captured_len` and the hash make truncation explicit.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawObservationHeader {
+    pub abi_version: u16,
+    pub header_len: u16,
+    pub flags: u32,
+    pub observation_sequence: u64,
+    pub captured_at_boot_ns: u64,
+    pub received_at_boot_ns: u64,
+    pub process_generation_hash: u64,
+    pub connection_id: u64,
+    pub stream_id: u64,
+    pub payload_len: u32,
+    pub captured_len: u32,
+    pub payload_hash: u64,
+    pub source_hash: u64,
+}
+
+const _: [(); 40] = [(); core::mem::size_of::<ProcessGenerationKey>()];
+const _: [(); 56] = [(); core::mem::size_of::<ConnectionIdentity>()];
+const _: [(); 32] = [(); core::mem::size_of::<SourceRef>()];
+const _: [(); 40] = [(); core::mem::size_of::<CoverageGap>()];
+const _: [(); 80] = [(); core::mem::size_of::<RawObservationHeader>()];
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureAggregateValue {
@@ -763,6 +864,22 @@ pub const TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND: u16 = 1 << 2;
 pub const TLS_PLAINTEXT_FLAG_TOOL_ROUTE: u16 = 1 << 3;
 pub const PLAINTEXT_HTTP_ROUTE_LLM: u8 = 1;
 pub const PLAINTEXT_HTTP_ROUTE_TOOL: u8 = 2;
+/// Maximum path bytes admitted by the fixed request-line route gate (excluding the leading `/`).
+pub const PLAINTEXT_HTTP_ROUTE_MAX_LEN: usize = 58;
+
+/// FNV-1a hash used by the kernel route map.  The path itself never enters the eBPF map, keeping
+/// the ABI bounded and avoiding plaintext route labels in kernel memory.
+#[inline(always)]
+pub const fn plaintext_http_route_hash(path: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut index = 0usize;
+    while index < path.len() && index < PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+        hash ^= path[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
