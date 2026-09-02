@@ -2440,8 +2440,20 @@ fn http_request_route_kind(buf: u64, len: u64) -> u8 {
         }
         path_end += 1;
     }
-    if path_end <= path_start || data[path_start] != b'/' {
+    if path_end <= path_start || path_end >= captured || data[path_start] != b'/' {
         return HTTP_PREFIX_UNKNOWN;
+    }
+    if data[path_end] != b' ' && data[path_end] != b'?' && data[path_end] != b'#' {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    if data[path_end] != b' ' {
+        let mut line_end = path_end;
+        while line_end < captured && data[line_end] != b' ' {
+            line_end += 1;
+        }
+        if line_end >= captured {
+            return HTTP_PREFIX_UNKNOWN;
+        }
     }
     if path_end.saturating_sub(path_start) > PLAINTEXT_HTTP_ROUTE_MAX_LEN {
         return HTTP_PREFIX_UNKNOWN;

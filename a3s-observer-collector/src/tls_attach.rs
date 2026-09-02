@@ -110,6 +110,18 @@ struct AttachFailure {
     last_failed_at: Instant,
 }
 
+/// Cumulative attachment health.  A failed/unsupported attach is an explicit coverage gap; it
+/// never authorizes a guessed offset or suppresses the independent KernelFact lane.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TlsAttachMetrics {
+    pub attempted: u64,
+    pub attached: u64,
+    pub failed: u64,
+    pub rejected: u64,
+    pub retry_scheduled: u64,
+    pub failure_evictions: u64,
+}
+
 /// A process-generation fence for a PID that has already been admitted as an Agent runtime.
 ///
 /// Process names and argv are mutable (Tokio/Rustls workers routinely rename their threads), and
@@ -137,6 +149,7 @@ pub struct TlsAttachManager {
     process_patterns: Vec<String>,
     static_targets: Vec<PathBuf>,
     explicit_target: Option<PathBuf>,
+    metrics: TlsAttachMetrics,
 }
 
 impl TlsAttachManager {
@@ -188,6 +201,7 @@ impl TlsAttachManager {
             process_patterns,
             static_targets,
             explicit_target,
+            metrics: TlsAttachMetrics::default(),
         }
     }
 
@@ -274,16 +288,20 @@ impl TlsAttachManager {
     }
 
     pub fn mark_attached(&mut self, key: String, _pid: Option<i32>) {
+        self.metrics.attempted = self.metrics.attempted.saturating_add(1);
         self.attach_failures.remove(&key);
         self.attached.insert(key);
+        self.metrics.attached = self.metrics.attached.saturating_add(1);
     }
 
     pub fn mark_attach_failed(&mut self, key: String, reason: &str) {
+        self.metrics.attempted = self.metrics.attempted.saturating_add(1);
         // The exported-symbol lane is speculative for interpreter main ELFs. Once the loader has
         // proved that no complete OpenSSL read/write pair exists, repeating the same symbol lookup
         // for an immutable inode cannot recover; mapped-library and static-family lanes remain
         // independent. Path/proc-root and uprobe lifecycle failures stay retryable below.
         if reason == "no complete OpenSSL read/write pair attached" {
+            self.metrics.failed = self.metrics.failed.saturating_add(1);
             self.mark_rejected(key, reason);
             return;
         }
@@ -305,6 +323,7 @@ impl TlsAttachManager {
                 .map(|(failure_key, _)| failure_key.clone())
             {
                 self.attach_failures.remove(&oldest);
+                self.metrics.failure_evictions = self.metrics.failure_evictions.saturating_add(1);
             }
         }
         self.attach_failures.insert(
@@ -315,6 +334,8 @@ impl TlsAttachManager {
                 last_failed_at: now,
             },
         );
+        self.metrics.failed = self.metrics.failed.saturating_add(1);
+        self.metrics.retry_scheduled = self.metrics.retry_scheduled.saturating_add(1);
         tracing::warn!(
             target = %key,
             reason,
@@ -326,12 +347,17 @@ impl TlsAttachManager {
 
     pub fn mark_rejected(&mut self, key: String, reason: &str) {
         if self.rejected.insert(key.clone()) {
+            self.metrics.rejected = self.metrics.rejected.saturating_add(1);
             tracing::warn!(target = %key, reason, "TLS target rejected; plaintext capture remains unavailable");
         }
     }
 
     pub fn attached_count(&self) -> usize {
         self.attached.len()
+    }
+
+    pub fn metrics(&self) -> TlsAttachMetrics {
+        self.metrics
     }
 
     fn plan_is_available(&self, key: &str) -> bool {
@@ -1462,6 +1488,26 @@ mod tests {
         assert!(manager.rejected.contains(&key));
         assert!(!manager.attach_failures.contains_key(&key));
         assert!(!manager.plan_is_available(&key));
+    }
+
+    #[test]
+    fn attachment_failures_are_explicitly_counted_and_bounded() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:9:ino:10:transient".to_string();
+        manager.mark_attach_failed(key.clone(), "temporary attach race");
+        let first = manager.metrics();
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.failed, 1);
+        assert_eq!(first.retry_scheduled, 1);
+        manager
+            .attach_failures
+            .get_mut(&key)
+            .expect("retry state")
+            .next_retry_at = Instant::now() - Duration::from_secs(1);
+        manager.mark_attached(key, None);
+        let second = manager.metrics();
+        assert_eq!(second.attempted, 2);
+        assert_eq!(second.attached, 1);
     }
 
     #[test]

@@ -2030,6 +2030,7 @@ async fn main() -> anyhow::Result<()> {
                 capture_profile_stats.as_ref(),
                 capture_aggregate_reader.as_ref(),
             ),
+            tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
             false,
         ),
         ExportPriority::Critical,
@@ -2118,6 +2119,18 @@ async fn main() -> anyhow::Result<()> {
                     );
                     last_tls_profile_diagnostics = tls_profile_snapshot;
                 }
+                if let Some(manager) = tls_attach_manager.as_ref() {
+                    let attach_metrics = manager.metrics();
+                    tracing::debug!(
+                        tls_attach_attempted = attach_metrics.attempted,
+                        tls_attach_succeeded = attach_metrics.attached,
+                        tls_attach_failed = attach_metrics.failed,
+                        tls_attach_rejected = attach_metrics.rejected,
+                        tls_attach_retries = attach_metrics.retry_scheduled,
+                        tls_attach_failure_evictions = attach_metrics.failure_evictions,
+                        "TLS attachment coverage metrics"
+                    );
+                }
                 let output_dropped = exporter.output_drops();
                 let output_critical_dropped =
                     exporter.output_drops_by_priority(ExportPriority::Critical);
@@ -2163,6 +2176,7 @@ async fn main() -> anyhow::Result<()> {
                         },
                         Some(pipeline),
                         capture_heartbeat,
+                        tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
                         false,
                     ),
                     ExportPriority::Critical,
@@ -2515,6 +2529,7 @@ async fn main() -> anyhow::Result<()> {
             capture_profile_stats.as_ref(),
             capture_aggregate_reader.as_ref(),
         ),
+        tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
         true,
     );
     if !exporter.export_and_flush(&final_heartbeat, FINAL_HEARTBEAT_FLUSH_TIMEOUT) {
@@ -3928,6 +3943,21 @@ impl CollectorProcessor {
                     return;
                 };
                 let mut chunk_raw_observation = raw_observation.clone();
+                // One TLS call can be framed into a semantic exchange distinct from the binary
+                // ring record. Give that derived payload its own immutable observation identity and
+                // retain the physical ring ID in `derivedFrom`; never reuse the parent ID with a
+                // different hash.
+                let derived_token = hash_prefix(format!(
+                    "{}|{}|{}|{}",
+                    raw_observation.observation_id,
+                    header.call_seq,
+                    header.direction,
+                    header.captured_at_boot_ns,
+                ));
+                chunk_raw_observation.observation_id = format!("ro_{derived_token}");
+                chunk_raw_observation.source_refs = vec![raw_observation.observation_id.clone()];
+                chunk_raw_observation.derived_from = vec![raw_observation.observation_id.clone()];
+                chunk_raw_observation.idempotency_key = format!("idem_{derived_token}");
                 chunk_raw_observation.payload.kind = "tls_plaintext_chunk".to_string();
                 chunk_raw_observation.payload.encoding = Some("binary".to_string());
                 chunk_raw_observation.payload.original_bytes = u64::from(header.original_len);
@@ -4117,10 +4147,10 @@ fn emit_completed_interaction(
         partial_reasons,
         capture_source,
     } = interaction;
-    let mut raw_observation = raw_observation;
-    raw_observation
-        .derived_from
-        .push(format!("interaction:{interaction_id}"));
+    // The physical ring observation is immutable and may fan out to more than one semantic
+    // exchange on a reused connection.  Keep its identity/fingerprint unchanged; semantic
+    // records carry their own `derivedFrom`/source reference instead of mutating this clone.
+    let raw_observation = raw_observation;
     let mut coverage_gaps = coverage_gaps;
     if parse_state != "parsed" {
         coverage_gaps.push(coverage_gap(
@@ -4252,10 +4282,9 @@ fn emit_plaintext_evidence(
         reasons,
         capture_source,
     } = evidence;
-    let mut raw_observation = raw_observation;
-    raw_observation
-        .derived_from
-        .push(format!("plaintext_evidence:{evidence_id}"));
+    // Preserve the immutable physical observation when emitting a metadata-only evidence record.
+    // The evidence ID is a downstream reference, not a mutation of the raw fact.
+    let raw_observation = raw_observation;
     let mut coverage_gaps = coverage_gaps;
     coverage_gaps.push(coverage_gap(
         format!("gap_{evidence_id}"),
@@ -4631,6 +4660,31 @@ fn partial_window_interval_secs(elapsed: Duration) -> u64 {
         .saturating_add(u64::from(elapsed.subsec_nanos() > 0))
 }
 
+fn tls_attach_coverage_gaps(manager: Option<&TlsAttachManager>) -> Vec<CoverageGap> {
+    let Some(manager) = manager else {
+        return Vec::new();
+    };
+    let metrics = manager.metrics();
+    if metrics.failed == 0 && metrics.rejected == 0 {
+        return Vec::new();
+    }
+    let now = system_now_unix_ns().unwrap_or(1).max(1).to_string();
+    vec![coverage_gap(
+        "gap_tls_attach",
+        "transport",
+        if metrics.rejected > 0 {
+            "unsupported_tls_profile"
+        } else {
+            "attach_pending"
+        },
+        "collector:tls_attach",
+        now,
+        Vec::new(),
+        metrics.failed,
+        metrics.rejected,
+    )]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collector_heartbeat(
     meta: &CollectorMeta,
@@ -4641,6 +4695,7 @@ fn collector_heartbeat(
     file_filter: FileFilterHeartbeatSnapshot,
     pipeline_accounting: Option<CollectorPipelineAccounting>,
     capture_profile: Option<CollectorCaptureProfileStats>,
+    coverage_gaps: Vec<CoverageGap>,
     shutdown_final: bool,
 ) -> EnrichedEvent {
     EnrichedEvent {
@@ -4650,7 +4705,7 @@ fn collector_heartbeat(
         workload: None,
         observation: None,
         raw_observation: None,
-        coverage_gaps: Vec::new(),
+        coverage_gaps,
         process: None,
         provider: None,
         event: AgentEvent::CollectorHeartbeat {
@@ -4730,7 +4785,10 @@ fn process_generation_from_context(
     process: &ProcessContext,
     event: &AgentEvent,
 ) -> Option<ProcessGenerationKey> {
-    let start_time_ticks = process.start_time_ticks?;
+    if process.pid == 0 {
+        return None;
+    }
+    let start_time_ticks = process.start_time_ticks.filter(|value| *value > 0)?;
     let host_id = process.host_id.clone();
     let boot_id = process.boot_id.clone();
     // A start marker is the minimum requirement for a non-reusable generation.  Host/boot are
@@ -4754,6 +4812,11 @@ fn process_generation_from_context(
         parent_process_generation_key: None,
         host_id,
         boot_id,
+        start_time_ticks: Some(start_time_ticks),
+        exec_id: match event {
+            AgentEvent::ToolExec { exec_id, .. } => Some(exec_id.to_string()),
+            _ => None,
+        },
         pid_namespace: process.pid_namespace.clone(),
         namespace_pid: process.namespace_pid,
         executable: process.exe.clone(),
@@ -5013,13 +5076,27 @@ fn peer_ip(ev: &ConnectEvent) -> IpAddr {
 }
 
 fn sock_key(cgroup_id: u64, pid: u32, fd: u32) -> SocketKey {
+    socket_key_with_generation(
+        cgroup_id,
+        pid,
+        fd,
+        read_process_stat(pid)
+            .map(|(_, start_time_ticks)| start_time_ticks)
+            .unwrap_or(0),
+    )
+}
+
+fn socket_key_with_generation(
+    cgroup_id: u64,
+    pid: u32,
+    fd: u32,
+    generation_ticks: u64,
+) -> SocketKey {
     SocketKey {
         cgroup_id,
         pid,
         fd,
-        generation_ticks: read_process_stat(pid)
-            .map(|(_, start_time_ticks)| start_time_ticks)
-            .unwrap_or(0),
+        generation_ticks,
     }
 }
 
@@ -5114,20 +5191,21 @@ mod tests {
         observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
         parse_unknown_file_policy, partial_window_interval_secs, pod_bytes, pod_from_bytes,
-        supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
-        CollectorMeta, CollectorProcessor, CompletedExec, ExecAssembler, FileFeatureFlags,
-        FileFilterHeartbeatSnapshot, PipelineAccountingState, PipelineRing, ProcessContextCache,
-        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
+        socket_key_with_generation, supplement_exec_argv_at, tls_capture_profile_needs_refresh,
+        tls_exec_comm_needs_refresh, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
+        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot,
+        PipelineAccountingState, PipelineRing, ProcessContextCache, ProcessLifecycleStore,
+        RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
         EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
     };
     use a3s_observer::{AgentEvent, ExportPriority, ProcessContext};
     use a3s_observer_common::{
-        CaptureDecisionContext, ExecRecord, FileFilterConfig, FileFilterStats, FileFilterValue,
-        RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROFILE_AGENT_FULL,
-        CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
-        EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK,
-        EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_FILTER_ACTION_DROP,
-        FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+        plaintext_http_route_hash, CaptureDecisionContext, ExecRecord, FileFilterConfig,
+        FileFilterStats, FileFilterValue, RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED,
+        CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_INVESTIGATION_FULL,
+        CAPTURE_PROFILE_PROBABLE_INVESTIGATION, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED,
+        EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
+        FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
         FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED,
         FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_COUNT, PIPELINE_RING_EXEC,
         PIPELINE_RING_FILE_ACCESS,
@@ -5413,6 +5491,7 @@ mod tests {
             },
             None,
             None,
+            Vec::new(),
             true,
         );
         let serialized = serde_json::to_value(&heartbeat).unwrap();
@@ -5949,6 +6028,36 @@ mod tests {
         let (_, pt, ct) = parse_llm_meta(resp).unwrap();
         assert_eq!((pt, ct), (Some(12), Some(34)));
         assert!(parse_llm_meta("just plaintext, no json fields here").is_none());
+    }
+
+    #[test]
+    fn plaintext_route_configuration_is_exact_and_bounded() {
+        assert!(valid_plaintext_http_route("/v1/chat/completions"));
+        assert!(!valid_plaintext_http_route("v1/chat/completions"));
+        assert!(!valid_plaintext_http_route(
+            "/v1/chat/completions?token=secret"
+        ));
+        assert!(!valid_plaintext_http_route("/v1/chat completions"));
+        let long = format!(
+            "/{}",
+            "x".repeat(a3s_observer_common::PLAINTEXT_HTTP_ROUTE_MAX_LEN)
+        );
+        assert!(!valid_plaintext_http_route(&long));
+        assert_ne!(
+            plaintext_http_route_hash(b"/v1/chat/completions"),
+            plaintext_http_route_hash(b"/v1/responses")
+        );
+    }
+
+    #[test]
+    fn socket_key_changes_across_process_generations_even_when_pid_fd_repeat() {
+        let first = socket_key_with_generation(77, 42, 9, 100);
+        let second = socket_key_with_generation(77, 42, 9, 101);
+        let other_cgroup = socket_key_with_generation(78, 42, 9, 100);
+        assert_ne!(first, second);
+        assert_ne!(first, other_cgroup);
+        assert_eq!(first.pid, second.pid);
+        assert_eq!(first.fd, second.fd);
     }
 
     #[test]

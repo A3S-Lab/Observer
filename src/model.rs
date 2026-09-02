@@ -145,6 +145,10 @@ pub struct ProcessGenerationKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid_namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_pid: Option<u32>,
