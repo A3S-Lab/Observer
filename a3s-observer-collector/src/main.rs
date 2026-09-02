@@ -4780,7 +4780,9 @@ fn monotonic_delta(current: u64, previous: u64) -> u64 {
 }
 
 fn unix_now_ms_u64() -> u64 {
-    (safe_unix_now_ns() / 1_000_000).min(u128::from(u64::MAX)) as u64
+    (safe_unix_now_ns() / 1_000_000)
+        .max(1)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn safe_unix_now_ns() -> u128 {
