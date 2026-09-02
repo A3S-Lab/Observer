@@ -2011,6 +2011,8 @@ async fn main() -> anyhow::Result<()> {
         aggregate_ring_pipeline_stats(&ring_pipeline_stats),
         unix_now_ms_u64(),
     );
+    let mut initial_coverage_gaps = tls_attach_coverage_gaps(tls_attach_manager.as_ref());
+    initial_coverage_gaps.extend(pipeline_coverage_gaps(&initial_pipeline));
     let _ = exporter.export_with_priority(
         &collector_heartbeat(
             &collector,
@@ -2030,7 +2032,7 @@ async fn main() -> anyhow::Result<()> {
                 capture_profile_stats.as_ref(),
                 capture_aggregate_reader.as_ref(),
             ),
-            tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
+            initial_coverage_gaps,
             false,
         ),
         ExportPriority::Critical,
@@ -2159,6 +2161,8 @@ async fn main() -> anyhow::Result<()> {
                     aggregate_ring_pipeline_stats(&ring_pipeline_stats),
                     unix_now_ms_u64(),
                 );
+                let mut coverage_gaps = tls_attach_coverage_gaps(tls_attach_manager.as_ref());
+                coverage_gaps.extend(pipeline_coverage_gaps(&pipeline));
                 let interval_secs = partial_window_interval_secs(stats_window_started.elapsed());
                 let reassembly_metrics = processor.interactions.metrics();
                 let _ = exporter.export_with_priority(
@@ -2176,7 +2180,7 @@ async fn main() -> anyhow::Result<()> {
                         },
                         Some(pipeline),
                         capture_heartbeat,
-                        tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
+                        coverage_gaps,
                         false,
                     ),
                     ExportPriority::Critical,
@@ -2511,6 +2515,8 @@ async fn main() -> anyhow::Result<()> {
         aggregate_ring_pipeline_stats(&ring_pipeline_stats),
         unix_now_ms_u64(),
     );
+    let mut final_coverage_gaps = tls_attach_coverage_gaps(tls_attach_manager.as_ref());
+    final_coverage_gaps.extend(pipeline_coverage_gaps(&final_pipeline));
     let final_heartbeat = collector_heartbeat(
         &collector,
         partial_window_interval_secs(stats_window_started.elapsed()),
@@ -2529,7 +2535,7 @@ async fn main() -> anyhow::Result<()> {
             capture_profile_stats.as_ref(),
             capture_aggregate_reader.as_ref(),
         ),
-        tls_attach_coverage_gaps(tls_attach_manager.as_ref()),
+        final_coverage_gaps,
         true,
     );
     if !exporter.export_and_flush(&final_heartbeat, FINAL_HEARTBEAT_FLUSH_TIMEOUT) {
@@ -3408,6 +3414,49 @@ fn emit_completed_exec(
     );
 }
 
+fn emit_decode_gap(
+    exporter: &dyn Exporter,
+    stats: &mut Stats,
+    envelope: &RawEnvelope,
+    reason: &str,
+) {
+    let gap = coverage_gap(
+        format!("gap_{}_{}", envelope.raw_observation.observation_id, reason),
+        "ingest",
+        reason,
+        format!("ring:{:?}", envelope.origin),
+        envelope.event_at_unix_ns.to_string(),
+        vec![envelope.raw_observation.observation_id.clone()],
+        0,
+        1,
+    );
+    let mut gaps = envelope.coverage_gaps.clone();
+    gaps.push(gap.clone());
+    emit(
+        exporter,
+        stats,
+        PipelineRing::from(match envelope.origin {
+            PipelineOrigin::Ring(origin) => origin,
+            PipelineOrigin::Bulk(_) => RingOrigin::Ssl,
+        }),
+        EnrichedEvent {
+            timing: Some(EventTiming::from_unix_ns(
+                envelope.event_at_unix_ns,
+                envelope.received_at_unix_ns,
+            )),
+            capture_decision: Some(event_capture_decision(envelope.capture_decision)),
+            identity: Identity::default(),
+            workload: None,
+            observation: None,
+            raw_observation: Some(envelope.raw_observation.clone()),
+            coverage_gaps: gaps,
+            process: None,
+            provider: None,
+            event: AgentEvent::CoverageGap(Box::new(gap)),
+        },
+    );
+}
+
 /// A NUL-terminated byte buffer (from a kernel copy) as a lossy String.
 fn cstr(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -3650,6 +3699,26 @@ impl CollectorProcessor {
         // add connection/process hints, but never replace its payload hash or observation ID.
         let raw_observation = envelope.raw_observation.clone();
         let coverage_gaps = envelope.coverage_gaps.clone();
+        if matches!(envelope.origin, PipelineOrigin::Ring(_)) && bytes.len() < 16 {
+            emit_decode_gap(
+                exporter,
+                &mut self.stats,
+                &envelope,
+                "malformed_ring_record",
+            );
+            return;
+        }
+        if matches!(envelope.origin, PipelineOrigin::Ring(RingOrigin::Ssl))
+            && read_tls_plaintext(bytes).is_none()
+        {
+            emit_decode_gap(
+                exporter,
+                &mut self.stats,
+                &envelope,
+                "invalid_plaintext_abi",
+            );
+            return;
+        }
         match envelope.origin {
             PipelineOrigin::Ring(RingOrigin::Exec) => {
                 let Some(record) = read_pod::<ExecRecord>(bytes) else {
@@ -4685,6 +4754,60 @@ fn tls_attach_coverage_gaps(manager: Option<&TlsAttachManager>) -> Vec<CoverageG
     )]
 }
 
+fn pipeline_coverage_gaps(pipeline: &CollectorPipelineAccounting) -> Vec<CoverageGap> {
+    let mut gaps = Vec::new();
+    let at = pipeline
+        .window
+        .ended_at_unix_ms
+        .saturating_mul(1_000_000)
+        .max(1);
+    let at = at.to_string();
+    for ring in &pipeline.rings {
+        if ring.ring_dropped > 0 {
+            gaps.push(coverage_gap(
+                format!("gap_ring_drop_{}", ring.ring),
+                "ingest",
+                "dropped",
+                format!("ring:{}", ring.ring),
+                at.clone(),
+                Vec::new(),
+                ring.ring_dropped,
+                0,
+            ));
+        }
+        if let Some(dropped) = ring
+            .collector_ingress
+            .as_ref()
+            .map(|ingress| ingress.collector_dropped)
+            .filter(|value| *value > 0)
+        {
+            gaps.push(coverage_gap(
+                format!("gap_collector_drop_{}", ring.ring),
+                "ingest",
+                "dropped",
+                format!("collector:ring:{}", ring.ring),
+                at.clone(),
+                Vec::new(),
+                dropped,
+                0,
+            ));
+        }
+        if ring.queue_dropped > 0 {
+            gaps.push(coverage_gap(
+                format!("gap_queue_drop_{}", ring.ring),
+                "projection",
+                "dropped",
+                format!("queue:ring:{}", ring.ring),
+                at.clone(),
+                Vec::new(),
+                ring.queue_dropped,
+                0,
+            ));
+        }
+    }
+    gaps
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collector_heartbeat(
     meta: &CollectorMeta,
@@ -4846,6 +4969,7 @@ fn connection_from_event(
         ),
         _ => return None,
     };
+    let raw_connection_id = connection_id.clone();
     let connection_id = format!(
         "conn_{}",
         hash_prefix(format!("{process_generation_key}|{connection_id}"))
@@ -4867,7 +4991,7 @@ fn connection_from_event(
         socket_cookie: None,
         fd: None,
         fd_generation: None,
-        tls_context_id: None,
+        tls_context_id: Some(format!("tlsctx_{}", hash_prefix(raw_connection_id))),
         netns_id: None,
         stream_id: None,
         transport,
@@ -5050,6 +5174,7 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev
         AgentEvent::LlmCall { .. } => stats.llm += 1,
         AgentEvent::LlmInteraction(..) => stats.llm += 1,
         AgentEvent::AgentPlaintextEvidence(..) => {}
+        AgentEvent::CoverageGap(..) => {}
         AgentEvent::SslContent { .. } => stats.ssl += 1,
         AgentEvent::LlmApi { .. } => stats.llm += 1,
         AgentEvent::SecurityAction { .. } => stats.sec += 1,
@@ -5186,19 +5311,21 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collector_heartbeat, cstr, env_value_disabled, exec_ppid, exec_process_context,
+        collector_heartbeat, cstr, emit, env_value_disabled, exec_ppid, exec_process_context,
         exit_lifecycle_context, file_feature_flags_from, monotonic_delta,
         observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
-        parse_unknown_file_policy, partial_window_interval_secs, pod_bytes, pod_from_bytes,
-        socket_key_with_generation, supplement_exec_argv_at, tls_capture_profile_needs_refresh,
-        tls_exec_comm_needs_refresh, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
-        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot,
-        PipelineAccountingState, PipelineRing, ProcessContextCache, ProcessLifecycleStore,
-        RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
+        parse_unknown_file_policy, partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes,
+        pod_from_bytes, process_context, socket_key_with_generation, supplement_exec_argv_at,
+        tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh, valid_plaintext_http_route,
+        CollectorMeta, CollectorProcessor, CompletedExec, ExecAssembler, FileFeatureFlags,
+        FileFilterHeartbeatSnapshot, PipelineAccountingState, PipelineRing, ProcessContextCache,
+        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
         EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
     };
-    use a3s_observer::{AgentEvent, ExportPriority, ProcessContext};
+    use a3s_observer::{
+        AgentEvent, EnrichedEvent, EventTiming, ExportPriority, Exporter, Identity, ProcessContext,
+    };
     use a3s_observer_common::{
         plaintext_http_route_hash, CaptureDecisionContext, ExecRecord, FileFilterConfig,
         FileFilterStats, FileFilterValue, RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED,
@@ -5211,6 +5338,7 @@ mod tests {
         PIPELINE_RING_FILE_ACCESS,
     };
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -6058,6 +6186,90 @@ mod tests {
         assert_ne!(first, other_cgroup);
         assert_eq!(first.pid, second.pid);
         assert_eq!(first.fd, second.fd);
+    }
+
+    #[test]
+    fn pipeline_drops_become_explicit_coverage_gaps() {
+        let pipeline = a3s_observer::CollectorPipelineAccounting {
+            schema_version: "anysentry.pipeline_accounting.v1".to_string(),
+            producer_instance_id: "collector".to_string(),
+            sequence: 1,
+            window: a3s_observer::CollectorPipelineWindow {
+                started_at_unix_ms: 1,
+                ended_at_unix_ms: 2,
+            },
+            temporality: "delta".to_string(),
+            unit: a3s_observer::CollectorPipelineUnit {
+                ring: "physical_record".to_string(),
+                queue: "logical_event".to_string(),
+            },
+            rings: vec![a3s_observer::CollectorRingAccounting {
+                ring: "ssl".to_string(),
+                ring_submitted: 1,
+                ring_dropped: 2,
+                collector_received: 1,
+                collector_ingress: Some(a3s_observer::CollectorIngressAccounting {
+                    collector_enqueued: 1,
+                    collector_dropped: 3,
+                }),
+                logical_events: 1,
+                queue_admitted: 0,
+                queue_dropped: 4,
+            }],
+        };
+        let gaps = pipeline_coverage_gaps(&pipeline);
+        assert_eq!(gaps.len(), 3);
+        assert!(gaps.iter().all(|gap| gap.reason == "dropped"));
+        assert!(gaps.iter().any(|gap| gap.dropped_count == 2));
+        assert!(gaps.iter().any(|gap| gap.dropped_count == 4));
+    }
+
+    #[test]
+    fn emitted_event_provenance_uses_validator_safe_generation_and_connection_ids() {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<EnrichedEvent>>>);
+        impl Exporter for Sink {
+            fn export(&self, event: &EnrichedEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let mut stats = Stats::default();
+        let pid = std::process::id();
+        let process = process_context(pid, 1, &[0; 16]);
+        let event = EnrichedEvent {
+            timing: Some(EventTiming::from_unix_ns(
+                1_780_000_000_000_000_000,
+                1_780_000_000_000_000_100,
+            )),
+            capture_decision: None,
+            identity: Identity::default(),
+            workload: None,
+            observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
+            process: Some(process),
+            provider: None,
+            event: AgentEvent::ProcessExit {
+                pid,
+                exit_code: 0,
+                signal: 0,
+            },
+        };
+        emit(&sink, &mut stats, PipelineRing::Exit, event);
+        let emitted = sink.0.lock().unwrap();
+        let raw = emitted[0].raw_observation.as_ref().expect("raw provenance");
+        assert!(raw.observation_id.starts_with("ro_"));
+        assert!(raw.payload.sha256.len() == 64);
+        assert!(raw.process.is_some());
+        assert!(raw
+            .process
+            .as_ref()
+            .unwrap()
+            .process_generation_key
+            .starts_with("pgk_"));
+        assert!(emitted[0].coverage_gaps.is_empty());
     }
 
     #[test]

@@ -825,6 +825,10 @@ pub enum AgentEvent {
     /// supported. No credential header or unredacted raw payload is exported. This keeps unknown
     /// protocols discoverable and re-testable without turning them into fabricated conversations.
     AgentPlaintextEvidence(Box<AgentPlaintextEvidence>),
+    /// Metadata-only degradation emitted when a raw record cannot be decoded.  The original raw
+    /// envelope/provenance remains attached to the enclosing event; this variant is not a KernelFact
+    /// and must never be interpreted as an agent action.
+    CoverageGap(Box<CoverageGap>),
     /// A security-sensitive action — rare and high-signal, filtered in-kernel: privilege escalation
     /// (`setuid`/`setresuid`/`setreuid` → root from non-root — note legitimate `sudo`/`su` also fire
     /// this; it's a real transition, expected to pair with a `ToolExec`), process injection (`ptrace`
