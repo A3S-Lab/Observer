@@ -5181,6 +5181,14 @@ fn enrich_raw_observation(
     event_at_unix_ns: Option<&str>,
 ) -> (RawObservation, Vec<CoverageGap>) {
     let mut gaps = Vec::new();
+    raw.source.collector_id = raw
+        .source
+        .collector_id
+        .or_else(|| env_any(&["A3S_OBSERVER_COLLECTOR_ID", "COLLECTOR_ID"]));
+    raw.runtime.namespace = raw
+        .runtime
+        .namespace
+        .or_else(|| env_any(&["A3S_NAMESPACE", "POD_NAMESPACE", "K8S_NAMESPACE"]));
     if let Some(process) = process {
         if let Some(mut generation) = process_generation_from_context(process, event) {
             generation.first_seen_at_unix_ns = event_at_unix_ns

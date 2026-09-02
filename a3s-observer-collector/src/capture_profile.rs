@@ -56,6 +56,7 @@ fn aggregate_raw_observation(
         received_at_unix_ns: at_unix_ns.to_string(),
         runtime: a3s_observer::RawObservationRuntime {
             environment: "unknown".to_string(),
+            source_refs: vec![observation_id.clone()],
             ..a3s_observer::RawObservationRuntime::default()
         },
         process: None,

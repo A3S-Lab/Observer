@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub const ADAPTER_MANIFEST_SCHEMA_V1: &str = "anysentry.agent_adapter.v1";
 pub const TRANSPORT_MANIFEST_SCHEMA_V1: &str = "anysentry.transport_decoder.v1";
 pub const LLM_FORMAT_MANIFEST_SCHEMA_V1: &str = "anysentry.llm_format.v1";
+pub const RUNTIME_MANIFEST_SCHEMA_V1: &str = "anysentry.runtime_adapter.v1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +107,14 @@ pub trait AgentAdapter: Send + Sync {
     fn match_runtime(&self, runtime: &RuntimeContext) -> RegistryMatch;
     fn extract_identity(&self, exchange: &Value, runtime: &RuntimeContext) -> Vec<IdentityHint>;
     fn extract_tool(&self, exchange: &Value) -> Vec<ToolHint>;
+}
+
+/// Runtime/environment adapter.  It resolves host/SSH/Docker/Kubernetes context only; it has no
+/// knowledge of Agent product fields or LLM wire formats.
+pub trait RuntimeAdapter: Send + Sync {
+    fn manifest(&self) -> &AdapterManifest;
+    fn detect(&self, runtime: &RuntimeContext) -> RegistryMatch;
+    fn enrich(&self, runtime: &RuntimeContext) -> RuntimeContext;
 }
 
 /// Small bounded registry used by host-side extensions.  Registration is explicit and duplicate
@@ -314,6 +323,49 @@ impl AgentAdapter for DefaultAgentAdapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct DefaultRuntimeAdapter {
+    manifest: AdapterManifest,
+}
+
+impl DefaultRuntimeAdapter {
+    pub fn new() -> Self {
+        Self {
+            manifest: AdapterManifest {
+                schema_version: RUNTIME_MANIFEST_SCHEMA_V1.to_string(),
+                id: "runtime-context-default".to_string(),
+                family: "runtime".to_string(),
+                version_policy: "platform-family".to_string(),
+                capabilities: vec![
+                    "host".to_string(),
+                    "ssh".to_string(),
+                    "docker".to_string(),
+                    "kubernetes".to_string(),
+                ],
+                limitations: Vec::new(),
+            },
+        }
+    }
+}
+
+impl RuntimeAdapter for DefaultRuntimeAdapter {
+    fn manifest(&self) -> &AdapterManifest {
+        &self.manifest
+    }
+
+    fn detect(&self, runtime: &RuntimeContext) -> RegistryMatch {
+        if runtime.environment.trim().is_empty() {
+            RegistryMatch::unknown("runtime environment missing")
+        } else {
+            RegistryMatch::confirmed("runtime environment provided")
+        }
+    }
+
+    fn enrich(&self, runtime: &RuntimeContext) -> RuntimeContext {
+        runtime.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,8 +375,32 @@ mod tests {
         let transport = HttpTransportManifest::new();
         let format = DefaultLlmFormatAdapter::new();
         let agent = DefaultAgentAdapter::new();
+        let runtime = DefaultRuntimeAdapter::new();
         assert_eq!(transport.manifest().family, "http1");
+        assert_eq!(
+            transport.manifest().schema_version,
+            TRANSPORT_MANIFEST_SCHEMA_V1
+        );
         assert_eq!(format.manifest().family, "llm-wire");
+        assert_eq!(
+            format.manifest().schema_version,
+            LLM_FORMAT_MANIFEST_SCHEMA_V1
+        );
+        assert_eq!(runtime.manifest().family, "runtime");
+        assert_eq!(
+            runtime.manifest().schema_version,
+            RUNTIME_MANIFEST_SCHEMA_V1
+        );
+        assert_eq!(agent.manifest().schema_version, ADAPTER_MANIFEST_SCHEMA_V1);
+        assert_eq!(
+            runtime
+                .detect(&RuntimeContext {
+                    environment: "host".to_string(),
+                    ..RuntimeContext::default()
+                })
+                .confidence,
+            "confirmed"
+        );
         assert_eq!(
             agent.match_runtime(&RuntimeContext::default()).confidence,
             "unknown"
