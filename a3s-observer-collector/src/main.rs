@@ -5081,7 +5081,7 @@ fn process_generation_from_context(
         .clone()
         .filter(|value| !value.trim().is_empty())?;
     let canonical = format!(
-        "{}|{}|{}|{}",
+        "{}\0{}\0{}\0{}",
         host_id, boot_id, process.pid, start_time_ticks
     );
     let process_generation_key = format!("pgk_{}", hash_prefix(canonical));
@@ -5517,7 +5517,7 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 mod tests {
     use super::{
         collector_heartbeat, cstr, emit, env_value_disabled, exec_ppid, exec_process_context,
-        exit_lifecycle_context, file_feature_flags_from, monotonic_delta,
+        exit_lifecycle_context, file_feature_flags_from, hash_prefix, monotonic_delta,
         observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
         parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
         parse_unknown_file_policy, partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes,
@@ -6575,7 +6575,15 @@ mod tests {
             start_time_ticks: Some(900),
             ..ProcessContext::default()
         };
-        assert!(process_generation_from_context(&complete, &event).is_some());
+        let generation = process_generation_from_context(&complete, &event)
+            .expect("complete process identity must produce a generation key");
+        assert_eq!(
+            generation.process_generation_key,
+            format!(
+                "pgk_{}",
+                hash_prefix(format!("host-a\0boot-a\0{}\0{}", 42, 900))
+            )
+        );
 
         for incomplete in [
             ProcessContext {
