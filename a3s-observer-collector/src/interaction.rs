@@ -737,7 +737,7 @@ impl WebSocketConnectionState {
     }
 
     fn prepare_recovered_frame(&mut self, data: &[u8]) {
-        if !self.recovered_without_handshake || !data.first().is_some_and(|byte| byte & 0x40 != 0) {
+        if !self.recovered_without_handshake || data.first().is_none_or(|byte| byte & 0x40 == 0) {
             return;
         }
         self.requests.compression_enabled = true;
@@ -1565,7 +1565,7 @@ fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) ->
     if !matches!(opcode, 0x1 | 0x2) {
         return false;
     }
-    if !data.get(1).is_some_and(|byte| byte & 0x80 != 0) {
+    if data.get(1).is_none_or(|byte| byte & 0x80 == 0) {
         return false;
     }
     // A compressed client data frame is already a strong WebSocket signal. For an uncompressed
@@ -2878,6 +2878,78 @@ fn bounded_provider_id(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn provider_id_from_metadata(value: Option<&Value>, depth: u8) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
+    let metadata = value?.as_object()?;
+    for key in ["conversation_id", "thread_id", "session_id"] {
+        if let Some(id) = bounded_provider_id(metadata.get(key)) {
+            return Some(id);
+        }
+    }
+    for key in ["user_id", "x-codex-turn-metadata", "turn_metadata"] {
+        let Some(encoded_value) = metadata.get(key) else {
+            continue;
+        };
+        if let Some(object) = encoded_value.as_object() {
+            if let Some(id) =
+                provider_id_from_metadata(Some(&Value::Object(object.clone())), depth + 1)
+            {
+                return Some(id);
+            }
+        }
+        let Some(encoded) = encoded_value.as_str().map(str::trim) else {
+            continue;
+        };
+        if encoded.is_empty() || encoded.len() > 4 * 1024 {
+            continue;
+        }
+        if let Some(id) = serde_json::from_str::<Value>(encoded)
+            .ok()
+            .and_then(|parsed| provider_id_from_metadata(Some(&parsed), depth + 1))
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn turn_id_from_metadata(value: Option<&Value>, depth: u8) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
+    let metadata = value?.as_object()?;
+    if let Some(turn_id) = bounded_provider_id(metadata.get("turn_id")) {
+        return Some(turn_id);
+    }
+    for key in ["x-codex-turn-metadata", "turn_metadata"] {
+        let Some(encoded_value) = metadata.get(key) else {
+            continue;
+        };
+        if let Some(object) = encoded_value.as_object() {
+            if let Some(turn_id) =
+                turn_id_from_metadata(Some(&Value::Object(object.clone())), depth + 1)
+            {
+                return Some(turn_id);
+            }
+        }
+        let Some(encoded) = encoded_value.as_str().map(str::trim) else {
+            continue;
+        };
+        if encoded.is_empty() || encoded.len() > 4 * 1024 {
+            continue;
+        }
+        if let Some(turn_id) = serde_json::from_str::<Value>(encoded)
+            .ok()
+            .and_then(|parsed| turn_id_from_metadata(Some(&parsed), depth + 1))
+        {
+            return Some(turn_id);
+        }
+    }
+    None
+}
+
 fn extract_provider_conversation_id(value: &Value) -> Option<String> {
     bounded_provider_id(value.get("conversation_id"))
         .or_else(|| bounded_provider_id(value.get("thread_id")))
@@ -2889,21 +2961,17 @@ fn extract_provider_conversation_id(value: &Value) -> Option<String> {
                 .and_then(|conversation| bounded_provider_id(conversation.get("id")))
         })
         .or_else(|| {
-            value.get("metadata").and_then(|metadata| {
-                bounded_provider_id(metadata.get("conversation_id"))
-                    .or_else(|| bounded_provider_id(metadata.get("thread_id")))
-                    .or_else(|| bounded_provider_id(metadata.get("session_id")))
-            })
+            value
+                .get("metadata")
+                .and_then(|metadata| provider_id_from_metadata(Some(metadata), 0))
         })
         .or_else(|| {
             // Codex Responses WebSocket prewarm and generated turns carry the resumable Thread
             // identity in client_metadata. This is protocol evidence, not a product/version gate:
             // any Responses-compatible client using the same fields receives the same treatment.
-            value.get("client_metadata").and_then(|metadata| {
-                bounded_provider_id(metadata.get("conversation_id"))
-                    .or_else(|| bounded_provider_id(metadata.get("thread_id")))
-                    .or_else(|| bounded_provider_id(metadata.get("session_id")))
-            })
+            value
+                .get("client_metadata")
+                .and_then(|metadata| provider_id_from_metadata(Some(metadata), 0))
         })
 }
 
@@ -3006,7 +3074,7 @@ fn extract_conversation_anchors(
     }
     if let Some(turn_id) = request_json
         .and_then(|value| value.get("client_metadata"))
-        .and_then(|metadata| bounded_provider_id(metadata.get("turn_id")))
+        .and_then(|metadata| turn_id_from_metadata(Some(metadata), 0))
     {
         push_conversation_anchor(
             &mut anchors,
@@ -4506,6 +4574,42 @@ mod tests {
             anchor.kind == "turn_id"
                 && anchor.source_path == "client_metadata.turn_id"
                 && anchor.strength == "exact"
+        }));
+    }
+
+    #[test]
+    fn anthropic_metadata_user_id_json_supplies_resumable_session_anchor() {
+        let request_body = r#"{
+          "model":"claude-opus",
+          "metadata":{"user_id":"{\"device_id\":\"device\",\"session_id\":\"claude-resume-session\"}"},
+          "messages":[{"role":"user","content":[{"type":"text","text":"continue"}]}]
+        }"#;
+        let response_body = r#"{
+          "id":"msg-json-session",
+          "type":"message",
+          "role":"assistant",
+          "content":[{"type":"text","text":"continued"}]
+        }"#;
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            custom_http_request("POST", "/v1/messages", "gateway.invalid", request_body),
+            100,
+        ));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(
+            interaction.provider_conversation_id.as_deref(),
+            Some("claude-resume-session")
+        );
+        assert!(interaction.conversation_anchors.iter().any(|anchor| {
+            anchor.kind == "provider_conversation" && anchor.strength == "exact"
         }));
     }
 

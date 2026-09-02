@@ -78,8 +78,9 @@ pub const CAPTURE_PROFILE_SECURITY_FULL: u8 = 4;
 pub const CAPTURE_PROFILE_BUSINESS_CONTEXT: u8 = 5;
 pub const CAPTURE_PROFILE_INFRASTRUCTURE_AGGREGATE: u8 = 6;
 pub const CAPTURE_PROFILE_SELF_HEALTH: u8 = 7;
-/// Bounded investigation for a weak Agent candidate. It intentionally shares the safe Unknown
-/// probe matrix while remaining a distinct control-plane/audit state.
+/// Bounded investigation for a weak Agent candidate. Routine filesystem/network probes remain
+/// sampled, while the TLS plaintext channel is full so a recognized Agent conversation cannot
+/// disappear after its first streamed turn.
 pub const CAPTURE_PROFILE_PROBABLE_INVESTIGATION: u8 = 8;
 
 pub const CAPTURE_MODE_LEGACY: u8 = 0;

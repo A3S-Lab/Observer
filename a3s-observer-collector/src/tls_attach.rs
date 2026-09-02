@@ -110,12 +110,27 @@ struct AttachFailure {
     last_failed_at: Instant,
 }
 
+/// A process-generation fence for a PID that has already been admitted as an Agent runtime.
+///
+/// Process names and argv are mutable (Tokio/Rustls workers routinely rename their threads), and
+/// the control-plane cgroup snapshot can legitimately lag while a CLI is idle. Retaining the
+/// positive identity until the process generation ends avoids dropping every later TLS turn. The
+/// executable inode and `/proc/<pid>/stat` start time make that retention safe across PID reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedRuntimeFence {
+    executable_dev: u64,
+    executable_ino: u64,
+    start_time_ticks: u64,
+    cgroup_id: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct TlsAttachManager {
     attached: HashSet<String>,
     rejected: HashSet<String>,
     attach_failures: HashMap<String, AttachFailure>,
     verified_processes: HashMap<i32, RuntimeRole>,
+    verified_runtime_fences: HashMap<i32, VerifiedRuntimeFence>,
     scope_verified_processes: HashSet<i32>,
     static_discovery_cache: HashMap<(u64, u64), Vec<StaticDiscoveryMatch>>,
     stable_mount_roots: HashMap<u64, i32>,
@@ -166,6 +181,7 @@ impl TlsAttachManager {
             rejected: HashSet::new(),
             attach_failures: HashMap::new(),
             verified_processes: HashMap::new(),
+            verified_runtime_fences: HashMap::new(),
             scope_verified_processes: HashSet::new(),
             static_discovery_cache: HashMap::new(),
             stable_mount_roots: HashMap::new(),
@@ -202,14 +218,22 @@ impl TlsAttachManager {
                 continue;
             };
             verified_processes.insert(pid, runtime_role);
+            self.remember_verified_runtime(pid);
             plans.extend(self.plans_for_process(pid, runtime_role));
         }
         self.scope_verified_processes
             .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
         for pid in self.scope_verified_processes.clone() {
             verified_processes.insert(pid, RuntimeRole::AgentRoot);
+            // A cgroup scope is authoritative for its current membership. If the process also
+            // carries a registry-matched Agent identity, retain that stronger process-generation
+            // fact when the next scope snapshot is briefly empty.
+            if self.process_matches_patterns(pid) {
+                self.remember_verified_runtime(pid);
+            }
             plans.extend(self.plans_for_process(pid, RuntimeRole::AgentRoot));
         }
+        self.retain_verified_runtime(&mut verified_processes);
         self.verified_processes = verified_processes;
         let mut seen = HashSet::new();
         plans.retain(|plan| self.plan_is_available(&plan.key) && seen.insert(plan.key.clone()));
@@ -219,9 +243,11 @@ impl TlsAttachManager {
     pub fn discover_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
         let Some(runtime_role) = self.runtime_role(pid) else {
             self.verified_processes.remove(&pid);
+            self.retain_one_verified_runtime(pid);
             return Vec::new();
         };
         self.verified_processes.insert(pid, runtime_role);
+        self.remember_verified_runtime(pid);
         self.plans_for_process(pid, runtime_role)
             .into_iter()
             .filter(|plan| self.plan_is_available(&plan.key))
@@ -238,6 +264,9 @@ impl TlsAttachManager {
         }
         let runtime_role = RuntimeRole::AgentRoot;
         self.verified_processes.insert(pid, runtime_role);
+        if self.process_matches_patterns(pid) {
+            self.remember_verified_runtime(pid);
+        }
         self.plans_for_process(pid, runtime_role)
             .into_iter()
             .filter(|plan| self.plan_is_available(&plan.key))
@@ -326,9 +355,51 @@ impl TlsAttachManager {
     pub fn verified_pids(&mut self) -> Vec<i32> {
         self.scope_verified_processes
             .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
-        self.verified_processes
-            .retain(|pid, _| Path::new(&format!("/proc/{pid}")).exists());
+        let mut desired = self
+            .scope_verified_processes
+            .iter()
+            .copied()
+            .map(|pid| (pid, RuntimeRole::AgentRoot))
+            .collect::<HashMap<_, _>>();
+        self.retain_verified_runtime(&mut desired);
+        self.verified_processes = desired;
         self.verified_processes.keys().copied().collect()
+    }
+
+    fn remember_verified_runtime(&mut self, pid: i32) {
+        if let Some(fence) = verified_runtime_fence(pid) {
+            self.verified_runtime_fences.insert(pid, fence);
+        }
+    }
+
+    fn retain_one_verified_runtime(&mut self, pid: i32) {
+        let Some(fence) = self.verified_runtime_fences.get(&pid).copied() else {
+            return;
+        };
+        if !verified_runtime_fence(pid).is_some_and(|current| current == fence) {
+            self.verified_runtime_fences.remove(&pid);
+        }
+    }
+
+    /// Merge generation-fenced named runtimes back into the current discovery result. The optional
+    /// output map keeps the role in one place for `discover`; `verified_pids` only needs the side
+    /// effect on `self.verified_processes`.
+    fn retain_verified_runtime(&mut self, output: &mut HashMap<i32, RuntimeRole>) {
+        let retained = self
+            .verified_runtime_fences
+            .iter()
+            .filter_map(|(pid, fence)| {
+                verified_runtime_fence(*pid)
+                    .is_some_and(|current| current == *fence)
+                    .then_some(*pid)
+            })
+            .collect::<Vec<_>>();
+        let retained_set = retained.iter().copied().collect::<HashSet<_>>();
+        self.verified_runtime_fences
+            .retain(|pid, _| retained_set.contains(pid));
+        for pid in retained {
+            output.insert(pid, RuntimeRole::AgentRoot);
+        }
     }
 
     pub fn is_named_agent_runtime_pid(&self, pid: i32) -> bool {
@@ -692,6 +763,46 @@ fn process_parent_pid(pid: i32) -> Option<i32> {
         .trim()
         .parse()
         .ok()
+}
+
+fn verified_runtime_fence(pid: i32) -> Option<VerifiedRuntimeFence> {
+    let executable = fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/<pid>/stat` keeps comm in parentheses and comm itself may contain spaces or `)`.
+    // The start-time field is field 22, hence index 19 after the state field (field 3).
+    let close = stat.rfind(") ")?;
+    let start_time_ticks = stat
+        .get(close + 2..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let cgroup_id = process_cgroup_id(pid);
+    Some(VerifiedRuntimeFence {
+        executable_dev: executable.dev(),
+        executable_ino: executable.ino(),
+        start_time_ticks,
+        cgroup_id,
+    })
+}
+
+fn process_cgroup_id(pid: i32) -> Option<u64> {
+    let membership = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .trim_start_matches('/');
+    let path = Path::new(relative);
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    fs::metadata(PathBuf::from("/sys/fs/cgroup").join(path))
+        .ok()
+        .map(|metadata| metadata.ino())
 }
 
 fn stable_executable_probe_path(
@@ -1406,5 +1517,22 @@ mod tests {
         manager.set_scope_verified_pids(HashSet::new());
         let _ = manager.discover();
         assert!(!manager.verified_pids().contains(&pid));
+    }
+
+    #[test]
+    fn verified_runtime_fence_keeps_a_live_process_admitted_when_name_temporarily_changes() {
+        let pid = std::process::id() as i32;
+        let fence =
+            verified_runtime_fence(pid).expect("test process must expose a generation fence");
+        let mut manager = TlsAttachManager::from_env("1");
+        manager.verified_runtime_fences.insert(pid, fence);
+
+        // Simulate a discovery pass in which the process title/argv no longer matches the Agent
+        // pattern (Tokio workers do this in real Codex/Claude processes). The exact PID generation
+        // is still admitted; a later PID reuse would fail the fence comparison and be removed.
+        manager.verified_processes.clear();
+        let pids = manager.verified_pids();
+        assert!(pids.contains(&pid));
+        assert_eq!(manager.verified_runtime_fences.get(&pid), Some(&fence));
     }
 }

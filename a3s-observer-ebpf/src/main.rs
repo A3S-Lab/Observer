@@ -865,6 +865,11 @@ fn capture_raw_decision(
     increment_capture_stat(probe, CAPTURE_STAT_ATTEMPTED);
     let now = unsafe { bpf_ktime_get_ns() };
     let protected = capture_probe_is_protected(probe);
+    // The Collector's verified-process map is a generation-fenced positive Agent identity. It
+    // intentionally outlives short cgroup/profile leases, which may be refreshed asynchronously
+    // while a CLI is idle. Plaintext TLS is the interaction payload we promised to observe, so a
+    // verified Agent must not fall back to the Unknown/probable sample matrix for this probe.
+    let verified_agent = verified_agent_process(pid, cgroup_id);
     let promoted = !protected && capture_promotion_valid(pid, cgroup_id, &config, now);
 
     let key = CaptureProfileKey {
@@ -916,7 +921,7 @@ fn capture_raw_decision(
         // race as unknown_discovery (where SSL is disabled) permanently loses the first turn.
         // Use the same FULL SSL policy as probable_investigation only for this rule-miss window.
         // Explicit/stale rules above remain authoritative and are never bypassed.
-        if probe == CAPTURE_PROBE_SSL && verified_agent_process(pid, cgroup_id) {
+        if probe == CAPTURE_PROBE_SSL && verified_agent {
             profile = CAPTURE_PROFILE_PROBABLE_INVESTIGATION;
             action = CAPTURE_ACTION_FULL;
             desired = CAPTURE_ACTION_FULL;
@@ -937,6 +942,23 @@ fn capture_raw_decision(
             authority,
             disposition,
             CAPTURE_DECISION_FLAG_PROTECTED,
+        );
+    }
+    if probe == CAPTURE_PROBE_SSL && verified_agent {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            // Keep the profile label useful to operators while the cgroup lease is absent or
+            // stale; the process-level identity is what authorized this full-fidelity payload.
+            if profile == CAPTURE_PROFILE_UNKNOWN_DISCOVERY {
+                CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+            } else {
+                profile
+            },
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            0,
         );
     }
     // `file_read` is a default-off signal. Ordinary capture shadow semantics force FULL to expose
