@@ -145,7 +145,7 @@ pub struct ProcessGenerationKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_time_ticks: Option<u64>,
+    pub start_time_ticks: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -886,6 +886,8 @@ pub enum AgentEvent {
         enabled_features: Vec<String>,
         interval_secs: u64,
         observed_agents: u64,
+        /// Number of unique process labels dropped after the bounded identity set saturated.
+        agent_identity_drops: u64,
         exec: u64,
         exit: u64,
         egress: u64,
@@ -957,6 +959,7 @@ mod tests {
             enabled_features: Vec::new(),
             interval_secs: 1,
             observed_agents: 0,
+            agent_identity_drops: 0,
             exec: 0,
             exit: 0,
             egress: 0,

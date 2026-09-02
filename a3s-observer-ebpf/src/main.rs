@@ -35,8 +35,9 @@ use a3s_observer_common::{
     PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
     TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
     TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
-    TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND, TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE,
-    TLS_PLAINTEXT_TIER_MEDIUM, TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
+    TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
+    TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE, TLS_PLAINTEXT_TIER_MEDIUM,
+    TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     cty::c_void,
@@ -251,6 +252,23 @@ static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
 // a closed route kind, never product names or JSON.
 #[map]
 static PLAINTEXT_HTTP_ROUTES: HashMap<u64, u8> = HashMap::with_max_entries(512, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextTlsSessionKey {
+    cgroup_id: u64,
+    pid: u32,
+    _reserved: u32,
+    tls_context_id: u64,
+    exec_id: u64,
+}
+
+// A write-side route match authorizes subsequent reads on the same TLS context.  The key keeps
+// cgroup + PID + TLS pointer together so allocator/PID reuse cannot inherit an old route.  LRU
+// eviction is bounded; a missing entry is fail-closed for plaintext capture.
+#[map]
+static PLAINTEXT_TLS_SESSIONS: LruHashMap<PlaintextTlsSessionKey, u8> =
+    LruHashMap::with_max_entries(8_192, 0);
 
 #[map]
 static HTTP_READ_ARGS: HashMap<u64, HttpReadArgs> = HashMap::with_max_entries(10_240, 0);
@@ -2470,6 +2488,35 @@ fn http_request_route_kind(buf: u64, len: u64) -> u8 {
 }
 
 #[inline(always)]
+fn http_method_prefix(buf: u64, len: u64) -> bool {
+    if buf == 0 || len < 4 {
+        return false;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return false;
+    }
+    bytes_at(&data, captured, 0, b"POST ")
+        || bytes_at(&data, captured, 0, b"GET ")
+        || bytes_at(&data, captured, 0, b"PUT ")
+        || bytes_at(&data, captured, 0, b"PATCH ")
+        || bytes_at(&data, captured, 0, b"DELETE ")
+        || bytes_at(&data, captured, 0, b"HEAD ")
+}
+
+#[inline(always)]
 fn verified_agent_process(pid: u32, cgroup_id: u64) -> bool {
     let key = PlaintextProcessKey {
         cgroup_id,
@@ -2477,6 +2524,46 @@ fn verified_agent_process(pid: u32, cgroup_id: u64) -> bool {
         _pad: 0,
     };
     unsafe { VERIFIED_AGENT_PROCESSES.get(&key) }.is_some()
+}
+
+#[inline(always)]
+fn valid_plaintext_route(route: u8) -> bool {
+    route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL
+}
+
+#[inline(always)]
+fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u64) -> Option<u8> {
+    // Plain TCP already passed the route gate in HTTP_SOCKS.  TLS contexts require a write-side
+    // exact POST/path match before any response bytes are admitted.
+    if args.api_kind == TLS_PLAINTEXT_API_TCP {
+        return valid_plaintext_route(args.route_kind).then_some(args.route_kind);
+    }
+    let key = PlaintextTlsSessionKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: args.ssl_ptr,
+        exec_id: unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) },
+    };
+    if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
+        let detected = http_request_route_kind(args.buf, actual_len);
+        if valid_plaintext_route(detected) {
+            let _ = PLAINTEXT_TLS_SESSIONS.insert(&key, &detected, 0);
+            return Some(detected);
+        }
+        if http_method_prefix(args.buf, actual_len) {
+            // A fresh request on a reused TLS pointer must not inherit the previous route.
+            let _ = PLAINTEXT_TLS_SESSIONS.remove(&key);
+            return None;
+        }
+        // A later write on an admitted keep-alive context may carry only a body/continuation.
+        return unsafe { PLAINTEXT_TLS_SESSIONS.get(&key) }
+            .copied()
+            .filter(|route| valid_plaintext_route(*route));
+    }
+    unsafe { PLAINTEXT_TLS_SESSIONS.get(&key) }
+        .copied()
+        .filter(|route| valid_plaintext_route(*route))
 }
 
 fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
@@ -2498,6 +2585,12 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
         }
         return 0;
     }
+    let Some(route_kind) = tls_session_route(&args, actual_len, pid, cgroup_id) else {
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
+            bump_tls_profile_diagnostic(9);
+        }
+        return 0;
+    };
     let capture_decision = capture_raw_decision(
         CAPTURE_PROBE_SSL,
         cgroup_id,
@@ -2543,6 +2636,9 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             }
             if args.ssl_ptr == 0 {
                 flags |= TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND;
+            }
+            if route_kind == PLAINTEXT_HTTP_ROUTE_TOOL {
+                flags |= TLS_PLAINTEXT_FLAG_TOOL_ROUTE;
             }
             let ev = entry.as_mut_ptr();
             unsafe {

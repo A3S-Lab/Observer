@@ -94,6 +94,7 @@ const PROC_CMDLINE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const PROCESS_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(2);
 const PROCESS_CONTEXT_CACHE_STALE: Duration = Duration::from_secs(30);
 const PROCESS_CONTEXT_CACHE_LIMIT: usize = 65_536;
+const MAX_OBSERVED_AGENTS_PER_WINDOW: usize = 65_536;
 const FINAL_HEARTBEAT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const FILTER_RULE_SNAPSHOT_SCHEMA: &str = "anysentry.filter_rule_snapshot.v1";
 const FILTER_RULE_SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -3519,6 +3520,7 @@ struct Stats {
     ssl: u64,
     sec: u64,
     agents: HashSet<String>,
+    agent_identity_drops: u64,
     pipeline: [RingWindowStats; PIPELINE_RING_COUNT],
 }
 
@@ -4027,6 +4029,7 @@ impl CollectorProcessor {
                 chunk_raw_observation.source_refs = vec![raw_observation.observation_id.clone()];
                 chunk_raw_observation.derived_from = vec![raw_observation.observation_id.clone()];
                 chunk_raw_observation.idempotency_key = format!("idem_{derived_token}");
+                chunk_raw_observation.source.source_sequence = Some(header.call_seq.to_string());
                 chunk_raw_observation.payload.kind = "tls_plaintext_chunk".to_string();
                 chunk_raw_observation.payload.encoding = Some("binary".to_string());
                 chunk_raw_observation.payload.original_bytes = u64::from(header.original_len);
@@ -4049,6 +4052,14 @@ impl CollectorProcessor {
                     TLS_PLAINTEXT_API_SSL_CLASSIC => ("tls_uprobe", "ssl-classic"),
                     _ => ("tls_uprobe", "unknown-tls-abi"),
                 };
+                chunk_raw_observation.source.source_type =
+                    if header.api_kind == TLS_PLAINTEXT_API_TCP {
+                        "socket_payload"
+                    } else {
+                        "uprobe"
+                    }
+                    .to_string();
+                chunk_raw_observation.source.probe_id = Some(adapter_id.to_string());
                 if tls_diagnostics_enabled_for(header.pid)
                     && header.api_kind == TLS_PLAINTEXT_API_RUSTLS
                 {
@@ -4841,6 +4852,7 @@ fn collector_heartbeat(
             enabled_features: meta.enabled_features.clone(),
             interval_secs,
             observed_agents: stats.agents.len() as u64,
+            agent_identity_drops: stats.agent_identity_drops,
             exec: stats.exec,
             exit: stats.exit,
             egress: stats.egress,
@@ -4933,7 +4945,7 @@ fn process_generation_from_context(
         parent_process_generation_key: None,
         host_id,
         boot_id,
-        start_time_ticks: Some(start_time_ticks),
+        start_time_ticks: Some(start_time_ticks.to_string()),
         exec_id: match event {
             AgentEvent::ToolExec { exec_id, .. } => Some(exec_id.to_string()),
             _ => None,
@@ -5000,6 +5012,32 @@ fn connection_from_event(
     })
 }
 
+fn runtime_environment(process: &ProcessContext) -> String {
+    if let Some(configured) = env_any(&["A3S_OBSERVER_RUNTIME_ENV"]) {
+        if matches!(
+            configured.as_str(),
+            "host" | "ssh" | "docker" | "kubernetes" | "microvm" | "unknown"
+        ) {
+            return configured;
+        }
+    }
+    let cgroup = process
+        .cgroup
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if cgroup.contains("kubepods") || cgroup.contains("pod") {
+        "kubernetes".to_string()
+    } else if cgroup.contains("docker")
+        || cgroup.contains("libpod")
+        || cgroup.contains("containerd")
+    {
+        "docker".to_string()
+    } else {
+        "host".to_string()
+    }
+}
+
 fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) -> RawObservation {
     let bytes = serde_json::to_vec(event).unwrap_or_default();
     let fallback_time = system_now_unix_ns().unwrap_or(1).max(1).to_string();
@@ -5037,6 +5075,7 @@ fn fallback_raw_observation(event: &AgentEvent, timing: Option<&EventTiming>) ->
             .unwrap_or_else(|| fallback_time.clone()),
         runtime: a3s_observer::RawObservationRuntime {
             environment: "unknown".to_string(),
+            source_refs: vec![observation_id.clone()],
             ..a3s_observer::RawObservationRuntime::default()
         },
         process: None,
@@ -5101,7 +5140,7 @@ fn enrich_raw_observation(
             generation.source_refs.push(raw.observation_id.clone());
             // Without a runtime adapter we can prove only host-level process facts.  Do not
             // invent a container/Kubernetes environment from a cgroup path alone.
-            raw.runtime.environment = "host".to_string();
+            raw.runtime.environment = runtime_environment(process);
             raw.runtime.host_id = process.host_id.clone();
             raw.runtime.boot_id = process.boot_id.clone();
             raw.process = Some(generation.clone());
@@ -5182,7 +5221,11 @@ fn emit(exporter: &dyn Exporter, stats: &mut Stats, origin: PipelineRing, mut ev
     }
     if !matches!(ev.event, AgentEvent::CollectorHeartbeat { .. }) {
         if let Some(agent) = &ev.identity.agent {
-            stats.agents.insert(agent.clone());
+            if stats.agents.len() < MAX_OBSERVED_AGENTS_PER_WINDOW {
+                stats.agents.insert(agent.clone());
+            } else if !stats.agents.contains(agent) {
+                stats.agent_identity_drops = stats.agent_identity_drops.saturating_add(1);
+            }
         }
     }
     let outcome = exporter.export_with_priority(&ev, origin.export_priority());
@@ -5323,7 +5366,8 @@ mod tests {
         EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
     };
     use a3s_observer::{
-        AgentEvent, EnrichedEvent, EventTiming, ExportPriority, Exporter, Identity, ProcessContext,
+        AgentEvent, AgentPlaintextEvidence, EnrichedEvent, EventTiming, ExportPriority, Exporter,
+        Identity, ProcessContext,
     };
     use a3s_observer_common::{
         plaintext_http_route_hash, CaptureDecisionContext, ExecRecord, FileFilterConfig,
@@ -6269,6 +6313,57 @@ mod tests {
             .process_generation_key
             .starts_with("pgk_"));
         assert!(emitted[0].coverage_gaps.is_empty());
+
+        drop(emitted);
+        let plaintext_event = EnrichedEvent {
+            timing: Some(EventTiming::from_unix_ns(
+                1_780_000_000_000_000_000,
+                1_780_000_000_000_000_100,
+            )),
+            capture_decision: None,
+            identity: Identity::default(),
+            workload: None,
+            observation: None,
+            raw_observation: None,
+            coverage_gaps: Vec::new(),
+            process: Some(process_context(pid, 1, &[0; 16])),
+            provider: None,
+            event: AgentEvent::AgentPlaintextEvidence(Box::new(AgentPlaintextEvidence {
+                schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
+                evidence_id: "pe_0123456789abcdef01234567".to_string(),
+                pid,
+                connection_id: "tls:abcd".to_string(),
+                direction: "write".to_string(),
+                tls_adapter_id: "test".to_string(),
+                transport_protocol: "http/1.1".to_string(),
+                parse_state: "unparsed".to_string(),
+                llm_likelihood: "unknown".to_string(),
+                schema_fingerprint: None,
+                observed_at_unix_ns: "1780000000000000000".to_string(),
+                captured_bytes: 0,
+                encoding: "metadata_only".to_string(),
+                redacted_sample: None,
+                sample_sha256: "a".repeat(64),
+                reasons: vec!["test".to_string()],
+                capture_source: "tls_uprobe".to_string(),
+            })),
+        };
+        emit(&sink, &mut stats, PipelineRing::Ssl, plaintext_event);
+        let emitted = sink.0.lock().unwrap();
+        let connection = emitted[1]
+            .raw_observation
+            .as_ref()
+            .and_then(|raw| raw.connection.as_ref())
+            .expect("canonical connection provenance");
+        assert!(connection.connection_id.starts_with("conn_"));
+        assert_eq!(
+            connection.process_generation_key.as_deref(),
+            emitted[1]
+                .raw_observation
+                .as_ref()
+                .and_then(|raw| raw.process.as_ref())
+                .map(|process| process.process_generation_key.as_str())
+        );
     }
 
     #[test]

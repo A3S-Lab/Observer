@@ -28,6 +28,56 @@ type CapturePromotionValueBytes = [u8; 40];
 type CaptureAggregateKeyBytes = [u8; 24];
 type CaptureAggregateValueBytes = [u8; 16];
 
+fn aggregate_raw_observation(
+    key: &CaptureAggregateKey,
+    count: u64,
+    bytes: u64,
+    at_unix_ns: u128,
+) -> a3s_observer::RawObservation {
+    let seed = format!(
+        "capture-aggregate|{}|{}|{}|{}|{}|{}",
+        key.cgroup_id, key.epoch, key.probe, key.action, count, bytes
+    );
+    let digest = sha256_hex(seed.as_bytes());
+    let observation_id = format!("ro_{}", &digest[..24]);
+    a3s_observer::RawObservation {
+        schema_version: a3s_observer::RAW_OBSERVATION_SCHEMA_V1.to_string(),
+        observation_id: observation_id.clone(),
+        revision: 1,
+        source: a3s_observer::RawObservationSource {
+            source_domain: Some("observer".to_string()),
+            source_id: None,
+            collector_id: None,
+            source_type: "kernel".to_string(),
+            probe_id: Some("capture_aggregate".to_string()),
+            source_sequence: None,
+        },
+        event_at_unix_ns: at_unix_ns.to_string(),
+        received_at_unix_ns: at_unix_ns.to_string(),
+        runtime: a3s_observer::RawObservationRuntime {
+            environment: "unknown".to_string(),
+            ..a3s_observer::RawObservationRuntime::default()
+        },
+        process: None,
+        connection: None,
+        payload: a3s_observer::RawObservationPayload {
+            kind: "capture_aggregate".to_string(),
+            encoding: None,
+            payload_ref: Some(format!("sha256:{digest}")),
+            sha256: digest,
+            original_bytes: 0,
+            captured_bytes: 0,
+            truncated: false,
+            redaction_state: "hash_only".to_string(),
+            body: None,
+        },
+        idempotency_key: format!("idem_{observation_id}"),
+        capture_decision: None,
+        source_refs: vec![observation_id],
+        derived_from: Vec::new(),
+    }
+}
+
 pub(crate) const ACK_SCHEMA: &str = "anysentry.capture_profile_ack.v1";
 pub(crate) const SNAPSHOT_SCHEMA: &str = "anysentry.filter_rule_snapshot.v1";
 pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
@@ -433,14 +483,28 @@ impl CaptureAggregateReader {
             if delta.count != 0 || delta.bytes != 0 {
                 let metadata = self.metadata.get(&(key.cgroup_id, key.epoch));
                 let rule_attributed = key.disposition == CAPTURE_DISPOSITION_RULE;
+                let raw_observation =
+                    aggregate_raw_observation(&key, delta.count, delta.bytes, ended_at_unix_ns);
                 let event = a3s_observer::EnrichedEvent {
                     timing: None,
                     capture_decision: None,
                     identity: a3s_observer::Identity::default(),
                     workload: None,
                     observation: None,
-                    raw_observation: None,
-                    coverage_gaps: Vec::new(),
+                    raw_observation: Some(raw_observation),
+                    coverage_gaps: vec![a3s_observer::CoverageGap {
+                        schema_version: a3s_observer::COVERAGE_GAP_SCHEMA_V1.to_string(),
+                        gap_id: format!("gap_{}", key.cgroup_id),
+                        stage: "runtime".to_string(),
+                        reason: "process_generation_unavailable".to_string(),
+                        scope: format!("cgroup:{}", key.cgroup_id),
+                        first_seen_at_unix_ns: ended_at_unix_ns.to_string(),
+                        last_seen_at_unix_ns: ended_at_unix_ns.to_string(),
+                        dropped_count: 0,
+                        orphaned_count: 0,
+                        revision: 1,
+                        source_refs: Vec::new(),
+                    }],
                     process: Some(a3s_observer::ProcessContext {
                         cgroup_id: key.cgroup_id,
                         ..a3s_observer::ProcessContext::default()

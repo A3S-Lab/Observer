@@ -397,7 +397,7 @@ fn raw_observation_for(
             revision: None,
             terminal_context_id: None,
             ssh_connection_id: None,
-            source_refs: Vec::new(),
+            source_refs: vec![observation_id.clone()],
         },
         // A process-generation key requires a boot/start marker. The ring ABI only has pid and
         // cgroup, so leave it absent until Collector /proc enrichment proves the generation.

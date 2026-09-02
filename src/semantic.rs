@@ -252,10 +252,10 @@ impl LlmFormatAdapter for DefaultLlmFormatAdapter {
     }
 
     fn detect(&self, method: &str, _headers: &[(String, String)], body: &Value) -> RegistryMatch {
-        if !matches!(
-            method.to_ascii_uppercase().as_str(),
-            "POST" | "PUT" | "PATCH"
-        ) {
+        // Generation routes are admitted only for POST.  PUT/PATCH may carry JSON with a
+        // `messages` field, but treating them as model calls would bypass the exact request-line
+        // gate shared by the eBPF/HTTP path matcher.
+        if !method.eq_ignore_ascii_case("POST") {
             return RegistryMatch::unknown("method is not a generation request");
         }
         let Some(object) = body.as_object() else {
@@ -337,6 +337,16 @@ mod tests {
         assert_eq!(
             format
                 .detect("GET", &[], &Value::Object(serde_json::Map::new()))
+                .confidence,
+            "unknown"
+        );
+        assert_eq!(
+            format
+                .detect(
+                    "PUT",
+                    &[],
+                    &serde_json::json!({"model": "fixture", "messages": []}),
+                )
                 .confidence,
             "unknown"
         );

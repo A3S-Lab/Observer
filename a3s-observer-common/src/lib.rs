@@ -345,6 +345,9 @@ const _: [(); 16] = [(); core::mem::size_of::<CaptureDecisionContext>()];
 // attach source, generation and connection identity without putting JSON parsing in the kernel
 // hot path.
 pub const RAW_OBSERVATION_ABI_V1: u16 = 1;
+pub const RAW_OBSERVATION_SCHEMA_V1: &str = "anysentry.raw_observation.v1";
+pub const CONNECTION_IDENTITY_SCHEMA_V1: &str = "anysentry.connection_identity.v1";
+pub const COVERAGE_GAP_SCHEMA_V1: &str = "anysentry.coverage_gap.v1";
 pub const RAW_OBSERVATION_FLAG_TRUNCATED: u32 = 1 << 0;
 pub const RAW_OBSERVATION_FLAG_PARTIAL: u32 = 1 << 1;
 pub const RAW_OBSERVATION_FLAG_REDACTED: u32 = 1 << 2;
@@ -429,6 +432,11 @@ pub struct RawObservationHeader {
     pub payload_hash: u64,
     pub source_hash: u64,
 }
+
+/// ABI-compatible shorthand used by producers that carry only the fixed raw header.  The rich
+/// serialized `RawObservation` lives in the host crate; this alias keeps the shared contract name
+/// discoverable without placing variable-length strings in no_std memory.
+pub type RawObservation = RawObservationHeader;
 
 const _: [(); 40] = [(); core::mem::size_of::<ProcessGenerationKey>()];
 const _: [(); 56] = [(); core::mem::size_of::<ConnectionIdentity>()];

@@ -1074,6 +1074,8 @@ impl InteractionReassembler {
                             continue;
                         }
                         let Some(request) = state.pending_requests.pop_front() else {
+                            self.metrics.orphan_chunks =
+                                self.metrics.orphan_chunks.saturating_add(1);
                             continue;
                         };
                         state.sequence = state.sequence.wrapping_add(1);
