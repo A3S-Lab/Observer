@@ -4,7 +4,7 @@
 //! non-waiting inbox admission, and immediately continues draining its ring. It deliberately does
 //! no `/proc` access, path parsing, classification, enrichment, serialization, or export.
 
-use crate::event_time::{system_now_unix_ns, CalibratedEventTimes, EventClock};
+use crate::event_time::{monotonic_now_ns, system_now_unix_ns, CalibratedEventTimes, EventClock};
 use crate::pipeline::{OwnedPayload, PipelineOrigin, PipelineSender, RawEnvelope, RingOrigin};
 use a3s_observer::{CoverageGap, COVERAGE_GAP_SCHEMA_V1};
 use a3s_observer_common::{
@@ -209,7 +209,9 @@ fn malformed_envelope(
     reason: &str,
 ) -> Option<RawEnvelope> {
     let layout = pod_layout(origin);
-    let captured_at_boot_ns = read_u64(item, layout.captured_at_boot_ns).unwrap_or(0);
+    let captured_at_boot_ns = read_u64(item, layout.captured_at_boot_ns)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| monotonic_now_ns().unwrap_or(1).max(1));
     let cgroup_id = read_u64(item, layout.cgroup_id).unwrap_or(0);
     let pid = read_u32(item, layout.pid).unwrap_or(0);
     let capture_decision = read_capture_decision_or_legacy(item, layout.capture_decision);
