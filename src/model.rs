@@ -1284,12 +1284,17 @@ mod tests {
             received_at_unix_ns: "1720000000000000100".to_string(),
             runtime: RawObservationRuntime {
                 environment: "host".to_string(),
+                host_id: Some("host-a".to_string()),
+                boot_id: Some("boot-a".to_string()),
                 source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
                 ..RawObservationRuntime::default()
             },
             process: Some(ProcessGenerationKey {
-                process_generation_key: "pgk_0123456789abcdef01234567".to_string(),
+                process_generation_key: "pgk_88e1687e5f6337deb8eb35ac".to_string(),
                 pid: 42,
+                host_id: Some("host-a".to_string()),
+                boot_id: Some("boot-a".to_string()),
+                start_time_ticks: Some("900".to_string()),
                 first_seen_at_unix_ns: "1720000000000000000".to_string(),
                 source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
                 ..ProcessGenerationKey::default()
@@ -1297,7 +1302,7 @@ mod tests {
             connection: Some(ConnectionIdentity {
                 schema_version: "anysentry.connection_identity.v1".to_string(),
                 connection_id: "conn_0123456789abcdef01234567".to_string(),
-                process_generation_key: Some("pgk_0123456789abcdef01234567".to_string()),
+                process_generation_key: Some("pgk_88e1687e5f6337deb8eb35ac".to_string()),
                 transport: "tls".to_string(),
                 quality: "strong".to_string(),
                 source_refs: vec!["ro_0123456789abcdef0123456789abcdef".to_string()],
@@ -1329,7 +1334,7 @@ mod tests {
         assert_eq!(value["runtime"]["environment"], "host");
         assert_eq!(
             value["process"]["processGenerationKey"],
-            "pgk_0123456789abcdef01234567"
+            "pgk_88e1687e5f6337deb8eb35ac"
         );
         assert_eq!(
             value["connection"]["connectionId"],
