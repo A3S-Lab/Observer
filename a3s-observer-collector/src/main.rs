@@ -2143,7 +2143,7 @@ async fn main() -> anyhow::Result<()> {
                 let output_bulk_dropped =
                     exporter.output_drops_by_priority(ExportPriority::Bulk);
                 let filter_stats = aggregate_file_filter_stats(&file_filter_stats);
-                let aggregate_ended_at = system_now_unix_ns().unwrap_or_default();
+                let aggregate_ended_at = safe_unix_now_ns();
                 if let Some(reader) = capture_aggregate_reader.as_mut() {
                     reader.drain(
                         exporter.as_ref(),
@@ -2327,7 +2327,7 @@ async fn main() -> anyhow::Result<()> {
                     reader.drain(
                         exporter.as_ref(),
                         manager.active_epoch,
-                        system_now_unix_ns().unwrap_or_default(),
+                        safe_unix_now_ns(),
                         false,
                     );
                 }
@@ -2502,7 +2502,7 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|manager| manager.active_epoch)
                 .unwrap_or(0),
-            system_now_unix_ns().unwrap_or_default(),
+            safe_unix_now_ns(),
             true,
         );
     }
@@ -4780,7 +4780,15 @@ fn monotonic_delta(current: u64, previous: u64) -> u64 {
 }
 
 fn unix_now_ms_u64() -> u64 {
-    (system_now_unix_ns().unwrap_or_default() / 1_000_000).min(u128::from(u64::MAX)) as u64
+    (safe_unix_now_ns() / 1_000_000).min(u128::from(u64::MAX)) as u64
+}
+
+fn safe_unix_now_ns() -> u128 {
+    nonzero_unix_ns(system_now_unix_ns().unwrap_or(1))
+}
+
+fn nonzero_unix_ns(value: u128) -> u128 {
+    value.max(1)
 }
 
 impl CollectorMeta {
@@ -5518,14 +5526,15 @@ mod tests {
     use super::{
         collector_heartbeat, cstr, emit, env_value_disabled, exec_ppid, exec_process_context,
         exit_lifecycle_context, file_feature_flags_from, hash_prefix, monotonic_delta,
-        observe_exec_commit_lifecycle, parse_dns_qname, parse_filter_rule_snapshot, parse_llm_meta,
-        parse_process_start_time_ticks, parse_rfc3339_unix_nanos, parse_sni,
-        parse_unknown_file_policy, partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes,
-        pod_from_bytes, process_context, process_generation_from_context,
-        socket_key_with_generation, supplement_exec_argv_at, tls_capture_profile_needs_refresh,
-        tls_exec_comm_needs_refresh, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
-        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
-        PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
+        nonzero_unix_ns, observe_exec_commit_lifecycle, parse_dns_qname,
+        parse_filter_rule_snapshot, parse_llm_meta, parse_process_start_time_ticks,
+        parse_rfc3339_unix_nanos, parse_sni, parse_unknown_file_policy,
+        partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes, pod_from_bytes,
+        process_context, process_generation_from_context, socket_key_with_generation,
+        supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
+        valid_plaintext_http_route, CollectorMeta, CollectorProcessor, CompletedExec,
+        ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState, PeerState,
+        PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
         ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
         Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
         SOCKET_STATE_TTL, UNKNOWN_PEER,
@@ -5978,6 +5987,12 @@ mod tests {
             partial_window_interval_secs(Duration::from_secs(1) + Duration::from_nanos(1)),
             2
         );
+    }
+
+    #[test]
+    fn canonical_timestamps_never_use_zero_fallback() {
+        assert_eq!(nonzero_unix_ns(0), 1);
+        assert_eq!(nonzero_unix_ns(42), 42);
     }
 
     #[test]
