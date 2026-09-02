@@ -3761,6 +3761,12 @@ impl CollectorProcessor {
         match envelope.origin {
             PipelineOrigin::Ring(RingOrigin::Exec) => {
                 let Some(record) = read_pod::<ExecRecord>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_exec_record",
+                    );
                     return;
                 };
                 if record.kind == EXEC_RECORD_COMMIT {
@@ -3800,13 +3806,27 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Security) => {
                 let Some(ev) = read_pod::<SecEvent>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_security_record",
+                    );
                     return;
                 };
                 let kind = match ev.kind {
                     SEC_SETUID => "setuid-root",
                     SEC_PTRACE => "ptrace",
                     SEC_BIND => "bind",
-                    _ => return,
+                    _ => {
+                        emit_decode_gap(
+                            exporter,
+                            &mut self.stats,
+                            &envelope,
+                            "unknown_security_kind",
+                        );
+                        return;
+                    }
                 };
                 emit(
                     exporter,
@@ -3832,6 +3852,12 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Connect) => {
                 let Some(ev) = read_pod::<ConnectEvent>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_connect_record",
+                    );
                     return;
                 };
                 let peer = peer_ip(&ev);
@@ -3875,6 +3901,7 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Tls) => {
                 let Some(ev) = read_pod::<TlsEvent>(bytes) else {
+                    emit_decode_gap(exporter, &mut self.stats, &envelope, "malformed_tls_record");
                     return;
                 };
                 let len = (ev.len as usize).min(ev.data.len());
@@ -3929,10 +3956,17 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Dns) => {
                 let Some(ev) = read_pod::<DnsEvent>(bytes) else {
+                    emit_decode_gap(exporter, &mut self.stats, &envelope, "malformed_dns_record");
                     return;
                 };
                 let len = (ev.len as usize).min(ev.data.len());
                 let Some(query) = parse_dns_qname(&ev.data[..len]) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_dns_payload",
+                    );
                     return;
                 };
                 emit(
@@ -3955,10 +3989,22 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::FileDelete) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_file_delete_record",
+                    );
                     return;
                 };
                 let path = cstr(&ev.path);
                 if path.is_empty() {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "empty_file_delete_path",
+                    );
                     return;
                 }
                 emit(
@@ -3981,10 +4027,17 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(origin @ (RingOrigin::FileAccess | RingOrigin::FileRead)) => {
                 let Some(ev) = read_pod::<FileEvent>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_file_record",
+                    );
                     return;
                 };
                 let path = cstr(&ev.path);
                 if path.is_empty() {
+                    emit_decode_gap(exporter, &mut self.stats, &envelope, "empty_file_path");
                     return;
                 }
                 emit(
@@ -4023,14 +4076,47 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Llm) => {
                 let Some(ev) = read_pod::<LlmEvent>(bytes) else {
+                    emit_decode_gap(exporter, &mut self.stats, &envelope, "malformed_llm_record");
                     return;
                 };
-                let Some(meta) = self.llm_meta.remove(&sock_key(ev.cgroup_id, ev.pid, ev.fd))
-                else {
-                    return;
-                };
+                let metadata = self.llm_meta.remove(&sock_key(ev.cgroup_id, ev.pid, ev.fd));
+                let metadata_missing = metadata.is_none();
+                let meta = metadata.unwrap_or(LlmMetaState {
+                    sni: None,
+                    provider: None,
+                    peer: UNKNOWN_PEER,
+                    last_seen: Instant::now(),
+                });
+                let mut llm_coverage_gaps = coverage_gaps.clone();
+                if metadata_missing {
+                    llm_coverage_gaps.push(coverage_gap(
+                        format!(
+                            "gap_{}_llm_socket_metadata_missing",
+                            raw_observation.observation_id
+                        ),
+                        "correlation",
+                        "llm_socket_metadata_missing",
+                        format!("pid:{}/fd:{}", ev.pid, ev.fd),
+                        envelope.event_at_unix_ns.to_string(),
+                        vec![raw_observation.observation_id.clone()],
+                        0,
+                        1,
+                    ));
+                }
                 if meta.provider.is_none() {
-                    return;
+                    llm_coverage_gaps.push(coverage_gap(
+                        format!(
+                            "gap_{}_llm_provider_unclassified",
+                            raw_observation.observation_id
+                        ),
+                        "identity",
+                        "llm_provider_unclassified",
+                        format!("pid:{}/fd:{}", ev.pid, ev.fd),
+                        envelope.event_at_unix_ns.to_string(),
+                        vec![raw_observation.observation_id.clone()],
+                        0,
+                        0,
+                    ));
                 }
                 emit(
                     exporter,
@@ -4043,7 +4129,7 @@ impl CollectorProcessor {
                         workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
                         observation: None,
                         raw_observation: Some(raw_observation.clone()),
-                        coverage_gaps: coverage_gaps.clone(),
+                        coverage_gaps: llm_coverage_gaps,
                         process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
                         provider: meta.provider,
                         event: AgentEvent::LlmCall {
@@ -4060,6 +4146,12 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Ssl) => {
                 let Some((header, plaintext)) = read_tls_plaintext(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "invalid_plaintext_abi",
+                    );
                     return;
                 };
                 let mut chunk_raw_observation = raw_observation.clone();
@@ -4174,6 +4266,12 @@ impl CollectorProcessor {
             }
             PipelineOrigin::Ring(RingOrigin::Exit) => {
                 let Some(ev) = read_pod::<ExitEvent>(bytes) else {
+                    emit_decode_gap(
+                        exporter,
+                        &mut self.stats,
+                        &envelope,
+                        "malformed_exit_record",
+                    );
                     return;
                 };
                 let comm = cstr(&ev.comm);
@@ -5427,21 +5525,23 @@ mod tests {
         socket_key_with_generation, supplement_exec_argv_at, tls_capture_profile_needs_refresh,
         tls_exec_comm_needs_refresh, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
         CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
-        PeerState, PipelineAccountingState, PipelineRing, ProcessContextCache,
-        ProcessLifecycleStore, RingReaderLedgerSnapshot, RingWindowStats, Stats, UnknownFilePolicy,
-        EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
+        PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
+        ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
+        Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
+        SOCKET_STATE_TTL, UNKNOWN_PEER,
     };
     use a3s_observer::{
         AgentEvent, AgentPlaintextEvidence, EnrichedEvent, EventTiming, ExportPriority, Exporter,
-        Identity, ProcessContext,
+        Identity, ProcResolver, ProcessContext, SniClassifier,
     };
     use a3s_observer_common::{
         plaintext_http_route_hash, CaptureDecisionContext, ExecRecord, FileFilterConfig,
-        FileFilterStats, FileFilterValue, RingPipelineStats, CAPTURE_DECISION_FLAG_SELECTED,
-        CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_INVESTIGATION_FULL,
-        CAPTURE_PROFILE_PROBABLE_INVESTIGATION, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED,
-        EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
-        FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+        FileFilterStats, FileFilterValue, LlmEvent, RingPipelineStats,
+        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROFILE_AGENT_FULL,
+        CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
+        EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_TRUNCATED, EXEC_RECORD_ARG_CHUNK,
+        EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_FILTER_ACTION_DROP,
+        FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
         FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED,
         FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_COUNT, PIPELINE_RING_EXEC,
         PIPELINE_RING_FILE_ACCESS,
@@ -6499,6 +6599,90 @@ mod tests {
         ] {
             assert!(process_generation_from_context(&incomplete, &event).is_none());
         }
+    }
+
+    #[test]
+    fn unknown_llm_socket_still_exports_call_and_provider_gap() {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<EnrichedEvent>>>);
+        impl Exporter for Sink {
+            fn export(&self, event: &EnrichedEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let mut event: LlmEvent = unsafe { std::mem::zeroed() };
+        event.cgroup_id = 7;
+        event.pid = std::process::id();
+        event.fd = 9;
+        event.req_bytes = 17;
+        event.resp_bytes = 23;
+        event.latency_ns = 31;
+        event.ttft_ns = 11;
+        event.comm[..4].copy_from_slice(b"test");
+        event.captured_at_boot_ns = 1_000;
+        let envelope = RawEnvelope::new(
+            PipelineOrigin::Ring(RingOrigin::Llm),
+            event.captured_at_boot_ns,
+            1_780_000_000_000_000_000,
+            1_780_000_000_000_000_100,
+            selected_capture_context(77),
+            event.cgroup_id,
+            event.pid,
+            1,
+            pod_bytes::<_, 88>(&event).to_vec(),
+        );
+
+        let mut processor = CollectorProcessor::new(true);
+        processor.process(envelope, &sink, &ProcResolver, &SniClassifier);
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, AgentEvent::LlmCall { .. }));
+        assert!(events[0].provider.is_none());
+        assert!(events[0]
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == "llm_socket_metadata_missing"));
+        assert!(events[0]
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == "llm_provider_unclassified"));
+        assert!(events[0].raw_observation.is_some());
+    }
+
+    #[test]
+    fn malformed_ring_decode_emits_gap_without_losing_raw_observation() {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<EnrichedEvent>>>);
+        impl Exporter for Sink {
+            fn export(&self, event: &EnrichedEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let envelope = RawEnvelope::new(
+            PipelineOrigin::Ring(RingOrigin::Dns),
+            2_000,
+            1_780_000_000_000_000_000,
+            1_780_000_000_000_000_100,
+            selected_capture_context(77),
+            7,
+            std::process::id(),
+            2,
+            vec![0; 16],
+        );
+        let mut processor = CollectorProcessor::new(true);
+        processor.process(envelope, &sink, &ProcResolver, &SniClassifier);
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, AgentEvent::CoverageGap(_)));
+        assert!(events[0]
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == "malformed_dns_record"));
+        assert!(events[0].raw_observation.is_some());
     }
 
     #[test]
