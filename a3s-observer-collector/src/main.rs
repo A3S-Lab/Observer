@@ -2343,7 +2343,17 @@ async fn main() -> anyhow::Result<()> {
                                     tracing::info!(
                                         cgroups = refresh.cgroups,
                                         pids = refresh.pids.len(),
+                                        fenced_roots = refresh.fenced_roots,
+                                        conflicts = refresh.conflicts,
                                         "reconciled product-neutral TLS Agent cgroup scopes"
+                                    );
+                                }
+                                if refresh.conflicts > 0 {
+                                    tracing::warn!(
+                                        conflicts = refresh.conflicts,
+                                        fenced_roots = refresh.fenced_roots,
+                                        admitted_pids = refresh.pids.len(),
+                                        "TLS Agent cgroup scope conflict retained; blanket admission disabled"
                                     );
                                 }
                             }
