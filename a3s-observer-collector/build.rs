@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
             name: "a3s-observer-ebpf",
             root_dir: &ebpf_dir,
             no_default_features: false,
-            features: &[],
+            features: &["build-ebpf"],
         }],
         Toolchain::default(), // Nightly
     )?;

@@ -511,6 +511,10 @@ impl BoundedInbox {
         }
     }
 
+    // Returning the rejected envelope is intentional: admission accounting must transfer
+    // ownership back to the caller without cloning or dropping the fixed ABI payload.  Clippy's
+    // `result_large_err` is therefore not actionable for this bounded test model.
+    #[allow(clippy::result_large_err)]
     fn try_push(&mut self, envelope: RawEnvelope) -> Result<(), RawEnvelope> {
         if self.entries.len() >= self.capacity {
             self.ledger.dropped = self.ledger.dropped.saturating_add(1);
@@ -570,6 +574,8 @@ impl PipelineInbox {
     }
 
     /// Attempts one O(1), non-waiting handoff. A full inbox returns ownership to the caller.
+    // See BoundedInbox::try_push: the full envelope is returned for lossless drop accounting.
+    #[allow(clippy::result_large_err)]
     pub fn try_push(&mut self, envelope: RawEnvelope) -> Result<(), InboxFull> {
         let class = envelope.origin.service_class();
         self.inbox_mut(class)
