@@ -3,17 +3,17 @@
 
 use a3s_observer_common::{
     capture_cpu_sample_quota, capture_probe_is_protected, capture_profile_default_actions,
-    capture_sample_partitions, file_access_mode, plaintext_http_route_hash, CaptureAggregateKey,
-    CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey,
-    CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue, CapturePromotionValue,
-    CaptureSampleKey, CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent,
-    FileEvent, FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats,
-    FileFilterValue, FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent,
-    TlsPlaintextEventHeader, TlsPlaintextEventLarge, TlsPlaintextEventMedium,
-    TlsPlaintextEventSmall, ARGV_SLOTS, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
-    CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
-    CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
-    CAPTURE_DECISION_FLAG_LEGACY, CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
+    capture_sample_partitions, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
+    CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+    CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+    CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
+    FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
+    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
+    TlsPlaintextEventLarge, TlsPlaintextEventMedium, TlsPlaintextEventSmall, ARGV_SLOTS,
+    CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+    CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
+    CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
+    CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
     CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DECISION_FLAG_SHADOW,
     CAPTURE_DECISION_FLAG_VERIFIED_AGENT, CAPTURE_DISPOSITION_MISS, CAPTURE_DISPOSITION_RULE,
     CAPTURE_DISPOSITION_STALE, CAPTURE_MODE_SHADOW, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
@@ -2421,6 +2421,59 @@ fn next_ssl_call_sequence(cgroup_id: u64, pid: u32, connection_id: u64, directio
 const HTTP_PREFIX_UNKNOWN: u8 = 0;
 const HTTP_REQUEST_LINE_SNAPSHOT: usize = 64;
 
+#[repr(C)]
+struct HttpRouteHashContext {
+    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    hash: u64,
+    captured: u32,
+    index: u32,
+    complete: u8,
+    invalid: u8,
+    _pad: [u8; 6],
+}
+
+// Hash one request-line byte per helper iteration.  Keeping the bounded scan in bpf_loop is
+// important: this function is reached from several syscall/TLS probes, and an ordinary Rust loop
+// over the variable-length path gets duplicated into each caller and exhausts the verifier state
+// budget.  The callback performs only fixed-array reads and FNV arithmetic; HTTP framing and body
+// semantics remain in userspace.
+unsafe extern "C" fn hash_http_route_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut HttpRouteHashContext);
+    let index = state.index as usize;
+    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
+        state.invalid = 1;
+        return 1;
+    }
+
+    let byte = state.data[index];
+    if index == 5 && byte != b'/' {
+        state.invalid = 1;
+        return 1;
+    }
+    // CR/LF before the request-target separator is malformed; unlike `?`/`#`, they must not
+    // authorize a route match.  Userspace still performs the complete HTTP-line validation.
+    if byte == b'\r' || byte == b'\n' {
+        state.invalid = 1;
+        return 1;
+    }
+    if byte == b' ' || byte == b'?' || byte == b'#' {
+        if index == 5 || index.saturating_sub(5) > PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+            state.invalid = 1;
+        } else {
+            state.complete = 1;
+        }
+        return 1;
+    }
+    if index.saturating_sub(5) >= PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+        state.invalid = 1;
+        return 1;
+    }
+    state.hash ^= byte as u64;
+    state.hash = state.hash.wrapping_mul(0x0000_0100_0000_01b3);
+    state.index = state.index.saturating_add(1);
+    0
+}
+
 #[inline(always)]
 fn bytes_at<const N: usize>(
     data: &[u8; HTTP_REQUEST_LINE_SNAPSHOT],
@@ -2469,35 +2522,27 @@ fn http_request_route_kind(buf: u64, len: u64) -> u8 {
     if !bytes_at(&data, captured, 0, b"POST ") {
         return HTTP_PREFIX_UNKNOWN;
     }
-    let path_start = 5usize;
-    let mut path_end = path_start;
-    while path_end < captured {
-        let byte = data[path_end];
-        if byte == b' ' || byte == b'?' || byte == b'#' || byte == b'\r' || byte == b'\n' {
-            break;
-        }
-        path_end += 1;
-    }
-    if path_end <= path_start || path_end >= captured || data[path_start] != b'/' {
+    let mut route = HttpRouteHashContext {
+        data,
+        hash: 0xcbf2_9ce4_8422_2325u64,
+        captured: captured as u32,
+        index: 5,
+        complete: 0,
+        invalid: 0,
+        _pad: [0; 6],
+    };
+    let iterations = unsafe {
+        bpf_loop(
+            (HTTP_REQUEST_LINE_SNAPSHOT - 5) as u32,
+            hash_http_route_byte as *mut c_void,
+            &mut route as *mut HttpRouteHashContext as *mut c_void,
+            0,
+        )
+    };
+    if iterations < 0 || route.complete == 0 || route.invalid != 0 {
         return HTTP_PREFIX_UNKNOWN;
     }
-    if data[path_end] != b' ' && data[path_end] != b'?' && data[path_end] != b'#' {
-        return HTTP_PREFIX_UNKNOWN;
-    }
-    if data[path_end] != b' ' {
-        let mut line_end = path_end;
-        while line_end < captured && data[line_end] != b' ' {
-            line_end += 1;
-        }
-        if line_end >= captured {
-            return HTTP_PREFIX_UNKNOWN;
-        }
-    }
-    if path_end.saturating_sub(path_start) > PLAINTEXT_HTTP_ROUTE_MAX_LEN {
-        return HTTP_PREFIX_UNKNOWN;
-    }
-    let hash = plaintext_http_route_hash(&data[path_start..path_end]);
-    let route = unsafe { PLAINTEXT_HTTP_ROUTES.get(&hash) }
+    let route = unsafe { PLAINTEXT_HTTP_ROUTES.get(&route.hash) }
         .copied()
         .unwrap_or(HTTP_PREFIX_UNKNOWN);
     if route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL {
