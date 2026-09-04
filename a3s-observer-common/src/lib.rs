@@ -78,9 +78,10 @@ pub const CAPTURE_PROFILE_SECURITY_FULL: u8 = 4;
 pub const CAPTURE_PROFILE_BUSINESS_CONTEXT: u8 = 5;
 pub const CAPTURE_PROFILE_INFRASTRUCTURE_AGGREGATE: u8 = 6;
 pub const CAPTURE_PROFILE_SELF_HEALTH: u8 = 7;
-/// Bounded investigation for a weak Agent candidate. Routine filesystem/network probes remain
-/// sampled, while the TLS plaintext channel is full so a recognized Agent conversation cannot
-/// disappear after its first streamed turn.
+/// Bounded investigation for an Agent candidate. Candidate and confirmed classifications use the
+/// same per-probe capture actions so promotion is an identity decision, never a visibility gate.
+/// The profile remains separately named for audit/rollout purposes; global ring, payload, TTL and
+/// queue budgets still bound the amount of data captured.
 pub const CAPTURE_PROFILE_PROBABLE_INVESTIGATION: u8 = 8;
 
 pub const CAPTURE_MODE_LEGACY: u8 = 0;
@@ -102,7 +103,7 @@ pub const CAPTURE_PROMOTION_FLAG_INVESTIGATION: u32 = 1 << 2;
 /// Safe closed-set defaults used when the control plane names a profile without overriding every
 /// probe. Protected lifecycle/security probes are always FULL. Unknown keeps non-content LLM
 /// metadata for discovery but leaves TLS plaintext disabled; probable/confirmed Agent profiles
-/// explicitly opt into plaintext content capture.
+/// explicitly opt into the same full probe matrix (still bounded by ring/payload/TTL budgets).
 pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_COUNT] {
     let full = CAPTURE_ACTION_FULL;
     let sample = CAPTURE_ACTION_SAMPLE;
@@ -137,9 +138,7 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
             full,
             CAPTURE_ACTION_NOT_ENABLED,
         ],
-        CAPTURE_PROFILE_PROBABLE_INVESTIGATION => [
-            full, full, sample, sample, sample, sample, sample, full, full, full, full,
-        ],
+        CAPTURE_PROFILE_PROBABLE_INVESTIGATION => [full; 11],
         CAPTURE_PROFILE_UNKNOWN_DISCOVERY => [
             full,
             full,
@@ -965,8 +964,8 @@ mod tests {
         ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
         RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
         CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
-        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
-        CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
+        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_COUNT,
+        CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
         CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM,
         CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS, CAPTURE_PROFILE_AGENT_FULL,
         CAPTURE_PROFILE_BUSINESS_CONTEXT, CAPTURE_PROFILE_INVESTIGATION_FULL,
@@ -1100,11 +1099,7 @@ mod tests {
 
         let unknown = capture_profile_default_actions(CAPTURE_PROFILE_UNKNOWN_DISCOVERY);
         let probable = capture_profile_default_actions(CAPTURE_PROFILE_PROBABLE_INVESTIGATION);
-        assert_eq!(
-            probable[CAPTURE_PROBE_FILE_READ as usize],
-            CAPTURE_ACTION_FULL
-        );
-        assert_eq!(probable[CAPTURE_PROBE_SSL as usize], CAPTURE_ACTION_FULL);
+        assert_eq!(probable, [CAPTURE_ACTION_FULL; CAPTURE_PROBE_COUNT]);
         assert_eq!(unknown[CAPTURE_PROBE_LLM as usize], CAPTURE_ACTION_FULL);
         assert_eq!(
             unknown[CAPTURE_PROBE_SSL as usize],

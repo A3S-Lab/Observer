@@ -1041,6 +1041,8 @@ fn process_matches_trusted_network_runtime(pid: i32) -> bool {
     matches_trusted_network_runtime_text(&comm, &executable)
 }
 
+/// Legacy packaged-runtime discovery hint.  This is intentionally not a TLS ABI/version gate;
+/// the process still needs a scope/generation fence and a validated implementation-family pair.
 fn matches_trusted_network_runtime_text(comm: &str, executable: &str) -> bool {
     comm == "codex-code-mode" || executable == "codex-code-mode-host"
 }

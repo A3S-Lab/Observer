@@ -1097,7 +1097,9 @@ pub(crate) fn parse_snapshot(
         let mut flags = 0u16;
         if matches!(
             profile,
-            CAPTURE_PROFILE_AGENT_FULL | CAPTURE_PROFILE_INVESTIGATION_FULL
+            CAPTURE_PROFILE_AGENT_FULL
+                | CAPTURE_PROFILE_INVESTIGATION_FULL
+                | CAPTURE_PROFILE_PROBABLE_INVESTIGATION
         ) {
             flags |= CAPTURE_PROFILE_FLAG_AGENT;
             actions = [CAPTURE_ACTION_FULL; CAPTURE_PROBE_COUNT];
@@ -1105,9 +1107,7 @@ pub(crate) fn parse_snapshot(
         }
         if matches!(
             profile,
-            CAPTURE_PROFILE_SECURITY_FULL
-                | CAPTURE_PROFILE_UNKNOWN_DISCOVERY
-                | CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+            CAPTURE_PROFILE_SECURITY_FULL | CAPTURE_PROFILE_UNKNOWN_DISCOVERY
         ) {
             let fixed = capture_profile_default_actions(profile);
             if actions != fixed || desired != fixed {
@@ -1731,6 +1731,48 @@ mod tests {
             10,
         )
         .is_err());
+    }
+
+    #[test]
+    fn probable_agent_profile_is_full_and_uses_agent_visibility_flag() {
+        let mut snapshot = signed_snapshot("enforce", "preview", 8051);
+        let all_full = json!({
+            "exec":"full","exit":"full","tls":"full","connect":"full","dns":"full",
+            "file_access":"full","file_delete":"full","llm":"full","ssl":"full",
+            "security":"full","file_read":"full"
+        });
+        snapshot["entries"][0]["classification"] = Value::String("candidate_agent".into());
+        snapshot["entries"][0]["authority"] = Value::String("candidate".into());
+        snapshot["entries"][0]["action"] = Value::String("keep".into());
+        snapshot["entries"][0]["captureProfile"] = Value::String("probable_investigation".into());
+        snapshot["entries"][0]["probeActions"] = all_full.clone();
+        snapshot["entries"][0]["desiredProbeActions"] = all_full;
+        let entries = snapshot["entries"].as_array().unwrap().clone();
+        snapshot["intentHash"] =
+            Value::String(canonical_digest(&intent_projection(&entries, 7).unwrap()));
+        snapshot["effectiveActionsHash"] =
+            Value::String(canonical_digest(&effective_actions_projection(&entries)));
+        snapshot["contentHash"] = Value::String(content_hash(&snapshot).unwrap());
+
+        let parsed = parse_snapshot(
+            serde_json::to_string(&snapshot).unwrap().as_bytes(),
+            CaptureProfileMode::Enforce,
+            &generation(),
+            None,
+            fixed_now(),
+            10,
+        )
+        .unwrap();
+        let (key, value) = &parsed.rules[0];
+        assert_eq!(key.cgroup_id, 42);
+        assert_eq!(value.profile, CAPTURE_PROFILE_PROBABLE_INVESTIGATION);
+        let mut expected = [CAPTURE_ACTION_FULL; CAPTURE_PROBE_COUNT];
+        // File reads remain an explicit root/generation-fenced opt-in for every profile; all
+        // ordinary discovery, network, TLS and semantic probes are identical to confirmed.
+        expected[CAPTURE_PROBE_FILE_READ as usize] = CAPTURE_ACTION_NOT_ENABLED;
+        assert_eq!(value.actions, expected);
+        assert_eq!(value.desired_actions, expected);
+        assert_ne!(value.flags & CAPTURE_PROFILE_FLAG_AGENT, 0);
     }
 
     #[test]

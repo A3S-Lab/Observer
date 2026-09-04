@@ -307,6 +307,11 @@ preview ACK and then validated a generation-fenced activation grant. The ACK def
 or expired state remains discovery-safe. `legacy` is the default and preserves the original v1 File
 filter. S5 and v1 File decisions are mutually exclusive.
 
+An Agent candidate uses the same full probe matrix as a confirmed Agent once its bounded scope is
+selected; promotion changes identity quality, not visibility. The optional `file_read` signal still
+requires an explicit root/process-generation grant, and every profile remains subject to the
+shared ring, payload, TTL and queue budgets.
+
 Exact cumulative SAMPLE/AGGREGATE/DROP summaries are emitted as `CaptureAggregate` Bulk events.
 The kernel ledger is deliberately bounded to 4096 keys; saturation never restores an unbounded raw
 stream, but switches to the shared emergency sample budget and sets
