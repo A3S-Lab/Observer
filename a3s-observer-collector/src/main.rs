@@ -2241,6 +2241,10 @@ async fn main() -> anyhow::Result<()> {
                     output_critical_dropped,
                     output_semantic_dropped,
                     output_bulk_dropped,
+                    output_critical_backpressure_waits =
+                        exporter.output_backpressure_waits(ExportPriority::Critical),
+                    output_critical_backpressure_timeouts =
+                        exporter.output_backpressure_timeouts(ExportPriority::Critical),
                     "a3s-observer: collector pipeline window"
                 );
                 processor.stats = Stats::default();
@@ -2611,6 +2615,10 @@ async fn main() -> anyhow::Result<()> {
         output_critical_dropped,
         output_semantic_dropped,
         output_bulk_dropped,
+        output_critical_backpressure_waits =
+            exporter.output_backpressure_waits(ExportPriority::Critical),
+        output_critical_backpressure_timeouts =
+            exporter.output_backpressure_timeouts(ExportPriority::Critical),
         process_cache_entries,
         process_cache_hits,
         process_cache_misses,

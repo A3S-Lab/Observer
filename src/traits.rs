@@ -151,6 +151,20 @@ pub trait Exporter: Send + Sync {
     fn output_drops_by_priority(&self, _priority: ExportPriority) -> u64 {
         0
     }
+
+    /// Number of times a priority-aware exporter had to wait for a saturated output lane.
+    ///
+    /// This is deliberately separate from `output_drops`: waiting is backpressure, not data
+    /// loss.  The default keeps older synchronous exporters source-compatible.
+    fn output_backpressure_waits(&self, _priority: ExportPriority) -> u64 {
+        0
+    }
+
+    /// Number of bounded waits that expired before an event could be admitted.  A non-zero value
+    /// is an explicit coverage signal; callers must not treat a full queue as a successful export.
+    fn output_backpressure_timeouts(&self, _priority: ExportPriority) -> u64 {
+        0
+    }
 }
 
 /// Trivial exporter that logs via `tracing`. Useful for bring-up; OTel is the real target.
@@ -175,6 +189,7 @@ pub struct JsonExporter {
     control_tx: std::sync::mpsc::SyncSender<FlushCommand>,
     next_barrier_id: std::sync::atomic::AtomicU64,
     dropped: std::sync::Arc<PriorityDropCounters>,
+    critical_backpressure_wait: Duration,
 }
 
 #[derive(Default)]
@@ -183,6 +198,8 @@ struct PriorityDropCounters {
     critical: std::sync::atomic::AtomicU64,
     semantic: std::sync::atomic::AtomicU64,
     bulk: std::sync::atomic::AtomicU64,
+    critical_waits: std::sync::atomic::AtomicU64,
+    critical_timeouts: std::sync::atomic::AtomicU64,
 }
 
 impl PriorityDropCounters {
@@ -203,6 +220,16 @@ impl PriorityDropCounters {
             ExportPriority::Semantic => &self.semantic,
             ExportPriority::Bulk => &self.bulk,
         }
+    }
+
+    fn record_critical_wait(&self) {
+        use std::sync::atomic::Ordering;
+        self.critical_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_critical_timeout(&self) {
+        use std::sync::atomic::Ordering;
+        self.critical_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -427,6 +454,13 @@ const DEFAULT_BULK_QUEUE_CAPACITY: usize = 8_192;
 const MIN_PRIORITY_QUEUE_CAPACITY: usize = 64;
 const MAX_PRIORITY_QUEUE_CAPACITY: usize = 262_144;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
+// Critical lifecycle/security facts are allowed to apply bounded backpressure to the Collector
+// instead of being rejected immediately when the Forwarder pipe is stalled. The wait is finite
+// so an unavailable downstream still becomes an explicit drop/coverage signal and cannot wedge
+// shutdown forever. Zero restores the historical strictly non-blocking behavior for fixtures
+// that intentionally exercise a full queue.
+const DEFAULT_CRITICAL_BACKPRESSURE_MS: u64 = 100;
+const MAX_CRITICAL_BACKPRESSURE_MS: u64 = 10_000;
 
 fn configured_capacity(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -434,6 +468,15 @@ fn configured_capacity(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(MIN_PRIORITY_QUEUE_CAPACITY, MAX_PRIORITY_QUEUE_CAPACITY)
+}
+
+fn configured_critical_backpressure() -> Duration {
+    let millis = std::env::var("A3S_OBSERVER_JSON_CRITICAL_BACKPRESSURE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CRITICAL_BACKPRESSURE_MS)
+        .min(MAX_CRITICAL_BACKPRESSURE_MS);
+    Duration::from_millis(millis)
 }
 
 impl JsonExporter {
@@ -489,6 +532,7 @@ impl JsonExporter {
             control_tx,
             next_barrier_id: std::sync::atomic::AtomicU64::new(0),
             dropped,
+            critical_backpressure_wait: configured_critical_backpressure(),
         }
     }
 
@@ -497,6 +541,51 @@ impl JsonExporter {
             ExportPriority::Critical => &self.critical_tx,
             ExportPriority::Semantic => &self.semantic_tx,
             ExportPriority::Bulk => &self.bulk_tx,
+        }
+    }
+
+    /// Admit a critical event with a small, finite retry window. A full critical lane is a
+    /// downstream backpressure condition, not a reason to immediately discard a lifecycle or
+    /// security fact. Once the deadline expires we return `Dropped` and increment the existing
+    /// explicit loss counter plus a dedicated timeout counter; no failure is hidden.
+    fn export_critical_with_backpressure(&self, event: &EnrichedEvent) -> ExportOutcome {
+        let mut pending = Some(WriterData::Event(Box::new(event.clone())));
+        let deadline = Instant::now() + self.critical_backpressure_wait;
+        let mut waited = false;
+        loop {
+            let value = pending
+                .take()
+                .expect("critical export retry must retain the owned event");
+            match self.critical_tx.try_send(value) {
+                Ok(()) => {
+                    if waited {
+                        self.dropped.record_critical_wait();
+                    }
+                    return ExportOutcome::Admitted;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    pending = Some(returned);
+                    if self.critical_backpressure_wait.is_zero() || Instant::now() >= deadline {
+                        if waited {
+                            self.dropped.record_critical_timeout();
+                        }
+                        self.dropped.increment(ExportPriority::Critical);
+                        return ExportOutcome::Dropped;
+                    }
+                    waited = true;
+                    // A millisecond granularity keeps the bounded wait responsive while yielding
+                    // enough for the writer thread to drain a pipe-sized burst.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    if waited {
+                        self.dropped.record_critical_timeout();
+                    }
+                    self.dropped.increment(ExportPriority::Critical);
+                    return ExportOutcome::Dropped;
+                }
+            }
         }
     }
 }
@@ -522,7 +611,12 @@ impl Exporter for JsonExporter {
         priority: ExportPriority,
     ) -> ExportOutcome {
         // Clone + try_send is bounded and never waits for stdout, JSON serialization, or another
-        // service level. Independent queues reserve critical capacity from bulk saturation.
+        // service level. Independent queues reserve critical capacity from bulk saturation. The
+        // critical lane gets a finite retry window so a transiently stalled Forwarder applies
+        // backpressure before an explicit loss is recorded.
+        if priority == ExportPriority::Critical {
+            return self.export_critical_with_backpressure(event);
+        }
         if self
             .sender_for(priority)
             .try_send(WriterData::Event(Box::new(event.clone())))
@@ -612,6 +706,24 @@ impl Exporter for JsonExporter {
     fn output_drops_by_priority(&self, priority: ExportPriority) -> u64 {
         self.dropped
             .for_priority(priority)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn output_backpressure_waits(&self, priority: ExportPriority) -> u64 {
+        if priority != ExportPriority::Critical {
+            return 0;
+        }
+        self.dropped
+            .critical_waits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn output_backpressure_timeouts(&self, priority: ExportPriority) -> u64 {
+        if priority != ExportPriority::Critical {
+            return 0;
+        }
+        self.dropped
+            .critical_timeouts
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -854,6 +966,7 @@ mod tests {
                 control_tx,
                 next_barrier_id: std::sync::atomic::AtomicU64::new(0),
                 dropped: dropped.clone(),
+                critical_backpressure_wait: Duration::from_millis(1),
             },
             WriterReceivers {
                 critical,
@@ -1050,6 +1163,50 @@ mod tests {
         assert_eq!(ex.output_drops(), 1);
         assert_eq!(ex.output_drops_by_priority(ExportPriority::Bulk), 1);
         assert_eq!(ex.output_drops_by_priority(ExportPriority::Critical), 0);
+    }
+
+    #[test]
+    fn json_exporter_critical_lane_waits_for_transient_consumer_backpressure() {
+        let (mut ex, receivers) = exporter_harness(1, 1, 1, 1);
+        ex.critical_backpressure_wait = Duration::from_millis(100);
+        assert_eq!(
+            ex.export_with_priority(&exit_event(1), ExportPriority::Critical),
+            ExportOutcome::Admitted
+        );
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = receivers.critical.recv();
+            // Keep the receiver alive long enough for the producer's retry to observe the freed
+            // slot; dropping it immediately would model a disconnect rather than backpressure.
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        assert_eq!(
+            ex.export_with_priority(&exit_event(2), ExportPriority::Critical),
+            ExportOutcome::Admitted
+        );
+        writer.join().unwrap();
+        assert_eq!(ex.output_drops_by_priority(ExportPriority::Critical), 0);
+        assert_eq!(ex.output_backpressure_waits(ExportPriority::Critical), 1);
+        assert_eq!(ex.output_backpressure_timeouts(ExportPriority::Critical), 0);
+    }
+
+    #[test]
+    fn json_exporter_critical_backpressure_timeout_is_explicit_and_bounded() {
+        let (mut ex, _receivers) = exporter_harness(1, 1, 1, 1);
+        ex.critical_backpressure_wait = Duration::from_millis(2);
+        assert_eq!(
+            ex.export_with_priority(&exit_event(1), ExportPriority::Critical),
+            ExportOutcome::Admitted
+        );
+        let started = Instant::now();
+        assert_eq!(
+            ex.export_with_priority(&exit_event(2), ExportPriority::Critical),
+            ExportOutcome::Dropped
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(ex.output_drops_by_priority(ExportPriority::Critical), 1);
+        assert_eq!(ex.output_backpressure_waits(ExportPriority::Critical), 0);
+        assert_eq!(ex.output_backpressure_timeouts(ExportPriority::Critical), 1);
     }
 
     #[test]
