@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "anysentry.tls_runtime_selection_hints.v1",
+  "purpose": "discovery-hint-only",
+  "versionPolicy": "implementation-family",
+  "hints": [
+    {
+      "id": "codex-cli",
+      "role": "agent_root",
+      "patterns": ["codex"]
+    },
+    {
+      "id": "claude-code-cli",
+      "role": "agent_root",
+      "patterns": ["claude"]
+    },
+    {
+      "id": "dify-plugin-runtime",
+      "role": "agent_root",
+      "patterns": ["dify-plugin-daemon"]
+    },
+    {
+      "id": "kimi-cli",
+      "role": "agent_root",
+      "patterns": ["kimi"]
+    },
+    {
+      "id": "langchain-runtime",
+      "role": "agent_root",
+      "patterns": ["langchain"]
+    },
+    {
+      "id": "pi-coding-agent",
+      "role": "agent_root",
+      "patterns": ["pi-coding-agent", "run-pi-"]
+    }
+  ]
+}

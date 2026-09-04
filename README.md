@@ -264,6 +264,15 @@ bounded to 8 MiB per direction. See the AnySentry
 [discovery-first design](../AnySentry/docs/anysentry-discovery-first-agent-tls-observability-v2-design.md)
 for the implementation-family matrix, timing semantics and security boundary.
 
+The embedded `a3s-observer-collector/src/tls-signature-families.json` registry is explicitly
+`versionPolicy=implementation-family`: its anchors and ABI pairs are reusable across releases of
+the same TLS implementation family, and it rejects product/version selectors. Runtime names in
+`tls-runtime-selection-hints.json` are bounded **discovery hints only**; they do not grant
+plaintext access or create an Agent identity. If an exceptional release changes an ABI, add a
+separately reviewed, signed capability extension that reuses the same attach/transport contracts;
+do not add a version branch to the generic scanner. Unknown ABI or malformed extension metadata
+fails closed and leaves the independent KernelFact/Coverage path intact.
+
 Each ring is drained by an event-driven reader into physically independent Critical, Semantic, and
 Bulk inboxes; raw probe evidence maps only to Critical or Semantic. The readers copy fixed PODs and
 never perform `/proc`, workload resolution, classification, or JSON work. A bounded event-time

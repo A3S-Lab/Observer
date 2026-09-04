@@ -1,5 +1,7 @@
 {
   "schemaVersion": "anysentry.tls_signature_families.v2",
+  "versionPolicy": "implementation-family",
+  "extensionPolicy": "explicit-capability-registry",
   "families": [
     {
       "implementationFamily": "boringssl-classic-x86-64",

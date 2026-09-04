@@ -15,6 +15,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SIGNATURE_FAMILY_DOCUMENT: &str = include_str!("tls-signature-families.json");
+const RUNTIME_SELECTION_HINT_DOCUMENT: &str = include_str!("tls-runtime-selection-hints.json");
+/// The base static-signature registry is intentionally scoped to implementation/ABI families.
+/// Product or CLI-version selectors belong to a separately reviewed capability extension and
+/// must never become an implicit attach gate in this module.
+const TLS_SIGNATURE_FAMILY_SCHEMA: &str = "anysentry.tls_signature_families.v2";
+const TLS_SIGNATURE_VERSION_POLICY: &str = "implementation-family";
+const TLS_SIGNATURE_EXTENSION_POLICY: &str = "explicit-capability-registry";
+const RUNTIME_SELECTION_HINT_SCHEMA: &str = "anysentry.tls_runtime_selection_hints.v1";
+const RUNTIME_SELECTION_HINT_PURPOSE: &str = "discovery-hint-only";
+const MAX_RUNTIME_SELECTION_HINTS: usize = 64;
+const MAX_RUNTIME_SELECTION_PATTERNS: usize = 128;
+const MAX_RUNTIME_SELECTION_TEXT: usize = 128;
 const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
 const MAX_ANCHOR_MATCHES: usize = 128;
@@ -154,15 +166,10 @@ pub struct TlsAttachManager {
 
 impl TlsAttachManager {
     pub fn from_env(ssl_setting: &str) -> Self {
-        let mut process_patterns = vec![
-            "codex".to_string(),
-            "claude".to_string(),
-            "dify-plugin-daemon".to_string(),
-            "kimi".to_string(),
-            "langchain".to_string(),
-            "pi-coding-agent".to_string(),
-            "run-pi-".to_string(),
-        ];
+        // These product-labelled values are declarative runtime discovery hints only.  They do
+        // not select a TLS ABI, authorize plaintext, or identify a LogicalAgent.  The actual
+        // Agent Scope/capture decision remains control-plane and generation fenced.
+        let mut process_patterns = runtime_selection_hint_patterns();
         if let Ok(extra) = std::env::var("A3S_OBSERVER_TLS_PROCESS_PATTERNS") {
             process_patterns.extend(
                 extra
@@ -781,6 +788,109 @@ fn matches_selected_agent_text(comm: &str, cmdline: &str, process_patterns: &[St
             .any(|pattern| comm.contains(pattern.as_str()) || cmdline.contains(pattern.as_str()))
 }
 
+/// Load the small built-in runtime hint catalogue.  Hints are intentionally separate from the
+/// TLS implementation-family registry: they only reduce the set of `/proc` entries considered
+/// for discovery and can never authorize a probe by themselves.  A malformed catalogue fails
+/// closed to scope-driven discovery instead of falling back to a broad process scan.
+fn runtime_selection_hint_patterns() -> Vec<String> {
+    match parse_runtime_selection_hint_patterns(RUNTIME_SELECTION_HINT_DOCUMENT) {
+        Ok(patterns) => patterns,
+        Err(error) => {
+            tracing::error!(error = %error, "TLS runtime-selection hints rejected; waiting for scope-verified discovery");
+            Vec::new()
+        }
+    }
+}
+
+fn parse_runtime_selection_hint_patterns(document: &str) -> anyhow::Result<Vec<String>> {
+    let root: Value =
+        serde_json::from_str(document).context("parse TLS runtime-selection hint document")?;
+    anyhow::ensure!(
+        root.get("schemaVersion").and_then(Value::as_str) == Some(RUNTIME_SELECTION_HINT_SCHEMA),
+        "unsupported TLS runtime-selection hint schema"
+    );
+    anyhow::ensure!(
+        root.get("purpose").and_then(Value::as_str) == Some(RUNTIME_SELECTION_HINT_PURPOSE),
+        "TLS runtime-selection hints must be discovery-only"
+    );
+    anyhow::ensure!(
+        root.get("versionPolicy").and_then(Value::as_str) == Some(TLS_SIGNATURE_VERSION_POLICY),
+        "TLS runtime-selection hints must use implementation-family policy"
+    );
+    let hints = root
+        .get("hints")
+        .and_then(Value::as_array)
+        .context("TLS runtime-selection hint document has no hints")?;
+    anyhow::ensure!(
+        !hints.is_empty() && hints.len() <= MAX_RUNTIME_SELECTION_HINTS,
+        "TLS runtime-selection hint count is outside the configured bound"
+    );
+    let mut ids = HashSet::new();
+    let mut patterns = Vec::new();
+    for hint in hints {
+        let id = hint
+            .get("id")
+            .and_then(Value::as_str)
+            .context("TLS runtime-selection hint id is missing")?;
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= MAX_RUNTIME_SELECTION_TEXT
+                && id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                }),
+            "TLS runtime-selection hint id is not a bounded slug"
+        );
+        anyhow::ensure!(ids.insert(id), "duplicate TLS runtime-selection hint id");
+        anyhow::ensure!(
+            hint.get("role").and_then(Value::as_str) == Some("agent_root"),
+            "TLS runtime-selection hints may only select agent roots"
+        );
+        // A hint document is not a place to smuggle a product/version gate.  The product
+        // label lives in `id` for operator diagnostics; matching remains an opaque fragment.
+        for field in [
+            "product",
+            "version",
+            "versionRange",
+            "wholeFileSha256",
+            "head64kSha256",
+        ] {
+            anyhow::ensure!(
+                hint.get(field).is_none(),
+                "TLS runtime-selection hint cannot contain selector `{field}`"
+            );
+        }
+        let hint_patterns = hint
+            .get("patterns")
+            .and_then(Value::as_array)
+            .context("TLS runtime-selection hint patterns are missing")?;
+        anyhow::ensure!(
+            !hint_patterns.is_empty(),
+            "TLS runtime-selection hint must contain a pattern"
+        );
+        for pattern in hint_patterns {
+            let pattern = pattern
+                .as_str()
+                .context("TLS runtime-selection hint pattern must be a string")?
+                .trim()
+                .to_ascii_lowercase();
+            anyhow::ensure!(
+                !pattern.is_empty()
+                    && pattern.len() <= MAX_RUNTIME_SELECTION_TEXT
+                    && !pattern.bytes().any(|byte| byte.is_ascii_control()),
+                "TLS runtime-selection hint pattern is outside the configured bound"
+            );
+            patterns.push(pattern);
+        }
+    }
+    anyhow::ensure!(
+        patterns.len() <= MAX_RUNTIME_SELECTION_PATTERNS,
+        "TLS runtime-selection pattern count is outside the configured bound"
+    );
+    patterns.sort();
+    patterns.dedup();
+    Ok(patterns)
+}
+
 fn process_parent_pid(pid: i32) -> Option<i32> {
     fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()?
@@ -982,10 +1092,10 @@ fn is_interpreter_or_shell(basename: &str) -> bool {
 fn static_signature_families() -> anyhow::Result<Vec<StaticSignatureFamily>> {
     let root: Value = serde_json::from_str(SIGNATURE_FAMILY_DOCUMENT)?;
     anyhow::ensure!(
-        root.get("schemaVersion").and_then(Value::as_str)
-            == Some("anysentry.tls_signature_families.v2"),
+        root.get("schemaVersion").and_then(Value::as_str) == Some(TLS_SIGNATURE_FAMILY_SCHEMA),
         "unsupported TLS signature-family schema"
     );
+    validate_signature_registry_metadata(&root)?;
     let values = root
         .get("families")
         .and_then(Value::as_array)
@@ -1005,6 +1115,7 @@ fn static_signature_families() -> anyhow::Result<Vec<StaticSignatureFamily>> {
 }
 
 fn parse_signature_family(value: &Value) -> anyhow::Result<StaticSignatureFamily> {
+    validate_signature_family_metadata(value)?;
     let string = |name: &str| -> anyhow::Result<&str> {
         value
             .get(name)
@@ -1054,6 +1165,62 @@ fn parse_signature_family(value: &Value) -> anyhow::Result<StaticSignatureFamily
         write_abi,
         write_after_read,
     })
+}
+
+/// Validate the policy boundary before parsing any offsets.  The embedded registry is a
+/// reusable implementation-family catalogue, not a product/version profile list.  Keeping this
+/// check explicit prevents a future contributor from adding a `version` selector that silently
+/// turns a generic TLS family into a Codex/Claude-specific hard gate.
+fn validate_signature_registry_metadata(root: &Value) -> anyhow::Result<()> {
+    let version_policy = root
+        .get("versionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_VERSION_POLICY);
+    anyhow::ensure!(
+        version_policy == TLS_SIGNATURE_VERSION_POLICY,
+        "TLS signature registry must use implementation-family policy; version-specific entries belong to an explicit capability extension"
+    );
+    let extension_policy = root
+        .get("extensionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_EXTENSION_POLICY);
+    anyhow::ensure!(
+        extension_policy == TLS_SIGNATURE_EXTENSION_POLICY,
+        "unsupported TLS signature extension policy"
+    );
+    Ok(())
+}
+
+fn validate_signature_family_metadata(value: &Value) -> anyhow::Result<()> {
+    let version_policy = value
+        .get("versionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_VERSION_POLICY);
+    anyhow::ensure!(
+        version_policy == TLS_SIGNATURE_VERSION_POLICY,
+        "version-specific TLS signatures must be registered as an explicit capability extension"
+    );
+    // These fields were present in the retired product/version profile document.  Rejecting
+    // them in the base registry is deliberate: an accidental addition must fail closed instead
+    // of looking like a supported generic family.  A future extension may carry such metadata in
+    // its own signed registry and still reuse TlsAttachKind/attach_offset_pair.
+    for field in [
+        "product",
+        "version",
+        "versionRange",
+        "minVersion",
+        "maxVersion",
+        "fileSize",
+        "head64kSha256",
+        "wholeFileSha256",
+        "capabilityExtension",
+    ] {
+        anyhow::ensure!(
+            value.get(field).is_none(),
+            "TLS base signature family cannot contain product/version selector `{field}`"
+        );
+    }
+    Ok(())
 }
 
 fn signature_family_fingerprint(
@@ -1347,10 +1514,46 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn signature_family_fixture() -> Value {
+        serde_json::json!({
+            "implementationFamily": "fixture-tls-x86-64",
+            "readExpectedPrefixHex": "00112233445566778899aabb",
+            "writeExpectedPrefixHex": "ffeeddccbbaa998877665544",
+            "readAbi": "classic",
+            "writeAbi": "classic",
+            "writeAfterReadOffsets": [16]
+        })
+    }
+
     #[test]
     fn static_document_contains_only_tls_implementation_families() {
+        let document: Value = serde_json::from_str(SIGNATURE_FAMILY_DOCUMENT).unwrap();
+        assert_eq!(
+            document.get("versionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_VERSION_POLICY)
+        );
+        assert_eq!(
+            document.get("extensionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_EXTENSION_POLICY)
+        );
         let families = static_signature_families().unwrap();
         assert_eq!(families.len(), 3);
+        let family_values = document.get("families").unwrap().as_array().unwrap();
+        assert!(family_values.iter().all(|family| {
+            [
+                "product",
+                "version",
+                "versionRange",
+                "minVersion",
+                "maxVersion",
+                "fileSize",
+                "head64kSha256",
+                "wholeFileSha256",
+                "capabilityExtension",
+            ]
+            .iter()
+            .all(|field| family.get(*field).is_none())
+        }));
         assert!(families.iter().all(|family| family.read_prefix.len() >= 12
             && family.write_prefix.len() >= 12
             && !family.write_after_read.is_empty()));
@@ -1370,6 +1573,84 @@ mod tests {
             .unwrap();
         assert_eq!(rustls.write_after_read, vec![-5248]);
         assert_eq!(rustls.write_abi, TlsAbi::RustlsOutboundChunks);
+    }
+
+    #[test]
+    fn runtime_selection_catalogue_is_explicitly_discovery_only() {
+        let patterns = runtime_selection_hint_patterns();
+        assert!(patterns.contains(&"codex".to_string()));
+        assert!(patterns.contains(&"claude".to_string()));
+        assert!(patterns.contains(&"langchain".to_string()));
+        assert!(patterns.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn malformed_runtime_selection_metadata_fails_closed_without_broad_defaults() {
+        let root: Value = serde_json::from_str(RUNTIME_SELECTION_HINT_DOCUMENT).unwrap();
+        assert_eq!(
+            root.get("purpose").and_then(Value::as_str),
+            Some(RUNTIME_SELECTION_HINT_PURPOSE)
+        );
+        assert_eq!(
+            root.get("versionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_VERSION_POLICY)
+        );
+        let mut invalid = root;
+        invalid["purpose"] = Value::String("capture-authority".to_string());
+        let result = parse_runtime_selection_hint_patterns(&invalid.to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn product_and_version_selectors_are_rejected_from_base_family_registry() {
+        for field in [
+            "product",
+            "version",
+            "versionRange",
+            "minVersion",
+            "maxVersion",
+            "fileSize",
+            "wholeFileSha256",
+            "capabilityExtension",
+        ] {
+            let mut fixture = signature_family_fixture();
+            fixture[field] = Value::String("must-live-in-explicit-extension".to_string());
+            assert!(
+                parse_signature_family(&fixture).is_err(),
+                "base family unexpectedly accepted selector {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_specific_policy_is_rejected_without_an_explicit_extension_loader() {
+        let mut fixture = signature_family_fixture();
+        fixture["versionPolicy"] = Value::String("version-range".to_string());
+        assert!(parse_signature_family(&fixture).is_err());
+
+        let mut document = serde_json::json!({
+            "schemaVersion": TLS_SIGNATURE_FAMILY_SCHEMA,
+            "versionPolicy": "version-range",
+            "extensionPolicy": TLS_SIGNATURE_EXTENSION_POLICY,
+            "families": []
+        });
+        assert!(validate_signature_registry_metadata(&document).is_err());
+        document["versionPolicy"] = Value::String(TLS_SIGNATURE_VERSION_POLICY.to_string());
+        document["extensionPolicy"] = Value::String("implicit-product-switch".to_string());
+        assert!(validate_signature_registry_metadata(&document).is_err());
+    }
+
+    #[test]
+    fn unknown_abi_is_fail_closed_without_an_offset_fallback() {
+        let mut fixture = signature_family_fixture();
+        fixture["readAbi"] = Value::String("future-abi".to_string());
+        let error = parse_signature_family(&fixture).unwrap_err().to_string();
+        assert!(error.contains("unsupported TLS ABI"));
+
+        fixture["readAbi"] = Value::String("classic".to_string());
+        fixture["writeAbi"] = Value::String("future-abi".to_string());
+        assert!(parse_signature_family(&fixture).is_err());
+        assert!(parse_abi("future-abi").is_err());
     }
 
     #[test]
