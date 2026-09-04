@@ -850,9 +850,13 @@ fn parse_runtime_selection_hint_patterns(document: &str) -> anyhow::Result<Vec<S
         for field in [
             "product",
             "version",
+            "productVersion",
             "versionRange",
+            "versionSelector",
+            "versions",
             "wholeFileSha256",
             "head64kSha256",
+            "binaryFingerprint",
         ] {
             anyhow::ensure!(
                 hint.get(field).is_none(),
@@ -1209,10 +1213,14 @@ fn validate_signature_family_metadata(value: &Value) -> anyhow::Result<()> {
     for field in [
         "product",
         "version",
+        "productVersion",
         "versionRange",
+        "versionSelector",
+        "versions",
         "minVersion",
         "maxVersion",
         "fileSize",
+        "binaryFingerprint",
         "head64kSha256",
         "wholeFileSha256",
         "capabilityExtension",
@@ -1545,10 +1553,14 @@ mod tests {
             [
                 "product",
                 "version",
+                "productVersion",
                 "versionRange",
+                "versionSelector",
+                "versions",
                 "minVersion",
                 "maxVersion",
                 "fileSize",
+                "binaryFingerprint",
                 "head64kSha256",
                 "wholeFileSha256",
                 "capabilityExtension",
@@ -1608,10 +1620,14 @@ mod tests {
         for field in [
             "product",
             "version",
+            "productVersion",
             "versionRange",
+            "versionSelector",
+            "versions",
             "minVersion",
             "maxVersion",
             "fileSize",
+            "binaryFingerprint",
             "wholeFileSha256",
             "capabilityExtension",
         ] {
