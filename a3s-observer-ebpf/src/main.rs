@@ -2608,6 +2608,55 @@ fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
     }
 }
 
+// Keep the optional WebSocket upgrade hint in its own BPF subprogram. Inlining a header parser
+// with nested line/value loops into `emit_tls_plaintext` exhausts the verifier state budget for
+// every TLS ABI caller. This callback performs one linear, bounded scan through a fixed snapshot;
+// it is only an admission hint and userspace remains authoritative for HTTP/WebSocket validity.
+#[repr(C)]
+struct WebSocketHintContext {
+    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    captured: u32,
+    index: u32,
+    rolling: u32,
+    saw_upgrade: u8,
+    saw_websocket: u8,
+    saw_connection: u8,
+    _pad: u8,
+}
+
+unsafe extern "C" fn scan_websocket_hint_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut WebSocketHintContext);
+    let index = state.index as usize;
+    // Keep both bounds explicit: the verifier/compiler cannot infer that the userspace-derived
+    // `captured` value is no larger than the fixed array solely from the caller's clamp.
+    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
+        return 1;
+    }
+    let raw = state.data[index];
+    let byte = if raw >= b'A' && raw <= b'Z' {
+        raw + (b'a' - b'A')
+    } else {
+        raw
+    };
+    state.rolling = (state.rolling << 8) | byte as u32;
+    state.index = state.index.saturating_add(1);
+    // Prefixes are intentionally used only as a cheap candidate hint. The userspace Transport
+    // decoder validates complete header names/values before producing a WebSocket relation.
+    if state.rolling == u32::from_be_bytes(*b"upgr") {
+        state.saw_upgrade = 1;
+    }
+    if state.rolling == u32::from_be_bytes(*b"webs") {
+        state.saw_websocket = 1;
+    }
+    if state.rolling == u32::from_be_bytes(*b"conn") {
+        state.saw_connection = 1;
+    }
+    if state.saw_upgrade != 0 && state.saw_websocket != 0 && state.saw_connection != 0 {
+        return 1;
+    }
+    0
+}
+
 #[inline(always)]
 fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
     if buf == 0 || len < 16 {
@@ -2632,84 +2681,28 @@ fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
     if !bytes_at(&data, captured, 0, b"GET ") {
         return false;
     }
-    let mut saw_upgrade = false;
-    let mut saw_connection_upgrade = false;
-    let mut index = 0usize;
-    while index + 2 <= captured {
-        if unsafe { *data.get_unchecked(index) } == b'\r'
-            && unsafe { *data.get_unchecked(index + 1) } == b'\n'
-        {
-            let line_start = index + 2;
-            let mut line_end = line_start;
-            while line_end < captured
-                && unsafe { *data.get_unchecked(line_end) } != b'\r'
-                && unsafe { *data.get_unchecked(line_end) } != b'\n'
-            {
-                line_end += 1;
-            }
-            if line_start + 8 <= line_end && bytes_window_matches(&data, line_start, b"upgrade:") {
-                let mut value = line_start + 8;
-                while value < line_end
-                    && (unsafe { *data.get_unchecked(value) } == b' '
-                        || unsafe { *data.get_unchecked(value) } == b'\t')
-                {
-                    value += 1;
-                }
-                while value + 9 <= line_end {
-                    if bytes_window_matches(&data, value, b"websocket") {
-                        saw_upgrade = true;
-                        break;
-                    }
-                    value += 1;
-                }
-            } else if line_start + 11 <= line_end
-                && bytes_window_matches(&data, line_start, b"connection:")
-            {
-                let mut value = line_start + 11;
-                while value < line_end
-                    && (unsafe { *data.get_unchecked(value) } == b' '
-                        || unsafe { *data.get_unchecked(value) } == b'\t')
-                {
-                    value += 1;
-                }
-                while value + 7 <= line_end {
-                    if bytes_window_matches(&data, value, b"upgrade") {
-                        saw_connection_upgrade = true;
-                        break;
-                    }
-                    value += 1;
-                }
-            }
-            if saw_upgrade && saw_connection_upgrade {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
-}
-
-#[inline(always)]
-fn bytes_window_matches<const N: usize>(
-    data: &[u8; HTTP_REQUEST_LINE_SNAPSHOT],
-    offset: usize,
-    expected: &[u8; N],
-) -> bool {
-    if offset.saturating_add(N) > HTTP_REQUEST_LINE_SNAPSHOT {
-        return false;
-    }
-    let mut index = 0usize;
-    while index < N {
-        // The explicit bound above makes these accesses safe and avoids a cold bounds-panic
-        // section in the linked BPF object.
-        let left = unsafe { *data.get_unchecked(offset + index) };
-        let right = unsafe { *expected.get_unchecked(index) };
-        if left.to_ascii_lowercase() != right {
-            return false;
-        }
-        index += 1;
-    }
-    true
+    let mut state = WebSocketHintContext {
+        data,
+        captured: captured as u32,
+        index: 0,
+        rolling: 0,
+        saw_upgrade: 0,
+        saw_websocket: 0,
+        saw_connection: 0,
+        _pad: 0,
+    };
+    let iterations = unsafe {
+        bpf_loop(
+            HTTP_REQUEST_LINE_SNAPSHOT as u32,
+            scan_websocket_hint_byte as *mut c_void,
+            &mut state as *mut WebSocketHintContext as *mut c_void,
+            0,
+        )
+    };
+    iterations >= 0
+        && state.saw_upgrade != 0
+        && state.saw_websocket != 0
+        && state.saw_connection != 0
 }
 
 #[inline(always)]

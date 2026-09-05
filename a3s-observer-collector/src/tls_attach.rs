@@ -339,8 +339,12 @@ impl TlsAttachManager {
         );
         self.metrics.failed = self.metrics.failed.saturating_add(1);
         self.metrics.retry_scheduled = self.metrics.retry_scheduled.saturating_add(1);
-        let reason_summary = if reason.len() > 2_048 {
-            format!("{}...[truncated]", &reason[..2_048])
+        // Keep enough verifier output to reach the terminal rejection reason while remaining
+        // bounded.  A 2 KiB prefix ends in the middle of the map-value copy for TLS uprobes and
+        // makes a targeted verifier fix impossible to diagnose.
+        const MAX_REASON_BYTES: usize = 16 * 1024;
+        let reason_summary = if reason.len() > MAX_REASON_BYTES {
+            format!("{}...[truncated]", &reason[..MAX_REASON_BYTES])
         } else {
             reason.to_string()
         };

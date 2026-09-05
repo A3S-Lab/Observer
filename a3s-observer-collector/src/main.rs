@@ -2675,7 +2675,12 @@ const UNKNOWN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// Keep kernel verifier diagnostics bounded so an optional probe failure cannot exhaust stderr.
 fn bounded_error_text(error: impl Display) -> String {
-    const MAX: usize = 2_048;
+    // Keep enough of the kernel's first failing instruction and terminal reason to distinguish
+    // verifier complexity, stack bounds, helper availability, and attach ABI errors.  The former
+    // 2 KiB cap cut every TLS failure off in the middle of the map-value copy, which made a
+    // targeted BPF fix impossible to validate.  16 KiB is still bounded per attempt and is only
+    // emitted for an optional attach failure.
+    const MAX: usize = 16 * 1_024;
     let text = error.to_string();
     if text.len() <= MAX {
         return text;
