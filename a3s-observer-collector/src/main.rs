@@ -54,6 +54,7 @@ use aya::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1694,7 +1695,8 @@ async fn main() -> anyhow::Result<()> {
         match attach(&mut ebpf, prog, "syscalls", tp) {
             Ok(()) => attached += 1,
             Err(e) => {
-                tracing::warn!(probe = prog, error = %e, "probe failed to attach — continuing")
+                let error = bounded_error_text(&e);
+                tracing::warn!(probe = prog, error = %error, "probe failed to attach — continuing")
             }
         }
     }
@@ -2670,6 +2672,18 @@ async fn main() -> anyhow::Result<()> {
 
 // ponytail: peer IP arrives with the flow probe (#5); SNI alone identifies the provider.
 const UNKNOWN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Keep kernel verifier diagnostics bounded so an optional probe failure cannot exhaust stderr.
+fn bounded_error_text(error: impl Display) -> String {
+    const MAX: usize = 2_048;
+    let text = error.to_string();
+    if text.len() <= MAX {
+        return text;
+    }
+    let mut truncated = text[..MAX].to_string();
+    truncated.push_str("...[truncated]");
+    truncated
+}
 
 fn attach(ebpf: &mut Ebpf, prog: &str, category: &str, name: &str) -> anyhow::Result<()> {
     let p: &mut TracePoint = ebpf

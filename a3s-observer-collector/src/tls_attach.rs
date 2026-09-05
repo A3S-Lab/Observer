@@ -339,9 +339,14 @@ impl TlsAttachManager {
         );
         self.metrics.failed = self.metrics.failed.saturating_add(1);
         self.metrics.retry_scheduled = self.metrics.retry_scheduled.saturating_add(1);
+        let reason_summary = if reason.len() > 2_048 {
+            format!("{}...[truncated]", &reason[..2_048])
+        } else {
+            reason.to_string()
+        };
         tracing::warn!(
             target = %key,
-            reason,
+            reason = %reason_summary,
             attempts,
             retry_ms = ATTACH_RETRY_DELAYS_MS[delay_index],
             "TLS target attach failed; bounded retry remains eligible"
