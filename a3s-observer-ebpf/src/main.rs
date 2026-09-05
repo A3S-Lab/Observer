@@ -2094,7 +2094,10 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let key = sock_key(cgroup_id, pid, fd);
-    try_plain_http_write(pid, fd, buf, count);
+    // This tracepoint is shared by TLS ClientHello discovery and legacy syscall capture. Keep
+    // the program limited to the small handshake classifier: the plain HTTP route hash path is
+    // userspace/eBPF-uProbe scoped and must not make the always-on TLS metadata probe fail the
+    // kernel verifier. TLS plaintext still uses its own exact session route gate below.
     // Already tracking this LLM socket → this write is request payload; accumulate + done.
     if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
         unsafe {
