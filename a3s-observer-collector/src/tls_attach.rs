@@ -27,6 +27,8 @@ const RUNTIME_SELECTION_HINT_PURPOSE: &str = "discovery-hint-only";
 const MAX_RUNTIME_SELECTION_HINTS: usize = 64;
 const MAX_RUNTIME_SELECTION_PATTERNS: usize = 128;
 const MAX_RUNTIME_SELECTION_TEXT: usize = 128;
+const MAX_RUNTIME_SELECTION_INPUT_BYTES: usize =
+    MAX_RUNTIME_SELECTION_PATTERNS * (MAX_RUNTIME_SELECTION_TEXT + 1);
 const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
 const MAX_ANCHOR_MATCHES: usize = 128;
@@ -171,13 +173,7 @@ impl TlsAttachManager {
         // Agent Scope/capture decision remains control-plane and generation fenced.
         let mut process_patterns = runtime_selection_hint_patterns();
         if let Ok(extra) = std::env::var("A3S_OBSERVER_TLS_PROCESS_PATTERNS") {
-            process_patterns.extend(
-                extra
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_ascii_lowercase()),
-            );
+            append_extra_runtime_selection_patterns(&mut process_patterns, &extra);
         }
         process_patterns.sort();
         process_patterns.dedup();
@@ -800,6 +796,59 @@ fn runtime_selection_hint_patterns() -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Append operator-supplied process-name/argv fragments under the same bounds as the packaged
+/// discovery catalogue. Invalid entries are ignored individually so one malformed environment
+/// value cannot disable otherwise valid scope discovery; the warning intentionally omits the raw
+/// fragment because process patterns may contain sensitive deployment labels.
+fn append_extra_runtime_selection_patterns(patterns: &mut Vec<String>, raw: &str) {
+    if raw.len() > MAX_RUNTIME_SELECTION_INPUT_BYTES {
+        tracing::warn!(
+            bytes = raw.len(),
+            max_bytes = MAX_RUNTIME_SELECTION_INPUT_BYTES,
+            "ignoring oversized TLS runtime-selection pattern environment value"
+        );
+        return;
+    }
+    let mut seen = patterns.iter().cloned().collect::<HashSet<_>>();
+    for (index, candidate) in raw.split(',').enumerate() {
+        if candidate.bytes().any(|byte| byte.is_ascii_control()) {
+            tracing::warn!(
+                index,
+                "ignoring TLS runtime-selection pattern containing control bytes"
+            );
+            continue;
+        }
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.len() > MAX_RUNTIME_SELECTION_TEXT {
+            tracing::warn!(
+                index,
+                bytes = candidate.len(),
+                max_bytes = MAX_RUNTIME_SELECTION_TEXT,
+                "ignoring oversized TLS runtime-selection pattern"
+            );
+            continue;
+        }
+        let normalized = candidate.to_ascii_lowercase();
+        if seen.contains(&normalized) {
+            continue;
+        }
+        if seen.len() >= MAX_RUNTIME_SELECTION_PATTERNS {
+            tracing::warn!(
+                index,
+                max_patterns = MAX_RUNTIME_SELECTION_PATTERNS,
+                "ignoring TLS runtime-selection pattern after bounded catalogue is full"
+            );
+            break;
+        }
+        seen.insert(normalized.clone());
+        patterns.push(normalized);
+    }
+    patterns.sort();
 }
 
 fn parse_runtime_selection_hint_patterns(document: &str) -> anyhow::Result<Vec<String>> {
@@ -1596,6 +1645,42 @@ mod tests {
         assert!(patterns.contains(&"claude".to_string()));
         assert!(patterns.contains(&"langchain".to_string()));
         assert!(patterns.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn extra_runtime_selection_patterns_are_bounded_like_builtin_hints() {
+        let mut patterns = runtime_selection_hint_patterns();
+        append_extra_runtime_selection_patterns(
+            &mut patterns,
+            " Custom-Agent , duplicate ,duplicate, bad\u{0001}pattern,\ntrimmed ",
+        );
+        assert!(patterns.contains(&"custom-agent".to_string()));
+        assert!(patterns.contains(&"duplicate".to_string()));
+        assert!(!patterns.iter().any(|value| value.contains("bad")));
+        assert!(!patterns.iter().any(|value| value.contains("trimmed")));
+        assert!(patterns.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let too_long = "x".repeat(MAX_RUNTIME_SELECTION_TEXT + 1);
+        let before_too_long = patterns.clone();
+        append_extra_runtime_selection_patterns(&mut patterns, &too_long);
+        assert_eq!(patterns, before_too_long);
+
+        let mut many = String::new();
+        for index in 0..(MAX_RUNTIME_SELECTION_PATTERNS + 10) {
+            if index > 0 {
+                many.push(',');
+            }
+            many.push_str(&format!("extra-pattern-{index}"));
+        }
+        append_extra_runtime_selection_patterns(&mut patterns, &many);
+        assert!(patterns.len() <= MAX_RUNTIME_SELECTION_PATTERNS);
+
+        let before_oversized = patterns.clone();
+        append_extra_runtime_selection_patterns(
+            &mut patterns,
+            &"z".repeat(MAX_RUNTIME_SELECTION_INPUT_BYTES + 1),
+        );
+        assert_eq!(patterns, before_oversized);
     }
 
     #[test]

@@ -364,6 +364,28 @@ pub struct CollectorFileFilterStats {
     pub file_filter_unknown_policy: String,
 }
 
+/// Additive interaction reassembly counters. These describe the userspace transport/parser
+/// boundary; they never alter the immutable RawObservation or KernelFact lanes. In particular,
+/// an ambiguous Rustls pointer is reported as a gap instead of being silently assigned by time.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectorInteractionReassemblyStats {
+    /// These counters are process-lifetime cumulative readings, not per-window deltas.
+    pub temporality: String,
+    pub connection_evictions: u64,
+    pub connection_expirations: u64,
+    pub alias_evictions: u64,
+    pub evidence_evictions: u64,
+    pub fragment_tracker_evictions: u64,
+    pub orphan_chunks: u64,
+    pub sequence_gaps: u64,
+    pub parser_failures: u64,
+    pub body_limit_drops: u64,
+    pub truncated_chunks: u64,
+    pub ambiguous_stream_bindings: u64,
+    pub stream_binding_gaps: u64,
+}
+
 /// Time bounds for one delta accounting window.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -904,6 +926,11 @@ pub enum AgentEvent {
         exec_reassembly_timeout: u64,
         dropped: u64,
         output_dropped: u64,
+        #[serde(
+            rename = "interactionReassembly",
+            skip_serializing_if = "Option::is_none"
+        )]
+        interaction_reassembly: Option<Box<CollectorInteractionReassemblyStats>>,
         #[serde(rename = "pipelineAccounting", skip_serializing_if = "Option::is_none")]
         pipeline_accounting: Option<Box<CollectorPipelineAccounting>>,
         #[serde(rename = "captureProfile", skip_serializing_if = "Option::is_none")]
@@ -974,6 +1001,7 @@ mod tests {
             exec_reassembly_timeout: 0,
             dropped: 0,
             output_dropped: 0,
+            interaction_reassembly: None,
             pipeline_accounting: None,
             capture_profile: None,
         }
@@ -1232,6 +1260,38 @@ mod tests {
         assert_eq!(accounting["rings"][0]["logicalEvents"], 1);
         assert!(accounting["rings"][0].get("collectorEnqueued").is_none());
         assert!(accounting["rings"][0].get("collectorDropped").is_none());
+    }
+
+    #[test]
+    fn collector_heartbeat_interaction_reassembly_is_additive_and_cumulative() {
+        let mut heartbeat = collector_heartbeat(false);
+        let AgentEvent::CollectorHeartbeat {
+            interaction_reassembly,
+            ..
+        } = &mut heartbeat
+        else {
+            unreachable!()
+        };
+        *interaction_reassembly = Some(Box::new(CollectorInteractionReassemblyStats {
+            temporality: "cumulative".to_string(),
+            connection_evictions: 1,
+            connection_expirations: 2,
+            alias_evictions: 3,
+            evidence_evictions: 4,
+            fragment_tracker_evictions: 5,
+            orphan_chunks: 6,
+            sequence_gaps: 7,
+            parser_failures: 8,
+            body_limit_drops: 9,
+            truncated_chunks: 10,
+            ambiguous_stream_bindings: 11,
+            stream_binding_gaps: 12,
+        }));
+        let value = serde_json::to_value(heartbeat).unwrap();
+        let metrics = &value["CollectorHeartbeat"]["interactionReassembly"];
+        assert_eq!(metrics["temporality"], "cumulative");
+        assert_eq!(metrics["ambiguousStreamBindings"], 11);
+        assert_eq!(metrics["streamBindingGaps"], 12);
     }
 
     #[test]

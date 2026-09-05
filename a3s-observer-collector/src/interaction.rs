@@ -9,6 +9,7 @@ use a3s_observer::{
     LlmInteractionMessage, LlmInteractionSemanticItem, LlmInteractionToolCall,
     LlmInteractionToolResult, LlmTokenUsage,
 };
+use a3s_observer_common::{classify_http_method_prefix, HTTP_METHOD_PREFIX_COMPLETE};
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -49,6 +50,10 @@ pub struct PlaintextChunk {
     pub event_at_unix_ns: u128,
     pub source: String,
     pub adapter_id: String,
+    /// The Rustls implementation-family adapter may admit a payload before an exact HTTP route
+    /// is visible (for example a body-only request or a WebSocket data frame).  This is capture
+    /// provenance only; it must never by itself make an interaction partial or complete.
+    pub route_candidate: bool,
     pub partial_reasons: Vec<String>,
 }
 
@@ -141,6 +146,13 @@ pub struct ReassemblyMetrics {
     pub parser_failures: u64,
     pub body_limit_drops: u64,
     pub truncated_chunks: u64,
+    /// Number of unknown Rustls pointers for which more than one stream remained a viable owner.
+    /// This is deliberately separate from parser failures: ambiguity is an evidence result, not
+    /// a reason to discard the underlying bytes or silently choose a stream.
+    pub ambiguous_stream_bindings: u64,
+    /// Number of Rustls pointer/stream observations that could not be safely bound and were
+    /// retained as a bounded metadata gap.
+    pub stream_binding_gaps: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -148,6 +160,354 @@ struct ConnectionKey {
     cgroup_id: u64,
     pid: u32,
     connection_id: u64,
+}
+
+const MAX_STREAM_IDENTITY_ANCHORS: usize = 256;
+const MAX_STREAM_IDENTITY_VALUE_BYTES: usize = 512;
+// Body-only Rustls callbacks are the least-framed lane, so keep a tighter per-stream budget than
+// the normal HTTP decoder. Oversize bytes still produce hash/gap evidence but cannot multiply
+// memory across thousands of candidate connections.
+const MAX_RUSTLS_BODY_ONLY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_PENDING_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bounded, in-memory identity evidence used only to decide whether a newly observed Rustls
+/// pointer can be safely aliased to an existing physical stream.  Values are immediately
+/// namespaced/hashed; raw provider/session identifiers are never retained in this state map.
+#[derive(Debug, Default)]
+struct StreamIdentityEvidence {
+    endpoints: HashSet<String>,
+    paths: HashSet<String>,
+    anchor_hashes: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct StreamIdentityProbe {
+    endpoints: HashSet<String>,
+    paths: HashSet<String>,
+    anchor_hashes: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct RustlsBodyOnlyState {
+    buffer: Vec<u8>,
+    started_at_unix_ns: Option<u128>,
+    partial_reasons: Vec<String>,
+    response_mode: BodyOnlyResponseMode,
+    response_parsed_offset: usize,
+    response_event_count: usize,
+    /// Exact JSON object slices used to build a parser-only sequence. The canonical response
+    /// bytes remain in `buffer`; keeping raw slices prevents serde reserialization from changing
+    /// hashes or key ordering in derived evidence.
+    response_raw_events: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BodyOnlyResponseMode {
+    #[default]
+    Unknown,
+    Json,
+    Sse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyOnlyFeedResult {
+    NotCandidate,
+    Pending,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionResolution {
+    New,
+    Resolved(ConnectionKey),
+    Ambiguous(usize),
+    Orphan,
+}
+
+impl StreamIdentityEvidence {
+    fn observe_route(&mut self, endpoint: &str, path: &str) {
+        if let Some(value) = bounded_route_value(endpoint) {
+            bounded_insert(
+                &mut self.endpoints,
+                conversation_anchor_hash("stream_endpoint", &value),
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        if let Some(value) = bounded_path_value(path) {
+            bounded_insert(
+                &mut self.paths,
+                conversation_anchor_hash("stream_path", &value),
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+    }
+
+    fn observe_http(&mut self, message: &HttpMessage, direction: ChunkDirection) {
+        let (endpoint, path) = message_route_identity(message);
+        if let (Some(endpoint), Some(path)) = (endpoint.as_deref(), path.as_deref()) {
+            self.observe_route(endpoint, path);
+        }
+        if let Some(value) = parse_json_body(&message.body)
+            .filter(|value| bindable_identity_payload(value, direction))
+        {
+            collect_stream_identity_values(&value, direction, &mut self.anchor_hashes);
+        } else {
+            for value in parse_sse_json_events(&message.body) {
+                if bindable_identity_payload(&value, direction) {
+                    collect_stream_identity_values(&value, direction, &mut self.anchor_hashes);
+                }
+            }
+        }
+    }
+
+    fn matches(&self, probe: &StreamIdentityProbe) -> bool {
+        let anchor_match = !probe.anchor_hashes.is_empty()
+            && self
+                .anchor_hashes
+                .iter()
+                .any(|value| probe.anchor_hashes.contains(value));
+        let endpoint_conflict = !probe.endpoints.is_empty()
+            && !self.endpoints.is_empty()
+            && self.endpoints.is_disjoint(&probe.endpoints);
+        let path_conflict = !probe.paths.is_empty()
+            && !self.paths.is_empty()
+            && self.paths.is_disjoint(&probe.paths);
+        if anchor_match && !endpoint_conflict && !path_conflict {
+            return true;
+        }
+        if endpoint_conflict || path_conflict {
+            return false;
+        }
+        let endpoint_match =
+            !probe.endpoints.is_empty() && !self.endpoints.is_disjoint(&probe.endpoints);
+        let path_match = !probe.paths.is_empty() && !self.paths.is_disjoint(&probe.paths);
+        if !probe.endpoints.is_empty() && !probe.paths.is_empty() {
+            endpoint_match && path_match
+        } else {
+            endpoint_match || path_match
+        }
+    }
+}
+
+impl StreamIdentityProbe {
+    fn from_http(message: &HttpMessage, direction: ChunkDirection) -> Self {
+        let mut probe = Self::default();
+        let (endpoint, path) = message_route_identity(message);
+        if let Some(endpoint) = endpoint {
+            bounded_insert(
+                &mut probe.endpoints,
+                conversation_anchor_hash("stream_endpoint", &endpoint),
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        if let Some(path) = path {
+            bounded_insert(
+                &mut probe.paths,
+                conversation_anchor_hash("stream_path", &path),
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        if let Some(value) = parse_json_body(&message.body)
+            .filter(|value| bindable_identity_payload(value, direction))
+        {
+            collect_stream_identity_values(&value, direction, &mut probe.anchor_hashes);
+        } else {
+            for value in parse_sse_json_events(&message.body) {
+                if bindable_identity_payload(&value, direction) {
+                    collect_stream_identity_values(&value, direction, &mut probe.anchor_hashes);
+                }
+            }
+        }
+        probe
+    }
+
+    fn from_websocket_payload(payload: &[u8], direction: ChunkDirection) -> Option<Self> {
+        let value = serde_json::from_slice::<Value>(payload).ok()?;
+        if !bindable_identity_payload(&value, direction) {
+            return None;
+        }
+        let mut probe = Self::default();
+        collect_stream_identity_values(&value, direction, &mut probe.anchor_hashes);
+        (!probe.anchor_hashes.is_empty()).then_some(probe)
+    }
+
+    fn has_signal(&self) -> bool {
+        !self.endpoints.is_empty() || !self.paths.is_empty() || !self.anchor_hashes.is_empty()
+    }
+}
+
+fn bounded_insert(set: &mut HashSet<String>, value: String, limit: usize) {
+    if set.len() < limit || set.contains(&value) {
+        set.insert(value);
+    }
+}
+
+fn bounded_route_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_STREAM_IDENTITY_VALUE_BYTES {
+        return None;
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let value = value
+        .split_once('#')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(value)
+        .split_once('?')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(value);
+    let value = value
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(value);
+    Some(value.to_ascii_lowercase())
+}
+
+fn message_route_identity(message: &HttpMessage) -> (Option<String>, Option<String>) {
+    let endpoint =
+        bounded_route_value(message.endpoint().as_str()).filter(|value| value != "unknown");
+    let path =
+        request_line(&message.start_line).and_then(|(_, path)| bounded_path_value(path.as_str()));
+    (endpoint, path)
+}
+
+fn bounded_path_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_STREAM_IDENTITY_VALUE_BYTES {
+        return None;
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(
+        value
+            .split_once('#')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(value)
+            .split_once('?')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(value)
+            .to_ascii_lowercase(),
+    )
+}
+
+fn add_stream_identity_value(set: &mut HashSet<String>, value: Option<&str>) {
+    let Some(value) = value.map(str::trim) else {
+        return;
+    };
+    if value.is_empty()
+        || value.len() > MAX_STREAM_IDENTITY_VALUE_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return;
+    }
+    // Keep only a namespaced digest in the bounded resolver state.  The same digest is used for
+    // a response ID and a later previous-response/tool-result reference, allowing an evidence
+    // match without retaining raw provider/session values in the long-lived connection map.
+    bounded_insert(
+        set,
+        conversation_anchor_hash("stream_identity", value),
+        MAX_STREAM_IDENTITY_ANCHORS,
+    );
+}
+
+fn collect_stream_identity_values(
+    value: &Value,
+    direction: ChunkDirection,
+    output: &mut HashSet<String>,
+) {
+    add_stream_identity_value(output, extract_provider_conversation_id(value).as_deref());
+    add_stream_identity_value(
+        output,
+        value.get("previous_response_id").and_then(Value::as_str),
+    );
+    add_stream_identity_value(
+        output,
+        value
+            .get("client_metadata")
+            .and_then(|metadata| provider_id_from_metadata(Some(metadata), 0))
+            .as_deref(),
+    );
+    add_stream_identity_value(
+        output,
+        value
+            .get("client_metadata")
+            .and_then(|metadata| turn_id_from_metadata(Some(metadata), 0))
+            .as_deref(),
+    );
+    if direction == ChunkDirection::Response {
+        add_stream_identity_value(output, extract_provider_response_id(value).as_deref());
+    }
+    for message in extract_request_messages(value) {
+        add_stream_identity_value(output, message.source_item_id.as_deref());
+        add_stream_identity_value(output, message.turn_id.as_deref());
+        add_stream_identity_value(output, message.tool_call_id.as_deref());
+    }
+    for call in extract_tool_calls(value, 0) {
+        add_stream_identity_value(output, Some(call.tool_call_id.as_str()));
+    }
+    for result in extract_tool_results(value, 0) {
+        add_stream_identity_value(output, Some(result.tool_call_id.as_str()));
+    }
+}
+
+fn bindable_identity_payload(value: &Value, direction: ChunkDirection) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let has_model = object.get("model").and_then(Value::as_str).is_some();
+    let has_input_shape = object
+        .get("input")
+        .is_some_and(|input| input.is_array() || input.is_string() || input.is_object());
+    match direction {
+        ChunkDirection::Request => {
+            (has_model
+                && (has_input_shape
+                    || object.contains_key("messages")
+                    || object.contains_key("contents")
+                    || object.contains_key("prompt")
+                    || object.contains_key("instructions")))
+                || object.get("type").and_then(Value::as_str) == Some("response.create")
+                || object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                || object.get("method").and_then(Value::as_str).is_some()
+        }
+        ChunkDirection::Response => {
+            object.get("choices").is_some_and(Value::is_array)
+                || object.get("candidates").is_some_and(Value::is_array)
+                || object
+                    .get("output")
+                    .is_some_and(|output| output.is_array() || output.is_object())
+                || object.get("output_text").is_some()
+                || object.get("content").is_some_and(Value::is_array)
+                || object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind.starts_with("response.")
+                            || matches!(
+                                kind,
+                                "message"
+                                    | "message_start"
+                                    | "message_delta"
+                                    | "message_stop"
+                                    | "content_block_start"
+                                    | "content_block_delta"
+                                    | "content_block_stop"
+                                    | "error"
+                                    | "message_error"
+                            )
+                    })
+                || object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        }
+    }
 }
 
 impl From<&PlaintextChunk> for ConnectionKey {
@@ -192,6 +552,11 @@ struct HttpMessage {
     partial_reasons: Vec<String>,
     metadata_inferred: bool,
     transport_protocol: Option<String>,
+    /// Optional parser-only representation for a body whose canonical bytes are kept in `body`.
+    /// Rustls can expose a sequence of JSON lifecycle objects without HTTP framing; the sequence
+    /// is converted to bounded SSE solely for the provider-neutral parser while hashes/evidence
+    /// continue to use the exact observed bytes.
+    derived_body: Option<Vec<u8>>,
 }
 
 impl HttpMessage {
@@ -298,6 +663,7 @@ impl HttpStreamDecoder {
                 partial_reasons: reasons,
                 metadata_inferred: false,
                 transport_protocol: None,
+                derived_body: None,
             });
             self.buffer.drain(..decoded.consumed);
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
@@ -681,6 +1047,9 @@ struct WebSocketResponseAccumulator {
     started_at_unix_ns: Option<u128>,
     partial_reasons: Vec<String>,
     tool_calls: Vec<LlmInteractionToolCall>,
+    /// Payloads that passed the provider-neutral lifecycle gate; used only for the parser-derived
+    /// SSE view. `body` remains the exact concatenation of every bounded observed payload.
+    semantic_payloads: Vec<Vec<u8>>,
 }
 
 impl WebSocketResponseAccumulator {
@@ -691,6 +1060,7 @@ impl WebSocketResponseAccumulator {
             started_at_unix_ns: None,
             partial_reasons: Vec::new(),
             tool_calls: Vec::new(),
+            semantic_payloads: Vec::new(),
         }
     }
 
@@ -700,6 +1070,7 @@ impl WebSocketResponseAccumulator {
         self.started_at_unix_ns = None;
         self.partial_reasons.clear();
         self.tool_calls.clear();
+        self.semantic_payloads.clear();
     }
 }
 
@@ -786,18 +1157,22 @@ struct ConnectionState {
     requests: HttpStreamDecoder,
     responses: HttpStreamDecoder,
     pending_requests: VecDeque<HttpMessage>,
+    pending_request_bytes: usize,
     sequence: u64,
     fragment_sequences: HashMap<(u64, ChunkDirection), u64>,
     source: String,
     adapter_id: String,
     evidence_fingerprints: HashSet<String>,
     websocket: WebSocketConnectionState,
+    identity: StreamIdentityEvidence,
+    rustls_request_body: RustlsBodyOnlyState,
+    rustls_response_body: RustlsBodyOnlyState,
+    /// Set when a moved pointer could not be uniquely attributed.  Any interaction assembled
+    /// from this provisional state remains explicitly partial, even if its wire framing is valid.
+    binding_uncertain: bool,
+    binding_reasons: Vec<String>,
+    pending_request_limit_hit: bool,
     last_activity: Instant,
-    // WebSocket ping/pong traffic proves that a connection is alive, but it does not prove that
-    // the next Rustls application pointer belongs to that connection. Keep data recency separate
-    // so an idle older Codex stream cannot steal a resumed Thread's next request merely because it
-    // received the latest control frame.
-    last_data_activity: Instant,
 }
 
 impl ConnectionState {
@@ -807,14 +1182,20 @@ impl ConnectionState {
             requests: HttpStreamDecoder::new(StreamKind::Request, max_body_bytes),
             responses: HttpStreamDecoder::new(StreamKind::Response, max_body_bytes),
             pending_requests: VecDeque::new(),
+            pending_request_bytes: 0,
             sequence: 0,
             fragment_sequences: HashMap::new(),
             source,
             adapter_id,
             evidence_fingerprints: HashSet::new(),
             websocket: WebSocketConnectionState::new(max_body_bytes),
+            identity: StreamIdentityEvidence::default(),
+            rustls_request_body: RustlsBodyOnlyState::default(),
+            rustls_response_body: RustlsBodyOnlyState::default(),
+            binding_uncertain: false,
+            binding_reasons: Vec::new(),
+            pending_request_limit_hit: false,
             last_activity: now,
-            last_data_activity: now,
         }
     }
 
@@ -830,6 +1211,28 @@ impl ConnectionState {
             && self.websocket.requests.buffer.is_empty()
             && self.websocket.responses.buffer.is_empty()
             && self.websocket.response.body.is_empty()
+            && self.rustls_request_body.buffer.is_empty()
+            && self.rustls_response_body.buffer.is_empty()
+    }
+
+    fn push_pending_request(&mut self, request: HttpMessage) -> bool {
+        let bytes = request.body.len();
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS
+            || self.pending_request_bytes.saturating_add(bytes) > MAX_PENDING_REQUEST_BYTES
+        {
+            return false;
+        }
+        self.pending_request_bytes = self.pending_request_bytes.saturating_add(bytes);
+        self.pending_requests.push_back(request);
+        true
+    }
+
+    fn pop_pending_request(&mut self) -> Option<HttpMessage> {
+        let request = self.pending_requests.pop_front()?;
+        self.pending_request_bytes = self
+            .pending_request_bytes
+            .saturating_sub(request.body.len());
+        Some(request)
     }
 }
 
@@ -891,7 +1294,19 @@ impl InteractionReassembler {
             self.enqueue_gap_evidence(observed_key, &chunk, "orphan_control_frame", "websocket");
             return Vec::new();
         }
-        let key = self.resolve_connection_key(&chunk);
+        let (key, binding_gap) = self.resolve_connection_key(&chunk);
+        if let Some(reason) = binding_gap.as_ref() {
+            if *reason == "ambiguous_stream_binding" {
+                self.metrics.ambiguous_stream_bindings =
+                    self.metrics.ambiguous_stream_bindings.saturating_add(1);
+            }
+            self.metrics.stream_binding_gaps = self.metrics.stream_binding_gaps.saturating_add(1);
+            extend_unique(&mut chunk.partial_reasons, [(*reason).to_string()]);
+            self.enqueue_gap_evidence(key, &chunk, reason, "stream");
+            if *reason == "orphan_stream_binding" {
+                return Vec::new();
+            }
+        }
         // A decoder error from a previous fragment means the stream can no longer prove a complete
         // exchange. Emit one bounded metadata-only evidence record before attempting recovery;
         // the next valid KernelFact is still processed normally.
@@ -922,15 +1337,8 @@ impl InteractionReassembler {
         });
         let now = Instant::now();
         state.last_activity = now;
-        if !is_websocket_control_frame(&chunk.data) {
-            state.last_data_activity = now;
-        }
-        if state.source != chunk.source {
-            state.source = format!("{}+{}", state.source, chunk.source);
-        }
-        if state.adapter_id != chunk.adapter_id {
-            state.adapter_id = format!("{}+{}", state.adapter_id, chunk.adapter_id);
-        }
+        merge_bounded_label(&mut state.source, &chunk.source);
+        merge_bounded_label(&mut state.adapter_id, &chunk.adapter_id);
         // Rustls connection objects can be reused after a socket closes. A retained WebSocket
         // state must yield to an unmistakable fresh HTTP request on the same pointer.
         if state.websocket.active
@@ -943,6 +1351,13 @@ impl InteractionReassembler {
                 chunk.adapter_id.clone(),
             );
             state.last_activity = Instant::now();
+        }
+        if binding_gap.is_some() {
+            state.binding_uncertain = true;
+            extend_unique(
+                &mut state.binding_reasons,
+                ["ambiguous_stream_binding".to_string()],
+            );
         }
         // Collector restarts and long historical idle windows can occur while the Agent keeps a
         // Responses WebSocket alive. Recover from the first strongly framed client/server data
@@ -1003,97 +1418,253 @@ impl InteractionReassembler {
             }
         }
 
+        let mut deferred_body_gap_reasons = Vec::new();
         let completed = if state.websocket.active {
             process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
         } else {
             match chunk.direction {
                 ChunkDirection::Request => {
-                    let body_only =
-                        if chunk.source.contains("rustls") && state.requests.buffer.is_empty() {
-                            body_only_llm_request(
-                                &chunk.data,
-                                chunk.event_at_unix_ns,
-                                &chunk.partial_reasons,
-                            )
-                        } else {
-                            None
-                        };
-                    if let Some(request) = body_only {
-                        state.pending_requests.push_back(request);
-                    } else {
-                        for request in state.requests.push(
+                    let mut effective_reasons = chunk.partial_reasons.clone();
+                    extend_unique(&mut effective_reasons, state.binding_reasons.clone());
+                    let body_only_candidate = rustls_like_chunk(&chunk)
+                        && !looks_like_http_request_prefix(&chunk.data)
+                        // Never bypass an HTTP decoder that already owns headers/body bytes. A
+                        // Rustls callback can split the body after a perfectly valid request
+                        // line; feeding that fragment into a second synthetic decoder would
+                        // duplicate or mis-pair the exchange.
+                        && state.requests.buffer.is_empty()
+                        && (!state.rustls_request_body.buffer.is_empty()
+                            || maybe_body_only_json_prefix(&chunk.data));
+                    let body_feed = if body_only_candidate {
+                        let body_state = &mut state.rustls_request_body;
+                        feed_rustls_body_only(
+                            body_state,
+                            ChunkDirection::Request,
                             &chunk.data,
                             chunk.event_at_unix_ns,
-                            &chunk.partial_reasons,
+                            &effective_reasons,
+                            self.max_body_bytes,
+                        )
+                    } else {
+                        BodyOnlyFeed {
+                            result: BodyOnlyFeedResult::NotCandidate,
+                            messages: Vec::new(),
+                            reasons: Vec::new(),
+                        }
+                    };
+                    for reason in &body_feed.reasons {
+                        extend_unique(&mut chunk.partial_reasons, [reason.clone()]);
+                        deferred_body_gap_reasons.push(reason.clone());
+                    }
+                    if body_feed.result == BodyOnlyFeedResult::Invalid {
+                        self.metrics.parser_failures =
+                            self.metrics.parser_failures.saturating_add(1);
+                    }
+                    if body_feed.result != BodyOnlyFeedResult::NotCandidate {
+                        for mut request in body_feed.messages {
+                            extend_unique(&mut request.partial_reasons, body_feed.reasons.clone());
+                            state
+                                .identity
+                                .observe_http(&request, ChunkDirection::Request);
+                            add_binding_reasons(state, &mut request.partial_reasons);
+                            if !state.push_pending_request(request) {
+                                self.metrics.body_limit_drops =
+                                    self.metrics.body_limit_drops.saturating_add(1);
+                                extend_unique(
+                                    &mut deferred_body_gap_reasons,
+                                    ["pending_request_limit".to_string()],
+                                );
+                            }
+                        }
+                    } else if !body_only_candidate {
+                        for mut request in state.requests.push(
+                            &chunk.data,
+                            chunk.event_at_unix_ns,
+                            &effective_reasons,
                         ) {
                             if let Some((endpoint, path)) = websocket_upgrade_metadata(&request) {
                                 state.websocket.upgrade_requested = true;
-                                state.websocket.endpoint = endpoint;
-                                state.websocket.path = path;
+                                state.websocket.endpoint = endpoint.clone();
+                                state.websocket.path = path.clone();
+                                state.identity.observe_route(&endpoint, &path);
                             } else {
-                                state.pending_requests.push_back(request);
+                                state
+                                    .identity
+                                    .observe_http(&request, ChunkDirection::Request);
+                                add_binding_reasons(state, &mut request.partial_reasons);
+                                if !state.push_pending_request(request) {
+                                    self.metrics.body_limit_drops =
+                                        self.metrics.body_limit_drops.saturating_add(1);
+                                    extend_unique(
+                                        &mut deferred_body_gap_reasons,
+                                        ["pending_request_limit".to_string()],
+                                    );
+                                }
                             }
                         }
+                    } else {
+                        // A candidate prefix which is not an LLM body is retained as bounded
+                        // plaintext/gap evidence, never handed to the normal HTTP decoder.
+                        extend_unique(
+                            &mut deferred_body_gap_reasons,
+                            ["rustls_body_only_not_candidate".to_string()],
+                        );
                     }
                     Vec::new()
                 }
                 ChunkDirection::Response => {
                     let mut completed = Vec::new();
-                    for response in state.responses.push(
-                        &chunk.data,
-                        chunk.event_at_unix_ns,
-                        &chunk.partial_reasons,
-                    ) {
-                        if state.websocket.upgrade_requested
-                            && response_status(&response.start_line) == Some(101)
-                        {
-                            let extension = response
-                                .header("sec-websocket-extensions")
-                                .map(str::to_owned);
-                            state.websocket.activate(extension.as_deref());
-                            let tail = state.responses.take_unparsed_tail();
-                            if !tail.is_empty() {
-                                let messages = state.websocket.responses.push(
-                                    &tail,
-                                    chunk.event_at_unix_ns,
-                                    &chunk.partial_reasons,
-                                );
-                                completed.extend(process_websocket_response_messages(
-                                    key,
-                                    state,
-                                    messages,
-                                    self.max_body_bytes,
-                                ));
+                    let mut effective_reasons = chunk.partial_reasons.clone();
+                    extend_unique(&mut effective_reasons, state.binding_reasons.clone());
+                    let body_only_candidate = rustls_like_chunk(&chunk)
+                        && !chunk.data.starts_with(b"HTTP/")
+                        // The synthetic response lane is valid only for a request that has
+                        // already been reconstructed and while the regular HTTP decoder is
+                        // empty. This prevents orphan/config JSON and split HTTP bodies from
+                        // poisoning the next model exchange.
+                        && !state.pending_requests.is_empty()
+                        && state.responses.buffer.is_empty()
+                        && (!state.rustls_response_body.buffer.is_empty()
+                            || maybe_body_only_response_prefix(&chunk.data));
+                    let orphan_body_only_response = rustls_like_chunk(&chunk)
+                        && !chunk.data.starts_with(b"HTTP/")
+                        && state.responses.buffer.is_empty()
+                        && state.pending_requests.is_empty();
+                    let body_feed = if body_only_candidate {
+                        let body_state = &mut state.rustls_response_body;
+                        feed_rustls_body_only_response(
+                            body_state,
+                            &chunk.data,
+                            chunk.event_at_unix_ns,
+                            &effective_reasons,
+                            self.max_body_bytes,
+                        )
+                    } else {
+                        BodyOnlyFeed {
+                            result: BodyOnlyFeedResult::NotCandidate,
+                            messages: Vec::new(),
+                            reasons: Vec::new(),
+                        }
+                    };
+                    for reason in &body_feed.reasons {
+                        extend_unique(&mut chunk.partial_reasons, [reason.clone()]);
+                        deferred_body_gap_reasons.push(reason.clone());
+                    }
+                    if body_feed.result == BodyOnlyFeedResult::Invalid {
+                        self.metrics.parser_failures =
+                            self.metrics.parser_failures.saturating_add(1);
+                    }
+                    if body_feed.result != BodyOnlyFeedResult::NotCandidate {
+                        for mut response in body_feed.messages {
+                            extend_unique(&mut response.partial_reasons, body_feed.reasons.clone());
+                            state
+                                .identity
+                                .observe_http(&response, ChunkDirection::Response);
+                            add_binding_reasons(state, &mut response.partial_reasons);
+                            let Some(mut request) = state.pop_pending_request() else {
+                                self.metrics.orphan_chunks =
+                                    self.metrics.orphan_chunks.saturating_add(1);
+                                continue;
+                            };
+                            add_binding_reasons(state, &mut request.partial_reasons);
+                            state.sequence = state.sequence.wrapping_add(1);
+                            if let Some(interaction) = build_interaction(
+                                key,
+                                state.sequence,
+                                &state.source,
+                                &state.adapter_id,
+                                request,
+                                response,
+                            ) {
+                                completed.push(interaction);
                             }
-                            continue;
                         }
-                        // Informational responses do not consume the request they precede.
-                        if response_status(&response.start_line)
-                            .is_some_and(|status| (100..200).contains(&status))
-                        {
-                            continue;
-                        }
-                        let Some(request) = state.pending_requests.pop_front() else {
-                            self.metrics.orphan_chunks =
-                                self.metrics.orphan_chunks.saturating_add(1);
-                            continue;
-                        };
-                        state.sequence = state.sequence.wrapping_add(1);
-                        if let Some(interaction) = build_interaction(
-                            key,
-                            state.sequence,
-                            &state.source,
-                            &state.adapter_id,
-                            request,
-                            response,
+                    } else if !body_only_candidate && !orphan_body_only_response {
+                        for mut response in state.responses.push(
+                            &chunk.data,
+                            chunk.event_at_unix_ns,
+                            &effective_reasons,
                         ) {
-                            completed.push(interaction);
+                            state
+                                .identity
+                                .observe_http(&response, ChunkDirection::Response);
+                            if state.websocket.upgrade_requested
+                                && response_status(&response.start_line) == Some(101)
+                            {
+                                let extension = response
+                                    .header("sec-websocket-extensions")
+                                    .map(str::to_owned);
+                                state.websocket.activate(extension.as_deref());
+                                let tail = state.responses.take_unparsed_tail();
+                                if !tail.is_empty() {
+                                    let messages = state.websocket.responses.push(
+                                        &tail,
+                                        chunk.event_at_unix_ns,
+                                        &effective_reasons,
+                                    );
+                                    completed.extend(process_websocket_response_messages(
+                                        key,
+                                        state,
+                                        messages,
+                                        self.max_body_bytes,
+                                    ));
+                                }
+                                continue;
+                            }
+                            // Informational responses do not consume the request they precede.
+                            if response_status(&response.start_line)
+                                .is_some_and(|status| (100..200).contains(&status))
+                            {
+                                continue;
+                            }
+                            add_binding_reasons(state, &mut response.partial_reasons);
+                            let Some(mut request) = state.pop_pending_request() else {
+                                self.metrics.orphan_chunks =
+                                    self.metrics.orphan_chunks.saturating_add(1);
+                                continue;
+                            };
+                            add_binding_reasons(state, &mut request.partial_reasons);
+                            state.sequence = state.sequence.wrapping_add(1);
+                            if let Some(interaction) = build_interaction(
+                                key,
+                                state.sequence,
+                                &state.source,
+                                &state.adapter_id,
+                                request,
+                                response,
+                            ) {
+                                completed.push(interaction);
+                            }
+                        }
+                    } else if orphan_body_only_response {
+                        extend_unique(
+                            &mut deferred_body_gap_reasons,
+                            ["orphan_rustls_body_only_response".to_string()],
+                        );
+                    } else {
+                        // Candidate bytes were handled by the bounded body-only lane. If that
+                        // lane rejected their shape, keep the gap but do not feed arbitrary JSON
+                        // into the HTTP decoder.
+                        if body_feed.result == BodyOnlyFeedResult::NotCandidate {
+                            extend_unique(
+                                &mut deferred_body_gap_reasons,
+                                ["rustls_body_only_not_candidate".to_string()],
+                            );
                         }
                     }
                     completed
                 }
             }
         };
+        let pending_request_limit_hit = state.pending_request_limit_hit;
+        state.pending_request_limit_hit = false;
+        if pending_request_limit_hit {
+            self.metrics.body_limit_drops = self.metrics.body_limit_drops.saturating_add(1);
+            extend_unique(
+                &mut deferred_body_gap_reasons,
+                ["pending_request_limit".to_string()],
+            );
+        }
         if state.requests.last_decode_error.is_some()
             || state.responses.last_decode_error.is_some()
             || state.websocket.requests.last_decode_error.is_some()
@@ -1108,7 +1679,7 @@ impl InteractionReassembler {
             .or_else(|| state.responses.last_decode_error.clone())
             .or_else(|| state.websocket.requests.last_decode_error.clone())
             .or_else(|| state.websocket.responses.last_decode_error.clone());
-        if interaction_diagnostics_enabled_for(chunk.pid) && chunk.source.contains("rustls") {
+        if interaction_diagnostics_enabled_for(chunk.pid) && rustls_like_chunk(&chunk) {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
             // but never put it on the default operational INFO path: a slow container
@@ -1137,61 +1708,196 @@ impl InteractionReassembler {
         if let Some(reason) = current_decode_gap {
             self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
         }
+        for reason in deferred_body_gap_reasons {
+            self.enqueue_gap_evidence(key, &chunk, &reason, "json-body");
+        }
         if sequence_gap_detected {
             self.enqueue_gap_evidence(key, &chunk, "fragment_sequence_gap", "unknown");
         }
         completed
     }
 
-    fn resolve_connection_key(&mut self, chunk: &PlaintextChunk) -> ConnectionKey {
+    /// Resolve an implementation-family pointer to a canonical stream only when the observed
+    /// bytes leave one defensible owner.  In particular, this method never ranks candidates by
+    /// wall-clock recency: a Rustls allocator can move pointers while several WebSocket/HTTP
+    /// streams are live, and choosing the newest stream would silently cross-wire conversations.
+    fn resolve_connection_key(
+        &mut self,
+        chunk: &PlaintextChunk,
+    ) -> (ConnectionKey, Option<&'static str>) {
         let observed = ConnectionKey::from(chunk);
         if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
-            return canonical;
+            return (canonical, None);
         }
-        if self.connections.contains_key(&observed) {
-            return observed;
+        let observed_binding_uncertain = self
+            .connections
+            .get(&observed)
+            .is_some_and(|state| state.binding_uncertain);
+        if self.connections.contains_key(&observed) && !observed_binding_uncertain {
+            return (observed, None);
         }
 
-        let candidate = if chunk.source.contains("rustls") {
-            self.most_recent_websocket_connection(observed, |state| {
-                state.websocket.awaits_moved_fragment(chunk)
-            })
-        } else {
-            None
-        };
-        let candidate = candidate.or_else(|| {
-            if chunk.direction == ChunkDirection::Response
-                && looks_like_websocket_switching_protocols(&chunk.data)
-            {
-                self.unique_websocket_connection(observed, |state| {
-                    state.websocket.upgrade_requested && !state.websocket.active
-                })
-            } else if looks_like_websocket_frame_prefix(&chunk.data)
-                && !is_websocket_control_frame(&chunk.data)
-            {
-                self.preferred_websocket_connection(observed, chunk)
-            } else {
-                None
+        if !rustls_like_chunk(chunk) {
+            return (observed, None);
+        }
+        let resolution = self.resolve_rustls_stream(observed, chunk);
+        match resolution {
+            ConnectionResolution::Resolved(canonical) => {
+                if canonical == observed {
+                    return (canonical, None);
+                }
+                if observed_binding_uncertain {
+                    if self.rebind_quiescent_connection(observed, canonical) {
+                        self.remember_connection_alias(observed, canonical);
+                        return (canonical, None);
+                    }
+                    // A unique hint is not enough when the target is already active: the
+                    // provisional state still owns bytes that cannot be merged safely. Keep it
+                    // provisional and surface the ambiguity rather than routing to the target.
+                    return (observed, Some("ambiguous_stream_binding"));
+                }
+                self.remember_connection_alias(observed, canonical);
+                (canonical, None)
             }
-        });
-        let Some(canonical) = candidate else {
-            return observed;
-        };
-        self.remember_connection_alias(observed, canonical);
-        canonical
+            ConnectionResolution::Ambiguous(_) => {
+                // Keep the bytes in their observed provisional state.  The caller adds an
+                // explicit partial/gap reason; no alias is created, so a later stronger pointer
+                // or protocol identity cannot inherit a wrong owner.
+                (observed, Some("ambiguous_stream_binding"))
+            }
+            ConnectionResolution::Orphan => {
+                // A continuation frame has no self-describing owner. Retain its bounded raw
+                // evidence, but do not create a new protocol state that could steal a later
+                // stream after allocator reuse.
+                (observed, Some("orphan_stream_binding"))
+            }
+            ConnectionResolution::New => (observed, None),
+        }
     }
 
-    fn preferred_websocket_connection(
+    fn resolve_rustls_stream(
         &self,
         observed: ConnectionKey,
         chunk: &PlaintextChunk,
-    ) -> Option<ConnectionKey> {
-        let response_data = chunk.direction == ChunkDirection::Response
-            && websocket_frame_opcode(&chunk.data)
-                .is_some_and(|opcode| matches!(opcode, 0x0..=0x2));
-        self.most_recent_websocket_connection(observed, |state| {
-            state.websocket.active && (!response_data || !state.pending_requests.is_empty())
-        })
+    ) -> ConnectionResolution {
+        let probe = chunk_identity_probe(chunk, self.max_body_bytes);
+
+        // HTTP 101 is the strongest available bridge when a Collector starts observing after a
+        // Rustls object has moved.  If two upgrades are pending, refusing to choose is safer than
+        // assigning a resumed stream to whichever handshake happened last.
+        if chunk.direction == ChunkDirection::Response
+            && looks_like_websocket_switching_protocols(&chunk.data)
+        {
+            let mut candidates = self
+                .connections
+                .iter()
+                .filter_map(|(key, state)| {
+                    (key.cgroup_id == observed.cgroup_id
+                        && key.pid == observed.pid
+                        && state.websocket.upgrade_requested
+                        && !state.websocket.active)
+                        .then_some(*key)
+                })
+                .collect::<Vec<_>>();
+            narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
+            return choose_connection_candidate(candidates);
+        }
+
+        // A Rustls `OutboundChunks`/`Payload` pointer can change in the middle of one frame.  The
+        // continuation bytes often begin with an arbitrary JSON/deflate byte and therefore do not
+        // carry a self-describing WebSocket header.  A decoder that already owns an incomplete
+        // frame is the only safe owner signal; if more than one decoder is waiting, leave the
+        // pointer provisional instead of selecting by recency.  Fresh HTTP request lines are
+        // checked first so a reused pointer can start a new connection generation cleanly.
+        if !looks_like_http_request_prefix(&chunk.data) {
+            let moved_fragment_candidates = self
+                .connections
+                .iter()
+                .filter_map(|(key, state)| {
+                    (key.cgroup_id == observed.cgroup_id
+                        && key.pid == observed.pid
+                        && state.websocket.awaits_moved_fragment(chunk))
+                    .then_some(*key)
+                })
+                .collect::<Vec<_>>();
+            if !moved_fragment_candidates.is_empty() {
+                return choose_connection_candidate(moved_fragment_candidates);
+            }
+        }
+
+        let is_continuation = looks_like_websocket_continuation_prefix(&chunk.data);
+        let is_websocket_frame = looks_like_websocket_frame_prefix(&chunk.data);
+        if is_continuation || is_websocket_frame {
+            let mut candidates = self
+                .connections
+                .iter()
+                .filter_map(|(key, state)| {
+                    if key.cgroup_id != observed.cgroup_id
+                        || key.pid != observed.pid
+                        || !state.websocket.active
+                    {
+                        return None;
+                    }
+                    if is_continuation {
+                        return state.websocket.awaits_moved_fragment(chunk).then_some(*key);
+                    }
+                    if chunk.direction == ChunkDirection::Response
+                        && state.pending_requests.is_empty()
+                        && state.websocket.response.started_at_unix_ns.is_none()
+                    {
+                        return None;
+                    }
+                    Some(*key)
+                })
+                .collect::<Vec<_>>();
+            narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
+            if is_continuation && candidates.is_empty() {
+                return ConnectionResolution::Orphan;
+            }
+            return choose_connection_candidate(candidates);
+        }
+
+        // Rustls CommonState may expose a body without an HTTP request line.  Treat non-WebSocket
+        // states with a pending request or an incomplete decoder/body buffer as structural
+        // candidates, then use explicit IDs/route evidence if available.  A single remaining
+        // candidate is sufficient; multiple candidates remain ambiguous.
+        let mut candidates = self
+            .connections
+            .iter()
+            .filter_map(|(key, state)| {
+                if key.cgroup_id != observed.cgroup_id
+                    || key.pid != observed.pid
+                    || state.websocket.active
+                {
+                    return None;
+                }
+                let decoder_has_state = match chunk.direction {
+                    ChunkDirection::Request => !state.requests.buffer.is_empty(),
+                    ChunkDirection::Response => !state.responses.buffer.is_empty(),
+                };
+                let body_has_state = match chunk.direction {
+                    ChunkDirection::Request => !state.rustls_request_body.buffer.is_empty(),
+                    ChunkDirection::Response => !state.rustls_response_body.buffer.is_empty(),
+                };
+                let response_lifecycle = chunk.direction == ChunkDirection::Response
+                    && !state.pending_requests.is_empty();
+                (decoder_has_state || body_has_state || response_lifecycle).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            candidates = self
+                .connections
+                .iter()
+                .filter_map(|(key, state)| {
+                    (key.cgroup_id == observed.cgroup_id
+                        && key.pid == observed.pid
+                        && !state.websocket.active)
+                        .then_some(*key)
+                })
+                .collect();
+        }
+        narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
+        choose_connection_candidate(candidates)
     }
 
     fn remember_connection_alias(&mut self, observed: ConnectionKey, canonical: ConnectionKey) {
@@ -1206,36 +1912,139 @@ impl InteractionReassembler {
         self.connection_aliases.insert(observed, canonical);
     }
 
-    fn unique_websocket_connection(
-        &self,
+    /// Move a provisional non-active stream onto a uniquely identified owner. Active competing
+    /// WebSockets are intentionally not merged here: without a frame-level proof, retaining the
+    /// provisional state and exposing `ambiguous_stream_binding` is safer than cross-wiring bytes.
+    fn rebind_quiescent_connection(
+        &mut self,
         observed: ConnectionKey,
-        predicate: impl Fn(&ConnectionState) -> bool,
-    ) -> Option<ConnectionKey> {
-        let mut candidates = self.connections.iter().filter_map(|(key, state)| {
-            (key.cgroup_id == observed.cgroup_id && key.pid == observed.pid && predicate(state))
-                .then_some(*key)
-        });
-        let candidate = candidates.next()?;
-        candidates.next().is_none().then_some(candidate)
-    }
-
-    fn most_recent_websocket_connection(
-        &self,
-        observed: ConnectionKey,
-        predicate: impl Fn(&ConnectionState) -> bool,
-    ) -> Option<ConnectionKey> {
-        self.connections
-            .iter()
-            .filter(|(key, state)| {
-                key.cgroup_id == observed.cgroup_id && key.pid == observed.pid && predicate(state)
-            })
-            .max_by(|(left_key, left_state), (right_key, right_state)| {
-                left_state
-                    .last_data_activity
-                    .cmp(&right_state.last_data_activity)
-                    .then_with(|| left_key.connection_id.cmp(&right_key.connection_id))
-            })
-            .map(|(key, _)| *key)
+        canonical: ConnectionKey,
+    ) -> bool {
+        let Some(mut provisional) = self.connections.remove(&observed) else {
+            return false;
+        };
+        let Some(target) = self.connections.get_mut(&canonical) else {
+            self.connections.insert(observed, provisional);
+            return false;
+        };
+        if target.websocket.active
+            || provisional.websocket.active
+            || target.websocket.upgrade_requested
+            || provisional.websocket.upgrade_requested
+            || !target.websocket.requests.buffer.is_empty()
+            || !provisional.websocket.requests.buffer.is_empty()
+            || !target.websocket.responses.buffer.is_empty()
+            || !provisional.websocket.responses.buffer.is_empty()
+            || target.websocket.requests.fragmented.is_some()
+            || provisional.websocket.requests.fragmented.is_some()
+            || target.websocket.responses.fragmented.is_some()
+            || provisional.websocket.responses.fragmented.is_some()
+            || !target.websocket.response.body.is_empty()
+            || !provisional.websocket.response.body.is_empty()
+            || !target.websocket.response.semantic_payloads.is_empty()
+            || !provisional.websocket.response.semantic_payloads.is_empty()
+            || !target.pending_requests.is_empty()
+            || (!target.requests.buffer.is_empty() && !provisional.requests.buffer.is_empty())
+            || (!target.responses.buffer.is_empty() && !provisional.responses.buffer.is_empty())
+            || (!target.rustls_request_body.buffer.is_empty()
+                && !provisional.rustls_request_body.buffer.is_empty())
+            || (!target.rustls_response_body.buffer.is_empty()
+                && !provisional.rustls_response_body.buffer.is_empty())
+        {
+            self.connections.insert(observed, provisional);
+            return false;
+        }
+        if target.requests.buffer.is_empty() {
+            target.requests.buffer = std::mem::take(&mut provisional.requests.buffer);
+            target.requests.buffer_started_at_unix_ns =
+                provisional.requests.buffer_started_at_unix_ns;
+        }
+        if target.responses.buffer.is_empty() {
+            target.responses.buffer = std::mem::take(&mut provisional.responses.buffer);
+            target.responses.buffer_started_at_unix_ns =
+                provisional.responses.buffer_started_at_unix_ns;
+        }
+        if target.rustls_request_body.buffer.is_empty() {
+            target.rustls_request_body = std::mem::take(&mut provisional.rustls_request_body);
+        }
+        if target.rustls_response_body.buffer.is_empty() {
+            target.rustls_response_body = std::mem::take(&mut provisional.rustls_response_body);
+        }
+        if target.pending_requests.is_empty() {
+            target.pending_requests = std::mem::take(&mut provisional.pending_requests);
+            target.pending_request_bytes = provisional.pending_request_bytes;
+        }
+        target.sequence = target.sequence.max(provisional.sequence);
+        for (sequence_key, sequence) in provisional.fragment_sequences {
+            match target.fragment_sequences.get(&sequence_key) {
+                Some(existing) if *existing != sequence => {
+                    extend_unique(
+                        &mut target.binding_reasons,
+                        ["fragment_sequence_conflict".to_string()],
+                    );
+                    target.binding_uncertain = true;
+                }
+                Some(_) => {}
+                None if target.fragment_sequences.len() < 64 => {
+                    target.fragment_sequences.insert(sequence_key, sequence);
+                }
+                None => {
+                    extend_unique(
+                        &mut target.binding_reasons,
+                        ["fragment_sequence_tracker_reset".to_string()],
+                    );
+                    target.binding_uncertain = true;
+                }
+            }
+        }
+        merge_bounded_label(&mut target.source, &provisional.source);
+        merge_bounded_label(&mut target.adapter_id, &provisional.adapter_id);
+        for fingerprint in provisional.evidence_fingerprints {
+            if target.evidence_fingerprints.len() < MAX_STREAM_IDENTITY_ANCHORS {
+                target.evidence_fingerprints.insert(fingerprint);
+            }
+        }
+        extend_unique(
+            &mut target.requests.partial_reasons,
+            provisional.requests.partial_reasons,
+        );
+        extend_unique(
+            &mut target.responses.partial_reasons,
+            provisional.responses.partial_reasons,
+        );
+        if target.requests.last_decode_error.is_none() {
+            target.requests.last_decode_error = provisional.requests.last_decode_error;
+        }
+        if target.responses.last_decode_error.is_none() {
+            target.responses.last_decode_error = provisional.responses.last_decode_error;
+        }
+        for value in provisional.identity.endpoints {
+            bounded_insert(
+                &mut target.identity.endpoints,
+                value,
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        for value in provisional.identity.paths {
+            bounded_insert(
+                &mut target.identity.paths,
+                value,
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        for value in provisional.identity.anchor_hashes {
+            bounded_insert(
+                &mut target.identity.anchor_hashes,
+                value,
+                MAX_STREAM_IDENTITY_ANCHORS,
+            );
+        }
+        target.binding_uncertain |= provisional.binding_uncertain;
+        extend_unique(&mut target.binding_reasons, provisional.binding_reasons);
+        if provisional.last_activity > target.last_activity {
+            target.last_activity = provisional.last_activity;
+        }
+        true
     }
 
     fn retain_live_connection_aliases(&mut self) {
@@ -1276,6 +2085,33 @@ impl InteractionReassembler {
             .connection_expirations
             .saturating_add((before.saturating_sub(self.connections.len())) as u64);
         self.retain_live_connection_aliases();
+    }
+
+    /// Drop every protocol/alias state owned by a process generation as soon as its kernel Exit
+    /// fact is observed.  TLS pointers and file descriptors can be reused before the normal idle
+    /// TTL; retaining this state would let a new generation inherit an old request or WebSocket
+    /// response. The raw chunks have already crossed the immutable evidence seam, so this cleanup
+    /// only removes derived reassembly state and increments the bounded expiration metric.
+    pub fn expire_process(&mut self, pid: u32, cgroup_id: u64) {
+        let keys = self
+            .connections
+            .keys()
+            .copied()
+            .filter(|key| key.pid == pid && key.cgroup_id == cgroup_id)
+            .collect::<Vec<_>>();
+        for key in keys {
+            if self.connections.remove(&key).is_some() {
+                self.metrics.connection_expirations =
+                    self.metrics.connection_expirations.saturating_add(1);
+            }
+        }
+        self.connection_aliases.retain(|observed, canonical| {
+            !((observed.pid == pid && observed.cgroup_id == cgroup_id)
+                || (canonical.pid == pid && canonical.cgroup_id == cgroup_id))
+        });
+        let prefix = format!("{cgroup_id}:{pid}:");
+        self.gap_evidence_fingerprints
+            .retain(|fingerprint| !fingerprint.starts_with(&prefix));
     }
 
     pub fn active_connections(&self) -> usize {
@@ -1430,7 +2266,17 @@ fn process_websocket_chunk(
                     .headers
                     .insert("host".to_string(), state.websocket.endpoint.clone());
                 request.transport_protocol = Some("websocket".to_string());
-                state.pending_requests.push_back(request);
+                state
+                    .identity
+                    .observe_http(&request, ChunkDirection::Request);
+                add_binding_reasons(state, &mut request.partial_reasons);
+                if !state.push_pending_request(request) {
+                    state.pending_request_limit_hit = true;
+                    extend_unique(
+                        &mut state.binding_reasons,
+                        ["pending_request_limit".to_string()],
+                    );
+                }
             }
             Vec::new()
         }
@@ -1453,10 +2299,37 @@ fn process_websocket_response_messages(
 ) -> Vec<CompletedInteraction> {
     let mut completed = Vec::new();
     for message in messages {
+        {
+            let response = &mut state.websocket.response;
+            if response.body.len().saturating_add(message.payload.len()) <= max_body_bytes {
+                response.body.extend_from_slice(&message.payload);
+                response.captured_body_bytes = response
+                    .captured_body_bytes
+                    .saturating_add(message.payload.len());
+            } else {
+                extend_unique(
+                    &mut response.partial_reasons,
+                    ["websocket_response_body_limit".to_string()],
+                );
+            }
+        }
         let Ok(value) = serde_json::from_slice::<Value>(&message.payload) else {
+            extend_unique(
+                &mut state.websocket.response.partial_reasons,
+                ["websocket_response_json_parse_error".to_string()],
+            );
             continue;
         };
+        collect_stream_identity_values(
+            &value,
+            ChunkDirection::Response,
+            &mut state.identity.anchor_hashes,
+        );
         let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+            extend_unique(
+                &mut state.websocket.response.partial_reasons,
+                ["websocket_response_event_type_missing".to_string()],
+            );
             continue;
         };
         if !event_type.starts_with("response.") && event_type != "error" {
@@ -1467,37 +2340,27 @@ fn process_websocket_response_messages(
             continue;
         }
 
+        let binding_reasons = if state.binding_uncertain {
+            state.binding_reasons.clone()
+        } else {
+            Vec::new()
+        };
         let response = &mut state.websocket.response;
         response
             .started_at_unix_ns
             .get_or_insert(message.started_at_unix_ns);
-        response.captured_body_bytes = response
-            .captured_body_bytes
-            .saturating_add(message.payload.len());
         extend_unique(&mut response.partial_reasons, message.partial_reasons);
+        extend_unique(&mut response.partial_reasons, binding_reasons);
         response
             .tool_calls
             .extend(extract_tool_calls(&value, message.completed_at_unix_ns));
 
-        let prefix = b"data: ";
-        let suffix = b"\n\n";
-        let needed = prefix
-            .len()
-            .saturating_add(message.payload.len())
-            .saturating_add(suffix.len());
-        if response.body.len().saturating_add(needed) <= max_body_bytes {
-            response.body.extend_from_slice(prefix);
-            response.body.extend_from_slice(&message.payload);
-            response.body.extend_from_slice(suffix);
-        } else {
-            extend_unique(
-                &mut response.partial_reasons,
-                ["websocket_response_body_limit".to_string()],
-            );
+        if response.semantic_payloads.len() < MAX_SSE_STRUCTURED_EVENTS {
+            response.semantic_payloads.push(message.payload.clone());
         }
 
         let status_code = match event_type {
-            "response.completed" => Some(200),
+            "response.completed" | "response.done" => Some(200),
             "response.failed" | "response.incomplete" | "response.cancelled" | "error" => Some(502),
             _ => None,
         };
@@ -1508,7 +2371,7 @@ fn process_websocket_response_messages(
             &mut state.websocket.response,
             WebSocketResponseAccumulator::new(),
         );
-        let Some(request) = state.pending_requests.pop_front() else {
+        let Some(request) = state.pop_pending_request() else {
             continue;
         };
         let started_at_unix_ns = response
@@ -1517,7 +2380,10 @@ fn process_websocket_response_messages(
         let response_message = HttpMessage {
             start_line: format!("HTTP/1.1 {status_code} WebSocket"),
             headers: BTreeMap::from([
-                ("content-type".to_string(), "text/event-stream".to_string()),
+                (
+                    "content-type".to_string(),
+                    "application/json-seq".to_string(),
+                ),
                 ("host".to_string(), state.websocket.endpoint.clone()),
             ]),
             captured_body_bytes: response.captured_body_bytes,
@@ -1527,6 +2393,7 @@ fn process_websocket_response_messages(
             partial_reasons: response.partial_reasons,
             metadata_inferred: true,
             transport_protocol: Some("websocket".to_string()),
+            derived_body: Some(synthetic_sse_from_raw_events(&response.semantic_payloads)),
         };
         state.sequence = state.sequence.wrapping_add(1);
         if let Some(mut interaction) = build_interaction(
@@ -1688,16 +2555,7 @@ fn looks_like_websocket_switching_protocols(data: &[u8]) -> bool {
 }
 
 fn looks_like_http_request_prefix(data: &[u8]) -> bool {
-    [
-        b"GET ".as_slice(),
-        b"POST ",
-        b"PUT ",
-        b"PATCH ",
-        b"DELETE ",
-        b"HEAD ",
-    ]
-    .iter()
-    .any(|prefix| data.starts_with(prefix))
+    classify_http_method_prefix(data) == HTTP_METHOD_PREFIX_COMPLETE
 }
 
 fn websocket_frame_opcode(data: &[u8]) -> Option<u8> {
@@ -1779,18 +2637,43 @@ fn body_only_llm_request(
 ) -> Option<HttpMessage> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let object = value.as_object()?;
+    let has_model = object.get("model").and_then(Value::as_str).is_some();
+    let has_input = object
+        .get("input")
+        .is_some_and(|input| input.is_array() || input.is_string() || input.is_object());
+    let mcp_request = object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && object.get("method").and_then(Value::as_str).is_some()
+        && object.get("id").is_some();
+    let generic_tool_request = (object.contains_key("instruction")
+        && (object.contains_key("requested_by")
+            || object.contains_key("tool")
+            || object.contains_key("name")))
+        || (object.get("code").and_then(Value::as_str).is_some()
+            && (object.contains_key("timeout_ms")
+                || object.contains_key("language")
+                || object.contains_key("runtime")));
     let path = if object.get("type").and_then(Value::as_str) == Some("response.create")
-        || object.contains_key("input")
+        && (has_model || has_input)
     {
         "/v1/responses"
-    } else if object.contains_key("messages") {
+    } else if has_model && object.contains_key("messages") {
         if object.contains_key("max_tokens") || object.contains_key("anthropic_version") {
             "/v1/messages"
         } else {
             "/v1/chat/completions"
         }
-    } else if object.get("model").and_then(Value::as_str).is_some() {
+    } else if has_model && has_input {
         "/v1/responses"
+    } else if has_model
+        && (object.contains_key("prompt")
+            || object.contains_key("contents")
+            || object.contains_key("instructions"))
+    {
+        "/v1/completions"
+    } else if mcp_request {
+        "/mcp"
+    } else if generic_tool_request {
+        "/tool/execute"
     } else {
         return None;
     };
@@ -1807,7 +2690,763 @@ fn body_only_llm_request(
         partial_reasons: partial_reasons.to_vec(),
         metadata_inferred: true,
         transport_protocol: Some("json-body".to_string()),
+        derived_body: None,
     })
+}
+
+fn body_only_llm_response(
+    body: &[u8],
+    event_at_unix_ns: u128,
+    partial_reasons: &[String],
+) -> Option<HttpMessage> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let looks_like_response = value.get("choices").is_some_and(Value::is_array)
+        || value.get("candidates").is_some_and(Value::is_array)
+        || value
+            .get("output")
+            .is_some_and(|output| output.is_array() || output.is_object())
+        || value.get("output_text").is_some()
+        || value
+            .get("content")
+            .is_some_and(|content| content.is_array() || content.is_string())
+        || value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("response.") || kind == "message")
+        || (value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+            && value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some()))
+        || value.get("tool_call_id").is_some_and(Value::is_string)
+        || (value.get("execution_id").is_some()
+            && value.get("exit_code").is_some()
+            && (value.get("stdout").is_some() || value.get("stderr").is_some()));
+    looks_like_response.then(|| HttpMessage {
+        start_line: "HTTP/1.1 200 OK".to_string(),
+        headers: BTreeMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("host".to_string(), "unknown".to_string()),
+        ]),
+        body: body.to_vec(),
+        captured_body_bytes: body.len(),
+        started_at_unix_ns: event_at_unix_ns,
+        completed_at_unix_ns: event_at_unix_ns,
+        partial_reasons: partial_reasons.to_vec(),
+        metadata_inferred: true,
+        transport_protocol: Some("json-body".to_string()),
+        derived_body: None,
+    })
+}
+
+struct BodyOnlyFeed {
+    result: BodyOnlyFeedResult,
+    messages: Vec<HttpMessage>,
+    reasons: Vec<String>,
+}
+
+impl RustlsBodyOnlyState {
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.started_at_unix_ns = None;
+        self.partial_reasons.clear();
+        self.response_mode = BodyOnlyResponseMode::Unknown;
+        self.response_parsed_offset = 0;
+        self.response_event_count = 0;
+        self.response_raw_events.clear();
+    }
+}
+
+/// Incrementally parse body-only Rustls application payloads.  Some CommonState profiles expose
+/// the JSON body but not the HTTP request line, and a single JSON body can be split over many
+/// `OutboundChunks`/`Payload` observations.  We only enter this state after a JSON-shaped prefix;
+/// arbitrary bytes are left to the normal HTTP/WebSocket decoders.  The deserializer is bounded,
+/// supports back-to-back values, and emits an explicit gap for malformed/non-LLM data.
+fn feed_rustls_body_only(
+    state: &mut RustlsBodyOnlyState,
+    direction: ChunkDirection,
+    data: &[u8],
+    event_at_unix_ns: u128,
+    reasons: &[String],
+    max_body_bytes: usize,
+) -> BodyOnlyFeed {
+    if data.is_empty() {
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::NotCandidate,
+            messages: Vec::new(),
+            reasons: Vec::new(),
+        };
+    }
+    let starts_json = data
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| matches!(byte, b'{' | b'['));
+    if state.buffer.is_empty() && !starts_json {
+        if data.iter().all(u8::is_ascii_whitespace) && data.len() <= 32 {
+            state.started_at_unix_ns = Some(event_at_unix_ns);
+            extend_unique(&mut state.partial_reasons, reasons.iter().cloned());
+            state.buffer.extend_from_slice(data);
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Pending,
+                messages: Vec::new(),
+                reasons: Vec::new(),
+            };
+        }
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::NotCandidate,
+            messages: Vec::new(),
+            reasons: Vec::new(),
+        };
+    }
+    if state.buffer.is_empty() {
+        state.started_at_unix_ns = Some(event_at_unix_ns);
+    }
+    extend_unique(&mut state.partial_reasons, reasons.iter().cloned());
+    let max_body_bytes = max_body_bytes.min(MAX_RUSTLS_BODY_ONLY_BYTES);
+    if state.buffer.len().saturating_add(data.len()) > max_body_bytes {
+        extend_unique(
+            &mut state.partial_reasons,
+            ["rustls_body_only_limit".to_string()],
+        );
+        let reasons = std::mem::take(&mut state.partial_reasons);
+        state.clear();
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::Invalid,
+            messages: Vec::new(),
+            reasons,
+        };
+    }
+    state.buffer.extend_from_slice(data);
+
+    let mut messages = Vec::new();
+    let mut invalid_reason = None;
+    loop {
+        let mut stream = serde_json::Deserializer::from_slice(&state.buffer).into_iter::<Value>();
+        let Some(parsed) = stream.next() else {
+            break;
+        };
+        match parsed {
+            Ok(_value) => {
+                let consumed = stream.byte_offset();
+                if consumed == 0 {
+                    break;
+                }
+                // Keep the exact observed JSON bytes (including key order and insignificant
+                // whitespace) as the transport evidence.  Include whitespace up to the next
+                // value (or the end of this fragment) so a pretty-printed body hashes exactly;
+                // re-serializing `Value` here would change replay/audit bytes.
+                let mut encoded_end = consumed;
+                while state
+                    .buffer
+                    .get(encoded_end)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    encoded_end += 1;
+                }
+                let encoded = state.buffer[..encoded_end].to_vec();
+                let started = state.started_at_unix_ns.unwrap_or(event_at_unix_ns);
+                let message = match direction {
+                    ChunkDirection::Request => {
+                        body_only_llm_request(&encoded, started, &state.partial_reasons)
+                    }
+                    ChunkDirection::Response => {
+                        body_only_llm_response(&encoded, started, &state.partial_reasons)
+                    }
+                };
+                let Some(mut message) = message else {
+                    invalid_reason = Some("rustls_body_only_not_llm".to_string());
+                    break;
+                };
+                message.started_at_unix_ns = started;
+                message.completed_at_unix_ns = event_at_unix_ns;
+                messages.push(message);
+                state.buffer.drain(..encoded_end);
+                state.started_at_unix_ns = (!state.buffer.is_empty()).then_some(event_at_unix_ns);
+                if state.buffer.is_empty() {
+                    state.partial_reasons.clear();
+                    break;
+                }
+            }
+            Err(error) if error.is_eof() => break,
+            Err(_) => {
+                invalid_reason = Some("rustls_body_only_json_parse_error".to_string());
+                break;
+            }
+        }
+    }
+
+    if let Some(reason) = invalid_reason {
+        extend_unique(&mut state.partial_reasons, [reason]);
+        let reasons = std::mem::take(&mut state.partial_reasons);
+        state.clear();
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::Invalid,
+            messages,
+            reasons,
+        };
+    }
+    BodyOnlyFeed {
+        result: BodyOnlyFeedResult::Pending,
+        messages,
+        reasons: Vec::new(),
+    }
+}
+
+fn response_event_terminal(value: &Value) -> Option<u16> {
+    let kind = value.get("type").and_then(Value::as_str)?;
+    match kind {
+        "response.completed" | "response.done" | "message_stop" => Some(200),
+        "response.failed"
+        | "response.incomplete"
+        | "response.cancelled"
+        | "error"
+        | "message_error" => Some(502),
+        _ => None,
+    }
+}
+
+fn body_only_response_message(
+    state: &RustlsBodyOnlyState,
+    raw_body: &[u8],
+    status_code: u16,
+    event_at_unix_ns: u128,
+    derived_body: Option<Vec<u8>>,
+) -> Option<HttpMessage> {
+    if raw_body.is_empty() {
+        return None;
+    }
+    let started = state.started_at_unix_ns.unwrap_or(event_at_unix_ns);
+    let (content_type, transport_protocol) = if state.response_mode == BodyOnlyResponseMode::Sse {
+        ("text/event-stream", "sse")
+    } else if derived_body.is_some() {
+        ("application/json-seq", "json-body-sequence")
+    } else {
+        ("application/json", "json-body")
+    };
+    Some(HttpMessage {
+        start_line: format!("HTTP/1.1 {status_code} OK"),
+        headers: BTreeMap::from([
+            ("content-type".to_string(), content_type.to_string()),
+            ("host".to_string(), "unknown".to_string()),
+        ]),
+        captured_body_bytes: raw_body.len(),
+        body: raw_body.to_vec(),
+        started_at_unix_ns: started,
+        completed_at_unix_ns: event_at_unix_ns,
+        partial_reasons: state.partial_reasons.clone(),
+        metadata_inferred: true,
+        transport_protocol: Some(transport_protocol.to_string()),
+        derived_body,
+    })
+}
+
+fn body_only_response_mode(data: &[u8]) -> Option<BodyOnlyResponseMode> {
+    let leading = data.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let trimmed = &data[leading..];
+    let first_line = trimmed
+        .split(|byte| *byte == b'\n' || *byte == b'\r')
+        .next()
+        .unwrap_or_default();
+    if first_line.starts_with(b"data:")
+        || first_line.starts_with(b"event:")
+        || first_line.starts_with(b":")
+    {
+        Some(BodyOnlyResponseMode::Sse)
+    } else if matches!(trimmed.first(), Some(b'{' | b'[')) {
+        Some(BodyOnlyResponseMode::Json)
+    } else {
+        None
+    }
+}
+
+fn maybe_body_only_json_prefix(data: &[u8]) -> bool {
+    let trimmed = data.iter().position(|byte| !byte.is_ascii_whitespace());
+    let Some(offset) = trimmed else {
+        // Whitespace-only fragments can precede a split JSON opener. Keep only a small prefix in
+        // the synthetic lane; a long whitespace run is handed to the normal decoder.
+        return data.len() <= 32;
+    };
+    let prefix = &data[offset..];
+    prefix.starts_with(b"{")
+        || prefix.starts_with(b"[")
+        || (prefix.len() <= 8 && (b"{".starts_with(prefix) || b"[".starts_with(prefix)))
+}
+
+fn maybe_body_only_response_prefix(data: &[u8]) -> bool {
+    if body_only_response_mode(data).is_some() {
+        return true;
+    }
+    let offset = data.iter().position(|byte| !byte.is_ascii_whitespace());
+    let Some(offset) = offset else {
+        return data.len() <= 32;
+    };
+    let prefix = &data[offset..];
+    prefix.len() <= 16
+        && (b"data:".starts_with(prefix)
+            || b"event:".starts_with(prefix)
+            || b":".starts_with(prefix)
+            || maybe_body_only_json_prefix(prefix))
+}
+
+/// Accept only provider/lifecycle-shaped objects in an unframed Rustls response.  A pending
+/// request is still required by the caller, but this second gate prevents health/config JSON from
+/// occupying the response accumulator and contaminating a later model exchange.
+fn body_only_response_value_is_candidate(value: &Value) -> bool {
+    if let Some(kind) = value.get("type").and_then(Value::as_str) {
+        if kind.starts_with("response.")
+            || matches!(
+                kind,
+                "message"
+                    | "message_start"
+                    | "message_delta"
+                    | "message_stop"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "error"
+                    | "message_error"
+            )
+        {
+            return true;
+        }
+    }
+    value.get("choices").is_some_and(Value::is_array)
+        || value.get("candidates").is_some_and(Value::is_array)
+        || value
+            .get("output")
+            .is_some_and(|output| output.is_array() || output.is_object())
+        || value.get("output_text").is_some()
+        || value.get("content").is_some_and(Value::is_array)
+        || (value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+            && value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some()))
+        || value.get("tool_call_id").is_some()
+        || (value.get("execution_id").is_some()
+            && value.get("exit_code").is_some()
+            && (value.get("stdout").is_some() || value.get("stderr").is_some()))
+}
+
+fn body_only_response_is_lifecycle(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("response.")
+                || matches!(
+                    kind,
+                    "message_start"
+                        | "message_delta"
+                        | "message_stop"
+                        | "content_block_start"
+                        | "content_block_delta"
+                        | "content_block_stop"
+                        | "error"
+                        | "message_error"
+                )
+        })
+}
+
+fn synthetic_sse_from_raw_events(events: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for raw in events.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(raw);
+        if !raw.ends_with(b"\n") {
+            body.push(b'\n');
+        }
+        body.push(b'\n');
+    }
+    body
+}
+
+/// Aggregate body-only response payloads until a terminal provider event is observed.  Rustls
+/// hooks can expose each decrypted WebSocket/HTTP body object independently; emitting every
+/// `response.output_text.delta` as a response would pair one request with many false exchanges.
+/// This state accepts SSE blocks or newline/concatenated JSON event objects, keeps all bytes within
+/// the stream budget, and returns exactly one synthetic response at terminal/failure.
+fn feed_rustls_body_only_response(
+    state: &mut RustlsBodyOnlyState,
+    data: &[u8],
+    event_at_unix_ns: u128,
+    reasons: &[String],
+    max_body_bytes: usize,
+) -> BodyOnlyFeed {
+    if data.is_empty() {
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::NotCandidate,
+            messages: Vec::new(),
+            reasons: Vec::new(),
+        };
+    }
+    if state.buffer.is_empty() {
+        state.started_at_unix_ns = Some(event_at_unix_ns);
+    }
+    extend_unique(&mut state.partial_reasons, reasons.iter().cloned());
+    let max_body_bytes = max_body_bytes.min(MAX_RUSTLS_BODY_ONLY_BYTES);
+    if state.buffer.len().saturating_add(data.len()) > max_body_bytes {
+        extend_unique(
+            &mut state.partial_reasons,
+            ["rustls_body_only_limit".to_string()],
+        );
+        let reasons = std::mem::take(&mut state.partial_reasons);
+        state.clear();
+        return BodyOnlyFeed {
+            result: BodyOnlyFeedResult::Invalid,
+            messages: Vec::new(),
+            reasons,
+        };
+    }
+    state.buffer.extend_from_slice(data);
+
+    if state.response_mode == BodyOnlyResponseMode::Unknown {
+        if let Some(mode) = body_only_response_mode(&state.buffer) {
+            state.response_mode = mode;
+        } else if state.buffer.len() < 32 {
+            // A Rustls callback may split the `data:` or JSON opener itself. Keep the bounded
+            // prefix until the next callback instead of handing it to the HTTP decoder.
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Pending,
+                messages: Vec::new(),
+                reasons: Vec::new(),
+            };
+        } else {
+            extend_unique(
+                &mut state.partial_reasons,
+                ["rustls_body_only_not_candidate".to_string()],
+            );
+            let reasons = std::mem::take(&mut state.partial_reasons);
+            state.clear();
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Invalid,
+                messages: Vec::new(),
+                reasons,
+            };
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut emitted_reasons = Vec::new();
+    loop {
+        let mut terminal: Option<(usize, u16)> = None;
+        let mut invalid_reason = None;
+        if state.response_mode == BodyOnlyResponseMode::Sse {
+            let mut cursor = state.response_parsed_offset;
+            loop {
+                let remaining = &state.buffer[cursor..];
+                let Some((mut end, delimiter_len)) = sse_block_delimiter(remaining) else {
+                    break;
+                };
+                end += delimiter_len;
+                let block = &remaining[..end];
+                cursor += end;
+                let data_lines = block
+                    .split(|byte| *byte == b'\n' || *byte == b'\r')
+                    .filter_map(|line| {
+                        let line = std::str::from_utf8(line).ok()?;
+                        line.strip_prefix("data:").map(str::trim_start)
+                    })
+                    .collect::<Vec<_>>();
+                let event_data = data_lines.join("\n");
+                if event_data.trim() == "[DONE]" {
+                    terminal = Some((cursor, 200));
+                    break;
+                }
+                if event_data.trim().is_empty() {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&event_data) else {
+                    invalid_reason = Some("rustls_body_only_sse_json_parse_error");
+                    break;
+                };
+                // SSE streams may carry provider-neutral heartbeat/comment objects between
+                // lifecycle events. Ignore an unrecognised object while retaining the raw block;
+                // only a provider-shaped event can contribute semantic output or close the
+                // response, so unrelated health JSON cannot be paired as an LLM response.
+                if !body_only_response_value_is_candidate(&value) {
+                    continue;
+                }
+                if state.response_event_count < MAX_SSE_STRUCTURED_EVENTS {
+                    state.response_event_count += 1;
+                } else {
+                    extend_unique(
+                        &mut state.partial_reasons,
+                        ["rustls_body_only_event_limit".to_string()],
+                    );
+                }
+                if let Some(status) = response_event_terminal(&value) {
+                    terminal = Some((cursor, status));
+                    break;
+                }
+            }
+            state.response_parsed_offset = cursor;
+        } else {
+            let mut cursor = state.response_parsed_offset;
+            loop {
+                let mut stream = serde_json::Deserializer::from_slice(&state.buffer[cursor..])
+                    .into_iter::<Value>();
+                let Some(parsed) = stream.next() else {
+                    break;
+                };
+                match parsed {
+                    Ok(value) => {
+                        let consumed = stream.byte_offset();
+                        if consumed == 0 {
+                            break;
+                        }
+                        let mut end = cursor + consumed;
+                        while state
+                            .buffer
+                            .get(end)
+                            .is_some_and(|byte| byte.is_ascii_whitespace())
+                        {
+                            end += 1;
+                        }
+                        let raw_value = state.buffer[cursor..end].to_vec();
+                        cursor = end;
+                        let regular_response = state.response_event_count == 0
+                            && body_only_llm_response(
+                                &raw_value,
+                                event_at_unix_ns,
+                                &state.partial_reasons,
+                            )
+                            .is_some()
+                            && !body_only_response_is_lifecycle(&value);
+                        if regular_response {
+                            terminal = Some((cursor, 200));
+                            break;
+                        }
+                        if !body_only_response_value_is_candidate(&value) {
+                            invalid_reason = Some("rustls_body_only_not_llm");
+                            break;
+                        }
+                        if state.response_event_count < MAX_SSE_STRUCTURED_EVENTS {
+                            state.response_event_count += 1;
+                            state.response_raw_events.push(raw_value);
+                        } else {
+                            extend_unique(
+                                &mut state.partial_reasons,
+                                ["rustls_body_only_event_limit".to_string()],
+                            );
+                        }
+                        let status = response_event_terminal(&value).or_else(|| {
+                            (state.response_mode == BodyOnlyResponseMode::Json
+                                && value.get("type").and_then(Value::as_str) == Some("message"))
+                            .then_some(200)
+                        });
+                        if let Some(status) = status {
+                            terminal = Some((cursor, status));
+                            break;
+                        }
+                    }
+                    Err(error) if error.is_eof() => break,
+                    Err(_) => {
+                        invalid_reason = Some("rustls_body_only_json_parse_error");
+                        break;
+                    }
+                }
+            }
+            state.response_parsed_offset = cursor;
+        }
+
+        if let Some(reason) = invalid_reason {
+            extend_unique(&mut state.partial_reasons, [reason.to_string()]);
+            let mut reasons = std::mem::take(&mut state.partial_reasons);
+            extend_unique(&mut reasons, emitted_reasons);
+            state.clear();
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Invalid,
+                messages,
+                reasons,
+            };
+        }
+        let Some((terminal_end, status_code)) = terminal else {
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Pending,
+                messages,
+                reasons: Vec::new(),
+            };
+        };
+        let raw_body = state.buffer[..terminal_end].to_vec();
+        let derived_body = if state.response_mode == BodyOnlyResponseMode::Json
+            && !state.response_raw_events.is_empty()
+        {
+            Some(synthetic_sse_from_raw_events(&state.response_raw_events))
+        } else {
+            None
+        };
+        let Some(message) = body_only_response_message(
+            state,
+            &raw_body,
+            status_code,
+            event_at_unix_ns,
+            derived_body,
+        ) else {
+            let mut reasons = emitted_reasons;
+            extend_unique(
+                &mut reasons,
+                ["rustls_body_only_empty_response".to_string()],
+            );
+            state.clear();
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Invalid,
+                messages,
+                reasons,
+            };
+        };
+        extend_unique(&mut emitted_reasons, state.partial_reasons.clone());
+        messages.push(message);
+        let tail = state.buffer[terminal_end..].to_vec();
+        state.clear();
+        if tail.is_empty() {
+            return BodyOnlyFeed {
+                result: BodyOnlyFeedResult::Pending,
+                messages,
+                reasons: emitted_reasons,
+            };
+        }
+        // A single callback can carry a terminal object followed by the next response. Retain the
+        // exact tail and continue parsing it in the same bounded call; no bytes are folded into
+        // the previous interaction or silently discarded.
+        state.buffer = tail;
+        state.started_at_unix_ns = Some(event_at_unix_ns);
+        state.response_mode =
+            body_only_response_mode(&state.buffer).unwrap_or(BodyOnlyResponseMode::Unknown);
+        state.response_parsed_offset = 0;
+    }
+}
+
+fn sse_block_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_bytes(bytes, b"\n\n").map(|offset| (offset, 2));
+    let crlf = find_bytes(bytes, b"\r\n\r\n").map(|offset| (offset, 4));
+    let cr = find_bytes(bytes, b"\r\r").map(|offset| (offset, 2));
+    [lf, crlf, cr]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(offset, _)| *offset)
+}
+
+fn rustls_like_chunk(chunk: &PlaintextChunk) -> bool {
+    chunk.route_candidate || chunk.source.to_ascii_lowercase().contains("rustls")
+}
+
+fn websocket_payload_probe(
+    data: &[u8],
+    direction: ChunkDirection,
+    max_body_bytes: usize,
+) -> Option<StreamIdentityProbe> {
+    let frame = decode_websocket_frame(data, max_body_bytes)
+        .ok()
+        .flatten()?;
+    if !frame.fin
+        || frame.compressed
+        || !matches!(frame.opcode, 0x1 | 0x2)
+        || frame.masked != (direction == ChunkDirection::Request)
+    {
+        return None;
+    }
+    StreamIdentityProbe::from_websocket_payload(&frame.payload, direction)
+}
+
+fn chunk_identity_probe(
+    chunk: &PlaintextChunk,
+    max_body_bytes: usize,
+) -> Option<StreamIdentityProbe> {
+    if !rustls_like_chunk(chunk) {
+        return None;
+    }
+    if looks_like_websocket_frame_prefix(&chunk.data) {
+        if let Some(probe) = websocket_payload_probe(&chunk.data, chunk.direction, max_body_bytes) {
+            return Some(probe);
+        }
+    }
+    let kind = match chunk.direction {
+        ChunkDirection::Request if looks_like_http_request_prefix(&chunk.data) => {
+            StreamKind::Request
+        }
+        ChunkDirection::Response if chunk.data.starts_with(b"HTTP/") => StreamKind::Response,
+        _ => {
+            let first = chunk
+                .data
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace());
+            if !matches!(first, Some(b'{' | b'[')) {
+                return None;
+            }
+            let value = serde_json::from_slice::<Value>(&chunk.data).ok()?;
+            let mut probe = StreamIdentityProbe::default();
+            collect_stream_identity_values(&value, chunk.direction, &mut probe.anchor_hashes);
+            return probe.has_signal().then_some(probe);
+        }
+    };
+    let decoded = decode_http_message(kind, &chunk.data, max_body_bytes)
+        .ok()
+        .flatten()?;
+    Some(StreamIdentityProbe::from_http(
+        &HttpMessage {
+            start_line: decoded.start_line,
+            headers: decoded.headers,
+            body: decoded.body,
+            captured_body_bytes: decoded.captured_body_bytes,
+            started_at_unix_ns: chunk.event_at_unix_ns,
+            completed_at_unix_ns: chunk.event_at_unix_ns,
+            partial_reasons: decoded.partial_reasons,
+            metadata_inferred: false,
+            transport_protocol: None,
+            derived_body: None,
+        },
+        chunk.direction,
+    ))
+}
+
+fn candidate_matches_probe(state: &ConnectionState, probe: Option<&StreamIdentityProbe>) -> bool {
+    let Some(probe) = probe else {
+        return false;
+    };
+    state.identity.matches(probe)
+}
+
+fn add_binding_reasons(state: &ConnectionState, reasons: &mut Vec<String>) {
+    if state.binding_uncertain {
+        extend_unique(reasons, state.binding_reasons.clone());
+    }
+}
+
+fn choose_connection_candidate(mut candidates: Vec<ConnectionKey>) -> ConnectionResolution {
+    candidates.sort_unstable_by_key(|key| (key.cgroup_id, key.pid, key.connection_id));
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => ConnectionResolution::New,
+        [candidate] => ConnectionResolution::Resolved(*candidate),
+        many => ConnectionResolution::Ambiguous(many.len()),
+    }
+}
+
+fn narrow_connection_candidates(
+    candidates: &mut Vec<ConnectionKey>,
+    probe: Option<&StreamIdentityProbe>,
+    states: &HashMap<ConnectionKey, ConnectionState>,
+) {
+    let Some(probe) = probe else {
+        return;
+    };
+    if !probe.has_signal() {
+        return;
+    }
+    let matching = candidates
+        .iter()
+        .copied()
+        .filter(|key| {
+            states
+                .get(key)
+                .is_some_and(|state| candidate_matches_probe(state, Some(probe)))
+        })
+        .collect::<Vec<_>>();
+    // A probe is a narrowing hint, not a reason to throw away a stream whose first request has
+    // not yet supplied the same anchor.  If no state matches, retain all candidates and let the
+    // unique/ambiguous decision below determine whether binding is safe.
+    if !matching.is_empty() {
+        *candidates = matching;
+    }
 }
 
 fn build_interaction(
@@ -1827,6 +3466,15 @@ fn build_interaction(
         decode_content_encoding(&request.body, request_encoding, DEFAULT_MAX_STREAM_BYTES);
     let (response_body, response_decode_reason) =
         decode_content_encoding(&response.body, response_encoding, DEFAULT_MAX_STREAM_BYTES);
+    // `response.body` remains the canonical observed bytes. A Rustls body-only JSON sequence may
+    // additionally carry a parser-only SSE representation so provider-neutral extraction can
+    // aggregate lifecycle events without changing the stored hash or transcript bytes.
+    let (response_parse_body, response_parse_reason) =
+        if let Some(derived) = response.derived_body.as_deref() {
+            decode_content_encoding(derived, "", DEFAULT_MAX_STREAM_BYTES)
+        } else {
+            (response_body.clone(), None)
+        };
     let request_json = parse_json_body(&request_body);
     // Unknown wire shapes are still transport facts.  Keep an explicit `unparsed` interaction so
     // downstream can emit a coverage gap and retain the KernelFact/raw provenance instead of
@@ -1858,11 +3506,14 @@ fn build_interaction(
     let response_is_sse = response
         .content_type()
         .eq_ignore_ascii_case("text/event-stream")
-        || looks_like_sse(&response_body);
+        || looks_like_sse(&response_parse_body);
+    // A bounded SSE parser intentionally stops materializing structured events after the cap,
+    // but that must remain visible in completeness rather than silently dropping tail events.
+    let response_sse_event_limit = response_is_sse && sse_event_limit_reached(&response_parse_body);
     let (response_structured, mut response_text, mut tool_calls) = if response_is_sse {
-        normalize_sse_response(&response_body, response.completed_at_unix_ns)
+        normalize_sse_response(&response_parse_body, response.completed_at_unix_ns)
     } else {
-        let structured = parse_json_body(&response_body);
+        let structured = parse_json_body(&response_parse_body);
         let text = structured.as_ref().and_then(extract_response_text);
         let calls = structured
             .as_ref()
@@ -1952,13 +3603,20 @@ fn build_interaction(
         .and_then(extract_provider_token_usage);
 
     let request_decode_complete = request_decode_reason.is_none();
-    let response_decode_complete = response_decode_reason.is_none();
+    let response_decode_complete =
+        response_decode_reason.is_none() && response_parse_reason.is_none();
+    let request_decode_ok = request_decode_reason.is_none();
+    let response_decode_ok = response_decode_reason.is_none();
+    let response_parse_ok = response_parse_reason.is_none();
     let mut partial_reasons = request.partial_reasons.clone();
     extend_unique(&mut partial_reasons, response.partial_reasons.clone());
     if let Some(reason) = request_decode_reason {
         extend_unique(&mut partial_reasons, [reason]);
     }
     if let Some(reason) = response_decode_reason {
+        extend_unique(&mut partial_reasons, [reason]);
+    }
+    if let Some(reason) = response_parse_reason {
         extend_unique(&mut partial_reasons, [reason]);
     }
     if wire_match.parse_state != "parsed" {
@@ -1980,11 +3638,15 @@ fn build_interaction(
         wire_match,
         status_code,
         response_is_sse,
-        &response_body,
+        &response_parse_body,
         response_structured.as_ref(),
+        response_sse_event_limit,
     );
     if wire_completeness != "complete" && wire_completeness != "error" {
         extend_unique(&mut partial_reasons, [format!("wire_{wire_completeness}")]);
+    }
+    if response_sse_event_limit {
+        extend_unique(&mut partial_reasons, ["sse_event_limit".to_string()]);
     }
     let has_pending_tool_result = has_unmatched_tool_calls(&tool_calls, &tool_results);
     let conversation_completeness = if has_pending_tool_result {
@@ -2012,7 +3674,7 @@ fn build_interaction(
         request_json,
         messages,
         None,
-        if request.partial_reasons.is_empty() {
+        if request.partial_reasons.is_empty() && request_decode_ok {
             "complete"
         } else {
             "partial"
@@ -2025,7 +3687,11 @@ fn build_interaction(
         response_structured,
         Vec::new(),
         response_text,
-        if response.partial_reasons.is_empty() {
+        if response.partial_reasons.is_empty()
+            && response_decode_ok
+            && response_parse_ok
+            && !response_sse_event_limit
+        {
             "complete"
         } else {
             "partial"
@@ -2564,10 +4230,28 @@ fn decode_http_message(
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
         || looks_like_sse(body_bytes)
     {
-        let Some(end) = sse_terminal_offset(body_bytes) else {
+        // With Content-Encoding the wire bytes are compressed, so looking for an SSE delimiter
+        // directly in `body_bytes` can never prove completion. Decode only into a bounded
+        // temporary framing view; the returned message still retains the exact compressed bytes
+        // as its canonical body/hash. An incomplete compressed stream simply remains pending.
+        let (framing_body, framing_reason) = decode_content_encoding(
+            body_bytes,
+            headers
+                .get("content-encoding")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            max_body_bytes,
+        );
+        if framing_reason.is_some() {
+            return Ok(None);
+        }
+        let Some(_end) = sse_terminal_offset(&framing_body) else {
             return Ok(None);
         };
-        (body_bytes[..end].to_vec(), end)
+        // No explicit HTTP framing is available here. Once the decoded stream has a terminal
+        // event, all currently observed compressed bytes belong to this response; consume the
+        // raw body while keeping the decoded view for the later parser stage.
+        (body_bytes.to_vec(), body_bytes.len())
     } else {
         // HTTP/1.x response bodies without framing end on connection close. A TLS fragment cannot
         // prove that boundary, so wait for a close/timeout-aware path instead of guessing.
@@ -3007,6 +4691,7 @@ fn wire_completeness(
     response_is_sse: bool,
     response_body: &[u8],
     response_structured: Option<&Value>,
+    sse_event_limit: bool,
 ) -> &'static str {
     if status_code >= 400 {
         return "error";
@@ -3015,6 +4700,9 @@ fn wire_completeness(
         return "unknown";
     }
     if response_is_sse {
+        if sse_event_limit {
+            return "partial";
+        }
         return if sse_terminal_offset(response_body).is_some() {
             "complete"
         } else {
@@ -3651,6 +5339,7 @@ fn extract_response_text(value: &Value) -> Option<String> {
     }
     collect_text_parts(value.get("output"), &mut output);
     collect_text_parts(value.get("content"), &mut output);
+    collect_text_parts(value.get("candidates"), &mut output);
     if output.is_empty() {
         value
             .get("item")
@@ -3789,16 +5478,38 @@ fn extract_provider_token_usage(value: &Value) -> Option<LlmTokenUsage> {
 }
 
 fn collect_text_parts(value: Option<&Value>, output: &mut String) {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return;
-    };
-    for item in items.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
-        if let Some(text) = item.get("text").and_then(Value::as_str) {
-            push_bounded_text(output, text, MAX_EXPORTED_STRUCTURED_BYTES);
+    fn visit(value: &Value, output: &mut String, depth: usize) {
+        if depth > 6 || output.len() >= MAX_EXPORTED_STRUCTURED_BYTES {
+            return;
         }
-        if let Some(content) = item.get("content") {
-            collect_text_parts(Some(content), output);
+        match value {
+            Value::Array(items) => {
+                for item in items.iter().take(MAX_SSE_STRUCTURED_EVENTS) {
+                    visit(item, output, depth + 1);
+                }
+            }
+            Value::Object(object) => {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    push_bounded_text(output, text, MAX_EXPORTED_STRUCTURED_BYTES);
+                }
+                for key in [
+                    "content",
+                    "parts",
+                    "candidates",
+                    "output",
+                    "message",
+                    "delta",
+                ] {
+                    if let Some(child) = object.get(key) {
+                        visit(child, output, depth + 1);
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+    if let Some(value) = value {
+        visit(value, output, 0);
     }
 }
 
@@ -4286,6 +5997,7 @@ fn sse_terminal_model_text(event: &Value) -> Option<String> {
         Some("response.completed" | "response.done") => {
             event.get("response").and_then(extract_response_text)
         }
+        Some("message") => extract_response_text(event),
         _ => None,
     }
 }
@@ -4314,27 +6026,57 @@ fn responses_event_call_id(
 }
 
 fn parse_sse_json_events(body: &[u8]) -> Vec<Value> {
-    let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
-    text.split("\n\n")
-        .take(MAX_SSE_STRUCTURED_EVENTS)
-        .filter_map(|block| {
-            let data = block
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() || data == "[DONE]" {
-                None
+    parse_sse_json_events_bounded(body).0
+}
+
+/// Parse at most `MAX_SSE_STRUCTURED_EVENTS` values and report whether another valid JSON SSE
+/// event existed after the cap. Keeping the boolean separate avoids allocating unbounded tail
+/// values while making the completeness downgrade auditable.
+fn parse_sse_json_events_bounded(body: &[u8]) -> (Vec<Value>, bool) {
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    let mut capped = false;
+    while cursor < body.len() {
+        let Some((offset, delimiter_len)) = sse_block_delimiter(&body[cursor..]) else {
+            break;
+        };
+        let end = cursor + offset + delimiter_len;
+        let block = &body[cursor..end];
+        cursor = end;
+        let data = block
+            .split(|byte| *byte == b'\n' || *byte == b'\r')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data.trim() == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str(&data) {
+            if output.len() < MAX_SSE_STRUCTURED_EVENTS {
+                output.push(value);
             } else {
-                serde_json::from_str(&data).ok()
+                capped = true;
+                break;
             }
-        })
-        .collect()
+        }
+    }
+    (output, capped)
+}
+
+fn sse_event_limit_reached(body: &[u8]) -> bool {
+    parse_sse_json_events_bounded(body).1
 }
 
 fn looks_like_sse(body: &[u8]) -> bool {
-    body.starts_with(b"data:") || find_bytes(body, b"\ndata:").is_some()
+    body.starts_with(b"data:")
+        || body.starts_with(b"event:")
+        || body.starts_with(b":")
+        || find_bytes(body, b"\ndata:").is_some()
+        || find_bytes(body, b"\rdata:").is_some()
+        || find_bytes(body, b"\nevent:").is_some()
+        || find_bytes(body, b"\revent:").is_some()
 }
 
 fn sse_terminal_offset(body: &[u8]) -> Option<usize> {
@@ -4346,24 +6088,25 @@ fn sse_terminal_offset(body: &[u8]) -> Option<usize> {
             return Some(offset + marker.len());
         }
     }
-    let normalized = String::from_utf8_lossy(body).replace("\r\n", "\n");
-    let mut consumed = 0usize;
-    for block in normalized.split_inclusive("\n\n") {
-        consumed += block.len();
-        if block.contains("\"type\":\"response.completed\"")
-            || block.contains("\"type\": \"response.completed\"")
-            || block.contains("\"type\":\"response.failed\"")
-            || block.contains("\"type\": \"response.failed\"")
-            || block.contains("\"type\":\"response.incomplete\"")
-            || block.contains("\"type\": \"response.incomplete\"")
-            || block.contains("\"type\":\"response.cancelled\"")
-            || block.contains("\"type\": \"response.cancelled\"")
-            || block.contains("\"type\":\"message_stop\"")
-            || block.contains("\"type\": \"message_stop\"")
-        {
-            // CRLF normalization may make this offset slightly shorter. The common HTTP/1 path is
-            // chunk-framed; this fallback is only for unframed test/proxy streams.
-            return Some(consumed.min(body.len()));
+    let mut cursor = 0usize;
+    while let Some((offset, delimiter_len)) = sse_block_delimiter(&body[cursor..]) {
+        let end = cursor + offset + delimiter_len;
+        let block = &body[cursor..end];
+        cursor = end;
+        let data = block
+            .split(|byte| *byte == b'\n' || *byte == b'\r')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim() == "[DONE]" {
+            return Some(cursor);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            if response_event_terminal(&value).is_some() {
+                return Some(cursor);
+            }
         }
     }
     None
@@ -4473,6 +6216,25 @@ fn extend_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = S
     }
 }
 
+fn merge_bounded_label(current: &mut String, next: &str) {
+    let next = next.trim();
+    if next.is_empty() || current == next || current.split('+').any(|item| item == next) {
+        return;
+    }
+    const MAX_LABEL_BYTES: usize = 256;
+    if current.len().saturating_add(next.len()).saturating_add(1) <= MAX_LABEL_BYTES {
+        current.push('+');
+        current.push_str(next);
+    } else if !current.split('+').any(|item| item == "mixed") {
+        if current.len().saturating_add(6) <= MAX_LABEL_BYTES {
+            current.push_str("+mixed");
+        } else {
+            current.truncate(MAX_LABEL_BYTES.saturating_sub(6));
+            current.push_str("+mixed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4491,6 +6253,7 @@ mod tests {
             event_at_unix_ns: at,
             source: "openssl_uprobe".to_string(),
             adapter_id: "openssl-ex".to_string(),
+            route_candidate: false,
             partial_reasons: Vec::new(),
         }
     }
@@ -4862,6 +6625,228 @@ mod tests {
     }
 
     #[test]
+    fn rustls_body_only_json_request_reassembles_across_pointer_fragments() {
+        let request_body = r#"{"model":"fixture-model","input":[{"role":"user","content":"split-body"}],"metadata":{"session_id":"split-session"}}"#;
+        let split = request_body.len() / 2;
+        let mut reassembler = InteractionReassembler::default();
+        let mut first = rustls_chunk_on(
+            ChunkDirection::Request,
+            request_body.as_bytes()[..split].to_vec(),
+            100,
+            0x7100,
+        );
+        first.route_candidate = true;
+        first.sequence = 1;
+        assert!(reassembler.push(first).is_empty());
+        let mut second = rustls_chunk_on(
+            ChunkDirection::Request,
+            request_body.as_bytes()[split..].to_vec(),
+            110,
+            0x7101,
+        );
+        second.route_candidate = true;
+        second.sequence = 2;
+        assert!(reassembler.push(second).is_empty());
+
+        let mut response = rustls_chunk_on(
+            ChunkDirection::Response,
+            http_response(
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"split-response"}]}]}"#,
+            ),
+            200,
+            0x7200,
+        );
+        response.route_candidate = true;
+        response.sequence = 1;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].request.body, request_body);
+        assert_eq!(
+            completed[0].request.sha256,
+            sha256_hex(request_body.as_bytes())
+        );
+        assert_eq!(
+            completed[0].request.decoded_bytes as usize,
+            request_body.len()
+        );
+        assert_eq!(completed[0].started_at_unix_ns, "100");
+        assert_eq!(completed[0].request_complete_at_unix_ns, "110");
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("split-response")
+        );
+        assert_eq!(completed[0].completeness, "complete");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .all(|reason| reason != "route_candidate"));
+    }
+
+    #[test]
+    fn rustls_body_only_sse_response_waits_for_terminal_event() {
+        let request_body = r#"{"model":"fixture-model","input":[{"role":"user","content":"sse-body"}],"metadata":{"session_id":"sse-session"}}"#;
+        let mut reassembler = InteractionReassembler::default();
+        let mut request = rustls_chunk_on(
+            ChunkDirection::Request,
+            request_body.as_bytes().to_vec(),
+            100,
+            0x7300,
+        );
+        request.route_candidate = true;
+        request.sequence = 1;
+        reassembler.push(request);
+
+        let first = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-sse\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n";
+        let mut first_chunk =
+            rustls_chunk_on(ChunkDirection::Response, first.to_vec(), 200, 0x7400);
+        first_chunk.route_candidate = true;
+        first_chunk.sequence = 1;
+        assert!(reassembler.push(first_chunk).is_empty());
+
+        let second = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sse\"}}\n\n";
+        let mut second_chunk =
+            rustls_chunk_on(ChunkDirection::Response, second.to_vec(), 220, 0x7401);
+        second_chunk.route_candidate = true;
+        second_chunk.sequence = 2;
+        let completed = reassembler.push(second_chunk);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].response.text.as_deref(), Some("hello world"));
+        assert_eq!(completed[0].response.content_type, "text/event-stream");
+        assert_eq!(completed[0].first_response_at_unix_ns, "200");
+        assert_eq!(completed[0].ended_at_unix_ns, "220");
+        assert_eq!(completed[0].completeness, "complete");
+    }
+
+    #[test]
+    fn rustls_body_only_sse_split_prefix_and_cr_delimiter_preserve_raw_body() {
+        let request_body =
+            r#"{"model":"fixture-model","input":[{"role":"user","content":"split-sse"}]}"#;
+        let mut reassembler = InteractionReassembler::default();
+        let mut request = rustls_chunk_on(
+            ChunkDirection::Request,
+            request_body.as_bytes().to_vec(),
+            100,
+            0x7500,
+        );
+        request.route_candidate = true;
+        request.sequence = 1;
+        reassembler.push(request);
+
+        let mut prefix = rustls_chunk_on(ChunkDirection::Response, b"da".to_vec(), 200, 0x7600);
+        prefix.route_candidate = true;
+        prefix.sequence = 1;
+        assert!(reassembler.push(prefix).is_empty());
+        let raw = b"ta: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\r\rdata: {\"type\":\"response.completed\"}\r\r";
+        let mut terminal = rustls_chunk_on(ChunkDirection::Response, raw.to_vec(), 220, 0x7601);
+        terminal.route_candidate = true;
+        terminal.sequence = 2;
+        let completed = reassembler.push(terminal);
+        assert_eq!(completed.len(), 1);
+        let expected = [b"da".as_slice(), raw.as_slice()].concat();
+        assert_eq!(
+            completed[0].response.body,
+            String::from_utf8(expected.clone()).unwrap()
+        );
+        assert_eq!(completed[0].response.sha256, sha256_hex(&expected));
+        assert_eq!(completed[0].response.text.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn rustls_body_only_json_sequence_keeps_raw_hash_and_parser_projection_separate() {
+        let request_body =
+            r#"{"model":"fixture-model","input":[{"role":"user","content":"json-seq"}]}"#;
+        let mut reassembler = InteractionReassembler::default();
+        let mut request = rustls_chunk_on(
+            ChunkDirection::Request,
+            request_body.as_bytes().to_vec(),
+            100,
+            0x7700,
+        );
+        request.route_candidate = true;
+        request.sequence = 1;
+        reassembler.push(request);
+        let raw = br#"{"type":"response.output_text.delta","delta":"hello"} {"type":"response.completed"}"#;
+        let mut response = rustls_chunk_on(ChunkDirection::Response, raw.to_vec(), 200, 0x7701);
+        response.route_candidate = true;
+        response.sequence = 1;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].response.body,
+            String::from_utf8(raw.to_vec()).unwrap()
+        );
+        assert_eq!(completed[0].response.sha256, sha256_hex(raw));
+        assert_eq!(completed[0].response.content_type, "application/json-seq");
+        assert_eq!(completed[0].response.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn rustls_body_only_response_does_not_buffer_orphan_bytes() {
+        let mut reassembler = InteractionReassembler::default();
+        let mut response = rustls_chunk_on(
+            ChunkDirection::Response,
+            br#"{"status":"health"}"#.to_vec(),
+            100,
+            0x7800,
+        );
+        response.route_candidate = true;
+        response.sequence = 1;
+        assert!(reassembler.push(response).is_empty());
+        assert_eq!(reassembler.active_connections(), 1);
+        let evidence = reassembler.take_evidence();
+        assert!(evidence.iter().any(|item| item
+            .reasons
+            .iter()
+            .any(|reason| reason == "orphan_rustls_body_only_response")));
+    }
+
+    #[test]
+    fn rustls_body_only_anthropic_message_and_gemini_response_are_terminal() {
+        let mut reassembler = InteractionReassembler::default();
+        let mut anthropic_request = rustls_chunk_on(
+            ChunkDirection::Request,
+            br#"{"model":"claude","messages":[{"role":"user","content":"hi"}]}"#.to_vec(),
+            100,
+            0x7900,
+        );
+        anthropic_request.route_candidate = true;
+        anthropic_request.sequence = 1;
+        reassembler.push(anthropic_request);
+        let mut anthropic_response = rustls_chunk_on(
+            ChunkDirection::Response,
+            br#"{"type":"message","content":[{"type":"text","text":"hello"}]}"#.to_vec(),
+            200,
+            0x7901,
+        );
+        anthropic_response.route_candidate = true;
+        anthropic_response.sequence = 1;
+        let first = reassembler.push(anthropic_response);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].response.text.as_deref(), Some("hello"));
+
+        let mut gemini_request = rustls_chunk_on(
+            ChunkDirection::Request,
+            br#"{"model":"gemini","contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#.to_vec(),
+            300,
+            0x7a00,
+        );
+        gemini_request.route_candidate = true;
+        gemini_request.sequence = 1;
+        reassembler.push(gemini_request);
+        let mut gemini_response = rustls_chunk_on(
+            ChunkDirection::Response,
+            br#"{"candidates":[{"content":{"parts":[{"text":"world"}]}}]}"#.to_vec(),
+            400,
+            0x7a01,
+        );
+        gemini_response.route_candidate = true;
+        gemini_response.sequence = 1;
+        let second = reassembler.push(gemini_response);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].response.text.as_deref(), Some("world"));
+    }
+
+    #[test]
     fn local_control_plane_http_is_not_misclassified_as_llm() {
         let mut reassembler = InteractionReassembler::default();
         reassembler.push(chunk(
@@ -5173,6 +7158,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(matched.template_id, "openai-chat-completions");
+    }
+
+    #[test]
+    fn request_line_detection_accepts_unknown_methods_without_widening_body_lane() {
+        for prefix in [
+            b"POST /v1/responses".as_slice(),
+            b"PROPFIND /dav".as_slice(),
+            b"M-SEARCH *".as_slice(),
+        ] {
+            assert!(looks_like_http_request_prefix(prefix));
+            assert_eq!(
+                classify_http_method_prefix(prefix),
+                HTTP_METHOD_PREFIX_COMPLETE
+            );
+        }
+        assert!(!looks_like_http_request_prefix(b"PROPFIND"));
+        assert!(!looks_like_http_request_prefix(br#"{"model":"fixture"}"#));
+        assert_eq!(
+            classify_http_method_prefix(b"PROPFIND"),
+            a3s_observer_common::HTTP_METHOD_PREFIX_INCOMPLETE
+        );
     }
 
     #[test]
@@ -5750,6 +7756,70 @@ mod tests {
     }
 
     #[test]
+    fn gzip_sse_without_content_length_uses_decoded_framing_and_keeps_raw_hash() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"compressed \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"sse\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(sse.as_bytes()).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let response = [
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\n\r\n"
+                .to_vec(),
+            encoded.clone(),
+        ]
+        .concat();
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(r#"{"model":"m","messages":[]}"#),
+            1,
+        ));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response, 2));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("compressed sse")
+        );
+        // Interaction content hashes the bounded decoded payload (the same representation shown
+        // to the provider parser); the framing path above still consumed the compressed wire
+        // bytes without requiring a Content-Length header.
+        assert_eq!(completed[0].response.sha256, sha256_hex(sse.as_bytes()));
+        assert_eq!(completed[0].completeness, "complete");
+    }
+
+    #[test]
+    fn sse_event_limit_is_explicitly_partial_even_after_terminal() {
+        let mut sse = String::new();
+        for index in 0..=MAX_SSE_STRUCTURED_EVENTS {
+            sse.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{index} \"}}}}]}}\n\n"
+            ));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            sse.len(),
+            sse
+        );
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(r#"{"model":"m","messages":[]}"#),
+            1,
+        ));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response.into_bytes(), 2));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].completeness, "partial");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "sse_event_limit"));
+    }
+
+    #[test]
     fn unsupported_http2_emits_metadata_evidence_without_false_interaction() {
         let mut reassembler = InteractionReassembler::default();
         let completed = reassembler.push(chunk(
@@ -6094,7 +8164,7 @@ mod tests {
     }
 
     #[test]
-    fn rustls_moved_pointers_follow_recent_websocket_and_continuations() {
+    fn rustls_moved_pointers_with_competing_websockets_remain_ambiguous() {
         let mut reassembler = InteractionReassembler::default();
         let upgrade = |path: &str| {
             format!(
@@ -6152,6 +8222,24 @@ mod tests {
             ))
             .is_empty());
 
+        // Both active streams are equally plausible and the frame is compressed, so there is no
+        // non-destructive payload identity probe.  The resolver must not choose the newest stream
+        // (or either pointer) merely by recency.
+        let evidence = reassembler.take_evidence();
+        assert!(evidence.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason == "ambiguous_stream_binding")
+        }));
+        assert!(reassembler.metrics().ambiguous_stream_bindings >= 1);
+        assert!(
+            !reassembler.connection_aliases.contains_key(&ConnectionKey {
+                cgroup_id: 7,
+                pid: 42,
+                connection_id: 0x3000,
+            })
+        );
+
         let text_event = serde_json::json!({
             "type": "response.output_text.delta",
             "delta": "MOVED_POINTER_RESPONSE"
@@ -6187,18 +8275,156 @@ mod tests {
             211,
             0x4002,
         ));
+        // The provisional stream may still be framed when later fragments make its lifecycle
+        // complete.  Preserve that exchange, but keep the ambiguity visible instead of claiming
+        // a definitive owner or silently assigning it to the newest WebSocket.
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].completeness, "partial");
+        assert_eq!(completed[0].connection_id, "tls:3000");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "ambiguous_stream_binding"));
+    }
 
+    #[test]
+    fn rustls_moved_pointer_binds_when_a_unique_session_anchor_matches() {
+        let mut reassembler = InteractionReassembler::default();
+        let upgrade = |path: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            )
+        };
+        let switching = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        for (at, write_pointer, read_pointer, path) in [
+            (10, 0x1000, 0x1100, "/older"),
+            (20, 0x2000, 0x2100, "/target"),
+        ] {
+            reassembler.push(rustls_chunk_on(
+                ChunkDirection::Request,
+                upgrade(path),
+                at,
+                write_pointer,
+            ));
+            reassembler.push(rustls_chunk_on(
+                ChunkDirection::Response,
+                switching,
+                at + 1,
+                read_pointer,
+            ));
+        }
+
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "client_metadata": {"session_id": "session-target"},
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "seed"}]}]
+        })
+        .to_string();
+        // The original pointer is an explicit owner, so this seeds identity evidence on the
+        // target stream without relying on timing or endpoint names.
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Request,
+            websocket_frame(request.as_bytes(), true, true, false, 0x1),
+            100,
+            0x2000,
+        ));
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(
+                serde_json::json!({"type": "response.output_text.delta", "delta": "seed-reply"})
+                    .to_string()
+                    .as_bytes(),
+                false,
+                true,
+                false,
+                0x1,
+            ),
+            110,
+            0x2100,
+        ));
+        let seed_done = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "response-seed"}
+                })
+                .to_string()
+                .as_bytes(),
+                false,
+                true,
+                false,
+                0x1,
+            ),
+            120,
+            0x2100,
+        ));
+        assert_eq!(seed_done.len(), 1);
+
+        let resumed = serde_json::json!({
+            "type": "response.create",
+            "model": "fixture-model",
+            "client_metadata": {"session_id": "session-target"},
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "resumed"}]}]
+        })
+        .to_string();
+        // The new pointer is ambiguous by recency, but the explicit session anchor uniquely
+        // matches the target stream and is therefore safe to alias.
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Request,
+                websocket_frame(resumed.as_bytes(), true, true, false, 0x1),
+                200,
+                0x3000,
+            ))
+            .is_empty());
+        assert_eq!(
+            reassembler
+                .connection_aliases
+                .get(&ConnectionKey {
+                    cgroup_id: 7,
+                    pid: 42,
+                    connection_id: 0x3000,
+                })
+                .map(|key| key.connection_id),
+            Some(0x2000)
+        );
+        reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(
+                serde_json::json!({"type": "response.output_text.delta", "delta": "resumed-reply"})
+                    .to_string()
+                    .as_bytes(),
+                false,
+                true,
+                false,
+                0x1,
+            ),
+            210,
+            0x4000,
+        ));
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(
+                serde_json::json!({"type": "response.completed"})
+                    .to_string()
+                    .as_bytes(),
+                false,
+                true,
+                false,
+                0x1,
+            ),
+            220,
+            0x4001,
+        ));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].connection_id, "tls:2000");
-        assert!(completed[0].request.body.contains("MOVED_POINTER_REQUEST"));
         assert_eq!(
-            completed[0].response.text.as_deref(),
-            Some("MOVED_POINTER_RESPONSE")
+            completed[0].provider_conversation_id.as_deref(),
+            Some("session-target")
         );
-        assert_eq!(
-            completed[0].provider_response_id.as_deref(),
-            Some("resp-moved-pointer")
-        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("resumed-reply"));
     }
 
     #[test]
@@ -6299,8 +8525,15 @@ mod tests {
         ));
 
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].connection_id, "tls:2000");
-        assert_eq!(completed[0].path, "/resumed-thread");
+        // The request was kept in a provisional observed-pointer stream because two canonical
+        // WebSockets competed.  It may be decoded locally, but it must remain visibly partial and
+        // must not be rewritten as either canonical stream by recency.
+        assert_eq!(completed[0].connection_id, "tls:3000");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "ambiguous_stream_binding"));
+        assert_eq!(completed[0].path, "/v1/responses");
         assert_eq!(
             completed[0].provider_conversation_id.as_deref(),
             Some("resumed-session")

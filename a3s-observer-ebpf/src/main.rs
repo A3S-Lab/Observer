@@ -3,17 +3,17 @@
 
 use a3s_observer_common::{
     capture_cpu_sample_quota, capture_probe_is_protected, capture_profile_default_actions,
-    capture_sample_partitions, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
-    CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
-    CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
-    CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
-    FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
-    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
-    TlsPlaintextEventLarge, TlsPlaintextEventMedium, TlsPlaintextEventSmall, ARGV_SLOTS,
-    CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
-    CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
-    CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
-    CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
+    capture_sample_partitions, classify_http_method_prefix, file_access_mode, CaptureAggregateKey,
+    CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey,
+    CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue, CapturePromotionValue,
+    CaptureSampleKey, CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent,
+    FileEvent, FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats,
+    FileFilterValue, FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent,
+    TlsPlaintextEventHeader, TlsPlaintextEventLarge, TlsPlaintextEventMedium,
+    TlsPlaintextEventSmall, ARGV_SLOTS, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
+    CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
+    CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+    CAPTURE_DECISION_FLAG_LEGACY, CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
     CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DECISION_FLAG_SHADOW,
     CAPTURE_DECISION_FLAG_VERIFIED_AGENT, CAPTURE_DISPOSITION_MISS, CAPTURE_DISPOSITION_RULE,
     CAPTURE_DISPOSITION_STALE, CAPTURE_MODE_SHADOW, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
@@ -28,14 +28,16 @@ use a3s_observer_common::{
     EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
     FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
     FILE_ACCESS_MODE_UNKNOWN, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
-    FILE_FILTER_AUTHORITY_AUTHORITATIVE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    FILE_FILTER_AUTHORITY_AUTHORITATIVE, HTTP_METHOD_PREFIX_COMPLETE,
+    HTTP_METHOD_PREFIX_INCOMPLETE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
-    PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_MAX_LEN,
-    PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1,
-    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
-    TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
-    TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
+    PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_CANDIDATE, PLAINTEXT_HTTP_ROUTE_LLM,
+    PLAINTEXT_HTTP_ROUTE_MAX_LEN, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
+    TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
+    TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
     TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE, TLS_PLAINTEXT_TIER_MEDIUM,
     TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
 };
@@ -270,11 +272,26 @@ struct PlaintextTlsSessionKey {
     exec_id: u64,
 }
 
-// A write-side route match authorizes subsequent reads on the same TLS context.  The key keeps
-// cgroup + PID + TLS pointer together so allocator/PID reuse cannot inherit an old route.  LRU
-// eviction is bounded; a missing entry is fail-closed for plaintext capture.
+const TLS_SESSION_CANDIDATE_TTL_NS: u64 = 60_000_000_000;
+const TLS_SESSION_EXACT_TTL_NS: u64 = 86_400_000_000_000;
+const TLS_SESSION_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TLS_SESSION_ROUTE_BLOCKED: u8 = u8::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextTlsSessionValue {
+    route: u8,
+    _pad: [u8; 7],
+    expires_at_boot_ns: u64,
+    captured_bytes: u64,
+}
+
+// A write-side route match authorizes subsequent reads on the same TLS context. The key keeps
+// cgroup + PID + TLS pointer together so allocator/PID reuse cannot inherit an old route. Values
+// carry a bounded idle lease and byte budget; LRU eviction is an additional bound and a missing /
+// expired entry is fail-closed for plaintext capture.
 #[map]
-static PLAINTEXT_TLS_SESSIONS: LruHashMap<PlaintextTlsSessionKey, u8> =
+static PLAINTEXT_TLS_SESSIONS: LruHashMap<PlaintextTlsSessionKey, PlaintextTlsSessionValue> =
     LruHashMap::with_max_entries(8_192, 0);
 
 #[map]
@@ -2018,6 +2035,15 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     let exec_id = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
     let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let process_key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    // Scope cleanup is unconditional: an exit that is itself filtered must still revoke the
+    // process admission before PID/SSL-pointer reuse can occur.
+    let _ = VERIFIED_AGENT_PROCESSES.remove(&process_key);
+    let _ = VERIFIED_AGENT_EXEC_IDS.remove(&process_key);
     let capture_decision = capture_raw_decision(CAPTURE_PROBE_EXIT, cgroup_id, pid, 0, 0);
     if !capture_decision.selected() {
         return Ok(0);
@@ -2041,11 +2067,6 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     let _ = PARENTS.remove(&pid);
     let _ = EXEC_IDS.remove(&pid);
     let _ = COMMITTED_EXEC_IDS.remove(&pid);
-    let _ = VERIFIED_AGENT_EXEC_IDS.remove(&PlaintextProcessKey {
-        cgroup_id,
-        pid,
-        _pad: 0,
-    });
     remove_capture_promotion(pid);
     Ok(0)
 }
@@ -2553,8 +2574,40 @@ fn http_request_route_kind(buf: u64, len: u64) -> u8 {
 }
 
 #[inline(always)]
-fn http_method_prefix(buf: u64, len: u64) -> bool {
-    if buf == 0 || len < 4 {
+fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
+    if buf == 0 || len == 0 {
+        return Some(false);
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        // Distinguish an unreadable callback buffer from a valid non-method payload. The former
+        // must revoke any prior route admission rather than silently inheriting it.
+        return None;
+    }
+    match classify_http_method_prefix(&data[..captured]) {
+        HTTP_METHOD_PREFIX_COMPLETE => Some(true),
+        // A bounded token with no separator may be a split/unknown request line. Do not retain a
+        // prior TLS route until the remaining bytes prove this is a body continuation.
+        HTTP_METHOD_PREFIX_INCOMPLETE => None,
+        _ => Some(false),
+    }
+}
+
+#[inline(always)]
+fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
+    if buf == 0 || len < 16 {
         return false;
     }
     let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
@@ -2573,12 +2626,69 @@ fn http_method_prefix(buf: u64, len: u64) -> bool {
     {
         return false;
     }
-    bytes_at(&data, captured, 0, b"POST ")
-        || bytes_at(&data, captured, 0, b"GET ")
-        || bytes_at(&data, captured, 0, b"PUT ")
-        || bytes_at(&data, captured, 0, b"PATCH ")
-        || bytes_at(&data, captured, 0, b"DELETE ")
-        || bytes_at(&data, captured, 0, b"HEAD ")
+    if !bytes_at(&data, captured, 0, b"GET ") {
+        return false;
+    }
+    let mut saw_upgrade = false;
+    let mut saw_connection_upgrade = false;
+    let mut index = 0usize;
+    while index + 2 <= captured {
+        if data[index] == b'\r' && data[index + 1] == b'\n' {
+            let line_start = index + 2;
+            let mut line_end = line_start;
+            while line_end < captured && data[line_end] != b'\r' && data[line_end] != b'\n' {
+                line_end += 1;
+            }
+            if line_start + 8 <= line_end
+                && data[line_start..line_start + 8]
+                    .iter()
+                    .zip(*b"upgrade:")
+                    .all(|(left, right)| left.to_ascii_lowercase() == right)
+            {
+                let mut value = line_start + 8;
+                while value < line_end && (data[value] == b' ' || data[value] == b'\t') {
+                    value += 1;
+                }
+                while value + 9 <= line_end {
+                    if data[value..value + 9]
+                        .iter()
+                        .zip(*b"websocket")
+                        .all(|(left, right)| left.to_ascii_lowercase() == right)
+                    {
+                        saw_upgrade = true;
+                        break;
+                    }
+                    value += 1;
+                }
+            } else if line_start + 11 <= line_end
+                && data[line_start..line_start + 11]
+                    .iter()
+                    .zip(*b"connection:")
+                    .all(|(left, right)| left.to_ascii_lowercase() == right)
+            {
+                let mut value = line_start + 11;
+                while value < line_end && (data[value] == b' ' || data[value] == b'\t') {
+                    value += 1;
+                }
+                while value + 7 <= line_end {
+                    if data[value..value + 7]
+                        .iter()
+                        .zip(*b"upgrade")
+                        .all(|(left, right)| left.to_ascii_lowercase() == right)
+                    {
+                        saw_connection_upgrade = true;
+                        break;
+                    }
+                    value += 1;
+                }
+            }
+            if saw_upgrade && saw_connection_upgrade {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 #[inline(always)]
@@ -2607,11 +2717,108 @@ fn valid_plaintext_route(route: u8) -> bool {
 }
 
 #[inline(always)]
+fn valid_plaintext_capture_route(route: u8) -> bool {
+    valid_plaintext_route(route) || route == PLAINTEXT_HTTP_ROUTE_CANDIDATE
+}
+
+#[inline(always)]
+fn admitted_tls_session_route(
+    key: &PlaintextTlsSessionKey,
+    actual_len: u64,
+    now_boot_ns: u64,
+) -> Option<u8> {
+    let current = unsafe { PLAINTEXT_TLS_SESSIONS.get(key) }.copied();
+    let Some(current) = current else {
+        return None;
+    };
+    if current.route == TLS_SESSION_ROUTE_BLOCKED
+        && (current.expires_at_boot_ns == 0 || now_boot_ns < current.expires_at_boot_ns)
+    {
+        return None;
+    }
+    if !valid_plaintext_capture_route(current.route)
+        || (current.expires_at_boot_ns != 0 && now_boot_ns >= current.expires_at_boot_ns)
+    {
+        let _ = PLAINTEXT_TLS_SESSIONS.remove(key);
+        return None;
+    }
+    let captured_bytes = current.captured_bytes.saturating_add(actual_len);
+    if captured_bytes > TLS_SESSION_MAX_BYTES {
+        let blocked = PlaintextTlsSessionValue {
+            route: TLS_SESSION_ROUTE_BLOCKED,
+            _pad: [0; 7],
+            expires_at_boot_ns: now_boot_ns.saturating_add(TLS_SESSION_CANDIDATE_TTL_NS),
+            captured_bytes: TLS_SESSION_MAX_BYTES,
+        };
+        let _ = PLAINTEXT_TLS_SESSIONS.insert(key, &blocked, 0);
+        return None;
+    }
+    let ttl = if current.route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+        TLS_SESSION_CANDIDATE_TTL_NS
+    } else {
+        TLS_SESSION_EXACT_TTL_NS
+    };
+    let refreshed = PlaintextTlsSessionValue {
+        route: current.route,
+        _pad: [0; 7],
+        expires_at_boot_ns: now_boot_ns.saturating_add(ttl),
+        captured_bytes,
+    };
+    if PLAINTEXT_TLS_SESSIONS.insert(key, &refreshed, 0).is_err() {
+        bump_tls_profile_diagnostic(11);
+        return None;
+    }
+    Some(current.route)
+}
+
+#[inline(always)]
+fn insert_tls_session(
+    key: &PlaintextTlsSessionKey,
+    route: u8,
+    actual_len: u64,
+    now_boot_ns: u64,
+) -> Option<u8> {
+    if !valid_plaintext_capture_route(route) || actual_len > TLS_SESSION_MAX_BYTES {
+        return None;
+    }
+    if let Some(current) = unsafe { PLAINTEXT_TLS_SESSIONS.get(key) }.copied() {
+        if current.route == TLS_SESSION_ROUTE_BLOCKED
+            && (current.expires_at_boot_ns == 0 || now_boot_ns < current.expires_at_boot_ns)
+        {
+            return None;
+        }
+    }
+    let ttl = if route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+        TLS_SESSION_CANDIDATE_TTL_NS
+    } else {
+        TLS_SESSION_EXACT_TTL_NS
+    };
+    let value = PlaintextTlsSessionValue {
+        route,
+        _pad: [0; 7],
+        expires_at_boot_ns: now_boot_ns.saturating_add(ttl),
+        captured_bytes: actual_len,
+    };
+    if PLAINTEXT_TLS_SESSIONS.insert(key, &value, 0).is_err() {
+        bump_tls_profile_diagnostic(11);
+        return None;
+    }
+    Some(route)
+}
+
+#[inline(always)]
 fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u64) -> Option<u8> {
     // Plain TCP already passed the route gate in HTTP_SOCKS.  TLS contexts require a write-side
     // exact POST/path match before any response bytes are admitted.
     if args.api_kind == TLS_PLAINTEXT_API_TCP {
         return valid_plaintext_route(args.route_kind).then_some(args.route_kind);
+    }
+    if args.api_kind == TLS_PLAINTEXT_API_RUSTLS && args.ssl_ptr == 0 {
+        // A zero Rustls pointer cannot identify a TLS session; sharing one map key across all
+        // sockets would authorize unrelated reads. Keep the raw ring/Kernel facts, but fail
+        // closed for plaintext association until the ABI supplies a stable context pointer.
+        bump_tls_profile_diagnostic(14);
+        return None;
     }
     let key = PlaintextTlsSessionKey {
         cgroup_id,
@@ -2620,25 +2827,70 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
         tls_context_id: args.ssl_ptr,
         exec_id: unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) },
     };
+    let now_boot_ns = unsafe { bpf_ktime_get_ns() };
     if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
         let detected = http_request_route_kind(args.buf, actual_len);
-        if valid_plaintext_route(detected) {
-            let _ = PLAINTEXT_TLS_SESSIONS.insert(&key, &detected, 0);
-            return Some(detected);
-        }
-        if http_method_prefix(args.buf, actual_len) {
-            // A fresh request on a reused TLS pointer must not inherit the previous route.
+        // A TLS allocator may reuse the same pointer for a new HTTP exchange. Clear the prior
+        // admission before considering a non-exact Rustls candidate; otherwise an unrelated
+        // method could inherit the previous LLM route and its response would be copied as
+        // plaintext. Body-only continuations do not carry a method prefix and keep the admission.
+        let fresh_method = http_method_prefix(args.buf, actual_len);
+        if fresh_method.is_none() || fresh_method == Some(true) {
             let _ = PLAINTEXT_TLS_SESSIONS.remove(&key);
+        }
+        if fresh_method.is_none() {
             return None;
         }
+        if valid_plaintext_route(detected) {
+            return insert_tls_session(&key, detected, actual_len, now_boot_ns);
+        }
+        if fresh_method == Some(true) {
+            // A fresh unrecognised HTTP method is not enough to admit an entire TLS context. The
+            // only exception is an explicitly framed WebSocket upgrade, whose data frames may
+            // legitimately omit an HTTP route after the handshake.
+            return if args.api_kind == TLS_PLAINTEXT_API_RUSTLS
+                && http_websocket_upgrade_hint(args.buf, actual_len)
+            {
+                insert_tls_session(
+                    &key,
+                    PLAINTEXT_HTTP_ROUTE_CANDIDATE,
+                    actual_len,
+                    now_boot_ns,
+                )
+            } else {
+                None
+            };
+        }
+        // Rustls' CommonState adapter observes application bytes before encryption/decryption,
+        // not necessarily the HTTP request line.  A WebSocket frame, a compressed continuation,
+        // or a body handed to the writer can therefore arrive without a route prefix.  Once the
+        // process-generation fence has admitted this Rustls target, retain a bounded candidate
+        // session and let the userspace Transport/LLM parser decide whether it is a model/tool
+        // exchange.  This is deliberately limited to the Rustls implementation-family ABI;
+        // OpenSSL/plain-HTTP paths remain exact-route gated below.
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
+            let existing = (fresh_method != Some(true))
+                .then(|| admitted_tls_session_route(&key, actual_len, now_boot_ns))
+                .flatten();
+            let route = existing.unwrap_or(PLAINTEXT_HTTP_ROUTE_CANDIDATE);
+            if route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+                bump_tls_profile_diagnostic(10);
+            }
+            return if existing.is_some() {
+                Some(route)
+            } else {
+                insert_tls_session(&key, route, actual_len, now_boot_ns)
+            };
+        }
         // A later write on an admitted keep-alive context may carry only a body/continuation.
-        return unsafe { PLAINTEXT_TLS_SESSIONS.get(&key) }
-            .copied()
+        return admitted_tls_session_route(&key, actual_len, now_boot_ns)
             .filter(|route| valid_plaintext_route(*route));
     }
-    unsafe { PLAINTEXT_TLS_SESSIONS.get(&key) }
-        .copied()
-        .filter(|route| valid_plaintext_route(*route))
+    admitted_tls_session_route(&key, actual_len, now_boot_ns).filter(|route| {
+        valid_plaintext_route(*route)
+            || (args.api_kind == TLS_PLAINTEXT_API_RUSTLS
+                && *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE)
+    })
 }
 
 fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
@@ -2715,6 +2967,9 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             if route_kind == PLAINTEXT_HTTP_ROUTE_TOOL {
                 flags |= TLS_PLAINTEXT_FLAG_TOOL_ROUTE;
             }
+            if route_kind == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+                flags |= TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE;
+            }
             let ev = entry.as_mut_ptr();
             unsafe {
                 (*ev).header = TlsPlaintextEventHeader {
@@ -2774,12 +3029,20 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
     let mut route_kind = unsafe { HTTP_SOCKS.get(&key) }
         .copied()
         .unwrap_or(HTTP_PREFIX_UNKNOWN);
-    match http_request_route_kind(buf as u64, len) {
+    let detected = http_request_route_kind(buf as u64, len);
+    match detected {
         PLAINTEXT_HTTP_ROUTE_LLM | PLAINTEXT_HTTP_ROUTE_TOOL => {
-            route_kind = http_request_route_kind(buf as u64, len);
+            route_kind = detected;
             let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
         }
         _ => {
+            // A new HTTP method on a keep-alive fd starts a fresh request. Drop the previous route
+            // before returning so /metrics, uploads, or health traffic cannot inherit an LLM
+            // admission. A body-only continuation has no method prefix and may keep the route.
+            if http_method_prefix(buf as u64, len) != Some(false) {
+                let _ = HTTP_SOCKS.remove(&key);
+                return;
+            }
             if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
                 return;
             }

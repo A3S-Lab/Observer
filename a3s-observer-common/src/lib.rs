@@ -869,10 +869,89 @@ pub const TLS_PLAINTEXT_FLAG_TRUNCATED: u16 = 1 << 0;
 pub const TLS_PLAINTEXT_FLAG_COPY_ERROR: u16 = 1 << 1;
 pub const TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND: u16 = 1 << 2;
 pub const TLS_PLAINTEXT_FLAG_TOOL_ROUTE: u16 = 1 << 3;
+/// The implementation-family adapter admitted a verified Rustls payload before an exact HTTP
+/// route was visible (for example a compressed WebSocket frame or a resumed stream).  This is a
+/// capture provenance bit, not an authorization grant: the PID/process-generation fence is still
+/// required and userspace must classify the bytes or retain an explicit coverage gap.
+pub const TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE: u16 = 1 << 4;
 pub const PLAINTEXT_HTTP_ROUTE_LLM: u8 = 1;
 pub const PLAINTEXT_HTTP_ROUTE_TOOL: u8 = 2;
+/// Rustls application bytes may be captured from an identity-verified process before the
+/// userspace transport decoder has observed an exact POST route.  OpenSSL/plain-HTTP lanes keep
+/// their exact route gate; this value is only a closed provenance marker for the Rustls adapter.
+pub const PLAINTEXT_HTTP_ROUTE_CANDIDATE: u8 = 3;
 /// Maximum path bytes admitted by the fixed request-line route gate (excluding the leading `/`).
 pub const PLAINTEXT_HTTP_ROUTE_MAX_LEN: usize = 58;
+
+/// Bounded classification of the prefix of an HTTP request-line method token.
+///
+/// The eBPF route gate still admits only configured `POST` paths.  This separate classifier is
+/// used to tell a fresh request (including an unknown extension method) from a body continuation
+/// before deciding whether a prior TLS-session candidate may be reused.  Keeping the classifier in
+/// the shared no-std crate prevents the kernel and userspace protocol boundaries from drifting.
+pub const HTTP_METHOD_PREFIX_NONE: u8 = 0;
+pub const HTTP_METHOD_PREFIX_COMPLETE: u8 = 1;
+pub const HTTP_METHOD_PREFIX_INCOMPLETE: u8 = 2;
+pub const HTTP_METHOD_PREFIX_MAX_LEN: usize = 32;
+
+#[inline(always)]
+const fn is_http_method_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
+/// Classify a bounded request-line prefix without requiring a registered method name.
+///
+/// `HTTP_METHOD_PREFIX_INCOMPLETE` is deliberately fail-closed for admission: the caller should
+/// not retain a previous route while the token could still become a new request method.  The
+/// function accepts the RFC token grammar (rather than a product/provider method list), so methods
+/// such as `PROPFIND`, `M-SEARCH`, and future extension methods remain discoverable.
+#[inline(always)]
+pub const fn classify_http_method_prefix(data: &[u8]) -> u8 {
+    if data.is_empty() {
+        return HTTP_METHOD_PREFIX_NONE;
+    }
+    let mut index = 0usize;
+    while index < data.len() && index <= HTTP_METHOD_PREFIX_MAX_LEN {
+        let byte = data[index];
+        if byte == b' ' {
+            return if index == 0 {
+                HTTP_METHOD_PREFIX_NONE
+            } else if index <= HTTP_METHOD_PREFIX_MAX_LEN {
+                HTTP_METHOD_PREFIX_COMPLETE
+            } else {
+                HTTP_METHOD_PREFIX_INCOMPLETE
+            };
+        }
+        if !is_http_method_token_byte(byte) {
+            return HTTP_METHOD_PREFIX_NONE;
+        }
+        if index >= HTTP_METHOD_PREFIX_MAX_LEN {
+            return HTTP_METHOD_PREFIX_INCOMPLETE;
+        }
+        index += 1;
+    }
+    HTTP_METHOD_PREFIX_INCOMPLETE
+}
 
 /// FNV-1a hash used by the kernel route map.  The path itself never enters the eBPF map, keeping
 /// the ABI bounded and avoiding plaintext route labels in kernel memory.
@@ -957,26 +1036,28 @@ pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a
 mod tests {
     use super::{
         capture_cpu_sample_quota, capture_profile_default_actions, capture_sample_partitions,
-        file_access_mode, plaintext_http_route_hash, CaptureAggregateKey, CaptureAggregateValue,
-        CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
-        CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
-        CaptureSampleWindow, ConnectEvent, ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord,
-        ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
-        RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
-        CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
-        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_COUNT,
-        CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
-        CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM,
-        CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS, CAPTURE_PROFILE_AGENT_FULL,
-        CAPTURE_PROFILE_BUSINESS_CONTEXT, CAPTURE_PROFILE_INVESTIGATION_FULL,
-        CAPTURE_PROFILE_PROBABLE_INVESTIGATION, CAPTURE_PROFILE_SECURITY_FULL,
-        CAPTURE_PROFILE_UNKNOWN_DISCOVERY, FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY,
-        FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY,
-        FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_CONNECT,
-        PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT,
-        PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ,
-        PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL, PIPELINE_RING_TLS,
-        RAW_OBSERVATION_ABI_V1,
+        classify_http_method_prefix, file_access_mode, plaintext_http_route_hash,
+        CaptureAggregateKey, CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats,
+        CaptureProcessKey, CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue,
+        CapturePromotionValue, CaptureSampleKey, CaptureSampleWindow, ConnectEvent,
+        ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord, ExitEvent, FileEvent,
+        FileFilterConfig, LlmEvent, ProcessGenerationKey, RawObservationHeader, RingPipelineStats,
+        SecEvent, SourceRef, SslEvent, TlsEvent, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+        CAPTURE_ACTION_SAMPLE, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT,
+        CAPTURE_PROBE_COUNT, CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT,
+        CAPTURE_PROBE_FILE_ACCESS, CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ,
+        CAPTURE_PROBE_LLM, CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS,
+        CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_BUSINESS_CONTEXT,
+        CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
+        CAPTURE_PROFILE_SECURITY_FULL, CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+        FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE,
+        FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_CONFIG_ENABLED,
+        FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, HTTP_METHOD_PREFIX_COMPLETE,
+        HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_MAX_LEN, HTTP_METHOD_PREFIX_NONE,
+        PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
+        PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
+        PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
+        PIPELINE_RING_TLS, RAW_OBSERVATION_ABI_V1,
     };
 
     macro_rules! assert_additive_event_time_abi {
@@ -1188,6 +1269,48 @@ mod tests {
         assert_ne!(
             plaintext_http_route_hash(b"/v1/chat/completions"),
             plaintext_http_route_hash(b"/v1/responses")
+        );
+    }
+
+    #[test]
+    fn request_method_prefix_classifier_is_generic_and_bounded() {
+        assert_eq!(
+            classify_http_method_prefix(b"POST /v1/responses"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"PROPFIND /dav"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"M-SEARCH * HTTP/1.1"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"future_method /resource"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"POST"),
+            HTTP_METHOD_PREFIX_INCOMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"PROPFIND"),
+            HTTP_METHOD_PREFIX_INCOMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"{\"model\":\"fixture\"}"),
+            HTTP_METHOD_PREFIX_NONE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"POST\n/v1/responses"),
+            HTTP_METHOD_PREFIX_NONE
+        );
+
+        let long_method = [b'A'; HTTP_METHOD_PREFIX_MAX_LEN + 1];
+        assert_eq!(
+            classify_http_method_prefix(&long_method),
+            HTTP_METHOD_PREFIX_INCOMPLETE
         );
     }
 

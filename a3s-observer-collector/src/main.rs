@@ -18,12 +18,12 @@ mod tls_attach;
 
 use a3s_observer::{
     AgentEvent, AgentPlaintextEvidence, CollectorCaptureProbeStats, CollectorCaptureProfileStats,
-    CollectorFileFilterStats, CollectorIngressAccounting, CollectorPipelineAccounting,
-    CollectorPipelineUnit, CollectorPipelineWindow, CollectorRingAccounting, ConnectionIdentity,
-    CoverageGap, EnrichedEvent, EventCaptureDecision, EventTiming, ExportOutcome, ExportPriority,
-    Exporter, Identity, IdentityResolver, JsonExporter, KubeResolver, LlmInteraction, LogExporter,
-    ProcessContext, ProcessGenerationKey, Provider, RawObservation, ServiceClassifier,
-    SniClassifier, RAW_OBSERVATION_SCHEMA_V1,
+    CollectorFileFilterStats, CollectorIngressAccounting, CollectorInteractionReassemblyStats,
+    CollectorPipelineAccounting, CollectorPipelineUnit, CollectorPipelineWindow,
+    CollectorRingAccounting, ConnectionIdentity, CoverageGap, EnrichedEvent, EventCaptureDecision,
+    EventTiming, ExportOutcome, ExportPriority, Exporter, Identity, IdentityResolver, JsonExporter,
+    KubeResolver, LlmInteraction, LogExporter, ProcessContext, ProcessGenerationKey, Provider,
+    RawObservation, ServiceClassifier, SniClassifier, RAW_OBSERVATION_SCHEMA_V1,
 };
 use a3s_observer_common::{
     file_access_mode, plaintext_http_route_hash, CaptureDecisionContext, CaptureProbeStats,
@@ -44,7 +44,7 @@ use a3s_observer_common::{
     PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
     SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
     TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
-    TLS_PLAINTEXT_FLAG_TRUNCATED,
+    TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -2034,6 +2034,7 @@ async fn main() -> anyhow::Result<()> {
                 capture_profile_stats.as_ref(),
                 capture_aggregate_reader.as_ref(),
             ),
+            None,
             initial_coverage_gaps,
             false,
         ),
@@ -2182,6 +2183,21 @@ async fn main() -> anyhow::Result<()> {
                         },
                         Some(pipeline),
                         capture_heartbeat,
+                        Some(CollectorInteractionReassemblyStats {
+                            temporality: "cumulative".to_string(),
+                            connection_evictions: reassembly_metrics.connection_evictions,
+                            connection_expirations: reassembly_metrics.connection_expirations,
+                            alias_evictions: reassembly_metrics.alias_evictions,
+                            evidence_evictions: reassembly_metrics.evidence_evictions,
+                            fragment_tracker_evictions: reassembly_metrics.fragment_tracker_evictions,
+                            orphan_chunks: reassembly_metrics.orphan_chunks,
+                            sequence_gaps: reassembly_metrics.sequence_gaps,
+                            parser_failures: reassembly_metrics.parser_failures,
+                            body_limit_drops: reassembly_metrics.body_limit_drops,
+                            truncated_chunks: reassembly_metrics.truncated_chunks,
+                            ambiguous_stream_bindings: reassembly_metrics.ambiguous_stream_bindings,
+                            stream_binding_gaps: reassembly_metrics.stream_binding_gaps,
+                        }),
                         coverage_gaps,
                         false,
                     ),
@@ -2236,6 +2252,9 @@ async fn main() -> anyhow::Result<()> {
                     reassembly_sequence_gaps = reassembly_metrics.sequence_gaps,
                     reassembly_parser_failures = reassembly_metrics.parser_failures,
                     reassembly_body_limit_drops = reassembly_metrics.body_limit_drops,
+                    reassembly_ambiguous_stream_bindings =
+                        reassembly_metrics.ambiguous_stream_bindings,
+                    reassembly_stream_binding_gaps = reassembly_metrics.stream_binding_gaps,
                     dropped,
                     output_dropped,
                     output_critical_dropped,
@@ -2533,6 +2552,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut final_coverage_gaps = tls_attach_coverage_gaps(tls_attach_manager.as_ref());
     final_coverage_gaps.extend(pipeline_coverage_gaps(&final_pipeline));
+    let reassembly_metrics = processor.interactions.metrics();
     let final_heartbeat = collector_heartbeat(
         &collector,
         partial_window_interval_secs(stats_window_started.elapsed()),
@@ -2551,6 +2571,21 @@ async fn main() -> anyhow::Result<()> {
             capture_profile_stats.as_ref(),
             capture_aggregate_reader.as_ref(),
         ),
+        Some(CollectorInteractionReassemblyStats {
+            temporality: "cumulative".to_string(),
+            connection_evictions: reassembly_metrics.connection_evictions,
+            connection_expirations: reassembly_metrics.connection_expirations,
+            alias_evictions: reassembly_metrics.alias_evictions,
+            evidence_evictions: reassembly_metrics.evidence_evictions,
+            fragment_tracker_evictions: reassembly_metrics.fragment_tracker_evictions,
+            orphan_chunks: reassembly_metrics.orphan_chunks,
+            sequence_gaps: reassembly_metrics.sequence_gaps,
+            parser_failures: reassembly_metrics.parser_failures,
+            body_limit_drops: reassembly_metrics.body_limit_drops,
+            truncated_chunks: reassembly_metrics.truncated_chunks,
+            ambiguous_stream_bindings: reassembly_metrics.ambiguous_stream_bindings,
+            stream_binding_gaps: reassembly_metrics.stream_binding_gaps,
+        }),
         final_coverage_gaps,
         true,
     );
@@ -2583,7 +2618,6 @@ async fn main() -> anyhow::Result<()> {
             )
         })
         .unwrap_or_default();
-    let reassembly_metrics = processor.interactions.metrics();
     tracing::info!(
         exec = processor.stats.exec,
         exec_truncated = processor.stats.exec_truncated,
@@ -2610,6 +2644,8 @@ async fn main() -> anyhow::Result<()> {
         reassembly_sequence_gaps = reassembly_metrics.sequence_gaps,
         reassembly_parser_failures = reassembly_metrics.parser_failures,
         reassembly_body_limit_drops = reassembly_metrics.body_limit_drops,
+        reassembly_ambiguous_stream_bindings = reassembly_metrics.ambiguous_stream_bindings,
+        reassembly_stream_binding_gaps = reassembly_metrics.stream_binding_gaps,
         dropped,
         output_dropped,
         output_critical_dropped,
@@ -4204,6 +4240,7 @@ impl CollectorProcessor {
                 {
                     partial_reasons.push("probe_call_limit".to_string());
                 }
+                let route_candidate = header.flags & TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE != 0;
                 let (source, adapter_id) = match header.api_kind {
                     TLS_PLAINTEXT_API_TCP => ("tcp_plaintext", "plain-http-syscall"),
                     TLS_PLAINTEXT_API_RUSTLS => ("tls_uprobe_rustls", "rustls-payload"),
@@ -4252,6 +4289,7 @@ impl CollectorProcessor {
                     event_at_unix_ns: envelope.event_at_unix_ns,
                     source: source.to_string(),
                     adapter_id: adapter_id.to_string(),
+                    route_candidate,
                     partial_reasons,
                 });
                 for interaction in completed {
@@ -4319,6 +4357,10 @@ impl CollectorProcessor {
                         },
                     },
                 );
+                // ProcessExit is the authoritative generation boundary for derived protocol
+                // state. Purge TLS pointer/connection aliases immediately so a PID/SSL allocator
+                // reuse cannot inherit the previous Agent's pending request or response.
+                self.interactions.expire_process(ev.pid, ev.cgroup_id);
                 forget_process_context(ev.pid);
             }
             PipelineOrigin::Bulk(_) => {
@@ -5008,6 +5050,7 @@ fn collector_heartbeat(
     file_filter: FileFilterHeartbeatSnapshot,
     pipeline_accounting: Option<CollectorPipelineAccounting>,
     capture_profile: Option<CollectorCaptureProfileStats>,
+    interaction_reassembly: Option<CollectorInteractionReassemblyStats>,
     coverage_gaps: Vec<CoverageGap>,
     shutdown_final: bool,
 ) -> EnrichedEvent {
@@ -5067,6 +5110,7 @@ fn collector_heartbeat(
             exec_reassembly_timeout: stats.exec_reassembly_timeout,
             dropped,
             output_dropped,
+            interaction_reassembly: interaction_reassembly.map(Box::new),
             pipeline_accounting: pipeline_accounting.map(Box::new),
             capture_profile: capture_profile.map(Box::new),
         },
@@ -5861,6 +5905,7 @@ mod tests {
                 epoch: 42,
                 unknown_policy: UnknownFilePolicy::Sample,
             },
+            None,
             None,
             None,
             Vec::new(),
