@@ -3054,13 +3054,10 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
             let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
         }
         _ => {
-            // A new HTTP method on a keep-alive fd starts a fresh request. Drop the previous route
-            // before returning so /metrics, uploads, or health traffic cannot inherit an LLM
-            // admission. A body-only continuation has no method prefix and may keep the route.
-            if http_method_prefix(buf as u64, len) != Some(false) {
-                let _ = HTTP_SOCKS.remove(&key);
-                return;
-            }
+            // The TLS ClientHello tracepoint also calls this helper before the userspace
+            // reassembler sees HTTP request lines. Keep this hot path limited to the exact route
+            // hash gate; generic extension-method classification runs in the uprobe/userspace
+            // paths, where it cannot make the ClientHello program exceed verifier complexity.
             if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
                 return;
             }
