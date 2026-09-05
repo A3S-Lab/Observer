@@ -895,7 +895,7 @@ pub const HTTP_METHOD_PREFIX_INCOMPLETE: u8 = 2;
 pub const HTTP_METHOD_PREFIX_MAX_LEN: usize = 32;
 
 #[inline(always)]
-const fn is_http_method_token_byte(byte: u8) -> bool {
+fn is_http_method_token_byte(byte: u8) -> bool {
     matches!(
         byte,
         b'A'..=b'Z'
@@ -926,13 +926,24 @@ const fn is_http_method_token_byte(byte: u8) -> bool {
 /// function accepts the RFC token grammar (rather than a product/provider method list), so methods
 /// such as `PROPFIND`, `M-SEARCH`, and future extension methods remain discoverable.
 #[inline(always)]
-pub const fn classify_http_method_prefix(data: &[u8]) -> u8 {
+pub fn classify_http_method_prefix(data: &[u8]) -> u8 {
+    classify_http_method_prefix_len(data, data.len())
+}
+
+/// Array-friendly variant for eBPF callers. `len` is clamped without constructing a
+/// potentially out-of-bounds subslice; this keeps the BPF object free of the cold
+/// `core::slice::index::slice_index_fail` section that some loaders cannot relocate.
+#[inline(always)]
+pub fn classify_http_method_prefix_len(data: &[u8], len: usize) -> u8 {
     if data.is_empty() {
         return HTTP_METHOD_PREFIX_NONE;
     }
+    let len = if len > data.len() { data.len() } else { len };
     let mut index = 0usize;
-    while index < data.len() && index <= HTTP_METHOD_PREFIX_MAX_LEN {
-        let byte = data[index];
+    while index < len && index <= HTTP_METHOD_PREFIX_MAX_LEN {
+        // `index < len` and `len <= data.len()` are established above; avoid generating a
+        // cold slice bounds panic section in the eBPF object, which older loaders cannot link.
+        let byte = unsafe { *data.get_unchecked(index) };
         if byte == b' ' {
             return if index == 0 {
                 HTTP_METHOD_PREFIX_NONE

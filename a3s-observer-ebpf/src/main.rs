@@ -3,13 +3,13 @@
 
 use a3s_observer_common::{
     capture_cpu_sample_quota, capture_probe_is_protected, capture_profile_default_actions,
-    capture_sample_partitions, classify_http_method_prefix, file_access_mode, CaptureAggregateKey,
-    CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey,
-    CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue, CapturePromotionValue,
-    CaptureSampleKey, CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent,
-    FileEvent, FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats,
-    FileFilterValue, FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent,
-    TlsPlaintextEventHeader, TlsPlaintextEventLarge, TlsPlaintextEventMedium,
+    capture_sample_partitions, classify_http_method_prefix_len, file_access_mode,
+    CaptureAggregateKey, CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats,
+    CaptureProcessKey, CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue,
+    CapturePromotionValue, CaptureSampleKey, CaptureSampleWindow, ConnectEvent, DnsEvent,
+    ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey, FileFilterSampleWindow,
+    FileFilterStats, FileFilterValue, FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent,
+    TlsEvent, TlsPlaintextEventHeader, TlsPlaintextEventLarge, TlsPlaintextEventMedium,
     TlsPlaintextEventSmall, ARGV_SLOTS, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
     CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
     CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
@@ -2596,7 +2596,7 @@ fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
         // must revoke any prior route admission rather than silently inheriting it.
         return None;
     }
-    match classify_http_method_prefix(&data[..captured]) {
+    match classify_http_method_prefix_len(&data, captured) {
         HTTP_METHOD_PREFIX_COMPLETE => Some(true),
         // A bounded token with no separator may be a split/unknown request line. Do not retain a
         // prior TLS route until the remaining bytes prove this is a body continuation.
@@ -2633,49 +2633,44 @@ fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
     let mut saw_connection_upgrade = false;
     let mut index = 0usize;
     while index + 2 <= captured {
-        if data[index] == b'\r' && data[index + 1] == b'\n' {
+        if unsafe { *data.get_unchecked(index) } == b'\r'
+            && unsafe { *data.get_unchecked(index + 1) } == b'\n'
+        {
             let line_start = index + 2;
             let mut line_end = line_start;
-            while line_end < captured && data[line_end] != b'\r' && data[line_end] != b'\n' {
+            while line_end < captured
+                && unsafe { *data.get_unchecked(line_end) } != b'\r'
+                && unsafe { *data.get_unchecked(line_end) } != b'\n'
+            {
                 line_end += 1;
             }
-            if line_start + 8 <= line_end
-                && data[line_start..line_start + 8]
-                    .iter()
-                    .zip(*b"upgrade:")
-                    .all(|(left, right)| left.to_ascii_lowercase() == right)
-            {
+            if line_start + 8 <= line_end && bytes_window_matches(&data, line_start, b"upgrade:") {
                 let mut value = line_start + 8;
-                while value < line_end && (data[value] == b' ' || data[value] == b'\t') {
+                while value < line_end
+                    && (unsafe { *data.get_unchecked(value) } == b' '
+                        || unsafe { *data.get_unchecked(value) } == b'\t')
+                {
                     value += 1;
                 }
                 while value + 9 <= line_end {
-                    if data[value..value + 9]
-                        .iter()
-                        .zip(*b"websocket")
-                        .all(|(left, right)| left.to_ascii_lowercase() == right)
-                    {
+                    if bytes_window_matches(&data, value, b"websocket") {
                         saw_upgrade = true;
                         break;
                     }
                     value += 1;
                 }
             } else if line_start + 11 <= line_end
-                && data[line_start..line_start + 11]
-                    .iter()
-                    .zip(*b"connection:")
-                    .all(|(left, right)| left.to_ascii_lowercase() == right)
+                && bytes_window_matches(&data, line_start, b"connection:")
             {
                 let mut value = line_start + 11;
-                while value < line_end && (data[value] == b' ' || data[value] == b'\t') {
+                while value < line_end
+                    && (unsafe { *data.get_unchecked(value) } == b' '
+                        || unsafe { *data.get_unchecked(value) } == b'\t')
+                {
                     value += 1;
                 }
                 while value + 7 <= line_end {
-                    if data[value..value + 7]
-                        .iter()
-                        .zip(*b"upgrade")
-                        .all(|(left, right)| left.to_ascii_lowercase() == right)
-                    {
+                    if bytes_window_matches(&data, value, b"upgrade") {
                         saw_connection_upgrade = true;
                         break;
                     }
@@ -2689,6 +2684,29 @@ fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
         index += 1;
     }
     false
+}
+
+#[inline(always)]
+fn bytes_window_matches<const N: usize>(
+    data: &[u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    offset: usize,
+    expected: &[u8; N],
+) -> bool {
+    if offset.saturating_add(N) > HTTP_REQUEST_LINE_SNAPSHOT {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < N {
+        // The explicit bound above makes these accesses safe and avoids a cold bounds-panic
+        // section in the linked BPF object.
+        let left = unsafe { *data.get_unchecked(offset + index) };
+        let right = unsafe { *expected.get_unchecked(index) };
+        if left.to_ascii_lowercase() != right {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 #[inline(always)]
