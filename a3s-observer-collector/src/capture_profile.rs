@@ -244,6 +244,7 @@ pub(crate) struct CaptureMapManager {
     first_samples: u16,
     sample_cpu_count: u16,
     destructive_enabled: bool,
+    bounded_unknown_lifecycle: bool,
     expires_at_boot_ns: u64,
 }
 
@@ -260,6 +261,7 @@ impl CaptureMapManager {
         sample_node_limit: u32,
         first_samples: u16,
         sample_cpu_count: u16,
+        bounded_unknown_lifecycle: bool,
     ) -> anyhow::Result<Self> {
         let mut manager = Self {
             rules,
@@ -276,6 +278,7 @@ impl CaptureMapManager {
             first_samples,
             sample_cpu_count,
             destructive_enabled: false,
+            bounded_unknown_lifecycle,
             expires_at_boot_ns: 0,
         };
         // S5 starts in discovery-safe mode before reading disk. This closes the startup race where
@@ -291,7 +294,8 @@ impl CaptureMapManager {
         destructive: bool,
     ) -> anyhow::Result<()> {
         use a3s_observer_common::{
-            CaptureProfileConfig, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_CONFIG_ENABLED,
+            CaptureProfileConfig, CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE,
+            CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_CONFIG_ENABLED,
         };
         let config = CaptureProfileConfig {
             active_epoch: epoch,
@@ -305,6 +309,11 @@ impl CaptureMapManager {
             flags: CAPTURE_CONFIG_ENABLED
                 | if destructive {
                     CAPTURE_CONFIG_DESTRUCTIVE_GRANTED
+                } else {
+                    0
+                }
+                | if self.bounded_unknown_lifecycle {
+                    CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE
                 } else {
                     0
                 },

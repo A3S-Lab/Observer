@@ -10,4 +10,9 @@
 ARG OBSERVER_RUNTIME_BASE=invalid.invalid/anysentry-observer-runtime:must-be-overridden
 FROM ${OBSERVER_RUNTIME_BASE}
 
-COPY a3s-observer-collector /usr/local/bin/a3s-observer-collector
+# BuildKit may materialize the base runtime's entrypoint as a non-directory cache mount. Copy the
+# replacement to a neutral path first, then atomically replace the runtime artifact.
+COPY a3s-observer-collector /tmp/a3s-observer-collector.new
+RUN rm -f /usr/local/bin/a3s-observer-collector \
+    && install -m 0755 /tmp/a3s-observer-collector.new /usr/local/bin/a3s-observer-collector \
+    && rm -f /tmp/a3s-observer-collector.new

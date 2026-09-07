@@ -37,14 +37,15 @@ use a3s_observer_common::{
     FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE, FILE_ACCESS_MODE_SPECIAL,
     FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
     FILE_FILTER_ACTION_SAMPLE, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
-    FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE,
-    PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
-    PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
-    PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-    PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
-    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
-    TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
+    FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED,
+    FILE_FILTER_CONFIG_FILE_READ_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_DROP,
+    FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
+    PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
+    PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
+    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS,
+    TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP,
+    TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -263,6 +264,7 @@ fn plaintext_process_key(pid: i32) -> Option<PlaintextProcessKeyBytes> {
 struct FileFeatureFlags {
     access: bool,
     delete: bool,
+    read: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -270,6 +272,7 @@ enum UnknownFilePolicy {
     #[default]
     Keep,
     Sample,
+    Drop,
 }
 
 impl UnknownFilePolicy {
@@ -277,6 +280,7 @@ impl UnknownFilePolicy {
         match self {
             Self::Keep => "keep",
             Self::Sample => "sample",
+            Self::Drop => "drop",
         }
     }
 
@@ -289,8 +293,22 @@ fn parse_unknown_file_policy(value: Option<&str>) -> Result<UnknownFilePolicy, S
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         None | Some("keep") => Ok(UnknownFilePolicy::Keep),
         Some("sample") => Ok(UnknownFilePolicy::Sample),
-        Some(_) => Err("A3S_OBSERVER_FILE_UNKNOWN_POLICY must be `keep` or `sample`".to_string()),
+        Some("drop") => Ok(UnknownFilePolicy::Drop),
+        Some(_) => {
+            Err("A3S_OBSERVER_FILE_UNKNOWN_POLICY must be `keep`, `sample`, or `drop`".to_string())
+        }
     }
+}
+
+fn bounded_unknown_lifecycle_from_env() -> bool {
+    // Prefer the Observer-local name; accept the AnySentry-prefixed alias for deploy overlays.
+    if std::env::var("A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE").is_ok() {
+        return env_enabled_default_on("A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE");
+    }
+    if std::env::var("ANYSENTRY_BOUNDED_UNKNOWN_LIFECYCLE").is_ok() {
+        return env_enabled_default_on("ANYSENTRY_BOUNDED_UNKNOWN_LIFECYCLE");
+    }
+    true
 }
 
 fn unknown_file_policy_from_env() -> UnknownFilePolicy {
@@ -298,7 +316,6 @@ fn unknown_file_policy_from_env() -> UnknownFilePolicy {
     match parse_unknown_file_policy(value.as_deref()) {
         Ok(policy) => policy,
         Err(error) => {
-            // Invalid configuration must never silently enable a lossy policy.
             tracing::warn!(error = %error, "invalid Unknown FileAccess policy; defaulting to keep");
             UnknownFilePolicy::Keep
         }
@@ -317,10 +334,14 @@ fn file_feature_flags_from(
     writes_alias: Option<bool>,
     delete: Option<bool>,
     deletes_alias: Option<bool>,
+    read: Option<bool>,
 ) -> FileFeatureFlags {
     FileFeatureFlags {
         access: access.or(writes_alias).unwrap_or(legacy),
         delete: delete.or(deletes_alias).unwrap_or(legacy),
+        // FileRead is intentionally explicit-only: enabling the legacy combined file switch or
+        // FileAccess must not turn on the high-volume read probe.
+        read: read.unwrap_or(false),
     }
 }
 
@@ -331,6 +352,7 @@ fn file_feature_flags() -> FileFeatureFlags {
         optional_env_enabled("A3S_OBSERVER_FILE_WRITES"),
         optional_env_enabled("A3S_OBSERVER_FILE_DELETE"),
         optional_env_enabled("A3S_OBSERVER_FILE_DELETES"),
+        optional_env_enabled("A3S_OBSERVER_FILE_READ"),
     )
 }
 
@@ -647,6 +669,12 @@ impl FileFilterMapManager {
         if self.unknown_policy.sampling_enabled() {
             flags |= FILE_FILTER_CONFIG_UNKNOWN_SAMPLE;
         }
+        if matches!(self.unknown_policy, UnknownFilePolicy::Drop) {
+            flags |= FILE_FILTER_CONFIG_UNKNOWN_DROP;
+        }
+        if file_feature_flags().read {
+            flags |= FILE_FILTER_CONFIG_FILE_READ_ENABLED;
+        }
         let config = FileFilterConfig {
             active_epoch: epoch,
             sample_window_ns: self.sample_window_ns,
@@ -691,6 +719,44 @@ impl FileFilterMapManager {
             let _ = self.rules.remove(&old_key);
         }
         Ok(self.installed_keys.len())
+    }
+
+    fn apply_capture_profile(
+        &mut self,
+        snapshot: &capture_profile::ParsedCaptureSnapshot,
+    ) -> anyhow::Result<usize> {
+        let mut rules = Vec::new();
+        for (key, value) in &snapshot.rules {
+            let agent = value.profile == CAPTURE_PROFILE_AGENT_FULL
+                || value.profile == CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+                || value.flags & a3s_observer_common::CAPTURE_PROFILE_FLAG_AGENT != 0;
+            if !agent {
+                continue;
+            }
+            let authority = if value.profile == CAPTURE_PROFILE_PROBABLE_INVESTIGATION {
+                FILE_FILTER_AUTHORITY_CANDIDATE
+            } else {
+                FILE_FILTER_AUTHORITY_AUTHORITATIVE
+            };
+            rules.push((
+                FileFilterKey {
+                    cgroup_id: key.cgroup_id,
+                    epoch: key.epoch,
+                },
+                FileFilterValue {
+                    action: FILE_FILTER_ACTION_KEEP,
+                    authority,
+                    flags: 0,
+                    _reserved: 0,
+                    epoch: key.epoch,
+                    expires_at_boot_ns: value.expires_at_boot_ns,
+                },
+            ));
+        }
+        self.apply(ParsedFileFilterSnapshot {
+            epoch: snapshot.epoch,
+            rules,
+        })
     }
 }
 
@@ -791,6 +857,7 @@ fn reload_capture_profile(
     preview_receipt: &mut Option<PreviewReceipt>,
     pending_ack: &mut Option<capture_profile::ParsedCaptureSnapshot>,
     aggregate_reader: Option<&mut CaptureAggregateReader>,
+    file_filter: &mut FileFilterMapManager,
 ) -> anyhow::Result<Option<usize>> {
     if let Some(snapshot) = pending_ack.as_ref() {
         finish_capture_profile_ack(manager, snapshot, generation, ack_path, preview_receipt)?;
@@ -832,6 +899,9 @@ fn reload_capture_profile(
         write_ack_atomic(ack_path, &rejected).context("write kernel rejection ACK")?;
         return Err(error);
     }
+    file_filter
+        .apply_capture_profile(&parsed)
+        .context("apply capture profile file filter")?;
     if let Err(error) =
         finish_capture_profile_ack(manager, &parsed, generation, ack_path, preview_receipt)
     {
@@ -1529,9 +1599,12 @@ async fn main() -> anyhow::Result<()> {
                  A3S_OBSERVER_FILES=1   capture FileAccess + FileDelete (legacy combined switch)\n  \
                  A3S_OBSERVER_FILE_ACCESS=1  override FileAccess capture independently\n  \
                  A3S_OBSERVER_FILE_DELETE=1  override FileDelete capture independently\n  \
+                 A3S_OBSERVER_FILE_READ=1    explicitly enable high-volume FileRead capture\n  \
                  ANYSENTRY_FILTER_RULES_FILE=/path/rules.json  hot-reload cgroup file filtering\n  \
-                 A3S_OBSERVER_FILE_UNKNOWN_POLICY=keep|sample  unresolved FileAccess policy \
-                 (default: keep; sample is compatibility-only)\n  \
+                 A3S_OBSERVER_FILE_UNKNOWN_POLICY=keep|sample|drop  unresolved FileAccess policy \
+                 (default: keep; drop is Ring-before strict unknown)\n  \
+                 A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE=1|0  Agent/Candidate FULL + bounded \
+                 unknown Exec/Exit/LLM discovery (default: on)\n  \
                  A3S_OBSERVER_SSL=1     also capture OpenSSL plaintext — prompts/responses \
                  (uprobe, OpenSSL-only, off by default; or set a libssl path)",
                 env!("CARGO_PKG_VERSION")
@@ -1584,7 +1657,10 @@ async fn main() -> anyhow::Result<()> {
     let mut file_filter = FileFilterMapManager::new(
         filter_rules,
         filter_config,
-        filter_rules_path.is_some() && capture_profile_mode == CaptureProfileMode::Legacy,
+        // The file-only prefilter is also the strict unknown gate for S5 profiles.  It must be
+        // enabled whenever a rule snapshot path is supplied; the active epoch is still switched
+        // atomically by the selected legacy or capture-profile loader.
+        filter_rules_path.is_some(),
         unknown_file_policy,
     )?;
     let mut filter_reloader = (capture_profile_mode == CaptureProfileMode::Legacy)
@@ -1648,6 +1724,7 @@ async fn main() -> anyhow::Result<()> {
             bounded_env_u64("ANYSENTRY_CAPTURE_SAMPLE_PER_NODE", 1_000, 1, 10_000_000) as u32,
             bounded_env_u64("ANYSENTRY_CAPTURE_FIRST_SAMPLES", 2, 1, 100) as u16,
             cpu_count,
+            bounded_unknown_lifecycle_from_env(),
         )?)
     };
     let mut capture_reloader = (capture_profile_mode != CaptureProfileMode::Legacy)
@@ -1921,6 +1998,7 @@ async fn main() -> anyhow::Result<()> {
             &mut preview_receipt,
             &mut pending_capture_ack,
             capture_aggregate_reader.as_mut(),
+            &mut file_filter,
         ) {
             Ok(Some(entries)) => tracing::info!(
                 epoch = manager.active_epoch,
@@ -2313,6 +2391,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut preview_receipt,
                         &mut pending_capture_ack,
                         capture_aggregate_reader.as_mut(),
+                        &mut file_filter,
                     )) {
                         Ok(Some(entries)) => {
                             reloader.last_error.clear();
@@ -4947,6 +5026,15 @@ fn env_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Optional feature switch that defaults to on when the variable is unset. Explicit
+/// `0|false|off|no|disabled` turns it off; any other non-empty value keeps it on.
+fn env_enabled_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().is_empty() || !env_value_disabled(&value))
+        .unwrap_or(true)
+}
+
 fn tls_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_enabled("A3S_OBSERVER_TLS_DIAGNOSTICS"))
@@ -5705,26 +5793,31 @@ mod tests {
     #[test]
     fn file_feature_flags_keep_legacy_behavior_and_allow_independent_overrides() {
         assert_eq!(
-            file_feature_flags_from(true, None, None, None, None),
+            file_feature_flags_from(true, None, None, None, None, None),
             FileFeatureFlags {
                 access: true,
-                delete: true
+                delete: true,
+                read: false,
             }
         );
         assert_eq!(
-            file_feature_flags_from(true, Some(false), None, Some(true), None),
+            file_feature_flags_from(true, Some(false), None, Some(true), None, None),
             FileFeatureFlags {
                 access: false,
-                delete: true
+                delete: true,
+                read: false,
             }
         );
         assert_eq!(
-            file_feature_flags_from(false, None, Some(true), None, Some(false)),
+            file_feature_flags_from(false, None, Some(true), None, Some(false), None),
             FileFeatureFlags {
                 access: true,
-                delete: false
+                delete: false,
+                read: false,
             }
         );
+        assert!(file_feature_flags_from(false, Some(true), None, None, None, Some(true)).read);
+        assert!(!file_feature_flags_from(true, Some(true), None, None, None, None).read);
     }
 
     #[test]
@@ -5758,7 +5851,10 @@ mod tests {
             UnknownFilePolicy::Sample
         );
         assert!(parse_unknown_file_policy(Some("true")).is_err());
-        assert!(parse_unknown_file_policy(Some("drop")).is_err());
+        assert_eq!(
+            parse_unknown_file_policy(Some("drop")).unwrap(),
+            UnknownFilePolicy::Drop
+        );
     }
 
     #[test]
