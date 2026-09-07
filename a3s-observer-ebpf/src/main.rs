@@ -2,18 +2,20 @@
 #![no_main]
 
 use a3s_observer_common::{
-    capture_cpu_sample_quota, capture_probe_is_protected, capture_profile_default_actions,
-    capture_sample_partitions, classify_http_method_prefix_len, file_access_mode,
-    CaptureAggregateKey, CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats,
-    CaptureProcessKey, CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue,
-    CapturePromotionValue, CaptureSampleKey, CaptureSampleWindow, ConnectEvent, DnsEvent,
-    ExecRecord, ExitEvent, FileEvent, FileFilterConfig, FileFilterKey, FileFilterSampleWindow,
-    FileFilterStats, FileFilterValue, FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent,
-    TlsEvent, TlsPlaintextEventHeader, TlsPlaintextEventLarge, TlsPlaintextEventMedium,
-    TlsPlaintextEventSmall, ARGV_SLOTS, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
-    CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
-    CAPTURE_CONFIG_DESTRUCTIVE_GRANTED, CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
-    CAPTURE_DECISION_FLAG_LEGACY, CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
+    capture_cpu_sample_quota, capture_probe_is_protected, capture_probe_is_security,
+    capture_profile_default_actions, capture_profile_is_agent_family,
+    capture_profile_is_infrastructure_family, capture_sample_partitions,
+    classify_http_method_prefix_len, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
+    CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+    CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+    CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
+    FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
+    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
+    TlsPlaintextEventLarge, TlsPlaintextEventMedium, TlsPlaintextEventSmall, ARGV_SLOTS,
+    CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+    CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
+    CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
+    CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
     CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DECISION_FLAG_SHADOW,
     CAPTURE_DECISION_FLAG_VERIFIED_AGENT, CAPTURE_DISPOSITION_MISS, CAPTURE_DISPOSITION_RULE,
     CAPTURE_DISPOSITION_STALE, CAPTURE_MODE_SHADOW, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
@@ -60,19 +62,21 @@ use aya_ebpf::{
 // one header, a few argument chunks and one end record; long argv values can use up to
 // EXEC_MAX_CHUNKS records without inflating every short exec event.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+// Exec carries the highest sustained burst on a shared development node. Keep enough kernel
+// ring headroom for short scheduler/HTTP stalls so a file canary cannot evict lifecycle records.
+static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
 #[map]
-static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
-static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
 #[map]
-static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 #[map]
-static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 #[map]
 // Confirmed Agent workloads bypass Unknown sampling and can legitimately open thousands of files
@@ -156,12 +160,12 @@ static CAPTURE_PROMOTED_PROCESSES: LruHashMap<CaptureProcessKey, CapturePromotio
     LruHashMap::with_max_entries(131_072, 0);
 
 #[map]
-static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 // Security-sensitive actions (privesc / injection / open-port). In-kernel-filtered to the loud
 // cases, so this stays near-empty — a small ring is plenty.
 #[map]
-static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 // Count of events dropped because a ring was full — data-loss visibility under extreme load.
 #[map]
@@ -491,6 +495,14 @@ fn capture_profile_enabled() -> bool {
         .get(0)
         .copied()
         .is_some_and(|config| config.enabled())
+}
+
+#[inline(always)]
+fn file_read_capture_enabled() -> bool {
+    FILE_FILTER_CONFIG
+        .get(0)
+        .copied()
+        .is_some_and(|config| config.file_read_enabled())
 }
 
 #[inline(always)]
@@ -899,6 +911,30 @@ fn legacy_selected_capture_decision() -> CaptureDecisionContext {
     )
 }
 
+#[inline(always)]
+fn capture_scope_exec_discovery_active(
+    cgroup_id: u64,
+    epoch: u64,
+    now: u64,
+    window_ns: u64,
+) -> bool {
+    let key = CaptureSampleKey {
+        cgroup_id,
+        epoch,
+        probe: CAPTURE_PROBE_EXEC,
+        _reserved: [0; 7],
+    };
+    let Some(state) = CAPTURE_SAMPLE_WINDOWS.get_ptr_mut(&key) else {
+        return false;
+    };
+    unsafe {
+        if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+            return false;
+        }
+        (*state).count > 0
+    }
+}
+
 /// Returns the exact decision made before raw payload construction and Ring reservation.
 /// AGGREGATE/DROP/sample rejection return an unselected context and terminate at the caller.
 #[inline(always)]
@@ -918,13 +954,17 @@ fn capture_raw_decision(
     }
     increment_capture_stat(probe, CAPTURE_STAT_ATTEMPTED);
     let now = unsafe { bpf_ktime_get_ns() };
-    let protected = capture_probe_is_protected(probe);
+    let protected_kind = capture_probe_is_protected(probe);
+    let bounded = config.bounded_unknown_lifecycle_enabled();
     // The Collector's verified-process map is a generation-fenced positive Agent identity. It
     // intentionally outlives short cgroup/profile leases, which may be refreshed asynchronously
     // while a CLI is idle. Plaintext TLS is the interaction payload we promised to observe, so a
     // verified Agent must not fall back to the Unknown/probable sample matrix for this probe.
     let verified_agent = verified_agent_process(pid, cgroup_id);
-    let promoted = !protected && capture_promotion_valid(pid, cgroup_id, &config, now);
+    // Promotions must be visible to Exec/Exit even though those probes are "protected kinds".
+    // The legacy `!protected && promotion` gate permanently hid Agent root promotions from the
+    // lifecycle path and is what forced unknown Exec/Exit through the unconditional FULL bypass.
+    let promotion_valid = capture_promotion_valid(pid, cgroup_id, &config, now);
 
     let key = CaptureProfileKey {
         cgroup_id,
@@ -936,8 +976,9 @@ fn capture_raw_decision(
     let mut desired = action;
     let mut authority = 0;
     let mut disposition = CAPTURE_DISPOSITION_MISS;
+    let mut rule_agent_flag = false;
     if config.expires_at_boot_ns != 0 && now >= config.expires_at_boot_ns {
-        if !protected && !promoted {
+        if !protected_kind && !promotion_valid {
             increment_capture_stat(probe, CAPTURE_STAT_STALE);
         }
         disposition = CAPTURE_DISPOSITION_STALE;
@@ -945,12 +986,12 @@ fn capture_raw_decision(
         if value.epoch != config.active_epoch
             || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
         {
-            if !protected && !promoted {
+            if !protected_kind && !promotion_valid {
                 increment_capture_stat(probe, CAPTURE_STAT_STALE);
             }
             disposition = CAPTURE_DISPOSITION_STALE;
         } else {
-            if !protected && !promoted {
+            if !protected_kind && !promotion_valid {
                 increment_capture_stat(probe, CAPTURE_STAT_RULE_HIT);
             }
             profile = value.profile;
@@ -958,15 +999,20 @@ fn capture_raw_decision(
             disposition = CAPTURE_DISPOSITION_RULE;
             action = value.actions[probe as usize];
             desired = value.desired_actions[probe as usize];
-            if value.flags & (CAPTURE_PROFILE_FLAG_AGENT | CAPTURE_PROFILE_FLAG_CONFLICT) != 0
-                && (probe != CAPTURE_PROBE_FILE_READ || action == CAPTURE_ACTION_FULL)
+            rule_agent_flag =
+                value.flags & (CAPTURE_PROFILE_FLAG_AGENT | CAPTURE_PROFILE_FLAG_CONFLICT) != 0;
+            if rule_agent_flag
+                && !matches!(
+                    probe,
+                    CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_DELETE | CAPTURE_PROBE_FILE_READ
+                )
             {
                 action = CAPTURE_ACTION_FULL;
                 desired = CAPTURE_ACTION_FULL;
             }
         }
     } else {
-        if !protected && !promoted {
+        if !protected_kind && !promotion_valid {
             increment_capture_stat(probe, CAPTURE_STAT_RULE_MISS);
         }
         // TLS profiles are attached only to an identity-verified Agent PID, and plaintext reaches
@@ -983,22 +1029,175 @@ fn capture_raw_decision(
         }
     }
 
-    if protected {
-        increment_capture_stat(probe, CAPTURE_STAT_FULL);
-        let protected_profile = if probe == CAPTURE_PROBE_SECURITY {
-            CAPTURE_PROFILE_SECURITY_FULL
-        } else {
-            profile
+    let agent_admitted = verified_agent
+        || promotion_valid
+        || (disposition == CAPTURE_DISPOSITION_RULE
+            && (rule_agent_flag || capture_profile_is_agent_family(profile)));
+    let promoted = promotion_valid;
+
+    // Strict unknown policy is deliberately scoped to file operations only.  It is evaluated
+    // before any file path copy or Ring reservation, while all other probes retain their normal
+    // discovery/fail-open matrix.  A generation-fenced verified/promoted Agent remains eligible
+    // during a short cgroup-rule refresh race.
+    let file_probe = matches!(
+        probe,
+        CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ | CAPTURE_PROBE_FILE_DELETE
+    );
+    let file_filter_config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    let file_rule_present = if file_filter_config.enabled() {
+        let key = FileFilterKey {
+            cgroup_id,
+            epoch: file_filter_config.active_epoch,
         };
+        unsafe {
+            FILE_FILTER_RULES.get(&key).is_some_and(|value| {
+                value.epoch == file_filter_config.active_epoch
+                    && (value.expires_at_boot_ns == 0 || now < value.expires_at_boot_ns)
+            })
+        }
+    } else {
+        false
+    };
+    if file_probe
+        && file_filter_config.enabled()
+        && file_filter_config.unknown_drop_enabled()
+        && !file_rule_present
+        && !verified_agent
+        && !promoted
+    {
+        increment_capture_stat(probe, CAPTURE_STAT_DROP);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            0,
+        );
+    }
+
+    // Admitted Agent identities normally bypass lossy sampling. File reads/accesses are
+    // deliberately different: even an explicitly identified Agent can generate an unbounded
+    // stream of open/read syscalls. Apply the same bounded per-cgroup/per-node budget before the
+    // caller copies a path or reserves Ring space, while keeping the event selected when budget
+    // remains. This closes the high-volume bypass observed during file canaries.
+    if file_probe && agent_admitted {
+        let sample_key = CaptureSampleKey {
+            cgroup_id,
+            epoch: config.active_epoch,
+            probe,
+            _reserved: [0; 7],
+        };
+        if capture_sample_allowed(&sample_key, &config, now) != 1 {
+            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+            return capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_SAMPLE,
+                authority,
+                disposition,
+                0,
+            );
+        }
+        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
         return selected_capture_decision(
             config.active_epoch,
-            protected_profile,
+            profile,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            if promoted {
+                CAPTURE_DECISION_FLAG_PROMOTED
+            } else if verified_agent {
+                CAPTURE_DECISION_FLAG_VERIFIED_AGENT
+            } else {
+                0
+            },
+        );
+    }
+
+    // Security evidence stays FULL for every workload.
+    if capture_probe_is_security(probe) {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_SECURITY_FULL,
             CAPTURE_ACTION_FULL,
             authority,
             disposition,
             CAPTURE_DECISION_FLAG_PROTECTED,
         );
     }
+
+    // Legacy mode: Exec/Exit remain unconditionally FULL (historical protected invariant).
+    // Bounded mode: only admitted Agent/Candidate Exec/Exit take the protected FULL path.
+    if matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_EXIT) && (agent_admitted || !bounded) {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        if promoted {
+            increment_capture_stat(probe, CAPTURE_STAT_PROMOTION_HIT);
+        }
+        return selected_capture_decision(
+            config.active_epoch,
+            if agent_admitted && capture_profile_is_agent_family(profile) {
+                profile
+            } else if agent_admitted {
+                CAPTURE_PROFILE_AGENT_FULL
+            } else {
+                profile
+            },
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROTECTED
+                | if promoted {
+                    CAPTURE_DECISION_FLAG_PROMOTED
+                } else if verified_agent {
+                    CAPTURE_DECISION_FLAG_VERIFIED_AGENT
+                } else {
+                    0
+                },
+        );
+    }
+
+    // Bounded unknown/infrastructure remapping happens before the shared SAMPLE/AGGREGATE path so
+    // unknown lifecycle never falls through to a FULL default from the legacy matrix.
+    if bounded && !agent_admitted {
+        if disposition == CAPTURE_DISPOSITION_RULE
+            && capture_profile_is_infrastructure_family(profile)
+        {
+            if matches!(
+                probe,
+                CAPTURE_PROBE_EXEC
+                    | CAPTURE_PROBE_EXIT
+                    | CAPTURE_PROBE_TLS
+                    | CAPTURE_PROBE_CONNECT
+                    | CAPTURE_PROBE_DNS
+                    | CAPTURE_PROBE_LLM
+            ) {
+                action = CAPTURE_ACTION_AGGREGATE;
+                desired = CAPTURE_ACTION_AGGREGATE;
+            }
+        } else if matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_LLM) {
+            action = CAPTURE_ACTION_SAMPLE;
+            desired = CAPTURE_ACTION_SAMPLE;
+        } else if probe == CAPTURE_PROBE_EXIT {
+            let window_ns = if config.sample_window_ns == 0 {
+                DEFAULT_FILE_SAMPLE_WINDOW_NS
+            } else {
+                config.sample_window_ns
+            };
+            // Exit only keeps a discovery raw sample when this cgroup already spent Exec budget in
+            // the current window; otherwise aggregate so unpaired unknown exits do not flood Critical.
+            if capture_scope_exec_discovery_active(cgroup_id, config.active_epoch, now, window_ns) {
+                action = CAPTURE_ACTION_SAMPLE;
+                desired = CAPTURE_ACTION_SAMPLE;
+            } else {
+                action = CAPTURE_ACTION_AGGREGATE;
+                desired = CAPTURE_ACTION_AGGREGATE;
+            }
+        }
+    }
+
     if probe == CAPTURE_PROBE_SSL
         && verified_agent
         // A valid explicit infrastructure/security profile remains authoritative. The bridge is
@@ -1051,7 +1250,7 @@ fn capture_raw_decision(
         );
     }
 
-    if promoted {
+    if promoted && !matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_EXIT) {
         increment_capture_stat(probe, CAPTURE_STAT_PROMOTION_HIT);
         increment_capture_stat(probe, CAPTURE_STAT_FULL);
         let promotion_key = CaptureProcessKey {
@@ -1068,10 +1267,16 @@ fn capture_raw_decision(
                 }
             })
             .unwrap_or(CAPTURE_PROFILE_AGENT_FULL);
+        let promoted_action =
+            if matches!(probe, CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ) {
+                CAPTURE_ACTION_SAMPLE
+            } else {
+                CAPTURE_ACTION_FULL
+            };
         return selected_capture_decision(
             config.active_epoch,
             promoted_profile,
-            CAPTURE_ACTION_FULL,
+            promoted_action,
             authority,
             disposition,
             CAPTURE_DECISION_FLAG_PROMOTED,
@@ -1113,6 +1318,40 @@ fn capture_raw_decision(
 
     match action {
         CAPTURE_ACTION_FULL => {
+            if matches!(probe, CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ) {
+                // A profile may request FULL for an Agent cgroup, but file operations are
+                // intrinsically unbounded.  Converting FULL to SAMPLE without consulting the
+                // shared quota would still reserve one Ring record for every read, which is the
+                // exact high-volume path this gate is meant to stop.  Apply the same bounded
+                // per-scope/node budget used by protected and promoted identities before the
+                // caller copies the path or reserves Ring space.
+                let sample_key = CaptureSampleKey {
+                    cgroup_id,
+                    epoch: config.active_epoch,
+                    probe,
+                    _reserved: [0; 7],
+                };
+                if capture_sample_allowed(&sample_key, &config, now) != 1 {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                    return capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    );
+                }
+                increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                return selected_capture_decision(
+                    config.active_epoch,
+                    profile,
+                    CAPTURE_ACTION_SAMPLE,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
             increment_capture_stat(probe, CAPTURE_STAT_FULL);
             selected_capture_decision(
                 config.active_epoch,
@@ -1179,7 +1418,7 @@ fn capture_raw_decision(
                 return capture_decision(
                     config.active_epoch,
                     profile,
-                    action,
+                    CAPTURE_ACTION_AGGREGATE,
                     authority,
                     disposition,
                     0,
@@ -1190,7 +1429,7 @@ fn capture_raw_decision(
                 return capture_decision(
                     config.active_epoch,
                     profile,
-                    action,
+                    CAPTURE_ACTION_DROP,
                     authority,
                     disposition,
                     0,
@@ -1226,7 +1465,7 @@ fn capture_raw_decision(
                     )
                 }
                 _ => {
-                    increment_capture_stat(probe, CAPTURE_STAT_PROBE_ERROR);
+                    increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
                     match capture_emergency_sample_allowed(probe, &config, now) {
                         1 => {
                             increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
@@ -1239,73 +1478,31 @@ fn capture_raw_decision(
                                 CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
                             )
                         }
-                        0 => {
-                            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
-                            capture_decision(
-                                config.active_epoch,
-                                profile,
-                                CAPTURE_ACTION_SAMPLE,
-                                authority,
-                                disposition,
-                                0,
-                            )
-                        }
-                        _ => {
-                            increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
-                            capture_decision(
-                                config.active_epoch,
-                                profile,
-                                CAPTURE_ACTION_SAMPLE,
-                                authority,
-                                disposition,
-                                0,
-                            )
-                        }
+                        _ => capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        ),
                     }
                 }
             }
         }
         _ => {
-            increment_capture_stat(probe, CAPTURE_STAT_PROBE_ERROR);
-            match capture_emergency_sample_allowed(probe, &config, now) {
-                1 => {
-                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
-                    selected_capture_decision(
-                        config.active_epoch,
-                        profile,
-                        CAPTURE_ACTION_SAMPLE,
-                        authority,
-                        disposition,
-                        CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
-                    )
-                }
-                0 => {
-                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
-                    capture_decision(
-                        config.active_epoch,
-                        profile,
-                        CAPTURE_ACTION_SAMPLE,
-                        authority,
-                        disposition,
-                        0,
-                    )
-                }
-                _ => {
-                    increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
-                    capture_decision(
-                        config.active_epoch,
-                        profile,
-                        CAPTURE_ACTION_SAMPLE,
-                        authority,
-                        disposition,
-                        0,
-                    )
-                }
-            }
+            increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+            capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_SAMPLE,
+                authority,
+                disposition,
+                0,
+            )
         }
     }
 }
-
 const FILE_STAT_ACCESS_KEPT: u8 = 1;
 const FILE_STAT_ACCESS_UNKNOWN_KEPT: u8 = 2;
 const FILE_STAT_ACCESS_SAMPLED: u8 = 3;
@@ -1511,6 +1708,17 @@ fn legacy_file_access_decision(cgroup_id: u64) -> CaptureDecisionContext {
     } else {
         CAPTURE_DISPOSITION_MISS
     };
+    if config.unknown_drop_enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_DROPPED);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
     if !config.unknown_sampling_enabled() {
         increment_file_stat(FILE_STAT_ACCESS_KEPT);
         increment_file_stat(FILE_STAT_ACCESS_UNKNOWN_KEPT);
@@ -1581,15 +1789,27 @@ fn legacy_file_delete_decision(cgroup_id: u64) -> CaptureDecisionContext {
             );
         }
     }
-    // FileDelete is fail-open for KEEP, SAMPLE, candidate DROP, misses, and stale rules.
-    increment_file_stat(FILE_STAT_DELETE_KEPT);
-    increment_file_stat(FILE_STAT_DELETE_UNKNOWN_KEPT);
     let authority = rule.map(|value| value.authority).unwrap_or(0);
     let disposition = if rule.is_some() {
         CAPTURE_DISPOSITION_RULE
     } else {
         CAPTURE_DISPOSITION_MISS
     };
+    if config.unknown_drop_enabled() {
+        increment_file_stat(FILE_STAT_DELETE_DROPPED);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
+    // FileDelete is fail-open for KEEP, SAMPLE, candidate DROP, misses, and stale rules unless
+    // the explicit file-only strict unknown policy is enabled.
+    increment_file_stat(FILE_STAT_DELETE_KEPT);
+    increment_file_stat(FILE_STAT_DELETE_UNKNOWN_KEPT);
     selected_capture_decision(
         config.active_epoch,
         CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
@@ -3555,7 +3775,7 @@ fn try_open_common(flags: u64, filename: *const u8) -> Result<u32, i64> {
     let read_only = access_mode == FILE_ACCESS_MODE_READ_ONLY;
     // Legacy capture intentionally keeps the historical global read-off behavior. Selective reads
     // require an atomically loaded S5 profile/Root map and never fail open on a map miss.
-    if read_only && !capture_profile_enabled() {
+    if read_only && (!capture_profile_enabled() || !file_read_capture_enabled()) {
         return Ok(0);
     }
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };

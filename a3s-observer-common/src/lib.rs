@@ -92,6 +92,13 @@ pub const CAPTURE_CONFIG_ENABLED: u8 = 1 << 0;
 /// Set only after the same collector process durably ACKed the immediately preceding preview and
 /// validated an activation grant fenced to its instance, host boot, publisher, intent and digest.
 pub const CAPTURE_CONFIG_DESTRUCTIVE_GRANTED: u8 = 1 << 1;
+/// When set, Exec/Exit are no longer unconditionally FULL for unknown workloads. Security remains
+/// always FULL. Agent/Candidate (verified, promoted, or Agent-flagged profile) still get FULL
+/// lifecycle evidence; unknown Exec/LLM use the shared discovery sample budget and then
+/// aggregate; unknown Exit aggregates unless the same cgroup already spent Exec discovery budget;
+/// infrastructure profiles aggregate routine lifecycle. Cleared by
+/// `A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE=0` for legacy behavior.
+pub const CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE: u8 = 1 << 2;
 
 pub const CAPTURE_PROFILE_FLAG_AGENT: u16 = 1 << 0;
 pub const CAPTURE_PROFILE_FLAG_CONFLICT: u16 = 1 << 1;
@@ -101,9 +108,10 @@ pub const CAPTURE_PROMOTION_FLAG_DESCENDANT: u32 = 1 << 1;
 pub const CAPTURE_PROMOTION_FLAG_INVESTIGATION: u32 = 1 << 2;
 
 /// Safe closed-set defaults used when the control plane names a profile without overriding every
-/// probe. Protected lifecycle/security probes are always FULL. Unknown keeps non-content LLM
-/// metadata for discovery but leaves TLS plaintext disabled; probable/confirmed Agent profiles
-/// explicitly opt into the same full probe matrix (still bounded by ring/payload/TTL budgets).
+/// probe. Security stays FULL. Legacy unknown discovery still lists Exec/Exit/LLM as FULL so
+/// `CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE=0` keeps the historical matrix; when the bounded flag
+/// is enabled the eBPF decision path remaps unknown lifecycle/LLM before Ring reservation.
+/// Probable/confirmed Agent profiles keep the full probe matrix (still bounded by ring/payload/TTL).
 pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_COUNT] {
     let full = CAPTURE_ACTION_FULL;
     let sample = CAPTURE_ACTION_SAMPLE;
@@ -168,9 +176,38 @@ pub const fn capture_profile_default_actions(profile: u8) -> [u8; CAPTURE_PROBE_
     }
 }
 
+/// Probe kinds whose evidence must not be silently disabled for admitted Agents. With
+/// `CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE` cleared this still forces FULL for every workload
+/// (legacy). With the flag set, only Security stays unconditionally FULL; Exec/Exit require an
+/// admitted Agent/Candidate identity before taking the protected FULL path.
 #[inline(always)]
 pub const fn capture_probe_is_protected(probe: u8) -> bool {
     probe == CAPTURE_PROBE_EXEC || probe == CAPTURE_PROBE_EXIT || probe == CAPTURE_PROBE_SECURITY
+}
+
+#[inline(always)]
+pub const fn capture_probe_is_security(probe: u8) -> bool {
+    probe == CAPTURE_PROBE_SECURITY
+}
+
+#[inline(always)]
+pub const fn capture_profile_is_agent_family(profile: u8) -> bool {
+    matches!(
+        profile,
+        CAPTURE_PROFILE_AGENT_FULL
+            | CAPTURE_PROFILE_INVESTIGATION_FULL
+            | CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+    )
+}
+
+#[inline(always)]
+pub const fn capture_profile_is_infrastructure_family(profile: u8) -> bool {
+    matches!(
+        profile,
+        CAPTURE_PROFILE_BUSINESS_CONTEXT
+            | CAPTURE_PROFILE_INFRASTRUCTURE_AGGREGATE
+            | CAPTURE_PROFILE_SELF_HEALTH
+    )
 }
 
 /// Exact per-CPU share of one node-wide sample budget. Summing CPU ids `0..cpu_count` is exactly
@@ -244,6 +281,11 @@ impl CaptureProfileConfig {
     pub const fn destructive_granted(&self) -> bool {
         self.flags & CAPTURE_CONFIG_DESTRUCTIVE_GRANTED != 0
     }
+
+    #[inline(always)]
+    pub const fn bounded_unknown_lifecycle_enabled(&self) -> bool {
+        self.flags & CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE != 0
+    }
 }
 
 /// Per-workload/probe state decides first-sample eligibility. Every admitted raw sample must also
@@ -294,7 +336,8 @@ pub const CAPTURE_DISPOSITION_STALE: u8 = 2;
 
 /// The raw payload was selected and submitted to its Ring Buffer.
 pub const CAPTURE_DECISION_FLAG_SELECTED: u8 = 1 << 0;
-/// Exec, Exit, or Security was forced to FULL by the protected-probe invariant.
+/// Security (always) or admitted-Agent Exec/Exit was forced to FULL by the protected-probe path.
+/// Legacy mode also sets this for every Exec/Exit regardless of identity.
 pub const CAPTURE_DECISION_FLAG_PROTECTED: u8 = 1 << 1;
 /// A root/descendant/investigation promotion forced the payload to FULL.
 pub const CAPTURE_DECISION_FLAG_PROMOTED: u8 = 1 << 2;
@@ -685,9 +728,13 @@ pub const FILE_FILTER_AUTHORITY_CANDIDATE: u8 = 1;
 pub const FILE_FILTER_AUTHORITY_AUTHORITATIVE: u8 = 2;
 
 pub const FILE_FILTER_CONFIG_ENABLED: u8 = 1 << 0;
-/// Compatibility-only bounded sampling for unresolved FileAccess. When this flag is absent,
-/// Unknown, stale, conflicting, and map-miss events are kept in full.
+/// Compatibility-only bounded sampling for unresolved file operations.
 pub const FILE_FILTER_CONFIG_UNKNOWN_SAMPLE: u8 = 1 << 1;
+/// Strict file-only mode: unresolved/stale/missing file scopes are dropped before Ring reserve.
+pub const FILE_FILTER_CONFIG_UNKNOWN_DROP: u8 = 1 << 2;
+/// Explicit opt-in for the high-volume read-only file probe. Write/open and delete probes remain
+/// independently controlled by their existing feature switches.
+pub const FILE_FILTER_CONFIG_FILE_READ_ENABLED: u8 = 1 << 3;
 
 /// One epoch-scoped cgroup lookup key. Including the epoch makes rule replacement atomic: userspace
 /// can populate the next generation completely, switch one config value, and only then delete the
@@ -734,6 +781,16 @@ impl FileFilterConfig {
     #[inline(always)]
     pub const fn unknown_sampling_enabled(&self) -> bool {
         self.flags & FILE_FILTER_CONFIG_UNKNOWN_SAMPLE != 0
+    }
+
+    #[inline(always)]
+    pub const fn unknown_drop_enabled(&self) -> bool {
+        self.flags & FILE_FILTER_CONFIG_UNKNOWN_DROP != 0
+    }
+
+    #[inline(always)]
+    pub const fn file_read_enabled(&self) -> bool {
+        self.flags & FILE_FILTER_CONFIG_FILE_READ_ENABLED != 0
     }
 }
 
@@ -1046,29 +1103,32 @@ pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_cpu_sample_quota, capture_profile_default_actions, capture_sample_partitions,
-        classify_http_method_prefix, file_access_mode, plaintext_http_route_hash,
-        CaptureAggregateKey, CaptureAggregateValue, CaptureDecisionContext, CaptureProbeStats,
-        CaptureProcessKey, CaptureProfileConfig, CaptureProfileKey, CaptureProfileValue,
-        CapturePromotionValue, CaptureSampleKey, CaptureSampleWindow, ConnectEvent,
-        ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord, ExitEvent, FileEvent,
-        FileFilterConfig, LlmEvent, ProcessGenerationKey, RawObservationHeader, RingPipelineStats,
-        SecEvent, SourceRef, SslEvent, TlsEvent, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
-        CAPTURE_ACTION_SAMPLE, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT,
-        CAPTURE_PROBE_COUNT, CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT,
-        CAPTURE_PROBE_FILE_ACCESS, CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ,
-        CAPTURE_PROBE_LLM, CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS,
-        CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_BUSINESS_CONTEXT,
+        capture_cpu_sample_quota, capture_probe_is_security, capture_profile_default_actions,
+        capture_profile_is_agent_family, capture_profile_is_infrastructure_family,
+        capture_sample_partitions, classify_http_method_prefix, file_access_mode,
+        plaintext_http_route_hash, CaptureAggregateKey, CaptureAggregateValue,
+        CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+        CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+        CaptureSampleWindow, ConnectEvent, ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord,
+        ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
+        RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
+        CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
+        CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE, CAPTURE_CONFIG_ENABLED,
+        CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_COUNT,
+        CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
+        CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM,
+        CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL, CAPTURE_PROBE_TLS, CAPTURE_PROFILE_AGENT_FULL,
+        CAPTURE_PROFILE_BUSINESS_CONTEXT, CAPTURE_PROFILE_INFRASTRUCTURE_AGGREGATE,
         CAPTURE_PROFILE_INVESTIGATION_FULL, CAPTURE_PROFILE_PROBABLE_INVESTIGATION,
         CAPTURE_PROFILE_SECURITY_FULL, CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
         FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_READ_WRITE,
         FILE_ACCESS_MODE_SPECIAL, FILE_ACCESS_MODE_WRITE_ONLY, FILE_FILTER_CONFIG_ENABLED,
-        FILE_FILTER_CONFIG_UNKNOWN_SAMPLE, HTTP_METHOD_PREFIX_COMPLETE,
-        HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_MAX_LEN, HTTP_METHOD_PREFIX_NONE,
-        PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS, PIPELINE_RING_EXEC,
-        PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS, PIPELINE_RING_FILE_DELETE,
-        PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY, PIPELINE_RING_SSL,
-        PIPELINE_RING_TLS, RAW_OBSERVATION_ABI_V1,
+        FILE_FILTER_CONFIG_UNKNOWN_DROP, FILE_FILTER_CONFIG_UNKNOWN_SAMPLE,
+        HTTP_METHOD_PREFIX_COMPLETE, HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_MAX_LEN,
+        HTTP_METHOD_PREFIX_NONE, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT, PIPELINE_RING_DNS,
+        PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
+        PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM,
+        PIPELINE_RING_SECURITY, PIPELINE_RING_SSL, PIPELINE_RING_TLS, RAW_OBSERVATION_ABI_V1,
     };
 
     macro_rules! assert_additive_event_time_abi {
@@ -1114,6 +1174,12 @@ mod tests {
             ..FileFilterConfig::default()
         };
         assert!(compatibility.unknown_sampling_enabled());
+        let strict = FileFilterConfig {
+            flags: FILE_FILTER_CONFIG_ENABLED | FILE_FILTER_CONFIG_UNKNOWN_DROP,
+            ..FileFilterConfig::default()
+        };
+        assert!(strict.unknown_drop_enabled());
+        assert!(!strict.unknown_sampling_enabled());
     }
 
     #[test]
@@ -1226,6 +1292,24 @@ mod tests {
             business[CAPTURE_PROBE_SECURITY as usize],
             CAPTURE_ACTION_FULL
         );
+        assert!(capture_profile_is_agent_family(
+            CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+        ));
+        assert!(capture_profile_is_infrastructure_family(
+            CAPTURE_PROFILE_INFRASTRUCTURE_AGGREGATE
+        ));
+        assert!(capture_probe_is_security(CAPTURE_PROBE_SECURITY));
+        assert!(!capture_probe_is_security(CAPTURE_PROBE_EXEC));
+        let bounded = CaptureProfileConfig {
+            flags: CAPTURE_CONFIG_ENABLED | CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE,
+            ..CaptureProfileConfig::default()
+        };
+        assert!(bounded.bounded_unknown_lifecycle_enabled());
+        let legacy = CaptureProfileConfig {
+            flags: CAPTURE_CONFIG_ENABLED,
+            ..CaptureProfileConfig::default()
+        };
+        assert!(!legacy.bounded_unknown_lifecycle_enabled());
     }
 
     #[test]
