@@ -1035,6 +1035,21 @@ fn capture_raw_decision(
             && (rule_agent_flag || capture_profile_is_agent_family(profile)));
     let promoted = promotion_valid;
 
+    // Optional FileRead is Agent/Candidate-only. Even if a mis-published profile names SAMPLE/FULL
+    // for unknown/infrastructure, never copy a path or reserve Ring space for non-admitted reads.
+    // The userspace `A3S_OBSERVER_FILE_READ` flag still gates probe entry; this is the identity gate.
+    if probe == CAPTURE_PROBE_FILE_READ && !agent_admitted {
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            0,
+        );
+    }
+
     // Strict unknown policy is deliberately scoped to file operations only.  It is evaluated
     // before any file path copy or Ring reservation, while all other probes retain their normal
     // discovery/fail-open matrix.  A generation-fenced verified/promoted Agent remains eligible
