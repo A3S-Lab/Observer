@@ -896,15 +896,27 @@ impl WebSocketFrameDecoder {
                     break;
                 }
                 Err(reason) => {
-                    if self.allow_midstream_resync
-                        && self.fragmented.is_none()
-                        && self.try_resync_frame_header()
-                    {
-                        extend_unique(
-                            &mut self.partial_reasons,
-                            ["websocket_midstream_resync".to_string()],
-                        );
-                        continue;
+                    if self.allow_midstream_resync && self.fragmented.is_none() {
+                        if self.try_resync_frame_header()
+                            || (self.buffer.len() > 64
+                                && self.try_resync_to_complete_plausible_event())
+                        {
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
+                        if self.buffer.len() > 1 {
+                            self.buffer.drain(..1);
+                            self.fragmented = None;
+                            self.last_decode_error = None;
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
                     }
                     self.reset_after_error(&reason);
                     break;
