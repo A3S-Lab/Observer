@@ -4222,10 +4222,16 @@ fn on_read_enter(ctx: &TracePointContext) -> u32 {
         return 0;
     };
     let tgid = bpf_get_current_pid_tgid();
+    let pid = (tgid >> 32) as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    let key = sock_key(cgroup_id, (tgid >> 32) as u32, fd);
+    let key = sock_key(cgroup_id, pid, fd);
     // Stash only for tracked LLM sockets — keeps this node-wide hot path cheap.
     if unsafe { LLM_SOCKS.get(&key) }.is_some() {
+        let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
+    }
+    // Agent TLS read bind: stash fd so SSL_read/rustls can pair even before ClientHello
+    // lands in LLM_SOCKS (Codex WS mid-session / short-lived attach).
+    if verified_agent_process(pid, cgroup_id) {
         let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
     }
     if unsafe { HTTP_SOCKS.get(&key) }.is_some() {
