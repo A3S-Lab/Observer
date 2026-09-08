@@ -878,7 +878,23 @@ impl WebSocketFrameDecoder {
                     }
                     frame
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // A misaligned length field can claim more bytes than will ever arrive as one
+                    // Responses event. If a later offset already holds a complete plausible event,
+                    // skip the false header instead of stalling the buffer forever.
+                    if self.allow_midstream_resync
+                        && self.fragmented.is_none()
+                        && self.buffer.len() > 64
+                        && self.try_resync_to_complete_plausible_event()
+                    {
+                        extend_unique(
+                            &mut self.partial_reasons,
+                            ["websocket_midstream_resync".to_string()],
+                        );
+                        continue;
+                    }
+                    break;
+                }
                 Err(reason) => {
                     if self.allow_midstream_resync
                         && self.fragmented.is_none()
@@ -1094,6 +1110,29 @@ impl WebSocketFrameDecoder {
             StreamKind::Response => payload_looks_like_responses_event(&payload),
             StreamKind::Request => payload_looks_like_llm_request_event(&payload),
         }
+    }
+
+    fn try_resync_to_complete_plausible_event(&mut self) -> bool {
+        let expect_masked = self.kind == StreamKind::Request;
+        let search_limit = self.buffer.len().min(self.max_bytes.saturating_add(64)).max(2);
+        for offset in 1..search_limit {
+            let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
+            else {
+                continue;
+            };
+            if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) {
+                continue;
+            }
+            if !self.frame_payload_plausible_json(&frame) {
+                continue;
+            }
+            self.buffer.drain(..offset);
+            self.fragmented = None;
+            self.last_decode_error = None;
+            self.inflater.reset(false);
+            return true;
+        }
+        false
     }
 
     fn try_resync_frame_header(&mut self) -> bool {
