@@ -1,5 +1,11 @@
 # a3s-observer
 
+<p align="center">
+  <strong>Language / 语言:</strong>
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
+
 Kernel-level **eBPF observability — and optional intervention — for AI agents.** It turns
 syscalls and network events into agent-semantic telemetry (which agent ran which tool, made
 which LLM call, touched which files, reached which endpoint, escalated privileges) with **zero changes to the agent
