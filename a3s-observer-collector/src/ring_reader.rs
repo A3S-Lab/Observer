@@ -12,7 +12,7 @@ use a3s_observer_common::{
     SecEvent, TlsEvent, TlsPlaintextEventHeader, CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP,
     CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
     CAPTURE_DECISION_FLAG_LEGACY, CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DISPOSITION_MISS,
-    CAPTURE_PROFILE_UNKNOWN_DISCOVERY, TLS_PLAINTEXT_ABI_V1,
+    CAPTURE_PROFILE_UNKNOWN_DISCOVERY, TLS_PLAINTEXT_ABI_V2,
 };
 use aya::maps::{MapData, RingBuf};
 use std::io;
@@ -313,7 +313,7 @@ fn envelope_from_tls_plaintext(
 ) -> Option<RawEnvelope> {
     let minimum_header = size_of::<TlsPlaintextEventHeader>();
     if item.len() < minimum_header
-        || read_u16(item, offset_of!(TlsPlaintextEventHeader, abi_version))? != TLS_PLAINTEXT_ABI_V1
+        || read_u16(item, offset_of!(TlsPlaintextEventHeader, abi_version))? != TLS_PLAINTEXT_ABI_V2
     {
         return None;
     }
@@ -512,7 +512,7 @@ mod tests {
         if origin == RingOrigin::Ssl {
             bytes[offset_of!(TlsPlaintextEventHeader, abi_version)
                 ..offset_of!(TlsPlaintextEventHeader, abi_version) + 2]
-                .copy_from_slice(&TLS_PLAINTEXT_ABI_V1.to_ne_bytes());
+                .copy_from_slice(&TLS_PLAINTEXT_ABI_V2.to_ne_bytes());
             bytes[offset_of!(TlsPlaintextEventHeader, header_len)
                 ..offset_of!(TlsPlaintextEventHeader, header_len) + 2]
                 .copy_from_slice(&(layout.len as u16).to_ne_bytes());

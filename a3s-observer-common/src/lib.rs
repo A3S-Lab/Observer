@@ -908,6 +908,9 @@ pub struct SslEvent {
 /// The common header is followed by one of three fixed-capacity payload tiers. Userspace must use
 /// `captured_len` rather than the ring-record size; bytes beyond it are uninitialized ring memory.
 pub const TLS_PLAINTEXT_ABI_V1: u16 = 1;
+/// Additive ConnectionIdentity fields (`bind_quality` / `socket_fd` / `socket_cookie` /
+/// `fd_generation`). Collectors must accept V2; V1 readers reject unknown abi_version fail-closed.
+pub const TLS_PLAINTEXT_ABI_V2: u16 = 2;
 pub const TLS_PLAINTEXT_TIER_SMALL: usize = 16 * 1024;
 pub const TLS_PLAINTEXT_TIER_MEDIUM: usize = 128 * 1024;
 pub const TLS_PLAINTEXT_TIER_LARGE: usize = 512 * 1024;
@@ -921,6 +924,13 @@ pub const TLS_PLAINTEXT_API_GNUTLS: u8 = 3;
 pub const TLS_PLAINTEXT_API_NSS: u8 = 4;
 pub const TLS_PLAINTEXT_API_TCP: u8 = 5;
 pub const TLS_PLAINTEXT_API_RUSTLS: u8 = 6;
+
+/// No tls_ctx↔socket bind observed for this fragment.
+pub const TLS_BIND_QUALITY_UNBOUND: u8 = 0;
+/// Bound via same-thread syscall adjacency to a socket `fd` (no cookie).
+pub const TLS_BIND_QUALITY_FD: u8 = 1;
+/// Bound with a kernel socket cookie when available.
+pub const TLS_BIND_QUALITY_COOKIE: u8 = 2;
 
 pub const TLS_PLAINTEXT_FLAG_TRUNCATED: u16 = 1 << 0;
 pub const TLS_PLAINTEXT_FLAG_COPY_ERROR: u16 = 1 << 1;
@@ -1046,6 +1056,8 @@ pub struct TlsPlaintextEventHeader {
     pub pid: u32,
     pub tid: u32,
     /// `SSL*`/TLS-session pointer, or a stable socket-derived key for plain HTTP.
+    /// When `bind_quality` is FD/COOKIE, Collector should prefer socket identity for stream
+    /// ownership; this field remains the observed TLS context id for aliasing.
     pub connection_id: u64,
     /// Monotonic sequence within `(pid, connection_id, direction)`.
     pub call_seq: u64,
@@ -1055,9 +1067,18 @@ pub struct TlsPlaintextEventHeader {
     pub captured_len: u32,
     pub direction: u8,
     pub api_kind: u8,
-    pub _pad1: [u8; 6],
+    /// `TLS_BIND_QUALITY_*`: whether `socket_fd` / `socket_cookie` were bound this generation.
+    pub bind_quality: u8,
+    pub _pad1: u8,
+    /// Socket file descriptor when bind_quality >= FD; otherwise 0.
+    pub socket_fd: i32,
     pub call_started_at_boot_ns: u64,
     pub captured_at_boot_ns: u64,
+    /// Kernel socket cookie when available; 0 when unbound or unsupported.
+    pub socket_cookie: u64,
+    /// Increments on close/reuse of `(pid, fd)`; 0 when unbound.
+    pub fd_generation: u32,
+    pub _pad2: u32,
     pub comm: [u8; 16],
     pub capture_decision: CaptureDecisionContext,
 }
@@ -1112,7 +1133,7 @@ mod tests {
         CaptureSampleWindow, ConnectEvent, ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord,
         ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
         RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
-        CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
+        TlsPlaintextEventHeader, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
         CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE, CAPTURE_CONFIG_ENABLED,
         CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_COUNT,
         CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
@@ -1129,6 +1150,7 @@ mod tests {
         PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
         PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM,
         PIPELINE_RING_SECURITY, PIPELINE_RING_SSL, PIPELINE_RING_TLS, RAW_OBSERVATION_ABI_V1,
+        TLS_PLAINTEXT_ABI_V2,
     };
 
     macro_rules! assert_additive_event_time_abi {
@@ -1205,6 +1227,16 @@ mod tests {
         assert_eq!(core::mem::size_of::<CaptureProcessKey>(), 16);
         assert_eq!(core::mem::size_of::<CapturePromotionValue>(), 40);
         assert_eq!(core::mem::size_of::<CaptureProbeStats>(), 184);
+        // ABI v2 header stays 8-byte aligned and carries ConnectionIdentity bind fields.
+        // Layout through socket_fd reuses the former `_pad1[6]` so call_started stays at offset 56.
+        assert_eq!(core::mem::align_of::<TlsPlaintextEventHeader>(), 8);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, bind_quality), 50);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, socket_fd), 52);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, call_started_at_boot_ns), 56);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, socket_cookie), 72);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, fd_generation), 80);
+        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, comm), 88);
+        assert_eq!(TLS_PLAINTEXT_ABI_V2, 2);
 
         let value = CaptureProfileValue::default();
         assert_eq!(value.epoch, 0);
