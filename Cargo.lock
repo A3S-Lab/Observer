@@ -24,6 +24,7 @@ dependencies = [
  "flate2",
  "httparse",
  "libc",
+ "memchr",
  "serde_json",
  "sha2",
  "tokio",
