@@ -261,10 +261,12 @@ static VERIFIED_AGENT_EXEC_IDS: LruHashMap<PlaintextProcessKey, u64> =
 #[map]
 static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
 
-// Same-thread TLS context → socket bind (Codex rustls pointer moves / OpenSSL SSL*→fd).
+// TLS context → socket bind (Codex rustls CommonState pointer moves / OpenSSL SSL*→fd).
 // LAST_TLS_CTX is written on SSL/rustls write enter; sys_enter_write/sendto/writev consumes it.
-// LAST_SOCKET_READ is written on successful read/recv exit; SSL/rustls read exit consumes it.
-const TLS_CTX_BIND_WINDOW_NS: u64 = 2_000_000;
+// LAST_SOCKET_READ is written on successful read/recv exit; SSL/rustls read consumes it.
+// Window must cover rustls decrypt latency (not just same-syscall proximity). Keys are stored
+// under both pid_tgid (preferred) and pid (tokio worker threads often split read vs uprobe).
+const TLS_CTX_BIND_WINDOW_NS: u64 = 100_000_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -417,6 +419,7 @@ fn remember_last_tls_ctx(ssl_ptr: u64, api_kind: u8, direction: u8) {
         return;
     }
     let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u64;
     let entry = LastTlsCtx {
         ssl_ptr,
         started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
@@ -425,6 +428,7 @@ fn remember_last_tls_ctx(ssl_ptr: u64, api_kind: u8, direction: u8) {
         _pad: [0; 6],
     };
     let _ = LAST_TLS_CTX.insert(&pid_tgid, &entry, 0);
+    let _ = LAST_TLS_CTX.insert(&pid, &entry, 0);
 }
 
 fn socket_fd_generation(cgroup_id: u64, pid: u32, fd: u64) -> u32 {
@@ -468,38 +472,56 @@ fn bind_tls_ctx_to_socket(ssl_ptr: u64, fd: u64) {
     let _ = TLS_CTX_SOCKET.insert(&key, &value, 0);
 }
 
-fn try_bind_tls_write_to_fd(fd: u64) {
+fn take_last_tls_ctx() -> Option<LastTlsCtx> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(last) = (unsafe { LAST_TLS_CTX.get(&pid_tgid) }).copied() else {
-        return;
-    };
+    let pid = (pid_tgid >> 32) as u64;
     let now = unsafe { bpf_ktime_get_ns() };
+    let last = unsafe { LAST_TLS_CTX.get(&pid_tgid) }
+        .copied()
+        .or_else(|| unsafe { LAST_TLS_CTX.get(&pid) }.copied())?;
     if now.saturating_sub(last.started_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
         let _ = LAST_TLS_CTX.remove(&pid_tgid);
-        return;
+        let _ = LAST_TLS_CTX.remove(&pid);
+        return None;
     }
+    Some(last)
+}
+
+fn try_bind_tls_write_to_fd(fd: u64) {
+    let Some(last) = take_last_tls_ctx() else {
+        return;
+    };
     if last.direction != TLS_PLAINTEXT_DIRECTION_WRITE || last.ssl_ptr == 0 {
         return;
     }
     bind_tls_ctx_to_socket(last.ssl_ptr, fd);
-    let _ = LAST_TLS_CTX.remove(&pid_tgid);
+    // Keep LAST_TLS_CTX for the window: rustls CommonState may move and need re-bind.
+}
+
+fn peek_last_socket_read() -> Option<LastSocketIo> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u64;
+    let now = unsafe { bpf_ktime_get_ns() };
+    let last = unsafe { LAST_SOCKET_READ.get(&pid_tgid) }
+        .copied()
+        .or_else(|| unsafe { LAST_SOCKET_READ.get(&pid) }.copied())?;
+    if now.saturating_sub(last.observed_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
+        let _ = LAST_SOCKET_READ.remove(&pid_tgid);
+        let _ = LAST_SOCKET_READ.remove(&pid);
+        return None;
+    }
+    Some(last)
 }
 
 fn try_bind_tls_read_from_last_socket(ssl_ptr: u64) {
     if ssl_ptr == 0 {
         return;
     }
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(last) = (unsafe { LAST_SOCKET_READ.get(&pid_tgid) }).copied() else {
+    let Some(last) = peek_last_socket_read() else {
         return;
     };
-    let now = unsafe { bpf_ktime_get_ns() };
-    if now.saturating_sub(last.observed_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
-        let _ = LAST_SOCKET_READ.remove(&pid_tgid);
-        return;
-    }
+    // Re-bind on every plaintext read so moved rustls CommonState pointers alias the same fd.
     bind_tls_ctx_to_socket(ssl_ptr, last.fd as u64);
-    let _ = LAST_SOCKET_READ.remove(&pid_tgid);
 }
 
 fn lookup_tls_ctx_bind(cgroup_id: u64, pid: u32, ssl_ptr: u64) -> Option<TlsCtxSocketValue> {
@@ -4281,6 +4303,7 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
                 observed_at_boot_ns: unsafe { bpf_ktime_get_ns() },
             };
             let _ = LAST_SOCKET_READ.insert(&tgid, &last, 0);
+            let _ = LAST_SOCKET_READ.insert(&(pid as u64), &last, 0);
         }
     }
     let _ = READ_FD.remove(&tgid);
