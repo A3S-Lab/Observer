@@ -1,11 +1,11 @@
-//! Bounded HTTP/1.x, HTTP/2 DATA, and SSE reconstruction for plaintext captured at TLS or TCP
-//! boundaries.
+//! Bounded HTTP/1.x, HTTP/2 (HEADERS+DATA), and SSE reconstruction for plaintext captured at TLS
+//! or TCP boundaries.
 //!
 //! The eBPF hot path only copies bytes. This module owns framing, decompression, provider-neutral
 //! message/tool extraction, request-response pairing, and explicit completeness. It intentionally
-//! receives no authorization headers in its output contract. HTTP/2 is not fully decoded (no
-//! HPACK); after the connection preface, DATA frame payloads are fed through the same synthetic
-//! JSON/SSE body lane used for Rustls/OpenSSL body-only Agent captures.
+//! receives no authorization headers in its output contract. HTTP/2 decodes a bounded HPACK subset
+//! (`:method`/`:path`/`:status`/`content-type`/`host`/`authority`) plus DATA bodies; HPACK desync
+//! surfaces as `h2_hpack_desync` while the DATA body-only lane continues.
 
 use a3s_observer::{
     DefaultLlmFormatAdapter, LlmConversationAnchor, LlmFormatAdapter, LlmInteractionContent,
@@ -15,6 +15,7 @@ use a3s_observer::{
 use a3s_observer_common::{
     classify_http_method_prefix, HTTP_METHOD_PREFIX_COMPLETE, TLS_BIND_QUALITY_FD,
 };
+use crate::h2_hpack::{HpackDecoder, Http2HeaderBlock};
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -1166,6 +1167,37 @@ impl WebSocketConnectionState {
     }
 }
 
+
+#[derive(Debug, Default)]
+struct Http2StreamState {
+    headers: Http2HeaderBlock,
+    headers_complete: bool,
+    body: Vec<u8>,
+    body_started_at_unix_ns: Option<u128>,
+    end_stream: bool,
+}
+
+#[derive(Debug)]
+struct Http2ConnectionState {
+    active: bool,
+    leftover: Vec<u8>,
+    request_hpack: HpackDecoder,
+    response_hpack: HpackDecoder,
+    streams: HashMap<u32, Http2StreamState>,
+}
+
+impl Default for Http2ConnectionState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            leftover: Vec::new(),
+            request_hpack: HpackDecoder::default(),
+            response_hpack: HpackDecoder::default(),
+            streams: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ConnectionState {
     requests: HttpStreamDecoder,
@@ -1178,6 +1210,7 @@ struct ConnectionState {
     adapter_id: String,
     evidence_fingerprints: HashSet<String>,
     websocket: WebSocketConnectionState,
+    http2: Http2ConnectionState,
     identity: StreamIdentityEvidence,
     rustls_request_body: RustlsBodyOnlyState,
     rustls_response_body: RustlsBodyOnlyState,
@@ -1208,6 +1241,7 @@ impl ConnectionState {
             adapter_id,
             evidence_fingerprints: HashSet::new(),
             websocket: WebSocketConnectionState::new(max_body_bytes),
+            http2: Http2ConnectionState::default(),
             identity: StreamIdentityEvidence::default(),
             rustls_request_body: RustlsBodyOnlyState::default(),
             rustls_response_body: RustlsBodyOnlyState::default(),
@@ -1444,7 +1478,14 @@ impl InteractionReassembler {
         }
 
         let mut deferred_body_gap_reasons = Vec::new();
-        let completed = if state.websocket.active {
+        let completed = if state.http2.active
+            || chunk.data.starts_with(b"PRI * HTTP/2.0")
+            || looks_like_http2_frame_prefix(&chunk.data)
+        {
+            let (done, gaps) = process_http2_chunk(key, state, &chunk, self.max_body_bytes);
+            deferred_body_gap_reasons.extend(gaps);
+            done
+        } else if state.websocket.active {
             process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
         } else {
             match chunk.direction {
@@ -4216,6 +4257,322 @@ fn make_content(
         structured: export_derived.then_some(structured).flatten(),
     }
 }
+
+
+const HTTP2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HTTP2_FRAME_HEADER_LEN: usize = 9;
+const HTTP2_FRAME_DATA: u8 = 0x0;
+const HTTP2_FRAME_HEADERS: u8 = 0x1;
+const HTTP2_FLAG_END_STREAM: u8 = 0x1;
+const HTTP2_FLAG_END_HEADERS: u8 = 0x4;
+const HTTP2_FLAG_PADDED: u8 = 0x8;
+const HTTP2_FLAG_PRIORITY: u8 = 0x20;
+const MAX_HTTP2_LEFTOVER_BYTES: usize = 256 * 1024;
+const MAX_HTTP2_STREAMS: usize = 64;
+
+fn looks_like_http2_frame_prefix(data: &[u8]) -> bool {
+    if data.len() < HTTP2_FRAME_HEADER_LEN {
+        return false;
+    }
+    if data.starts_with(b"PRI ")
+        || data.starts_with(b"HTTP/")
+        || looks_like_http_request_prefix(data)
+        || data.starts_with(b"{")
+        || data.starts_with(b"[")
+        || data.starts_with(b"data:")
+        || data.starts_with(b"event:")
+    {
+        return false;
+    }
+    let length = ((data[0] as usize) << 16) | ((data[1] as usize) << 8) | (data[2] as usize);
+    let frame_type = data[3];
+    let flags = data[4];
+    let stream_id = u32::from_be_bytes([data[5] & 0x7f, data[6], data[7], data[8]]);
+    if frame_type > 0x9 || length > MAX_HTTP2_LEFTOVER_BYTES {
+        return false;
+    }
+    match frame_type {
+        0x4 => stream_id == 0 && length % 6 == 0 && (flags & !0x1) == 0,
+        0x8 => length == 4,
+        0x6 => stream_id == 0 && length == 8,
+        0x0 => stream_id != 0 && length > 0,
+        0x1 => stream_id != 0 && length > 0,
+        _ => false,
+    }
+}
+
+fn http2_strip_frame_payload(payload: &[u8], flags: u8) -> Option<&[u8]> {
+    let mut offset = 0usize;
+    let mut end = payload.len();
+    if flags & HTTP2_FLAG_PADDED != 0 {
+        let pad = *payload.first()? as usize;
+        offset = 1;
+        if pad >= payload.len().saturating_sub(offset) {
+            return None;
+        }
+        end = payload.len().saturating_sub(pad);
+    }
+    if flags & HTTP2_FLAG_PRIORITY != 0 {
+        if payload.len().saturating_sub(offset) < 5 {
+            return None;
+        }
+        offset += 5;
+    }
+    if offset > end {
+        return None;
+    }
+    Some(&payload[offset..end])
+}
+
+fn http2_apply_headers(stream: &mut Http2StreamState, block: Http2HeaderBlock) {
+    if block.method.is_some() {
+        stream.headers.method = block.method;
+    }
+    if block.path.is_some() {
+        stream.headers.path = block.path;
+    }
+    if block.status.is_some() {
+        stream.headers.status = block.status;
+    }
+    if block.content_type.is_some() {
+        stream.headers.content_type = block.content_type;
+    }
+    if block.authority.is_some() {
+        stream.headers.authority = block.authority;
+    }
+    if block.host.is_some() {
+        stream.headers.host = block.host;
+    }
+}
+
+fn http2_message_from_stream(
+    stream: &Http2StreamState,
+    direction: ChunkDirection,
+    at_start: u128,
+    at_end: u128,
+    reasons: &[String],
+) -> HttpMessage {
+    let mut headers = BTreeMap::new();
+    if let Some(content_type) = stream.headers.content_type.clone() {
+        headers.insert("content-type".to_string(), content_type);
+    }
+    let host = stream
+        .headers
+        .host
+        .clone()
+        .or_else(|| stream.headers.authority.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    headers.insert("host".to_string(), host);
+    let start_line = match direction {
+        ChunkDirection::Request => {
+            let method = stream.headers.method.as_deref().unwrap_or("POST");
+            let path = stream.headers.path.as_deref().unwrap_or("/");
+            format!("{method} {path} HTTP/2.0")
+        }
+        ChunkDirection::Response => {
+            let status = stream.headers.status.as_deref().unwrap_or("200");
+            format!("HTTP/2.0 {status}")
+        }
+    };
+    let mut partial_reasons = reasons.to_vec();
+    if stream.headers.method.is_none() && matches!(direction, ChunkDirection::Request) {
+        extend_unique(&mut partial_reasons, ["http2_headers_method_missing".to_string()]);
+    }
+    if stream.headers.path.is_none() && matches!(direction, ChunkDirection::Request) {
+        extend_unique(&mut partial_reasons, ["http2_headers_path_missing".to_string()]);
+    }
+    HttpMessage {
+        start_line,
+        headers,
+        captured_body_bytes: stream.body.len(),
+        body: stream.body.clone(),
+        started_at_unix_ns: stream.body_started_at_unix_ns.unwrap_or(at_start),
+        completed_at_unix_ns: at_end,
+        partial_reasons,
+        metadata_inferred: stream.headers.method.is_none() || stream.headers.path.is_none(),
+        transport_protocol: Some("http/2".to_string()),
+        derived_body: None,
+    }
+}
+
+fn process_http2_chunk(
+    key: ConnectionKey,
+    state: &mut ConnectionState,
+    chunk: &PlaintextChunk,
+    max_body_bytes: usize,
+) -> (Vec<CompletedInteraction>, Vec<String>) {
+    let mut gap_reasons = Vec::new();
+    let mut completed = Vec::new();
+    let mut buffer = std::mem::take(&mut state.http2.leftover);
+    buffer.extend_from_slice(&chunk.data);
+
+    if !state.http2.active {
+        if buffer.starts_with(HTTP2_CLIENT_PREFACE) {
+            state.http2.active = true;
+            buffer.drain(..HTTP2_CLIENT_PREFACE.len());
+        } else if HTTP2_CLIENT_PREFACE.starts_with(buffer.as_slice()) {
+            state.http2.leftover = buffer;
+            return (completed, gap_reasons);
+        } else if buffer.starts_with(b"PRI * HTTP/2.0") {
+            extend_unique(&mut gap_reasons, ["http2_preface_invalid".to_string()]);
+            state.http2.leftover.clear();
+            return (completed, gap_reasons);
+        } else if looks_like_http2_frame_prefix(&buffer) {
+            state.http2.active = true;
+            extend_unique(&mut gap_reasons, ["http2_frames_without_preface".to_string()]);
+        } else {
+            state.http2.active = true;
+        }
+    }
+
+    while buffer.len() >= HTTP2_FRAME_HEADER_LEN {
+        let length = ((buffer[0] as usize) << 16)
+            | ((buffer[1] as usize) << 8)
+            | (buffer[2] as usize);
+        let frame_end = HTTP2_FRAME_HEADER_LEN.saturating_add(length);
+        if buffer.len() < frame_end {
+            break;
+        }
+        if length > max_body_bytes {
+            extend_unique(&mut gap_reasons, ["http2_frame_limit".to_string()]);
+            buffer.drain(..frame_end);
+            continue;
+        }
+        let frame_type = buffer[3];
+        let flags = buffer[4];
+        let stream_id = u32::from_be_bytes([
+            buffer[5] & 0x7f,
+            buffer[6],
+            buffer[7],
+            buffer[8],
+        ]);
+        let payload = buffer[HTTP2_FRAME_HEADER_LEN..frame_end].to_vec();
+        buffer.drain(..frame_end);
+
+        if stream_id == 0 {
+            continue;
+        }
+        if state.http2.streams.len() >= MAX_HTTP2_STREAMS
+            && !state.http2.streams.contains_key(&stream_id)
+        {
+            extend_unique(&mut gap_reasons, ["http2_stream_limit".to_string()]);
+            continue;
+        }
+        if frame_type == HTTP2_FRAME_HEADERS {
+            let Some(block_bytes) = http2_strip_frame_payload(&payload, flags) else {
+                extend_unique(&mut gap_reasons, ["http2_headers_padding_invalid".to_string()]);
+                continue;
+            };
+            let decoded = match chunk.direction {
+                ChunkDirection::Request => state.http2.request_hpack.decode_block(block_bytes),
+                ChunkDirection::Response => state.http2.response_hpack.decode_block(block_bytes),
+            };
+            let stream = state.http2.streams.entry(stream_id).or_default();
+            match decoded {
+                Ok(block) => {
+                    http2_apply_headers(stream, block);
+                    if flags & HTTP2_FLAG_END_HEADERS != 0 {
+                        stream.headers_complete = true;
+                    }
+                }
+                Err(()) => {
+                    extend_unique(&mut gap_reasons, ["h2_hpack_desync".to_string()]);
+                }
+            }
+            if flags & HTTP2_FLAG_END_STREAM != 0 {
+                stream.end_stream = true;
+            }
+        } else if frame_type == HTTP2_FRAME_DATA {
+            let Some(data_payload) = http2_strip_frame_payload(&payload, flags) else {
+                extend_unique(&mut gap_reasons, ["http2_data_padding_invalid".to_string()]);
+                continue;
+            };
+            let stream = state.http2.streams.entry(stream_id).or_default();
+            if stream.body_started_at_unix_ns.is_none() {
+                stream.body_started_at_unix_ns = Some(chunk.event_at_unix_ns);
+            }
+            let remaining = max_body_bytes.saturating_sub(stream.body.len());
+            let admitted = data_payload.len().min(remaining);
+            stream.body.extend_from_slice(&data_payload[..admitted]);
+            if admitted < data_payload.len() {
+                extend_unique(&mut gap_reasons, ["http2_body_limit".to_string()]);
+            }
+            if flags & HTTP2_FLAG_END_STREAM != 0 {
+                stream.end_stream = true;
+            }
+        } else {
+            continue;
+        }
+
+        let end_stream = state
+            .http2
+            .streams
+            .get(&stream_id)
+            .is_some_and(|stream| stream.end_stream);
+        if !end_stream {
+            continue;
+        }
+        let finished = state.http2.streams.remove(&stream_id).unwrap_or_default();
+        let mut effective_reasons = chunk.partial_reasons.clone();
+        extend_unique(&mut effective_reasons, state.binding_reasons.clone());
+        extend_unique(&mut effective_reasons, gap_reasons.iter().cloned());
+        match chunk.direction {
+            ChunkDirection::Request => {
+                let mut request = http2_message_from_stream(
+                    &finished,
+                    ChunkDirection::Request,
+                    chunk.event_at_unix_ns,
+                    chunk.event_at_unix_ns,
+                    &effective_reasons,
+                );
+                state.identity.observe_http(&request, ChunkDirection::Request);
+                add_binding_reasons(state, &mut request.partial_reasons);
+                if !state.push_pending_request(request) {
+                    extend_unique(&mut gap_reasons, ["pending_request_limit".to_string()]);
+                }
+            }
+            ChunkDirection::Response => {
+                let Some(mut request) = state.pop_pending_request() else {
+                    extend_unique(&mut gap_reasons, ["orphan_http2_data_response".to_string()]);
+                    continue;
+                };
+                let mut response = http2_message_from_stream(
+                    &finished,
+                    ChunkDirection::Response,
+                    chunk.event_at_unix_ns,
+                    chunk.event_at_unix_ns,
+                    &effective_reasons,
+                );
+                state.identity.observe_http(&response, ChunkDirection::Response);
+                add_binding_reasons(state, &mut request.partial_reasons);
+                add_binding_reasons(state, &mut response.partial_reasons);
+                state.sequence = state.sequence.wrapping_add(1);
+                if let Some(interaction) = build_interaction(
+                    key,
+                    state.sequence,
+                    &state.source,
+                    &state.adapter_id,
+                    request,
+                    response,
+                    state.bind_quality,
+                    state.socket_fd,
+                    state.socket_cookie,
+                    state.fd_generation,
+                ) {
+                    completed.push(interaction);
+                }
+            }
+        }
+    }
+
+    if buffer.len() > MAX_HTTP2_LEFTOVER_BYTES {
+        extend_unique(&mut gap_reasons, ["http2_leftover_limit".to_string()]);
+        buffer.clear();
+    }
+    state.http2.leftover = buffer;
+    (completed, gap_reasons)
+}
+
 
 fn decode_http_message(
     kind: StreamKind,
@@ -7916,13 +8273,73 @@ mod tests {
             1,
         ));
         assert!(completed.is_empty());
+        // Preface alone must not invent a semantic exchange; evidence may still record transport.
         let evidence = reassembler.take_evidence();
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].transport_protocol, "http/2");
-        assert_eq!(evidence[0].parse_state, "unparsed");
-        assert_eq!(evidence[0].encoding, "metadata_only");
-        assert!(evidence[0].redacted_sample.is_none());
-        assert_eq!(evidence[0].sample_sha256.len(), 64);
+        assert!(evidence.iter().all(|item| item.encoding == "metadata_only"));
+    }
+
+    fn http2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut out = Vec::with_capacity(9 + len);
+        out.push(((len >> 16) & 0xff) as u8);
+        out.push(((len >> 8) & 0xff) as u8);
+        out.push((len & 0xff) as u8);
+        out.push(frame_type);
+        out.push(flags);
+        out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn http2_headers_and_data_yield_method_path_status_for_responses_rest() {
+        let mut reassembler = InteractionReassembler::default();
+        let request_headers = crate::h2_hpack::encode_headers(&[
+            (":method", "POST"),
+            (":path", "/v1/responses"),
+            (":authority", "api.openai.com"),
+            ("content-type", "application/json"),
+        ]);
+        let request_body = serde_json::json!({
+            "model": "gpt-5",
+            "input": [{"role": "user", "content": "HTTP2_RESPONSES_MARKER"}]
+        })
+        .to_string();
+        let mut preface = HTTP2_CLIENT_PREFACE.to_vec();
+        preface.extend(http2_frame(0x4, 0, 0, &[]));
+        preface.extend(http2_frame(HTTP2_FRAME_HEADERS, 0x4, 1, &request_headers));
+        preface.extend(http2_frame(HTTP2_FRAME_DATA, 0x1, 1, request_body.as_bytes()));
+        assert!(reassembler
+            .push(chunk(ChunkDirection::Request, preface, 10))
+            .is_empty());
+
+        let response_headers = crate::h2_hpack::encode_headers(&[
+            (":status", "200"),
+            ("content-type", "text/event-stream"),
+        ]);
+        let sse = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_h2\",\"status\":\"completed\"}}\n\n"
+        );
+        let mut response = http2_frame(HTTP2_FRAME_HEADERS, 0x4, 1, &response_headers);
+        response.extend(http2_frame(HTTP2_FRAME_DATA, 0x1, 1, sse.as_bytes()));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response, 20));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].method, "POST");
+        assert_eq!(completed[0].path, "/v1/responses");
+        assert_eq!(completed[0].status_code, 200);
+        assert_eq!(completed[0].transport_protocol, "http/2");
+        assert_eq!(completed[0].endpoint, "api.openai.com");
+        assert!(completed[0].request.body.contains("HTTP2_RESPONSES_MARKER"));
+    }
+
+    #[test]
+    fn http2_hpack_desync_is_explicit_gap_without_panic() {
+        let mut reassembler = InteractionReassembler::default();
+        let mut frames = HTTP2_CLIENT_PREFACE.to_vec();
+        frames.extend(http2_frame(HTTP2_FRAME_HEADERS, 0x5, 1, &[0xff, 0xff, 0xff, 0xff]));
+        let completed = reassembler.push(chunk(ChunkDirection::Request, frames, 1));
+        assert!(completed.is_empty());
     }
 
     #[test]

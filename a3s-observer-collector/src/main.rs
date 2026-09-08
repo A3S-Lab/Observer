@@ -8,6 +8,7 @@
 
 mod capture_profile;
 mod event_time;
+mod h2_hpack;
 mod interaction;
 mod pipeline;
 mod process_lifecycle;
