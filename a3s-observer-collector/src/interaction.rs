@@ -1175,8 +1175,10 @@ impl WebSocketConnectionState {
 
     fn recover_from_frame(&mut self, data: &[u8]) {
         let compressed = data.first().is_some_and(|byte| byte & 0x40 != 0);
-        self.requests.configure_compression(compressed, false);
-        self.responses.configure_compression(compressed, false);
+        // Mid-flight attach never saw the 101 extension list. Prefer no_context_takeover so each
+        // RSV1 message is self-contained; shared sliding-window state from before attach is gone.
+        self.requests.configure_compression(compressed, true);
+        self.responses.configure_compression(compressed, true);
         self.active = true;
         self.recovered_without_handshake = true;
     }
@@ -2479,8 +2481,33 @@ fn process_websocket_response_messages(
             continue;
         }
         if state.pending_requests.is_empty() {
-            state.websocket.response.clear();
-            continue;
+            if state.websocket.recovered_without_handshake {
+                // Attach missed the client response.create; keep streaming server events under a
+                // synthetic request so marker text / tools still surface as a parsed interaction.
+                let mut synthetic = HttpMessage {
+                    start_line: format!("POST {} HTTP/1.1", state.websocket.path),
+                    headers: BTreeMap::from([(
+                        "host".to_string(),
+                        state.websocket.endpoint.clone(),
+                    )]),
+                    captured_body_bytes: 0,
+                    body: br#"{"type":"response.create","model":"unknown","input":[]}"#.to_vec(),
+                    started_at_unix_ns: message.started_at_unix_ns,
+                    completed_at_unix_ns: message.started_at_unix_ns,
+                    partial_reasons: vec!["websocket_request_missing_recovered".to_string()],
+                    metadata_inferred: true,
+                    transport_protocol: Some("websocket".to_string()),
+                    derived_body: None,
+                };
+                add_binding_reasons(state, &mut synthetic.partial_reasons);
+                if !state.push_pending_request(synthetic) {
+                    state.websocket.response.clear();
+                    continue;
+                }
+            } else {
+                state.websocket.response.clear();
+                continue;
+            }
         }
 
         let binding_reasons = if state.binding_uncertain {
@@ -2732,20 +2759,21 @@ fn is_websocket_control_frame(data: &[u8]) -> bool {
 }
 
 fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) -> bool {
-    if direction != ChunkDirection::Request {
-        return false;
-    }
     let Some(opcode) = websocket_frame_opcode(data) else {
         return false;
     };
     if !matches!(opcode, 0x1 | 0x2) {
         return false;
     }
-    if data.get(1).is_none_or(|byte| byte & 0x80 == 0) {
-        return false;
+    let masked = data.get(1).is_some_and(|byte| byte & 0x80 != 0);
+    // Client frames must be masked; server frames must not.
+    match direction {
+        ChunkDirection::Request if !masked => return false,
+        ChunkDirection::Response if masked => return false,
+        _ => {}
     }
-    // A compressed client data frame is already a strong WebSocket signal. For an uncompressed
-    // frame, require the first unmasked application byte to be JSON so arbitrary TLS payloads do
+    // A compressed data frame is already a strong WebSocket signal. For an uncompressed
+    // frame, require the first application byte to be JSON so arbitrary TLS payloads do
     // not consume a long-lived reassembly slot.
     if data[0] & 0x40 != 0 {
         return true;
@@ -2758,19 +2786,30 @@ fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) ->
     } else {
         0
     };
-    let mask_offset = 2usize.saturating_add(length_bytes);
-    let Some(mask) = data.get(mask_offset..mask_offset + 4) else {
-        return false;
-    };
-    let payload_offset = mask_offset + 4;
-    data.get(payload_offset..)
-        .into_iter()
-        .flatten()
-        .take(16)
-        .enumerate()
-        .map(|(index, byte)| *byte ^ mask[index % 4])
-        .find(|byte| !byte.is_ascii_whitespace())
-        .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    let header_len = 2usize.saturating_add(length_bytes);
+    if masked {
+        let mask_offset = header_len;
+        let Some(mask) = data.get(mask_offset..mask_offset + 4) else {
+            return false;
+        };
+        let payload_offset = mask_offset + 4;
+        data.get(payload_offset..)
+            .into_iter()
+            .flatten()
+            .take(16)
+            .enumerate()
+            .map(|(index, byte)| *byte ^ mask[index % 4])
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    } else {
+        data.get(header_len..)
+            .into_iter()
+            .flatten()
+            .take(16)
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    }
 }
 
 fn looks_like_websocket_continuation_prefix(data: &[u8]) -> bool {
@@ -8757,6 +8796,57 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, Some(40));
         assert_eq!(usage.reasoning_output_tokens, Some(12));
         assert!(!usage.total_tokens_derived);
+    }
+
+    #[test]
+    fn websocket_response_frames_recover_without_client_request() {
+        let mut reassembler = InteractionReassembler::default();
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "RESPONSE_ONLY_RECOVERED_MARKER"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(delta.as_bytes(), false, true, false, 0x1),
+                300,
+                0x7100,
+            ))
+            .is_empty());
+        let evidence = reassembler.take_evidence();
+        assert!(evidence.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason == "websocket_handshake_recovered")
+        }));
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-response-only",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "total_tokens": 18
+                }
+            }
+        })
+        .to_string();
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            websocket_frame(terminal.as_bytes(), false, true, false, 0x1),
+            310,
+            0x7101,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "websocket_request_missing_recovered"));
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("RESPONSE_ONLY_RECOVERED_MARKER")
+        );
     }
 
     #[test]
