@@ -19,6 +19,9 @@ sha2 = "0.10"
 httparse = "1.10"
 flate2 = "1"
 base64 = "0.22"
+# SIMD substring search for the SSE delimiter/terminal scanning hot path. The previous naive
+# sliding-window scan measurably pinned a collector core at 100% on long streaming responses.
+memchr = "2"
 
 [build-dependencies]
 aya-build = "0.1"

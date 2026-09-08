@@ -195,6 +195,11 @@ struct RustlsBodyOnlyState {
     partial_reasons: Vec<String>,
     response_mode: BodyOnlyResponseMode,
     response_parsed_offset: usize,
+    /// Offset through which the pending SSE tail was already searched for a block delimiter.
+    /// Without it every fragment re-scanned the whole undelimited tail (quadratic; a never
+    /// delimiting tail pinned a core inside `sse_block_delimiter`). Maintains the invariant
+    /// that `buffer[parsed_offset .. scan_offset - 3]` contains no block delimiter.
+    response_scan_offset: usize,
     response_event_count: usize,
     /// Exact JSON object slices used to build a parser-only sequence. The canonical response
     /// bytes remain in `buffer`; keeping raw slices prevents serde reserialization from changing
@@ -588,6 +593,12 @@ struct HttpStreamDecoder {
     max_bytes: usize,
     partial_reasons: Vec<String>,
     last_decode_error: Option<String>,
+    /// Terminal-scan resume cursors for the pending unframed/chunked SSE response. Offsets are
+    /// relative to the current pending message body and reset on every message advance.
+    sse_scan: SseTerminalScanState,
+    /// Separate cursors for the de-chunked body inside `decode_chunked`: the de-chunked bytes
+    /// and the raw framing bytes are different sequences and must not share resume offsets.
+    chunked_scan: SseTerminalScanState,
 }
 
 impl HttpStreamDecoder {
@@ -600,6 +611,8 @@ impl HttpStreamDecoder {
             max_bytes,
             partial_reasons: Vec::new(),
             last_decode_error: None,
+            sse_scan: SseTerminalScanState::default(),
+            chunked_scan: SseTerminalScanState::default(),
         }
     }
 
@@ -634,6 +647,10 @@ impl HttpStreamDecoder {
                 let detached_terminator = detached_chunk_terminator_prefix(&self.buffer);
                 if detached_terminator > 0 {
                     self.buffer.drain(..detached_terminator);
+                    // The body offsets the scan cursors refer to shift with the drain; restart
+                    // the terminal search for whatever pending message remains.
+                    self.sse_scan = SseTerminalScanState::default();
+                    self.chunked_scan = SseTerminalScanState::default();
                     self.buffer_started_at_unix_ns =
                         (!self.buffer.is_empty()).then_some(event_at_unix_ns);
                     if self.buffer.is_empty() {
@@ -641,11 +658,24 @@ impl HttpStreamDecoder {
                     }
                 }
             }
-            let decoded = match decode_http_message(self.kind, &self.buffer, self.max_bytes) {
+            let kind = self.kind;
+            let max_bytes = self.max_bytes;
+            let Self {
+                buffer,
+                sse_scan,
+                chunked_scan,
+                ..
+            } = self;
+            let decoded = match decode_http_message(kind, buffer, max_bytes, sse_scan, chunked_scan)
+            {
                 Ok(Some(decoded)) => decoded,
                 Ok(None) => break,
                 Err(reason) => {
                     self.last_decode_error = Some(reason.clone());
+                    // The next attempt re-decodes from a possibly different framing state; do
+                    // not keep resume offsets that may point into a different body.
+                    self.sse_scan = SseTerminalScanState::default();
+                    self.chunked_scan = SseTerminalScanState::default();
                     extend_unique(&mut self.partial_reasons, [reason]);
                     break;
                 }
@@ -666,6 +696,10 @@ impl HttpStreamDecoder {
                 derived_body: None,
             });
             self.buffer.drain(..decoded.consumed);
+            // A completed message ends the pending body the scan cursors referred to; whatever
+            // bytes remain start a new pending message from offset zero.
+            self.sse_scan = SseTerminalScanState::default();
+            self.chunked_scan = SseTerminalScanState::default();
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
         }
         messages
@@ -676,6 +710,8 @@ impl HttpStreamDecoder {
         self.last_at_unix_ns = 0;
         self.partial_reasons.clear();
         self.last_decode_error = None;
+        self.sse_scan = SseTerminalScanState::default();
+        self.chunked_scan = SseTerminalScanState::default();
         std::mem::take(&mut self.buffer)
     }
 }
@@ -2750,6 +2786,7 @@ impl RustlsBodyOnlyState {
         self.partial_reasons.clear();
         self.response_mode = BodyOnlyResponseMode::Unknown;
         self.response_parsed_offset = 0;
+        self.response_scan_offset = 0;
         self.response_event_count = 0;
         self.response_raw_events.clear();
     }
@@ -3130,14 +3167,24 @@ fn feed_rustls_body_only_response(
         let mut invalid_reason = None;
         if state.response_mode == BodyOnlyResponseMode::Sse {
             let mut cursor = state.response_parsed_offset;
+            // Only bytes past the previous scan boundary (minus the longest delimiter minus
+            // one, so a delimiter straddling that boundary is still found) can introduce a new
+            // block; the prefix is delimiter-free by the scan-offset invariant.
+            let mut search_from = state
+                .response_scan_offset
+                .saturating_sub(3)
+                .max(cursor)
+                .min(state.buffer.len());
             loop {
-                let remaining = &state.buffer[cursor..];
-                let Some((mut end, delimiter_len)) = sse_block_delimiter(remaining) else {
+                let Some((rel, delimiter_len)) = sse_block_delimiter(&state.buffer[search_from..])
+                else {
+                    state.response_scan_offset = state.buffer.len();
                     break;
                 };
-                end += delimiter_len;
-                let block = &remaining[..end];
-                cursor += end;
+                let end = search_from + rel + delimiter_len;
+                let block = &state.buffer[cursor..end];
+                cursor = end;
+                search_from = end;
                 let data_lines = block
                     .split(|byte| *byte == b'\n' || *byte == b'\r')
                     .filter_map(|line| {
@@ -3311,6 +3358,7 @@ fn feed_rustls_body_only_response(
         state.response_mode =
             body_only_response_mode(&state.buffer).unwrap_or(BodyOnlyResponseMode::Unknown);
         state.response_parsed_offset = 0;
+        state.response_scan_offset = 0;
     }
 }
 
@@ -3378,9 +3426,18 @@ fn chunk_identity_probe(
             return probe.has_signal().then_some(probe);
         }
     };
-    let decoded = decode_http_message(kind, &chunk.data, max_body_bytes)
-        .ok()
-        .flatten()?;
+    // One-shot probe over a single chunk: a fresh scan state gives full-body search semantics.
+    let mut probe_sse_scan = SseTerminalScanState::default();
+    let mut probe_chunked_scan = SseTerminalScanState::default();
+    let decoded = decode_http_message(
+        kind,
+        &chunk.data,
+        max_body_bytes,
+        &mut probe_sse_scan,
+        &mut probe_chunked_scan,
+    )
+    .ok()
+    .flatten()?;
     Some(StreamIdentityProbe::from_http(
         &HttpMessage {
             start_line: decoded.start_line,
@@ -4137,6 +4194,8 @@ fn decode_http_message(
     kind: StreamKind,
     bytes: &[u8],
     max_body_bytes: usize,
+    sse_scan: &mut SseTerminalScanState,
+    chunked_scan: &mut SseTerminalScanState,
 ) -> Result<Option<DecodedHttpMessage>, String> {
     if bytes.is_empty() {
         return Ok(None);
@@ -4207,7 +4266,8 @@ fn decode_http_message(
         .split(',')
         .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
     {
-        let Some((decoded, consumed)) = decode_chunked(body_bytes, max_body_bytes, sse_response)?
+        let Some((decoded, consumed)) =
+            decode_chunked(body_bytes, max_body_bytes, sse_response, chunked_scan)?
         else {
             return Ok(None);
         };
@@ -4245,7 +4305,7 @@ fn decode_http_message(
         if framing_reason.is_some() {
             return Ok(None);
         }
-        let Some(_end) = sse_terminal_offset(&framing_body) else {
+        let Some(_end) = sse_terminal_offset_incremental(framing_body.as_ref(), sse_scan) else {
             return Ok(None);
         };
         // No explicit HTTP framing is available here. Once the decoded stream has a terminal
@@ -4308,6 +4368,7 @@ fn decode_chunked(
     bytes: &[u8],
     max_body_bytes: usize,
     stop_at_sse_terminal: bool,
+    sse_scan: &mut SseTerminalScanState,
 ) -> Result<Option<(Vec<u8>, usize)>, String> {
     let mut cursor = 0usize;
     let mut body = Vec::new();
@@ -4347,7 +4408,9 @@ fn decode_chunked(
         body.extend_from_slice(&bytes[cursor..chunk_end]);
         cursor = chunk_end + 2;
         if stop_at_sse_terminal {
-            if let Some(terminal) = sse_terminal_offset(&body) {
+            // The de-chunked `body` grows chunk by chunk and is rebuilt per attempt from the
+            // same input prefix, so the incremental cursors stay valid across attempts.
+            if let Some(terminal) = sse_terminal_offset_incremental(&body, sse_scan) {
                 body.truncate(terminal);
                 return Ok(Some((body, cursor)));
             }
@@ -4355,14 +4418,16 @@ fn decode_chunked(
     }
 }
 
-fn decode_content_encoding(
-    bytes: &[u8],
+fn decode_content_encoding<'a>(
+    bytes: &'a [u8],
     encoding: &str,
     max_output_bytes: usize,
-) -> (Vec<u8>, Option<String>) {
+) -> (std::borrow::Cow<'a, [u8]>, Option<String>) {
     let normalized = encoding.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == "identity" {
-        return (bytes.to_vec(), None);
+        // Borrow instead of copying: identity is the common case and this runs on every
+        // reassembly attempt against the whole accumulated body.
+        return (std::borrow::Cow::Borrowed(bytes), None);
     }
     let decoder: Box<dyn Read> = match normalized.as_str() {
         "gzip" | "x-gzip" => Box::new(GzDecoder::new(bytes)),
@@ -4370,7 +4435,7 @@ fn decode_content_encoding(
         "raw-deflate" => Box::new(DeflateDecoder::new(bytes)),
         _ => {
             return (
-                bytes.to_vec(),
+                std::borrow::Cow::Borrowed(bytes),
                 Some(format!("unsupported_content_encoding:{normalized}")),
             )
         }
@@ -4378,12 +4443,18 @@ fn decode_content_encoding(
     let mut output = Vec::new();
     let mut bounded = decoder.take(max_output_bytes as u64 + 1);
     match bounded.read_to_end(&mut output) {
-        Ok(_) if output.len() <= max_output_bytes => (output, None),
+        Ok(_) if output.len() <= max_output_bytes => (std::borrow::Cow::Owned(output), None),
         Ok(_) => {
             output.truncate(max_output_bytes);
-            (output, Some("decompressed_body_limit".to_string()))
+            (
+                std::borrow::Cow::Owned(output),
+                Some("decompressed_body_limit".to_string()),
+            )
         }
-        Err(_) => (bytes.to_vec(), Some("content_decode_error".to_string())),
+        Err(_) => (
+            std::borrow::Cow::Borrowed(bytes),
+            Some("content_decode_error".to_string()),
+        ),
     }
 }
 
@@ -6079,16 +6150,52 @@ fn looks_like_sse(body: &[u8]) -> bool {
         || find_bytes(body, b"\revent:").is_some()
 }
 
+/// Incremental resume cursors for SSE terminal detection on a pending, still-accumulating
+/// body. Re-scanning the whole body on every reassembly fragment made long streaming responses
+/// quadratic — a single large response (or a misframed stream whose tail never contains a block
+/// delimiter) pinned a collector core at 100% inside `sse_block_delimiter` while the pipeline
+/// starved. The decoder therefore persists how far it has searched:
+///
+/// - `marker` is the offset through which the literal `data: [DONE]` terminators were
+///   exhaustively searched;
+/// - `block` is the end offset of the last complete block already proven non-terminal.
+///
+/// Both are absolute offsets into the current pending message body and MUST be reset whenever
+/// the message boundary advances (buffer drain, decode error, unparsed-tail takeover).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SseTerminalScanState {
+    block: usize,
+    marker: usize,
+}
+
+/// Longest literal terminal marker plus one block delimiter; a new terminal can only appear
+/// straddling the previously searched boundary within this overlap.
+const SSE_TERMINAL_MARKER_OVERLAP: usize = 32;
+
+/// One-shot terminal search over a complete body. Equivalent to searching from scratch.
 fn sse_terminal_offset(body: &[u8]) -> Option<usize> {
+    let mut scan = SseTerminalScanState::default();
+    sse_terminal_offset_incremental(body, &mut scan)
+}
+
+/// Terminal search that only examines bytes not yet ruled out by earlier attempts. A terminal
+/// fully inside the previously searched region would have completed the message then; only the
+/// overlap window at the boundary and the not-yet-searched tail can introduce a new one.
+fn sse_terminal_offset_incremental(body: &[u8], scan: &mut SseTerminalScanState) -> Option<usize> {
+    let from = scan
+        .marker
+        .saturating_sub(SSE_TERMINAL_MARKER_OVERLAP)
+        .min(body.len());
     for marker in [
         b"data: [DONE]\r\n\r\n".as_slice(),
         b"data: [DONE]\n\n".as_slice(),
     ] {
-        if let Some(offset) = find_bytes(body, marker) {
-            return Some(offset + marker.len());
+        if let Some(offset) = find_bytes(&body[from..], marker) {
+            return Some(from + offset + marker.len());
         }
     }
-    let mut cursor = 0usize;
+    scan.marker = body.len();
+    let mut cursor = scan.block.min(body.len());
     while let Some((offset, delimiter_len)) = sse_block_delimiter(&body[cursor..]) {
         let end = cursor + offset + delimiter_len;
         let block = &body[cursor..end];
@@ -6101,14 +6208,17 @@ fn sse_terminal_offset(body: &[u8]) -> Option<usize> {
             .collect::<Vec<_>>()
             .join("\n");
         if data.trim() == "[DONE]" {
+            scan.block = cursor;
             return Some(cursor);
         }
         if let Ok(value) = serde_json::from_str::<Value>(&data) {
             if response_event_terminal(&value).is_some() {
+                scan.block = cursor;
                 return Some(cursor);
             }
         }
     }
+    scan.block = cursor;
     None
 }
 
@@ -6203,9 +6313,9 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    // memchr-backed search: the SSE terminal/delimiter paths call this on every reassembly
+    // fragment, where a naive sliding-window scan is quadratic in the accumulated body size.
+    memchr::memmem::find(haystack, needle)
 }
 
 fn extend_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = String>) {
@@ -6715,6 +6825,107 @@ mod tests {
         assert_eq!(completed[0].first_response_at_unix_ns, "200");
         assert_eq!(completed[0].ended_at_unix_ns, "220");
         assert_eq!(completed[0].completeness, "complete");
+    }
+
+    #[test]
+    fn sse_terminal_offset_incremental_matches_one_shot_at_every_prefix() {
+        // The incremental cursors must reproduce the one-shot result exactly for every prefix,
+        // including prefixes that split a delimiter, a marker, or a JSON event mid-way.
+        let bodies = [
+            b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: [DONE]\n\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\r\ndata: {\"type\":\"response.completed\"}\r\n\r\n".as_slice(),
+            b": comment\n\ndata: {\"type\":\"irrelevant\"}\n\ndata: {\"type\":\"message_stop\"}\n\n".as_slice(),
+            b"garbage-without-any-delimiter-or-terminal".as_slice(),
+        ];
+        for body in bodies {
+            let mut scan = SseTerminalScanState::default();
+            for split in 1..=body.len() {
+                let prefix = &body[..split];
+                assert_eq!(
+                    sse_terminal_offset_incremental(prefix, &mut scan),
+                    sse_terminal_offset(prefix),
+                    "incremental diverged from one-shot at prefix len {split} of body {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sse_terminal_offset_incremental_is_bytescanned_bounded_by_new_data() {
+        // After a feed that ends without a delimiter, the next search must resume near the
+        // previous boundary instead of rescanning the whole tail: the marker cursor equals the
+        // previous body length and only the overlap window plus new bytes are examined.
+        let mut scan = SseTerminalScanState::default();
+        let tail_without_delimiter = vec![b'x'; 4096];
+        assert!(sse_terminal_offset_incremental(&tail_without_delimiter, &mut scan).is_none());
+        assert_eq!(scan.marker, tail_without_delimiter.len());
+        let grown = [
+            tail_without_delimiter.as_slice(),
+            b"data: [DONE]\n\n".as_slice(),
+        ]
+        .concat();
+        let found = sse_terminal_offset_incremental(&grown, &mut scan);
+        assert_eq!(found, sse_terminal_offset(&grown));
+    }
+
+    #[test]
+    fn http_framed_sse_without_length_completes_across_fragment_boundaries() {
+        // A long streaming response fed one byte-group at a time, with the terminal event
+        // split across feeds, must complete exactly once with the full SSE body retained.
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        let body = b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"chunked words \"}\n\ndata: {\"type\":\"response.completed\"}\n\n";
+        let wire = [header.as_bytes(), body.as_slice()].concat();
+        let mut decoder = HttpStreamDecoder::new(StreamKind::Response, 8 * 1024 * 1024);
+        let mut completed = Vec::new();
+        for size in [1usize, 7, 3, 64, 2, 31, 5] {
+            let mut cursor = 0;
+            while cursor < wire.len() {
+                let end = (cursor + size).min(wire.len());
+                completed.extend(decoder.push(&wire[cursor..end], 100, &[]));
+                cursor = end;
+            }
+            if !completed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].body, body);
+        assert_eq!(completed[0].content_type(), "text/event-stream");
+        assert_eq!(completed[0].partial_reasons.len(), 0);
+    }
+
+    #[test]
+    fn chunked_sse_early_stop_completes_when_terminal_spans_feeds() {
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let event_a = b"data: {\"type\":\"response.created\"}\n\n";
+        let event_b = b"data: {\"type\":\"response.completed\"}\n\n";
+        let chunked = |payload: &[u8]| -> Vec<u8> {
+            format!("{:x}\r\n", payload.len())
+                .into_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .chain(b"\r\n".iter().copied())
+                .collect()
+        };
+        let wire = [
+            header.as_bytes(),
+            chunked(event_a).as_slice(),
+            chunked(event_b).as_slice(),
+            b"0\r\n\r\n".as_slice(),
+        ]
+        .concat();
+        let mut decoder = HttpStreamDecoder::new(StreamKind::Response, 8 * 1024 * 1024);
+        // Feed a split inside the terminal chunk so completion is decided by the incremental
+        // terminal scan resuming across feeds rather than a single whole-body parse.
+        let split = header.len() + chunked(event_a).len() + 5;
+        let mut completed = decoder.push(&wire[..split], 100, &[]);
+        assert!(completed.is_empty(), "no terminal observed yet");
+        completed.extend(decoder.push(&wire[split..], 120, &[]));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].body,
+            [event_a.as_slice(), event_b.as_slice()].concat()
+        );
     }
 
     #[test]
