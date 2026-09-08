@@ -3927,13 +3927,15 @@ impl CollectorProcessor {
                         let named_agent_runtime = tls_exec_comm_needs_refresh(&cstr(&record.comm));
                         if named_agent_runtime {
                             self.tls_fast_retry_candidate_pids.insert(pid);
-                        }
-                        if tls_capture_profile_needs_refresh(
+                            // Host CLI roots (codex/claude/…) are often shorter than the
+                            // capture-profile → TLS-scope publication loop. Admit the PID into
+                            // the verified plaintext allowlist on named-agent exec so short-lived
+                            // sessions do not depend on FORWARD_RETAIN_NON_AGENT.
+                            self.tls_verified_candidate_pids.insert(pid);
+                        } else if tls_capture_profile_needs_refresh(
                             record.capture_decision.capture_profile,
                         ) {
                             self.tls_verified_candidate_pids.insert(pid);
-                        } else if named_agent_runtime {
-                            self.tls_attach_candidate_pids.insert(pid);
                         }
                     }
                 }
