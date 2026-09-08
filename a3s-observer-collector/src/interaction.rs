@@ -1911,6 +1911,12 @@ impl InteractionReassembler {
             .get(&observed)
             .is_some_and(|state| state.binding_uncertain);
         if self.connections.contains_key(&observed) && !observed_binding_uncertain {
+            if let Some(owner) = self.sibling_websocket_exchange_owner(observed, chunk) {
+                if owner != observed {
+                    self.remember_connection_alias(observed, owner);
+                    return (owner, None);
+                }
+            }
             return (observed, None);
         }
 
@@ -1950,6 +1956,38 @@ impl InteractionReassembler {
             }
             ConnectionResolution::New => (observed, None),
         }
+    }
+
+    fn sibling_websocket_exchange_owner(
+        &self,
+        observed: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<ConnectionKey> {
+        let state = self.connections.get(&observed)?;
+        let observed_busy = !state.pending_requests.is_empty()
+            || state.websocket.response.started_at_unix_ns.is_some()
+            || state.websocket.awaits_moved_fragment(chunk);
+        if observed_busy || !state.websocket.active {
+            return Some(observed);
+        }
+        let mut owners = self
+            .connections
+            .iter()
+            .filter_map(|(key, sibling)| {
+                (*key != observed
+                    && key.cgroup_id == observed.cgroup_id
+                    && key.pid == observed.pid
+                    && sibling.websocket.active
+                    && (!sibling.pending_requests.is_empty()
+                        || sibling.websocket.response.started_at_unix_ns.is_some()
+                        || sibling.websocket.awaits_moved_fragment(chunk)))
+                .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        if owners.len() == 1 {
+            return owners.pop();
+        }
+        None
     }
 
     fn resolve_rustls_stream(
@@ -2016,7 +2054,15 @@ impl InteractionReassembler {
                         return None;
                     }
                     if is_continuation {
-                        return state.websocket.awaits_moved_fragment(chunk).then_some(*key);
+                        if state.websocket.awaits_moved_fragment(chunk) {
+                            return Some(*key);
+                        }
+                        // Mid-flight / pointer-split: continuations often cannot prove decoder
+                        // ownership, but a sibling with a pending Responses turn is still the
+                        // only safe home for server bytes on this pid.
+                        return (!state.pending_requests.is_empty()
+                            || state.websocket.response.started_at_unix_ns.is_some())
+                        .then_some(*key);
                     }
                     if chunk.direction == ChunkDirection::Response
                         && state.pending_requests.is_empty()
@@ -2030,6 +2076,27 @@ impl InteractionReassembler {
                 .collect::<Vec<_>>();
             narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
             if is_continuation && candidates.is_empty() {
+                // Prefer an open Responses exchange on this pid over dropping the bytes.
+                let mut pending_owners = self
+                    .connections
+                    .iter()
+                    .filter_map(|(key, state)| {
+                        (key.cgroup_id == observed.cgroup_id
+                            && key.pid == observed.pid
+                            && state.websocket.active
+                            && (!state.pending_requests.is_empty()
+                                || state.websocket.response.started_at_unix_ns.is_some()))
+                        .then_some(*key)
+                    })
+                    .collect::<Vec<_>>();
+                narrow_connection_candidates(
+                    &mut pending_owners,
+                    probe.as_ref(),
+                    &self.connections,
+                );
+                if !pending_owners.is_empty() {
+                    return choose_connection_candidate(pending_owners);
+                }
                 return ConnectionResolution::Orphan;
             }
             return choose_connection_candidate(candidates);
