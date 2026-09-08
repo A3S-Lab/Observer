@@ -945,6 +945,24 @@ impl WebSocketFrameDecoder {
             match frame.opcode {
                 0x8..=0xA => {
                     if !frame.fin || frame.payload.len() > 125 {
+                        if self.allow_midstream_resync {
+                            if self.try_resync_frame_header()
+                                || (self.buffer.len() > 64
+                                    && self.try_resync_to_complete_plausible_event())
+                            {
+                                extend_unique(
+                                    &mut self.partial_reasons,
+                                    ["websocket_midstream_resync".to_string()],
+                                );
+                                continue;
+                            }
+                            if self.buffer.len() > 1 {
+                                self.buffer.drain(..1);
+                                self.fragmented = None;
+                                self.last_decode_error = None;
+                                continue;
+                            }
+                        }
                         self.reset_after_error("websocket_invalid_control_frame");
                         break;
                     }
@@ -1012,6 +1030,28 @@ impl WebSocketFrameDecoder {
                     }
                 }
                 _ => {
+                    if self.allow_midstream_resync {
+                        if self.try_resync_frame_header()
+                            || (self.buffer.len() > 64
+                                && self.try_resync_to_complete_plausible_event())
+                        {
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
+                        if self.buffer.len() > 1 {
+                            self.buffer.drain(..1);
+                            self.fragmented = None;
+                            self.last_decode_error = None;
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
+                    }
                     self.reset_after_error("websocket_reserved_opcode");
                     break;
                 }
@@ -1107,7 +1147,12 @@ impl WebSocketFrameDecoder {
     fn frame_payload_plausible_json(&mut self, frame: &DecodedWebSocketFrame) -> bool {
         let payload = if frame.compressed {
             if !self.compression_enabled {
-                return false;
+                if !self.allow_midstream_resync {
+                    return false;
+                }
+                // Late RSV1 after recover without an early compression hint.
+                self.compression_enabled = true;
+                self.no_context_takeover = true;
             }
             match self.inflate_message(&frame.payload) {
                 Ok(payload) => {
@@ -1357,11 +1402,13 @@ impl WebSocketConnectionState {
     }
 
     fn recover_from_frame(&mut self, data: &[u8]) {
-        let compressed = data.first().is_some_and(|byte| byte & 0x40 != 0);
-        // Mid-flight attach never saw the 101 extension list. Prefer no_context_takeover so each
-        // RSV1 message is self-contained; shared sliding-window state from before attach is gone.
-        self.requests.configure_compression(compressed, true);
-        self.responses.configure_compression(compressed, true);
+        let _ = data;
+        // Mid-flight attach never saw the 101 extension list. Codex/OpenAI Responses WS uses
+        // permessage-deflate; the first observed byte is often mid-frame and may not show RSV1
+        // even though later real frames are compressed. Always enable deflate with
+        // no_context_takeover so each RSV1 message is self-contained.
+        self.requests.configure_compression(true, true);
+        self.responses.configure_compression(true, true);
         self.requests.allow_midstream_resync = true;
         self.responses.allow_midstream_resync = true;
         self.active = true;
@@ -1369,11 +1416,14 @@ impl WebSocketConnectionState {
     }
 
     fn prepare_recovered_frame(&mut self, data: &[u8]) {
-        if !self.recovered_without_handshake || data.first().is_none_or(|byte| byte & 0x40 == 0) {
+        let _ = data;
+        if !self.recovered_without_handshake {
             return;
         }
         self.requests.compression_enabled = true;
         self.responses.compression_enabled = true;
+        self.requests.no_context_takeover = true;
+        self.responses.no_context_takeover = true;
     }
 
     fn decoder(&self, direction: ChunkDirection) -> &WebSocketFrameDecoder {
