@@ -19,7 +19,6 @@ sha2 = "0.10"
 httparse = "1.10"
 flate2 = "1"
 base64 = "0.22"
-hpack = "0.3"
 
 [build-dependencies]
 aya-build = "0.1"

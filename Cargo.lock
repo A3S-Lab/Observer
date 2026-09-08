@@ -22,7 +22,6 @@ dependencies = [
  "aya-build",
  "base64",
  "flate2",
- "hpack",
  "httparse",
  "libc",
  "serde_json",
@@ -79,7 +78,7 @@ dependencies = [
  "bitflags",
  "bytes",
  "libc",
- "log 0.4.33",
+ "log",
  "object",
  "once_cell",
  "thiserror 1.0.69",
@@ -147,7 +146,7 @@ dependencies = [
  "bytes",
  "core-error",
  "hashbrown 0.15.5",
- "log 0.4.33",
+ "log",
  "object",
  "thiserror 1.0.69",
 ]
@@ -325,15 +324,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
-name = "hpack"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
-dependencies = [
- "log 0.3.9",
-]
-
-[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -366,15 +356,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "log"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
-dependencies = [
- "log 0.4.33",
-]
 
 [[package]]
 name = "log"
@@ -707,7 +688,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log 0.4.33",
+ "log",
  "once_cell",
  "tracing-core",
 ]

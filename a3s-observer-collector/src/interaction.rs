@@ -1783,7 +1783,15 @@ impl InteractionReassembler {
             self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
         }
         for reason in deferred_body_gap_reasons {
-            self.enqueue_gap_evidence(key, &chunk, &reason, "json-body");
+            let transport = if reason == "h2_hpack_desync"
+                || reason.starts_with("http2_")
+                || reason.starts_with("h2_")
+            {
+                "http/2"
+            } else {
+                "json-body"
+            };
+            self.enqueue_gap_evidence(key, &chunk, &reason, transport);
         }
         if sequence_gap_detected {
             self.enqueue_gap_evidence(key, &chunk, "fragment_sequence_gap", "unknown");
@@ -3985,6 +3993,7 @@ fn build_interaction(
         protocol: match request.transport_protocol.as_deref() {
             Some("websocket") => "websocket-json",
             Some("json-body") => "http/1.1-body-inferred",
+            Some("http/2") => "http/2",
             _ if request.metadata_inferred => "application-body-inferred",
             _ => "http/1.1",
         }
@@ -4525,6 +4534,20 @@ fn process_http2_chunk(
                     chunk.event_at_unix_ns,
                     &effective_reasons,
                 );
+                // After HPACK desync, keep the DATA body-only lane: infer route from JSON body.
+                if request.metadata_inferred {
+                    if let Some(inferred) = body_only_llm_request(
+                        &finished.body,
+                        chunk.event_at_unix_ns,
+                        &effective_reasons,
+                    ) {
+                        request.start_line = inferred.start_line;
+                        for (name, value) in inferred.headers {
+                            request.headers.entry(name).or_insert(value);
+                        }
+                        request.transport_protocol = Some("http/2".to_string());
+                    }
+                }
                 state.identity.observe_http(&request, ChunkDirection::Request);
                 add_binding_reasons(state, &mut request.partial_reasons);
                 if !state.push_pending_request(request) {
@@ -4543,6 +4566,24 @@ fn process_http2_chunk(
                     chunk.event_at_unix_ns,
                     &effective_reasons,
                 );
+                if response.headers.get("content-type").is_none() {
+                    if looks_like_sse(&finished.body) {
+                        response.headers.insert(
+                            "content-type".to_string(),
+                            "text/event-stream".to_string(),
+                        );
+                    } else if finished
+                        .body
+                        .iter()
+                        .find(|b| !b.is_ascii_whitespace())
+                        .is_some_and(|b| matches!(*b, b'{' | b'['))
+                    {
+                        response.headers.insert(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        );
+                    }
+                }
                 state.identity.observe_http(&response, ChunkDirection::Response);
                 add_binding_reasons(state, &mut request.partial_reasons);
                 add_binding_reasons(state, &mut response.partial_reasons);
@@ -8337,9 +8378,19 @@ mod tests {
     fn http2_hpack_desync_is_explicit_gap_without_panic() {
         let mut reassembler = InteractionReassembler::default();
         let mut frames = HTTP2_CLIENT_PREFACE.to_vec();
-        frames.extend(http2_frame(HTTP2_FRAME_HEADERS, 0x5, 1, &[0xff, 0xff, 0xff, 0xff]));
+        frames.extend(http2_frame(
+            HTTP2_FRAME_HEADERS,
+            0x5,
+            1,
+            &[0xff, 0xff, 0xff, 0xff],
+        ));
         let completed = reassembler.push(chunk(ChunkDirection::Request, frames, 1));
         assert!(completed.is_empty());
+        let evidence = reassembler.take_evidence();
+        assert!(evidence.iter().any(|item| {
+            item.transport_protocol == "http/2"
+                && item.reasons.iter().any(|reason| reason == "h2_hpack_desync")
+        }));
     }
 
     #[test]
