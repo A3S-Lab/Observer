@@ -1,6 +1,6 @@
 # a3s-observer
 
-<p align="center">
+<p>
   <strong>Language / 语言:</strong>
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md">中文</a>
