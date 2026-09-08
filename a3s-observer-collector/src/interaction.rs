@@ -1073,7 +1073,15 @@ impl WebSocketFrameDecoder {
         } else {
             frame.payload.clone()
         };
-        payload_looks_like_json_prefix(&payload)
+        // Fragment starts only need a JSON prefix; FIN frames must look like the protocol we
+        // actually reassemble, or midstream false positives keep desynchronizing the decoder.
+        if !frame.fin {
+            return payload_looks_like_json_prefix(&payload);
+        }
+        match self.kind {
+            StreamKind::Response => payload_looks_like_responses_event(&payload),
+            StreamKind::Request => payload_looks_like_llm_request_event(&payload),
+        }
     }
 
     fn try_resync_frame_header(&mut self) -> bool {
@@ -1112,6 +1120,20 @@ fn payload_looks_like_json_prefix(payload: &[u8]) -> bool {
         .map(|index| &payload[index..])
         .unwrap_or(&[]);
     matches!(trimmed.first(), Some(b'{' | b'['))
+}
+
+fn payload_looks_like_responses_event(payload: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type.starts_with("response.") || event_type == "error")
+}
+
+fn payload_looks_like_llm_request_event(payload: &[u8]) -> bool {
+    body_only_llm_request(payload, 0, &[]).is_some()
 }
 
 fn decode_websocket_frame(
