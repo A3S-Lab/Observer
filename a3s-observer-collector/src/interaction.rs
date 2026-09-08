@@ -845,7 +845,27 @@ impl WebSocketFrameDecoder {
         let mut messages = Vec::new();
         loop {
             let frame = match decode_websocket_frame(&self.buffer, self.max_bytes) {
-                Ok(Some(frame)) => frame,
+                Ok(Some(frame)) => {
+                    // Misaligned mid-flight bytes often forge syntactically valid frames. When
+                    // recovery enabled resync, only commit data frames whose payload looks like
+                    // JSON (Responses / chat events); otherwise skip toward the next header.
+                    if self.allow_midstream_resync
+                        && self.fragmented.is_none()
+                        && matches!(frame.opcode, 0x1 | 0x2)
+                        && !self.frame_payload_plausible_json(&frame)
+                    {
+                        if self.try_resync_frame_header() {
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
+                        self.reset_after_error("websocket_midstream_false_frame");
+                        break;
+                    }
+                    frame
+                }
                 Ok(None) => break,
                 Err(reason) => {
                     if self.allow_midstream_resync
@@ -1037,6 +1057,25 @@ impl WebSocketFrameDecoder {
         Ok(output)
     }
 
+    fn frame_payload_plausible_json(&mut self, frame: &DecodedWebSocketFrame) -> bool {
+        let payload = if frame.compressed {
+            if !self.compression_enabled {
+                return false;
+            }
+            match self.inflate_message(&frame.payload) {
+                Ok(payload) => {
+                    // Inflate is only a probe here; reset so finish_message can inflate again.
+                    self.inflater.reset(false);
+                    payload
+                }
+                Err(_) => return false,
+            }
+        } else {
+            frame.payload.clone()
+        };
+        payload_looks_like_json_prefix(&payload)
+    }
+
     fn try_resync_frame_header(&mut self) -> bool {
         if self.buffer.len() < 2 {
             return false;
@@ -1064,6 +1103,15 @@ impl WebSocketFrameDecoder {
         self.inflater.reset(false);
         self.last_decode_error = Some(reason.to_string());
     }
+}
+
+fn payload_looks_like_json_prefix(payload: &[u8]) -> bool {
+    let trimmed = payload
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|index| &payload[index..])
+        .unwrap_or(&[]);
+    matches!(trimmed.first(), Some(b'{' | b'['))
 }
 
 fn decode_websocket_frame(
@@ -9016,6 +9064,59 @@ mod tests {
             completed[0].response.text.as_deref(),
             Some("RESPONSE_ONLY_RECOVERED_MARKER")
         );
+    }
+
+    #[test]
+    fn websocket_midstream_resync_rejects_false_positive_text_frames() {
+        let mut reassembler = InteractionReassembler::default();
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "FALSE_FRAME_RESYNC_MARKER"
+        })
+        .to_string();
+        // Recover path: first response activates midstream resync.
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(br#"{"type":"response.created"}"#, false, true, false, 0x1),
+                500,
+                0x8200,
+            ))
+            .is_empty());
+        let frame = websocket_frame(delta.as_bytes(), false, true, false, 0x1);
+        // Syntactically valid text frame with non-JSON payload must not steal the real frame.
+        let mut garbage_then_frame = vec![0x81, 0x03, b'a', b'b', b'c'];
+        garbage_then_frame.extend_from_slice(&frame);
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-false-frame",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        })
+        .to_string();
+        garbage_then_frame.extend_from_slice(&websocket_frame(
+            terminal.as_bytes(),
+            false,
+            true,
+            false,
+            0x1,
+        ));
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            garbage_then_frame,
+            510,
+            0x8200,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("FALSE_FRAME_RESYNC_MARKER")
+        );
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "websocket_midstream_resync"));
     }
 
     #[test]
