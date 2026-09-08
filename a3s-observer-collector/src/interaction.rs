@@ -863,24 +863,10 @@ impl WebSocketFrameDecoder {
                             _ => false,
                         };
                         if !accept {
-                            if self.try_resync_frame_header()
-                                || (self.buffer.len() > 64
-                                    && self.try_resync_to_complete_plausible_event())
-                            {
-                                extend_unique(
-                                    &mut self.partial_reasons,
-                                    ["websocket_midstream_resync".to_string()],
-                                );
-                                continue;
-                            }
-                            if self.buffer.len() > 1 {
-                                self.buffer.drain(..1);
-                                self.fragmented = None;
-                                self.last_decode_error = None;
-                                extend_unique(
-                                    &mut self.partial_reasons,
-                                    ["websocket_midstream_resync".to_string()],
-                                );
+                            // Prefer a complete Responses/LLM event over a header-only jump:
+                            // header-shaped false positives often claim huge lengths and stall
+                            // the buffer after discarding tens of KB of real frames.
+                            if self.try_midstream_resync() {
                                 continue;
                             }
                             self.reset_after_error("websocket_midstream_false_frame");
@@ -911,23 +897,7 @@ impl WebSocketFrameDecoder {
                         // A forged non-FIN latch must not force a full buffer wipe on the next
                         // reserved-bit error — clear the fragment and keep hunting.
                         self.fragmented = None;
-                        if self.try_resync_frame_header()
-                            || (self.buffer.len() > 64
-                                && self.try_resync_to_complete_plausible_event())
-                        {
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
-                            continue;
-                        }
-                        if self.buffer.len() > 1 {
-                            self.buffer.drain(..1);
-                            self.last_decode_error = None;
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
+                        if self.try_midstream_resync() {
                             continue;
                         }
                     }
@@ -951,23 +921,8 @@ impl WebSocketFrameDecoder {
             match frame.opcode {
                 0x8..=0xA => {
                     if !frame.fin || frame.payload.len() > 125 {
-                        if self.allow_midstream_resync {
-                            if self.try_resync_frame_header()
-                                || (self.buffer.len() > 64
-                                    && self.try_resync_to_complete_plausible_event())
-                            {
-                                extend_unique(
-                                    &mut self.partial_reasons,
-                                    ["websocket_midstream_resync".to_string()],
-                                );
-                                continue;
-                            }
-                            if self.buffer.len() > 1 {
-                                self.buffer.drain(..1);
-                                self.fragmented = None;
-                                self.last_decode_error = None;
-                                continue;
-                            }
+                        if self.allow_midstream_resync && self.try_midstream_resync() {
+                            continue;
                         }
                         self.reset_after_error("websocket_invalid_control_frame");
                         break;
@@ -1004,11 +959,7 @@ impl WebSocketFrameDecoder {
                         break;
                     }
                     let Some(mut fragmented) = self.fragmented.take() else {
-                        if self.allow_midstream_resync && self.try_resync_frame_header() {
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
+                        if self.allow_midstream_resync && self.try_midstream_resync() {
                             continue;
                         }
                         self.reset_after_error("websocket_orphan_continuation");
@@ -1036,27 +987,8 @@ impl WebSocketFrameDecoder {
                     }
                 }
                 _ => {
-                    if self.allow_midstream_resync {
-                        if self.try_resync_frame_header()
-                            || (self.buffer.len() > 64
-                                && self.try_resync_to_complete_plausible_event())
-                        {
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
-                            continue;
-                        }
-                        if self.buffer.len() > 1 {
-                            self.buffer.drain(..1);
-                            self.fragmented = None;
-                            self.last_decode_error = None;
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
-                            continue;
-                        }
+                    if self.allow_midstream_resync && self.try_midstream_resync() {
+                        continue;
                     }
                     self.reset_after_error("websocket_reserved_opcode");
                     break;
@@ -1166,7 +1098,10 @@ impl WebSocketFrameDecoder {
                     self.inflater.reset(false);
                     payload
                 }
-                Err(_) => return false,
+                Err(reason) => {
+                    self.last_decode_error = Some(reason);
+                    return false;
+                }
             }
         } else {
             frame.payload.clone()
@@ -1205,23 +1140,25 @@ impl WebSocketFrameDecoder {
         false
     }
 
-    fn try_resync_frame_header(&mut self) -> bool {
-        if self.buffer.len() < 2 {
-            return false;
+    /// Mid-flight recover must not jump to a header-shaped offset that is only incomplete: those
+    /// false positives discard real frames and then stall on a forged length. Prefer a complete
+    /// plausible event; otherwise advance one byte at a time.
+    fn try_midstream_resync(&mut self) -> bool {
+        if self.buffer.len() > 64 && self.try_resync_to_complete_plausible_event() {
+            extend_unique(
+                &mut self.partial_reasons,
+                ["websocket_midstream_resync".to_string()],
+            );
+            return true;
         }
-        let expect_masked = self.kind == StreamKind::Request;
-        // Search the whole buffer (capped by max frame size): false headers often claim a large
-        // payload that still contains the next real frame well past 8 KiB.
-        let search_limit = self.buffer.len().min(self.max_bytes.saturating_add(64)).max(2);
-        // Skip the current misaligned leading byte and search for the next plausible data frame.
-        for offset in 1..search_limit {
-            if !plausible_websocket_data_frame_at(&self.buffer[offset..], expect_masked) {
-                continue;
-            }
-            self.buffer.drain(..offset);
+        if self.buffer.len() > 1 {
+            self.buffer.drain(..1);
             self.fragmented = None;
-            self.last_decode_error = None;
-            self.inflater.reset(false);
+            // Keep last_decode_error (e.g. deflate failure) visible in diagnostics.
+            extend_unique(
+                &mut self.partial_reasons,
+                ["websocket_midstream_resync".to_string()],
+            );
             return true;
         }
         false
@@ -3156,27 +3093,6 @@ fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) ->
             .copied()
             .find(|byte| !byte.is_ascii_whitespace())
             .is_some_and(|byte| matches!(byte, b'{' | b'['))
-    }
-}
-
-fn plausible_websocket_data_frame_at(data: &[u8], expect_masked: bool) -> bool {
-    if data.len() < 2 || data[0] & 0x30 != 0 {
-        return false;
-    }
-    let opcode = data[0] & 0x0f;
-    if !matches!(opcode, 0x1 | 0x2) {
-        return false;
-    }
-    if data[0] & 0x80 == 0 {
-        return false;
-    }
-    let masked = data[1] & 0x80 != 0;
-    if masked != expect_masked {
-        return false;
-    }
-    match decode_websocket_frame(data, 16 * 1024 * 1024) {
-        Ok(Some(_)) | Ok(None) => true,
-        Err(_) => false,
     }
 }
 
