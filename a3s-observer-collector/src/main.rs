@@ -224,6 +224,22 @@ impl VerifiedProcessMap {
         self.installed = desired;
         Ok(newly_installed)
     }
+
+    /// Admit one PID immediately (e.g. named-agent exec) so the next TLS plaintext event in the
+    /// same pipeline batch is not dropped before the periodic sync runs.
+    fn insert_pid(&mut self, pid: i32) -> bool {
+        let Some(key) = plaintext_process_key(pid) else {
+            return false;
+        };
+        if self.installed.contains(&key) {
+            return false;
+        }
+        if self.map.insert(key, 1, 0).is_err() {
+            return false;
+        }
+        self.installed.insert(key);
+        true
+    }
 }
 
 fn plaintext_process_key(pid: i32) -> Option<PlaintextProcessKeyBytes> {
@@ -2162,6 +2178,7 @@ async fn main() -> anyhow::Result<()> {
                     release_reorder_by_wall_clock(
                         &mut reorder,
                         &mut processor,
+                        &mut verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2497,6 +2514,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut pipeline_receiver,
                         &mut reorder,
                         &mut processor,
+                        &mut verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2522,6 +2540,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut pipeline_receiver,
                         &mut reorder,
                         &mut processor,
+                        &mut verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2584,6 +2603,7 @@ async fn main() -> anyhow::Result<()> {
             &mut pipeline_receiver,
             &mut reorder,
             &mut processor,
+            &mut verified_process_map,
             exporter.as_ref(),
             &resolver,
             &classifier,
@@ -2596,6 +2616,7 @@ async fn main() -> anyhow::Result<()> {
     let ready = reorder.flush_all();
     process_ready_envelopes(
         &mut processor,
+        &mut verified_process_map,
         ready,
         exporter.as_ref(),
         &resolver,
@@ -3733,6 +3754,9 @@ struct CollectorProcessor {
     process_lifecycles: ProcessLifecycleStore,
     tls_attach_candidate_pids: HashSet<i32>,
     tls_verified_candidate_pids: HashSet<i32>,
+    /// Named-agent / capture-profile exec PIDs that must enter the BPF allowlist before the next
+    /// TLS plaintext event in the same batch is processed.
+    pending_immediate_allowlist_pids: HashSet<i32>,
     tls_fast_retry_candidate_pids: HashSet<i32>,
     tls_attach_retries: HashMap<i32, PendingTlsAttachRetry>,
     stats: Stats,
@@ -3754,6 +3778,7 @@ impl CollectorProcessor {
             process_lifecycles: ProcessLifecycleStore::default(),
             tls_attach_candidate_pids: HashSet::new(),
             tls_verified_candidate_pids: HashSet::new(),
+            pending_immediate_allowlist_pids: HashSet::new(),
             tls_fast_retry_candidate_pids: HashSet::new(),
             tls_attach_retries: HashMap::new(),
             stats: Stats::default(),
@@ -3860,6 +3885,23 @@ impl CollectorProcessor {
         self.tls_attach_retries.remove(&pid);
     }
 
+    fn flush_immediate_allowlist(&mut self, verified_process_map: &mut VerifiedProcessMap) {
+        let pending = std::mem::take(&mut self.pending_immediate_allowlist_pids);
+        let mut newly = 0usize;
+        for pid in pending {
+            if verified_process_map.insert_pid(pid) {
+                newly = newly.saturating_add(1);
+            }
+        }
+        if newly > 0 {
+            tracing::info!(
+                newly_installed = newly,
+                installed = verified_process_map.installed.len(),
+                "immediately admitted Agent plaintext PID allowlist from exec"
+            );
+        }
+    }
+
     fn expire_socket_state(&mut self, now: Instant) {
         let before_peers = self.peers.len();
         self.peers
@@ -3932,10 +3974,12 @@ impl CollectorProcessor {
                             // the verified plaintext allowlist on named-agent exec so short-lived
                             // sessions do not depend on FORWARD_RETAIN_NON_AGENT.
                             self.tls_verified_candidate_pids.insert(pid);
+                            self.pending_immediate_allowlist_pids.insert(pid);
                         } else if tls_capture_profile_needs_refresh(
                             record.capture_decision.capture_profile,
                         ) {
                             self.tls_verified_candidate_pids.insert(pid);
+                            self.pending_immediate_allowlist_pids.insert(pid);
                         }
                     }
                 }
@@ -4746,6 +4790,7 @@ fn emit_plaintext_evidence(
 
 fn process_ready_envelopes(
     processor: &mut CollectorProcessor,
+    verified_process_map: &mut VerifiedProcessMap,
     ready: impl IntoIterator<Item = RawEnvelope>,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
@@ -4753,12 +4798,16 @@ fn process_ready_envelopes(
 ) {
     for envelope in ready {
         processor.process(envelope, exporter, resolver, classifier);
+        // Exec commits must open the plaintext gate before a same-batch TLS write/read is
+        // evaluated; otherwise the WS upgrade is dropped and mid-flight recover cannot inflate.
+        processor.flush_immediate_allowlist(verified_process_map);
     }
 }
 
 fn push_reorder_envelope(
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
+    verified_process_map: &mut VerifiedProcessMap,
     envelope: RawEnvelope,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
@@ -4766,20 +4815,40 @@ fn push_reorder_envelope(
 ) {
     match reorder.try_push(envelope) {
         Ok(ready) => {
-            process_ready_envelopes(processor, ready, exporter, resolver, classifier);
+            process_ready_envelopes(
+                processor,
+                verified_process_map,
+                ready,
+                exporter,
+                resolver,
+                classifier,
+            );
         }
         Err(ReorderPushError::Full(envelope)) => {
             // Capacity pressure degrades only ordering, never fact retention. Flush the bounded
             // coordinator, then re-admit the rejected record into an empty buffer.
             processor.reorder_forced_flushes = processor.reorder_forced_flushes.saturating_add(1);
             let ready = reorder.flush_all();
-            process_ready_envelopes(processor, ready, exporter, resolver, classifier);
+            process_ready_envelopes(
+                processor,
+                verified_process_map,
+                ready,
+                exporter,
+                resolver,
+                classifier,
+            );
             match reorder.try_push(envelope) {
-                Ok(ready) => {
-                    process_ready_envelopes(processor, ready, exporter, resolver, classifier)
-                }
+                Ok(ready) => process_ready_envelopes(
+                    processor,
+                    verified_process_map,
+                    ready,
+                    exporter,
+                    resolver,
+                    classifier,
+                ),
                 Err(ReorderPushError::Full(envelope) | ReorderPushError::Duplicate(envelope)) => {
                     processor.process(envelope, exporter, resolver, classifier);
+                    processor.flush_immediate_allowlist(verified_process_map);
                 }
             }
         }
@@ -4788,6 +4857,7 @@ fn push_reorder_envelope(
             // Preserve it in arrival order and surface the bounded diagnostic counter.
             processor.reorder_key_collisions = processor.reorder_key_collisions.saturating_add(1);
             processor.process(envelope, exporter, resolver, classifier);
+            processor.flush_immediate_allowlist(verified_process_map);
         }
     }
 }
@@ -4796,6 +4866,7 @@ fn drain_pipeline(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
+    verified_process_map: &mut VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -4804,7 +4875,15 @@ fn drain_pipeline(
     let batch = receiver.try_drain_weighted(limit);
     let count = batch.len();
     for envelope in batch {
-        push_reorder_envelope(reorder, processor, envelope, exporter, resolver, classifier);
+        push_reorder_envelope(
+            reorder,
+            processor,
+            verified_process_map,
+            envelope,
+            exporter,
+            resolver,
+            classifier,
+        );
     }
     count
 }
@@ -4814,6 +4893,7 @@ fn process_pipeline_cycle(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
+    verified_process_map: &mut VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -4821,11 +4901,19 @@ fn process_pipeline_cycle(
     reorder_window_ns: u64,
 ) -> anyhow::Result<usize> {
     let drained = drain_pipeline(
-        receiver, reorder, processor, exporter, resolver, classifier, limit,
+        receiver,
+        reorder,
+        processor,
+        verified_process_map,
+        exporter,
+        resolver,
+        classifier,
+        limit,
     );
     release_reorder_by_wall_clock(
         reorder,
         processor,
+        verified_process_map,
         exporter,
         resolver,
         classifier,
@@ -4837,6 +4925,7 @@ fn process_pipeline_cycle(
 fn release_reorder_by_wall_clock(
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
+    verified_process_map: &mut VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -4844,7 +4933,14 @@ fn release_reorder_by_wall_clock(
 ) -> anyhow::Result<()> {
     let watermark = monotonic_now_ns()?.saturating_sub(reorder_window_ns);
     let ready = reorder.release_through_boot_ns(watermark);
-    process_ready_envelopes(processor, ready, exporter, resolver, classifier);
+    process_ready_envelopes(
+        processor,
+        verified_process_map,
+        ready,
+        exporter,
+        resolver,
+        classifier,
+    );
     Ok(())
 }
 
