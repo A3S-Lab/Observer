@@ -672,10 +672,15 @@ impl HttpStreamDecoder {
                 Ok(None) => break,
                 Err(reason) => {
                     self.last_decode_error = Some(reason.clone());
-                    // The next attempt re-decodes from a possibly different framing state; do
-                    // not keep resume offsets that may point into a different body.
-                    self.sse_scan = SseTerminalScanState::default();
-                    self.chunked_scan = SseTerminalScanState::default();
+                    // A decode error does NOT advance the message boundary: the buffer prefix
+                    // (and therefore the parsed headers and the pending body start) is
+                    // unchanged, so the terminal-scan resume cursors still point into the same
+                    // monotonically growing body. Resetting them here would make every retry
+                    // rescan the whole body from scratch — a misframed-but-persistent stream
+                    // (e.g. declared chunked carrying raw LF-only SSE) re-errs on every
+                    // fragment and turned that into a quadratic rescan that pinned a core.
+                    // Real boundary advances (drain, detached prefix, unparsed tail) reset the
+                    // cursors in their own branches.
                     extend_unique(&mut self.partial_reasons, [reason]);
                     break;
                 }
@@ -6926,6 +6931,42 @@ mod tests {
             completed[0].body,
             [event_a.as_slice(), event_b.as_slice()].concat()
         );
+    }
+
+    #[test]
+    fn repeated_framing_errors_do_not_reset_terminal_scan_cursors() {
+        // A response declared chunked whose body is actually raw CRLF SSE fails chunk-size
+        // parsing on every fragment (a `data:` line is not a hex size). Framing errors do not
+        // advance the message boundary, so the terminal-scan cursors must survive them: this
+        // pins the invariant that a persistently misframed stream cannot force the decoder back
+        // into whole-body rescans via the error path. (The misframed stream stays pending; the
+        // semantic chunked→SSE fallback itself is owned by the framing layer.)
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let sse = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\r\n\r\n";
+        let mut decoder = HttpStreamDecoder::new(StreamKind::Response, 8 * 1024 * 1024);
+        assert!(decoder.push(header.as_bytes(), 100, &[]).is_empty());
+        let cursors_before_error = (decoder.sse_scan, decoder.chunked_scan);
+        assert!(
+            decoder.push(sse, 110, &[]).is_empty(),
+            "misframed chunked SSE stays pending, not completed"
+        );
+        assert!(
+            decoder.last_decode_error.is_some(),
+            "a `data:` line is not a valid chunk size"
+        );
+        assert_eq!(
+            (decoder.sse_scan, decoder.chunked_scan),
+            cursors_before_error,
+            "framing errors must not reset the terminal-scan cursors"
+        );
+        for _ in 0..4 {
+            assert!(decoder.push(sse, 120, &[]).is_empty());
+            assert!(decoder.last_decode_error.is_some());
+            assert_eq!(
+                (decoder.sse_scan, decoder.chunked_scan),
+                cursors_before_error
+            );
+        }
     }
 
     #[test]
