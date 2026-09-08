@@ -782,6 +782,9 @@ struct WebSocketFrameDecoder {
     fragmented: Option<FragmentedWebSocketMessage>,
     compression_enabled: bool,
     no_context_takeover: bool,
+    /// Mid-flight recovery: skip bytes to the next plausible frame header on decode errors
+    /// instead of hard-resetting (first TLS callback often starts mid-frame).
+    allow_midstream_resync: bool,
     inflater: Decompress,
     last_decode_error: Option<String>,
 }
@@ -797,6 +800,7 @@ impl WebSocketFrameDecoder {
             fragmented: None,
             compression_enabled: false,
             no_context_takeover: false,
+            allow_midstream_resync: false,
             inflater: Decompress::new(false),
             last_decode_error: None,
         }
@@ -844,6 +848,16 @@ impl WebSocketFrameDecoder {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(reason) => {
+                    if self.allow_midstream_resync
+                        && self.fragmented.is_none()
+                        && self.try_resync_frame_header()
+                    {
+                        extend_unique(
+                            &mut self.partial_reasons,
+                            ["websocket_midstream_resync".to_string()],
+                        );
+                        continue;
+                    }
                     self.reset_after_error(&reason);
                     break;
                 }
@@ -899,6 +913,13 @@ impl WebSocketFrameDecoder {
                         break;
                     }
                     let Some(mut fragmented) = self.fragmented.take() else {
+                        if self.allow_midstream_resync && self.try_resync_frame_header() {
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
                         self.reset_after_error("websocket_orphan_continuation");
                         break;
                     };
@@ -1014,6 +1035,25 @@ impl WebSocketFrameDecoder {
             self.inflater.reset(false);
         }
         Ok(output)
+    }
+
+    fn try_resync_frame_header(&mut self) -> bool {
+        if self.buffer.len() < 2 {
+            return false;
+        }
+        let expect_masked = self.kind == StreamKind::Request;
+        // Skip the current misaligned leading byte and search for the next plausible data frame.
+        for offset in 1..self.buffer.len().min(8 * 1024) {
+            if !plausible_websocket_data_frame_at(&self.buffer[offset..], expect_masked) {
+                continue;
+            }
+            self.buffer.drain(..offset);
+            self.fragmented = None;
+            self.last_decode_error = None;
+            self.inflater.reset(false);
+            return true;
+        }
+        false
     }
 
     fn reset_after_error(&mut self, reason: &str) {
@@ -1179,6 +1219,8 @@ impl WebSocketConnectionState {
         // RSV1 message is self-contained; shared sliding-window state from before attach is gone.
         self.requests.configure_compression(compressed, true);
         self.responses.configure_compression(compressed, true);
+        self.requests.allow_midstream_resync = true;
+        self.responses.allow_midstream_resync = true;
         self.active = true;
         self.recovered_without_handshake = true;
     }
@@ -1979,6 +2021,7 @@ impl InteractionReassembler {
                     if chunk.direction == ChunkDirection::Response
                         && state.pending_requests.is_empty()
                         && state.websocket.response.started_at_unix_ns.is_none()
+                        && !state.websocket.recovered_without_handshake
                     {
                         return None;
                     }
@@ -2765,16 +2808,17 @@ fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) ->
     if !matches!(opcode, 0x1 | 0x2) {
         return false;
     }
+    // Require FIN so mid-payload bytes that happen to look like opcode 1/2 do not activate a
+    // decoder on a misaligned stream (live Codex attach often starts mid-frame).
+    if data[0] & 0x80 == 0 {
+        return false;
+    }
     let masked = data.get(1).is_some_and(|byte| byte & 0x80 != 0);
-    // Client frames must be masked; server frames must not.
     match direction {
         ChunkDirection::Request if !masked => return false,
         ChunkDirection::Response if masked => return false,
         _ => {}
     }
-    // A compressed data frame is already a strong WebSocket signal. For an uncompressed
-    // frame, require the first application byte to be JSON so arbitrary TLS payloads do
-    // not consume a long-lived reassembly slot.
     if data[0] & 0x40 != 0 {
         return true;
     }
@@ -2809,6 +2853,27 @@ fn recoverable_websocket_frame_prefix(data: &[u8], direction: ChunkDirection) ->
             .copied()
             .find(|byte| !byte.is_ascii_whitespace())
             .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    }
+}
+
+fn plausible_websocket_data_frame_at(data: &[u8], expect_masked: bool) -> bool {
+    if data.len() < 2 || data[0] & 0x30 != 0 {
+        return false;
+    }
+    let opcode = data[0] & 0x0f;
+    if !matches!(opcode, 0x1 | 0x2) {
+        return false;
+    }
+    if data[0] & 0x80 == 0 {
+        return false;
+    }
+    let masked = data[1] & 0x80 != 0;
+    if masked != expect_masked {
+        return false;
+    }
+    match decode_websocket_frame(data, 16 * 1024 * 1024) {
+        Ok(Some(_)) | Ok(None) => true,
+        Err(_) => false,
     }
 }
 
@@ -8847,6 +8912,48 @@ mod tests {
             completed[0].response.text.as_deref(),
             Some("RESPONSE_ONLY_RECOVERED_MARKER")
         );
+    }
+
+    #[test]
+    fn websocket_midstream_resync_skips_prefix_garbage_after_recovery() {
+        let mut reassembler = InteractionReassembler::default();
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "RESYNCED_MARKER"
+        })
+        .to_string();
+        assert!(reassembler
+            .push(rustls_chunk_on(
+                ChunkDirection::Response,
+                websocket_frame(delta.as_bytes(), false, true, false, 0x1),
+                400,
+                0x8100,
+            ))
+            .is_empty());
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-resync",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        })
+        .to_string();
+        let frame = websocket_frame(terminal.as_bytes(), false, true, false, 0x1);
+        // Reserved RSV bits force a decode error so midstream resync can skip to the real frame.
+        let mut garbage_then_frame = vec![0x30, 0x01, 0xaa, 0xbb];
+        garbage_then_frame.extend_from_slice(&frame);
+        let completed = reassembler.push(rustls_chunk_on(
+            ChunkDirection::Response,
+            garbage_then_frame,
+            410,
+            0x8100,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].response.text.as_deref(), Some("RESYNCED_MARKER"));
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "websocket_midstream_resync"));
     }
 
     #[test]
