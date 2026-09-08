@@ -1619,10 +1619,12 @@ impl InteractionReassembler {
         merge_bounded_label(&mut state.source, &chunk.source);
         merge_bounded_label(&mut state.adapter_id, &chunk.adapter_id);
         // Rustls connection objects can be reused after a socket closes. A retained WebSocket
-        // state must yield to an unmistakable fresh HTTP request on the same pointer.
+        // state must yield to an unmistakable fresh HTTP request on the same pointer — but not
+        // to a duplicate WebSocket upgrade GET for the same handshake.
         if state.websocket.active
             && chunk.direction == ChunkDirection::Request
             && looks_like_http_request_prefix(&chunk.data)
+            && !looks_like_websocket_upgrade(&chunk.data)
         {
             *state = ConnectionState::new(
                 self.max_body_bytes,
@@ -1707,7 +1709,13 @@ impl InteractionReassembler {
             deferred_body_gap_reasons.extend(gaps);
             done
         } else if state.websocket.active {
-            process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
+            if looks_like_websocket_upgrade(&chunk.data) {
+                // Duplicate upgrade GET on an already-activated connection (common when Rustls
+                // redelivers the handshake buffer); keep the existing deflate settings.
+                Vec::new()
+            } else {
+                process_websocket_chunk(key, state, &chunk, self.max_body_bytes)
+            }
         } else {
             match chunk.direction {
                 ChunkDirection::Request => {
@@ -1774,6 +1782,16 @@ impl InteractionReassembler {
                                 state.websocket.endpoint = endpoint.clone();
                                 state.websocket.path = path.clone();
                                 state.identity.observe_route(&endpoint, &path);
+                                // Rustls CommonState pointers often change between the upgrade
+                                // GET and later WS frames. Activate from the client offer now so
+                                // sibling pointers remount onto this connection before 101, using
+                                // the offered Sec-WebSocket-Extensions (refined when 101 arrives).
+                                if !state.websocket.active {
+                                    let extension = request
+                                        .header("sec-websocket-extensions")
+                                        .map(str::to_owned);
+                                    state.websocket.activate(extension.as_deref());
+                                }
                             } else {
                                 state
                                     .identity
@@ -2137,9 +2155,12 @@ impl InteractionReassembler {
             if observed_busy {
                 return Some(observed);
             }
-            // Non-WS observed keys keep their own home for requests; responses may still join a
-            // unique pending sibling below.
-            if !state.websocket.active && chunk.direction != ChunkDirection::Response {
+            // Fresh HTTP requests keep their own home. WebSocket data frames on a new Rustls
+            // pointer should still remount onto the unique upgrade/pending sibling below.
+            if !state.websocket.active
+                && chunk.direction != ChunkDirection::Response
+                && looks_like_http_request_prefix(&chunk.data)
+            {
                 return Some(observed);
             }
         }
@@ -2151,7 +2172,8 @@ impl InteractionReassembler {
                     && key.cgroup_id == observed.cgroup_id
                     && key.pid == observed.pid
                     && sibling.websocket.active
-                    && (!sibling.pending_requests.is_empty()
+                    && (sibling.websocket.upgrade_requested
+                        || !sibling.pending_requests.is_empty()
                         || sibling.websocket.response.started_at_unix_ns.is_some()
                         || sibling.websocket.awaits_moved_fragment(chunk)))
                 .then_some(*key)
@@ -2182,9 +2204,8 @@ impl InteractionReassembler {
                 .filter_map(|(key, state)| {
                     (key.cgroup_id == observed.cgroup_id
                         && key.pid == observed.pid
-                        && state.websocket.upgrade_requested
-                        && !state.websocket.active)
-                        .then_some(*key)
+                        && state.websocket.upgrade_requested)
+                    .then_some(*key)
                 })
                 .collect::<Vec<_>>();
             narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
