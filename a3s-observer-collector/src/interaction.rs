@@ -1892,26 +1892,32 @@ impl InteractionReassembler {
         &mut self,
         chunk: &PlaintextChunk,
     ) -> (ConnectionKey, Option<&'static str>) {
-        // Prefer kernel tls_ctx↔socket bind when present. Bound streams use a stable socket-
-        // derived connection_id already filled by eBPF; still alias any provisional TLS-pointer
-        // key that may have been observed before the first bind completed.
-        if chunk.bind_quality >= TLS_BIND_QUALITY_FD {
-            let observed = ConnectionKey::from(chunk);
-            if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
-                return (canonical, None);
-            }
-            return (observed, None);
-        }
         let observed = ConnectionKey::from(chunk);
         if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
             return (canonical, None);
+        }
+        // Prefer kernel tls_ctx↔socket bind when present. Bound streams use a stable socket-
+        // derived connection_id already filled by eBPF; still alias any provisional TLS-pointer
+        // key that may have been observed before the first bind completed.
+        //
+        // Even after FD bind, rustls can still surface distinct CommonState pointers for the
+        // same pid (request vs response). If this observed key cannot progress an exchange but a
+        // unique sibling already owns a pending Responses turn, re-home instead of splitting.
+        if chunk.bind_quality >= TLS_BIND_QUALITY_FD {
+            if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
+                if owner != observed {
+                    self.remember_connection_alias(observed, owner);
+                    return (owner, None);
+                }
+            }
+            return (observed, None);
         }
         let observed_binding_uncertain = self
             .connections
             .get(&observed)
             .is_some_and(|state| state.binding_uncertain);
         if self.connections.contains_key(&observed) && !observed_binding_uncertain {
-            if let Some(owner) = self.sibling_websocket_exchange_owner(observed, chunk) {
+            if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
                 if owner != observed {
                     self.remember_connection_alias(observed, owner);
                     return (owner, None);
@@ -1946,29 +1952,60 @@ impl InteractionReassembler {
                 // Keep the bytes in their observed provisional state.  The caller adds an
                 // explicit partial/gap reason; no alias is created, so a later stronger pointer
                 // or protocol identity cannot inherit a wrong owner.
+                // Still collapse onto a unique pending Responses sibling when that is the only
+                // defensible owner for response bytes on this pid.
+                if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
+                    if owner != observed {
+                        self.remember_connection_alias(observed, owner);
+                        return (owner, None);
+                    }
+                }
                 (observed, Some("ambiguous_stream_binding"))
             }
             ConnectionResolution::Orphan => {
-                // A continuation frame has no self-describing owner. Retain its bounded raw
-                // evidence, but do not create a new protocol state that could steal a later
-                // stream after allocator reuse.
+                // A continuation frame has no self-describing owner. Prefer a unique pending
+                // sibling over dropping the bytes as orphan evidence.
+                if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
+                    if owner != observed {
+                        self.remember_connection_alias(observed, owner);
+                        return (owner, None);
+                    }
+                }
+                // Retain bounded raw evidence, but do not create a new protocol state that could
+                // steal a later stream after allocator reuse.
                 (observed, Some("orphan_stream_binding"))
             }
-            ConnectionResolution::New => (observed, None),
+            ConnectionResolution::New => {
+                if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
+                    if owner != observed {
+                        self.remember_connection_alias(observed, owner);
+                        return (owner, None);
+                    }
+                }
+                (observed, None)
+            }
         }
     }
 
-    fn sibling_websocket_exchange_owner(
+    /// Prefer the unique active WebSocket on this pid that already owns a pending / in-flight
+    /// Responses exchange when the observed pointer is idle or unknown.
+    fn preferred_websocket_exchange_owner(
         &self,
         observed: ConnectionKey,
         chunk: &PlaintextChunk,
     ) -> Option<ConnectionKey> {
-        let state = self.connections.get(&observed)?;
-        let observed_busy = !state.pending_requests.is_empty()
-            || state.websocket.response.started_at_unix_ns.is_some()
-            || state.websocket.awaits_moved_fragment(chunk);
-        if observed_busy || !state.websocket.active {
-            return Some(observed);
+        if let Some(state) = self.connections.get(&observed) {
+            let observed_busy = !state.pending_requests.is_empty()
+                || state.websocket.response.started_at_unix_ns.is_some()
+                || state.websocket.awaits_moved_fragment(chunk);
+            if observed_busy {
+                return Some(observed);
+            }
+            // Non-WS observed keys keep their own home for requests; responses may still join a
+            // unique pending sibling below.
+            if !state.websocket.active && chunk.direction != ChunkDirection::Response {
+                return Some(observed);
+            }
         }
         let mut owners = self
             .connections
