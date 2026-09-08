@@ -848,33 +848,40 @@ impl WebSocketFrameDecoder {
                 Ok(Some(frame)) => {
                     // Misaligned mid-flight bytes often forge syntactically valid frames. When
                     // recovery enabled resync, only commit data frames whose payload looks like
-                    // JSON (Responses / chat events); otherwise skip toward the next header.
-                    if self.allow_midstream_resync
-                        && self.fragmented.is_none()
-                        && matches!(frame.opcode, 0x1 | 0x2)
-                        && !self.frame_payload_plausible_json(&frame)
-                    {
-                        if self.try_resync_frame_header() {
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
-                            continue;
+                    // JSON (Responses / chat events); otherwise skip toward the next header
+                    // BEFORE draining, including reserved opcodes / bogus controls.
+                    if self.allow_midstream_resync && self.fragmented.is_none() {
+                        let accept = match frame.opcode {
+                            0x1 | 0x2 => self.frame_payload_plausible_json(&frame),
+                            // Ignore control frames until the stream has produced application
+                            // data; forged ping/close headers are common in mid-frame noise.
+                            0x8..=0xA => false,
+                            _ => false,
+                        };
+                        if !accept {
+                            if self.try_resync_frame_header()
+                                || (self.buffer.len() > 64
+                                    && self.try_resync_to_complete_plausible_event())
+                            {
+                                extend_unique(
+                                    &mut self.partial_reasons,
+                                    ["websocket_midstream_resync".to_string()],
+                                );
+                                continue;
+                            }
+                            if self.buffer.len() > 1 {
+                                self.buffer.drain(..1);
+                                self.fragmented = None;
+                                self.last_decode_error = None;
+                                extend_unique(
+                                    &mut self.partial_reasons,
+                                    ["websocket_midstream_resync".to_string()],
+                                );
+                                continue;
+                            }
+                            self.reset_after_error("websocket_midstream_false_frame");
+                            break;
                         }
-                        // Do not wipe the whole buffer: a false header can claim tens of KB of
-                        // payload that still contains the real frames further in.
-                        if self.buffer.len() > 1 {
-                            self.buffer.drain(..1);
-                            self.fragmented = None;
-                            self.last_decode_error = None;
-                            extend_unique(
-                                &mut self.partial_reasons,
-                                ["websocket_midstream_resync".to_string()],
-                            );
-                            continue;
-                        }
-                        self.reset_after_error("websocket_midstream_false_frame");
-                        break;
                     }
                     frame
                 }
