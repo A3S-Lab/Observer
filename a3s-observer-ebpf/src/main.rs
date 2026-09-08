@@ -3284,11 +3284,13 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
             return insert_tls_session(&key, detected, actual_len, now_boot_ns);
         }
         if fresh_method == Some(true) {
-            // A fresh unrecognised HTTP method is not enough to admit an entire TLS context. The
-            // only exception is an explicitly framed WebSocket upgrade, whose data frames may
-            // legitimately omit an HTTP route after the handshake.
+            // A fresh unrecognised HTTP method is not enough to admit an entire TLS context on
+            // OpenSSL/plain-HTTP paths. Rustls CommonState observes the full request including
+            // WebSocket upgrades whose Upgrade/Connection headers often sit past the 64-byte
+            // hint snapshot (Authorization-first Codex requests). Admit those as candidates and
+            // let userspace validate the handshake / deflate negotiation.
             return if args.api_kind == TLS_PLAINTEXT_API_RUSTLS
-                && http_websocket_upgrade_hint(args.buf, actual_len)
+                || http_websocket_upgrade_hint(args.buf, actual_len)
             {
                 insert_tls_session(
                     &key,
