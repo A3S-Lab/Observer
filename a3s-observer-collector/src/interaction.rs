@@ -861,6 +861,18 @@ impl WebSocketFrameDecoder {
                             );
                             continue;
                         }
+                        // Do not wipe the whole buffer: a false header can claim tens of KB of
+                        // payload that still contains the real frames further in.
+                        if self.buffer.len() > 1 {
+                            self.buffer.drain(..1);
+                            self.fragmented = None;
+                            self.last_decode_error = None;
+                            extend_unique(
+                                &mut self.partial_reasons,
+                                ["websocket_midstream_resync".to_string()],
+                            );
+                            continue;
+                        }
                         self.reset_after_error("websocket_midstream_false_frame");
                         break;
                     }
@@ -1089,8 +1101,11 @@ impl WebSocketFrameDecoder {
             return false;
         }
         let expect_masked = self.kind == StreamKind::Request;
+        // Search the whole buffer (capped by max frame size): false headers often claim a large
+        // payload that still contains the next real frame well past 8 KiB.
+        let search_limit = self.buffer.len().min(self.max_bytes.saturating_add(64)).max(2);
         // Skip the current misaligned leading byte and search for the next plausible data frame.
-        for offset in 1..self.buffer.len().min(8 * 1024) {
+        for offset in 1..search_limit {
             if !plausible_websocket_data_frame_at(&self.buffer[offset..], expect_masked) {
                 continue;
             }
