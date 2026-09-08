@@ -737,6 +737,15 @@ pub struct LlmInteraction {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partial_reasons: Vec<String>,
     pub capture_source: String,
+    /// Kernel tls_ctx↔socket bind quality (`unbound` / `fd` / `cookie`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_fd: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_cookie: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_generation: Option<String>,
 }
 
 /// A raw event captured by an eBPF probe, before identity enrichment.
@@ -816,6 +825,9 @@ pub enum AgentEvent {
         /// Destination port (host order) — the service class: 443 API, 22 SSH, 5432 PG, 6379 Redis…
         port: u16,
         bytes: u64,
+        /// Socket fd when known from Connect/TLS ClientHello; joins ConnectionIdentity to plaintext.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fd: Option<u32>,
     },
     /// A DNS query — a hostname the process resolved (`sys_enter_sendto` to :53).
     Dns { pid: u32, query: String },

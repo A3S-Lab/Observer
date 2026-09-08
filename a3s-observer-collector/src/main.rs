@@ -43,7 +43,7 @@ use a3s_observer_common::{
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
-    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_FD, TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS,
+    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS,
     TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP,
     TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
@@ -4047,6 +4047,7 @@ impl CollectorProcessor {
                             peer,
                             port: ev.port,
                             bytes: 0,
+                            fd: Some(ev.fd),
                         },
                     },
                 );
@@ -4102,6 +4103,7 @@ impl CollectorProcessor {
                             peer,
                             port,
                             bytes: ev.len as u64,
+                            fd: Some(ev.fd),
                         },
                     },
                 );
@@ -4535,6 +4537,10 @@ fn emit_completed_interaction(
         completeness,
         partial_reasons,
         capture_source,
+        bind_quality,
+        socket_fd,
+        socket_cookie,
+        fd_generation,
     } = interaction;
     // The physical ring observation is immutable and may fan out to more than one semantic
     // exchange on a reused connection.  Keep its identity/fingerprint unchanged; semantic
@@ -4633,6 +4639,17 @@ fn emit_completed_interaction(
                 completeness,
                 partial_reasons,
                 capture_source,
+                bind_quality: if bind_quality >= TLS_BIND_QUALITY_COOKIE {
+                    Some("cookie".to_string())
+                } else if bind_quality >= TLS_BIND_QUALITY_FD {
+                    Some("fd".to_string())
+                } else {
+                    None
+                },
+                socket_fd: (socket_fd > 0).then_some(socket_fd),
+                socket_cookie: (socket_cookie != 0).then(|| format!("{socket_cookie:x}")),
+                fd_generation: (fd_generation != 0 || bind_quality >= TLS_BIND_QUALITY_FD)
+                    .then(|| fd_generation.to_string()),
             })),
         },
     );
@@ -5306,19 +5323,64 @@ fn connection_from_event(
     process_generation_key: Option<&str>,
 ) -> Option<ConnectionIdentity> {
     let process_generation_key = process_generation_key?;
-    let (connection_id, transport, direction) = match event {
-        AgentEvent::LlmInteraction(interaction) => (
-            interaction.connection_id.clone(),
-            interaction.transport.clone(),
-            None,
-        ),
-        AgentEvent::AgentPlaintextEvidence(evidence) => (
-            evidence.connection_id.clone(),
-            evidence.transport_protocol.clone(),
-            Some(evidence.direction.clone()),
-        ),
-        _ => return None,
-    };
+    let (connection_id, transport, direction, socket_cookie, fd, fd_generation, quality, tls_hint) =
+        match event {
+            AgentEvent::LlmInteraction(interaction) => {
+                let cookie = interaction.socket_cookie.clone();
+                let fd = interaction
+                    .socket_fd
+                    .filter(|value| *value > 0)
+                    .map(|value| value as u32);
+                let fd_generation = interaction.fd_generation.clone();
+                let quality = match interaction.bind_quality.as_deref() {
+                    Some("cookie") if cookie.is_some() => "exact",
+                    Some("cookie") | Some("fd") if fd.is_some() || cookie.is_some() => "strong",
+                    Some("fd") => "weak",
+                    _ if cookie.is_some() => "exact",
+                    _ if fd.is_some() => "weak",
+                    _ => "strong",
+                }
+                .to_string();
+                (
+                    interaction.connection_id.clone(),
+                    interaction.transport.clone(),
+                    None,
+                    cookie,
+                    fd,
+                    fd_generation,
+                    quality,
+                    true,
+                )
+            }
+            AgentEvent::AgentPlaintextEvidence(evidence) => (
+                evidence.connection_id.clone(),
+                evidence.transport_protocol.clone(),
+                Some(evidence.direction.clone()),
+                None,
+                None,
+                None,
+                "strong".to_string(),
+                true,
+            ),
+            AgentEvent::Egress { pid: _, fd, .. } => {
+                let fd = *fd;
+                let connection_id = match fd {
+                    Some(fd) => format!("egress:fd:{fd}"),
+                    None => return None,
+                };
+                (
+                    connection_id,
+                    "tcp".to_string(),
+                    None,
+                    None,
+                    fd,
+                    None,
+                    if fd.is_some() { "weak".to_string() } else { "unknown".to_string() },
+                    false,
+                )
+            }
+            _ => return None,
+        };
     let raw_connection_id = connection_id.clone();
     let connection_id = format!(
         "conn_{}",
@@ -5338,16 +5400,16 @@ fn connection_from_event(
         schema_version: "anysentry.connection_identity.v1".to_string(),
         connection_id,
         process_generation_key: Some(process_generation_key.to_string()),
-        socket_cookie: None,
-        fd: None,
-        fd_generation: None,
-        tls_context_id: Some(format!("tlsctx_{}", hash_prefix(raw_connection_id))),
+        socket_cookie,
+        fd,
+        fd_generation,
+        tls_context_id: tls_hint.then(|| format!("tlsctx_{}", hash_prefix(raw_connection_id))),
         netns_id: None,
         stream_id: None,
         transport,
         direction,
         sequence: None,
-        quality: "strong".to_string(),
+        quality,
         source_refs: Vec::new(),
     })
 }

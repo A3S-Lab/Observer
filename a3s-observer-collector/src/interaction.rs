@@ -117,6 +117,10 @@ pub struct CompletedInteraction {
     pub completeness: String,
     pub partial_reasons: Vec<String>,
     pub capture_source: String,
+    pub bind_quality: u8,
+    pub socket_fd: i32,
+    pub socket_cookie: u64,
+    pub fd_generation: u32,
 }
 
 #[derive(Debug)]
@@ -1182,6 +1186,11 @@ struct ConnectionState {
     binding_uncertain: bool,
     binding_reasons: Vec<String>,
     pending_request_limit_hit: bool,
+    /// Best tls_ctx↔socket bind observed on this stream (max bind_quality wins).
+    bind_quality: u8,
+    socket_fd: i32,
+    socket_cookie: u64,
+    fd_generation: u32,
     last_activity: Instant,
 }
 
@@ -1205,6 +1214,10 @@ impl ConnectionState {
             binding_uncertain: false,
             binding_reasons: Vec::new(),
             pending_request_limit_hit: false,
+            bind_quality: 0,
+            socket_fd: 0,
+            socket_cookie: 0,
+            fd_generation: 0,
             last_activity: now,
         }
     }
@@ -1347,6 +1360,7 @@ impl InteractionReassembler {
         });
         let now = Instant::now();
         state.last_activity = now;
+        observe_socket_bind(state, &chunk);
         merge_bounded_label(&mut state.source, &chunk.source);
         merge_bounded_label(&mut state.adapter_id, &chunk.adapter_id);
         // Rustls connection objects can be reused after a socket closes. A retained WebSocket
@@ -1361,6 +1375,7 @@ impl InteractionReassembler {
                 chunk.adapter_id.clone(),
             );
             state.last_activity = Instant::now();
+            observe_socket_bind(state, &chunk);
         }
         if binding_gap.is_some() {
             state.binding_uncertain = true;
@@ -1585,6 +1600,10 @@ impl InteractionReassembler {
                                 &state.adapter_id,
                                 request,
                                 response,
+                                state.bind_quality,
+                                state.socket_fd,
+                                state.socket_cookie,
+                                state.fd_generation,
                             ) {
                                 completed.push(interaction);
                             }
@@ -1642,6 +1661,10 @@ impl InteractionReassembler {
                                 &state.adapter_id,
                                 request,
                                 response,
+                                state.bind_quality,
+                                state.socket_fd,
+                                state.socket_cookie,
+                                state.fd_generation,
                             ) {
                                 completed.push(interaction);
                             }
@@ -2061,6 +2084,16 @@ impl InteractionReassembler {
         }
         target.binding_uncertain |= provisional.binding_uncertain;
         extend_unique(&mut target.binding_reasons, provisional.binding_reasons);
+        if provisional.bind_quality > target.bind_quality
+            || (provisional.bind_quality == target.bind_quality
+                && provisional.socket_cookie != 0
+                && target.socket_cookie == 0)
+        {
+            target.bind_quality = provisional.bind_quality;
+            target.socket_fd = provisional.socket_fd;
+            target.socket_cookie = provisional.socket_cookie;
+            target.fd_generation = provisional.fd_generation;
+        }
         if provisional.last_activity > target.last_activity {
             target.last_activity = provisional.last_activity;
         }
@@ -2423,6 +2456,10 @@ fn process_websocket_response_messages(
             &state.adapter_id,
             request,
             response_message,
+            state.bind_quality,
+            state.socket_fd,
+            state.socket_cookie,
+            state.fd_generation,
         ) {
             let mut tool_calls = response.tool_calls;
             tool_calls.append(&mut interaction.tool_calls);
@@ -3469,6 +3506,25 @@ fn narrow_connection_candidates(
     }
 }
 
+
+fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
+    if chunk.bind_quality < TLS_BIND_QUALITY_FD {
+        return;
+    }
+    if chunk.bind_quality < state.bind_quality {
+        return;
+    }
+    if chunk.bind_quality > state.bind_quality
+        || (chunk.socket_cookie != 0 && state.socket_cookie == 0)
+        || (chunk.socket_fd > 0 && state.socket_fd <= 0)
+    {
+        state.bind_quality = chunk.bind_quality;
+        state.socket_fd = chunk.socket_fd;
+        state.socket_cookie = chunk.socket_cookie;
+        state.fd_generation = chunk.fd_generation;
+    }
+}
+
 fn build_interaction(
     key: ConnectionKey,
     sequence: u64,
@@ -3476,6 +3532,10 @@ fn build_interaction(
     adapter_id: &str,
     request: HttpMessage,
     response: HttpMessage,
+    bind_quality: u8,
+    socket_fd: i32,
+    socket_cookie: u64,
+    fd_generation: u32,
 ) -> Option<CompletedInteraction> {
     let (method, path) = request_line(&request.start_line)?;
     let endpoint = request.endpoint();
@@ -3931,6 +3991,10 @@ fn build_interaction(
         completeness,
         partial_reasons,
         capture_source: source.to_string(),
+        bind_quality,
+        socket_fd,
+        socket_cookie,
+        fd_generation,
     })
 }
 
