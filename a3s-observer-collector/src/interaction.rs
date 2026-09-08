@@ -1,15 +1,20 @@
-//! Bounded HTTP/1.x and SSE reconstruction for plaintext captured at TLS or TCP boundaries.
+//! Bounded HTTP/1.x, HTTP/2 DATA, and SSE reconstruction for plaintext captured at TLS or TCP
+//! boundaries.
 //!
 //! The eBPF hot path only copies bytes. This module owns framing, decompression, provider-neutral
 //! message/tool extraction, request-response pairing, and explicit completeness. It intentionally
-//! receives no authorization headers in its output contract.
+//! receives no authorization headers in its output contract. HTTP/2 is not fully decoded (no
+//! HPACK); after the connection preface, DATA frame payloads are fed through the same synthetic
+//! JSON/SSE body lane used for Rustls/OpenSSL body-only Agent captures.
 
 use a3s_observer::{
     DefaultLlmFormatAdapter, LlmConversationAnchor, LlmFormatAdapter, LlmInteractionContent,
     LlmInteractionMessage, LlmInteractionSemanticItem, LlmInteractionToolCall,
     LlmInteractionToolResult, LlmTokenUsage,
 };
-use a3s_observer_common::{classify_http_method_prefix, HTTP_METHOD_PREFIX_COMPLETE};
+use a3s_observer_common::{
+    classify_http_method_prefix, HTTP_METHOD_PREFIX_COMPLETE, TLS_BIND_QUALITY_FD,
+};
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -55,6 +60,11 @@ pub struct PlaintextChunk {
     /// provenance only; it must never by itself make an interaction partial or complete.
     pub route_candidate: bool,
     pub partial_reasons: Vec<String>,
+    /// Kernel tls_ctx↔socket bind quality (`TLS_BIND_QUALITY_*`).
+    pub bind_quality: u8,
+    pub socket_fd: i32,
+    pub socket_cookie: u64,
+    pub fd_generation: u32,
 }
 
 #[derive(Debug)]
@@ -1725,6 +1735,16 @@ impl InteractionReassembler {
         &mut self,
         chunk: &PlaintextChunk,
     ) -> (ConnectionKey, Option<&'static str>) {
+        // Prefer kernel tls_ctx↔socket bind when present. Bound streams use a stable socket-
+        // derived connection_id already filled by eBPF; still alias any provisional TLS-pointer
+        // key that may have been observed before the first bind completed.
+        if chunk.bind_quality >= TLS_BIND_QUALITY_FD {
+            let observed = ConnectionKey::from(chunk);
+            if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
+                return (canonical, None);
+            }
+            return (observed, None);
+        }
         let observed = ConnectionKey::from(chunk);
         if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
             return (canonical, None);
@@ -6255,6 +6275,10 @@ mod tests {
             adapter_id: "openssl-ex".to_string(),
             route_candidate: false,
             partial_reasons: Vec::new(),
+            bind_quality: 0,
+            socket_fd: 0,
+            socket_cookie: 0,
+            fd_generation: 0,
         }
     }
 

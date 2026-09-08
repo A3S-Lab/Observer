@@ -43,7 +43,7 @@ use a3s_observer_common::{
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
-    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS,
+    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_FD, TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS,
     TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP,
     TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
@@ -3160,7 +3160,7 @@ fn read_pod<T: Copy>(item: &[u8]) -> Option<T> {
 
 fn read_tls_plaintext(item: &[u8]) -> Option<(TlsPlaintextEventHeader, &[u8])> {
     let header = read_pod::<TlsPlaintextEventHeader>(item)?;
-    if header.abi_version != TLS_PLAINTEXT_ABI_V1 {
+    if header.abi_version != TLS_PLAINTEXT_ABI_V2 {
         return None;
     }
     let minimum = core::mem::size_of::<TlsPlaintextEventHeader>();
@@ -4389,6 +4389,10 @@ impl CollectorProcessor {
                     adapter_id: adapter_id.to_string(),
                     route_candidate,
                     partial_reasons,
+                    bind_quality: header.bind_quality,
+                    socket_fd: header.socket_fd,
+                    socket_cookie: header.socket_cookie,
+                    fd_generation: header.fd_generation,
                 });
                 for interaction in completed {
                     emit_completed_interaction(

@@ -36,7 +36,8 @@ use a3s_observer_common::{
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_CANDIDATE, PLAINTEXT_HTTP_ROUTE_LLM,
     PLAINTEXT_HTTP_ROUTE_MAX_LEN, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID,
-    TLS_PLAINTEXT_ABI_V1, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    TLS_PLAINTEXT_ABI_V2, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND,
+    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
     TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
     TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
     TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
@@ -260,6 +261,60 @@ static VERIFIED_AGENT_EXEC_IDS: LruHashMap<PlaintextProcessKey, u64> =
 #[map]
 static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
 
+// Same-thread TLS context → socket bind (Codex rustls pointer moves / OpenSSL SSL*→fd).
+// LAST_TLS_CTX is written on SSL/rustls write enter; sys_enter_write/sendto/writev consumes it.
+// LAST_SOCKET_READ is written on successful read/recv exit; SSL/rustls read exit consumes it.
+const TLS_CTX_BIND_WINDOW_NS: u64 = 2_000_000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LastTlsCtx {
+    ssl_ptr: u64,
+    started_at_boot_ns: u64,
+    api_kind: u8,
+    direction: u8,
+    _pad: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LastSocketIo {
+    fd: u32,
+    _pad: u32,
+    observed_at_boot_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TlsCtxSocketKey {
+    cgroup_id: u64,
+    pid: u32,
+    _reserved: u32,
+    tls_context_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TlsCtxSocketValue {
+    fd: u32,
+    fd_generation: u32,
+    socket_cookie: u64,
+    bound_at_boot_ns: u64,
+    bind_quality: u8,
+    _pad: [u8; 7],
+}
+
+#[map]
+static LAST_TLS_CTX: HashMap<u64, LastTlsCtx> = HashMap::with_max_entries(10_240, 0);
+#[map]
+static LAST_SOCKET_READ: HashMap<u64, LastSocketIo> = HashMap::with_max_entries(10_240, 0);
+#[map]
+static TLS_CTX_SOCKET: LruHashMap<TlsCtxSocketKey, TlsCtxSocketValue> =
+    LruHashMap::with_max_entries(8_192, 0);
+/// Per-(cgroup,pid,fd) generation; bumped on close so reused fds do not inherit binds.
+#[map]
+static SOCKET_FD_GENERATION: LruHashMap<u64, u32> = LruHashMap::with_max_entries(8_192, 0);
+
 // Exact POST path admission for the generic plain-HTTP lane.  Userspace installs the default
 // model routes and any explicitly authorised tool routes; the kernel stores only FNV-1a hashes and
 // a closed route kind, never product names or JSON.
@@ -355,6 +410,109 @@ fn sock_key(cgroup_id: u64, pid: u32, fd: u64) -> u64 {
     key ^= (pid as u64).rotate_left(31);
     key ^= fd & 0xffff_ffff;
     key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn remember_last_tls_ctx(ssl_ptr: u64, api_kind: u8, direction: u8) {
+    if ssl_ptr == 0 {
+        return;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let entry = LastTlsCtx {
+        ssl_ptr,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        api_kind,
+        direction,
+        _pad: [0; 6],
+    };
+    let _ = LAST_TLS_CTX.insert(&pid_tgid, &entry, 0);
+}
+
+fn socket_fd_generation(cgroup_id: u64, pid: u32, fd: u64) -> u32 {
+    let key = sock_key(cgroup_id, pid, fd);
+    unsafe { SOCKET_FD_GENERATION.get(&key) }
+        .copied()
+        .unwrap_or(0)
+}
+
+fn bump_socket_fd_generation(cgroup_id: u64, pid: u32, fd: u64) {
+    let key = sock_key(cgroup_id, pid, fd);
+    let next = socket_fd_generation(cgroup_id, pid, fd).wrapping_add(1);
+    let _ = SOCKET_FD_GENERATION.insert(&key, &next, 0);
+}
+
+fn bind_tls_ctx_to_socket(ssl_ptr: u64, fd: u64) {
+    if ssl_ptr == 0 || fd == 0 || fd > 0xffff_ffff {
+        return;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !verified_agent_process(pid, cgroup_id) {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let key = TlsCtxSocketKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: ssl_ptr,
+    };
+    let value = TlsCtxSocketValue {
+        fd: fd as u32,
+        fd_generation: socket_fd_generation(cgroup_id, pid, fd),
+        socket_cookie: 0,
+        bound_at_boot_ns: now,
+        bind_quality: TLS_BIND_QUALITY_FD,
+        _pad: [0; 7],
+    };
+    let _ = TLS_CTX_SOCKET.insert(&key, &value, 0);
+}
+
+fn try_bind_tls_write_to_fd(fd: u64) {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(last) = (unsafe { LAST_TLS_CTX.get(&pid_tgid) }).copied() else {
+        return;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    if now.saturating_sub(last.started_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
+        let _ = LAST_TLS_CTX.remove(&pid_tgid);
+        return;
+    }
+    if last.direction != TLS_PLAINTEXT_DIRECTION_WRITE || last.ssl_ptr == 0 {
+        return;
+    }
+    bind_tls_ctx_to_socket(last.ssl_ptr, fd);
+    let _ = LAST_TLS_CTX.remove(&pid_tgid);
+}
+
+fn try_bind_tls_read_from_last_socket(ssl_ptr: u64) {
+    if ssl_ptr == 0 {
+        return;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(last) = (unsafe { LAST_SOCKET_READ.get(&pid_tgid) }).copied() else {
+        return;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    if now.saturating_sub(last.observed_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
+        let _ = LAST_SOCKET_READ.remove(&pid_tgid);
+        return;
+    }
+    bind_tls_ctx_to_socket(ssl_ptr, last.fd as u64);
+    let _ = LAST_SOCKET_READ.remove(&pid_tgid);
+}
+
+fn lookup_tls_ctx_bind(cgroup_id: u64, pid: u32, ssl_ptr: u64) -> Option<TlsCtxSocketValue> {
+    if ssl_ptr == 0 {
+        return None;
+    }
+    let key = TlsCtxSocketKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: ssl_ptr,
+    };
+    unsafe { TLS_CTX_SOCKET.get(&key) }.copied()
 }
 
 /// Reserve a ring-buffer slot, counting a drop if the ring is full (so userspace can report
@@ -2435,6 +2593,7 @@ fn remember_ssl_call(ctx: &ProbeContext, direction: u8, api_kind: u8, result_len
         _pad: [0; 5],
     };
     let _ = SSL_CALL_ARGS.insert(&pid_tgid, &args, 0);
+    remember_last_tls_ctx(ssl_ptr, api_kind, direction);
     0
 }
 
@@ -2554,6 +2713,7 @@ pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
     // call. rustls normally accepts the full slice; if a future profile observes backpressure,
     // duplicate HTTP bytes are rejected by userspace framing/sequence quality rather than read
     // from encrypted socket buffers.
+    remember_last_tls_ctx(args.ssl_ptr, args.api_kind, args.direction);
     bump_tls_profile_diagnostic(4);
     emit_tls_plaintext(args, layout[2])
 }
@@ -2591,9 +2751,11 @@ pub fn rustls_read_enter(ctx: ProbeContext) -> u32 {
         return 0;
     }
     bump_tls_profile_diagnostic(7);
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    try_bind_tls_read_from_last_socket(ssl_ptr);
     emit_tls_plaintext(
         SslCallArgs {
-            ssl_ptr: ctx.arg::<u64>(0).unwrap_or(0),
+            ssl_ptr,
             buf: layout[1],
             requested_len: layout[2],
             result_len_ptr: 0,
@@ -2629,6 +2791,9 @@ fn finish_ssl_classic(ctx: &RetProbeContext, direction: u8) -> u32 {
         return 0;
     }
     let actual = (result as u64).min(args.requested_len);
+    if direction == TLS_PLAINTEXT_DIRECTION_READ {
+        try_bind_tls_read_from_last_socket(args.ssl_ptr);
+    }
     bump_tls_profile_diagnostic(17);
     emit_tls_plaintext(args, actual)
 }
@@ -2653,6 +2818,9 @@ fn finish_ssl_ex(ctx: &RetProbeContext, direction: u8) -> u32 {
     };
     if result < 0 || actual == 0 {
         return 0;
+    }
+    if direction == TLS_PLAINTEXT_DIRECTION_READ {
+        try_bind_tls_read_from_last_socket(args.ssl_ptr);
     }
     bump_tls_profile_diagnostic(12);
     emit_tls_plaintext(args, actual.min(args.requested_len))
@@ -3183,7 +3351,23 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
         return 0;
     }
     capture_payload_candidate(CAPTURE_PROBE_SSL);
-    let connection_id = if args.ssl_ptr != 0 {
+    let bind = lookup_tls_ctx_bind(cgroup_id, pid, args.ssl_ptr);
+    let (bind_quality, socket_fd, socket_cookie, fd_generation) = match bind {
+        Some(value) => (
+            value.bind_quality,
+            value.fd as i32,
+            value.socket_cookie,
+            value.fd_generation,
+        ),
+        None => (TLS_BIND_QUALITY_UNBOUND, 0i32, 0u64, 0u32),
+    };
+    // Prefer a stable socket-derived identity when bound so rustls CommonState moves alias to one
+    // stream. Unbound TLS contexts keep the observed SSL*/CommonState pointer as connection_id.
+    let connection_id = if bind_quality >= TLS_BIND_QUALITY_COOKIE && socket_cookie != 0 {
+        socket_cookie
+    } else if bind_quality >= TLS_BIND_QUALITY_FD && socket_fd > 0 {
+        sock_key(cgroup_id, pid, socket_fd as u64)
+    } else if args.ssl_ptr != 0 {
         args.ssl_ptr
     } else {
         pid_tgid
@@ -3210,7 +3394,7 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             if actual_len > $capacity as u64 {
                 flags |= TLS_PLAINTEXT_FLAG_TRUNCATED;
             }
-            if args.ssl_ptr == 0 {
+            if args.ssl_ptr == 0 && bind_quality == TLS_BIND_QUALITY_UNBOUND {
                 flags |= TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND;
             }
             if route_kind == PLAINTEXT_HTTP_ROUTE_TOOL {
@@ -3222,7 +3406,7 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             let ev = entry.as_mut_ptr();
             unsafe {
                 (*ev).header = TlsPlaintextEventHeader {
-                    abi_version: TLS_PLAINTEXT_ABI_V1,
+                    abi_version: TLS_PLAINTEXT_ABI_V2,
                     header_len: core::mem::size_of::<TlsPlaintextEventHeader>() as u16,
                     flags,
                     _pad0: 0,
@@ -3235,9 +3419,14 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
                     captured_len,
                     direction: args.direction,
                     api_kind: args.api_kind,
-                    _pad1: [0; 6],
+                    bind_quality,
+                    _pad1: 0,
+                    socket_fd,
                     call_started_at_boot_ns: args.started_at_boot_ns,
                     captured_at_boot_ns,
+                    socket_cookie,
+                    fd_generation,
+                    _pad2: 0,
                     comm: bpf_get_current_comm().unwrap_or_default(),
                     capture_decision,
                 };
@@ -3313,6 +3502,44 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
 }
 
 #[tracepoint]
+pub fn http_write(ctx: TracePointContext) -> u32 {
+    // sys_enter_write: fd @16, buf @24, count @32.
+    // Python urllib/httpx/http.client use write/sendto for plain HTTP, not writev (Node/libuv).
+    // Keep this as a sibling program so the always-on TLS ClientHello probe stays verifier-light.
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(buf) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(len) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    try_plain_http_write(pid, fd, buf as *const u8, len);
+    0
+}
+
+#[tracepoint]
+pub fn http_sendto(ctx: TracePointContext) -> u32 {
+    // sys_enter_sendto: fd @16, buf @24, size @32 (flags/addr unused for plain-HTTP body).
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(buf) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(len) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    try_plain_http_write(pid, fd, buf as *const u8, len);
+    0
+}
+
+#[tracepoint]
 pub fn http_writev(ctx: TracePointContext) -> u32 {
     // sys_enter_writev: fd @16, iovec* @24, iovcnt @32. The first entries normally hold the HTTP
     // header and JSON body separately (notably Node/libuv). Four fixed iterations keep verifier
@@ -3330,6 +3557,7 @@ pub fn http_writev(ctx: TracePointContext) -> u32 {
         return 0;
     }
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
     for index in 0..4u64 {
         if index >= iov_count {
             break;
@@ -4040,6 +4268,14 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
                 }
             }
         }
+        if verified_agent_process(pid, cgroup_id) {
+            let last = LastSocketIo {
+                fd,
+                _pad: 0,
+                observed_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+            };
+            let _ = LAST_SOCKET_READ.insert(&tgid, &last, 0);
+        }
     }
     let _ = READ_FD.remove(&tgid);
     if let Some(value) = unsafe { HTTP_READ_ARGS.get(&tgid) } {
@@ -4078,6 +4314,7 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let key = sock_key(cgroup_id, pid, fd);
+    bump_socket_fd_generation(cgroup_id, pid, fd);
     let _ = HTTP_SOCKS.remove(&key);
     let Some(&stat) = (unsafe { LLM_SOCKS.get(&key) }) else {
         return 0; // not an LLM socket
