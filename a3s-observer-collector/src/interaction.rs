@@ -852,7 +852,11 @@ impl WebSocketFrameDecoder {
                     // BEFORE draining, including reserved opcodes / bogus controls.
                     if self.allow_midstream_resync && self.fragmented.is_none() {
                         let accept = match frame.opcode {
-                            0x1 | 0x2 => self.frame_payload_plausible_json(&frame),
+                            // Responses events are single FIN frames. Rejecting non-FIN starts
+                            // avoids a forged fragment latch that later Err paths wipe.
+                            0x1 | 0x2 => {
+                                frame.fin && self.frame_payload_plausible_json(&frame)
+                            }
                             // Ignore control frames until the stream has produced application
                             // data; forged ping/close headers are common in mid-frame noise.
                             0x8..=0xA => false,
@@ -903,7 +907,10 @@ impl WebSocketFrameDecoder {
                     break;
                 }
                 Err(reason) => {
-                    if self.allow_midstream_resync && self.fragmented.is_none() {
+                    if self.allow_midstream_resync {
+                        // A forged non-FIN latch must not force a full buffer wipe on the next
+                        // reserved-bit error — clear the fragment and keep hunting.
+                        self.fragmented = None;
                         if self.try_resync_frame_header()
                             || (self.buffer.len() > 64
                                 && self.try_resync_to_complete_plausible_event())
@@ -916,7 +923,6 @@ impl WebSocketFrameDecoder {
                         }
                         if self.buffer.len() > 1 {
                             self.buffer.drain(..1);
-                            self.fragmented = None;
                             self.last_decode_error = None;
                             extend_unique(
                                 &mut self.partial_reasons,
@@ -1184,7 +1190,7 @@ impl WebSocketFrameDecoder {
             else {
                 continue;
             };
-            if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) {
+            if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) || !frame.fin {
                 continue;
             }
             if !self.frame_payload_plausible_json(&frame) {
