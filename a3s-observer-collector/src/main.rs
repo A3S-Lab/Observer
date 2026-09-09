@@ -1759,6 +1759,12 @@ async fn main() -> anyhow::Result<()> {
         ("exec", "sys_enter_execve"),
         ("tls_write", "sys_enter_write"),
         ("tls_sendto", "sys_enter_sendto"),
+        // Plain HTTP LLM/tool capture for runtimes that use write/sendto (Python
+        // urllib/httpx/http.client). tls_write/tls_sendto only classify TLS ClientHello and must
+        // stay verifier-light; http_write/http_sendto are sibling programs that call
+        // try_plain_http_write. writev alone is not enough — Node/libuv uses writev, Python does not.
+        ("http_write", "sys_enter_write"),
+        ("http_sendto", "sys_enter_sendto"),
         ("http_writev", "sys_enter_writev"),
         ("connect", "sys_enter_connect"),
         ("dns_query", "sys_enter_sendto"),
