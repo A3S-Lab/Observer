@@ -631,6 +631,15 @@ impl HttpStreamDecoder {
         }
     }
 
+    fn buffered_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn observed_at_unix_ns(&self) -> u128 {
+        self.last_at_unix_ns
+            .max(self.buffer_started_at_unix_ns.unwrap_or(0))
+    }
+
     fn push(
         &mut self,
         data: &[u8],
@@ -2504,35 +2513,113 @@ impl InteractionReassembler {
 
     /// Remove idle state even when a request or response is incomplete. Retaining an orphaned
     /// request across a later keep-alive reuse can pair a new response with the wrong Agent turn,
-    /// which is worse than explicitly losing the incomplete exchange. Coverage/drop telemetry is
-    /// the authority for that missing record; completed evidence is never fabricated.
+    /// which is worse than explicitly losing the incomplete exchange. Completed evidence is never
+    /// fabricated; when buffered bytes or pending requests remain, emit AgentPlaintextEvidence so
+    /// coverage can distinguish silent idle loss from filter drops.
     pub fn expire_idle(&mut self, now: Instant) {
         let idle_timeout = self.idle_timeout;
         let websocket_idle_timeout = self.websocket_idle_timeout;
-        let before = self.connections.len();
-        self.connections.retain(|key, state| {
-            let timeout = if state.quiescent_websocket() {
-                websocket_idle_timeout
-            } else {
-                idle_timeout
+        let expired_keys = self
+            .connections
+            .iter()
+            .filter(|(_, state)| {
+                let timeout = if state.quiescent_websocket() {
+                    websocket_idle_timeout
+                } else {
+                    idle_timeout
+                };
+                state.idle(now, timeout)
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            let Some(state) = self.connections.remove(&key) else {
+                continue;
             };
-            let retain = !state.idle(now, timeout);
-            if !retain && interaction_diagnostics_enabled_for(key.pid) {
+            let request_buffer_bytes = state.requests.buffered_bytes();
+            let response_buffer_bytes = state.responses.buffered_bytes();
+            let pending_requests = state.pending_requests.len();
+            if interaction_diagnostics_enabled_for(key.pid) {
                 tracing::warn!(
                     pid = key.pid,
                     connection_id = format_args!("{:x}", key.connection_id),
-                    pending_requests = state.pending_requests.len(),
-                    request_buffer_bytes = state.requests.buffer.len(),
-                    response_buffer_bytes = state.responses.buffer.len(),
+                    pending_requests,
+                    request_buffer_bytes,
+                    response_buffer_bytes,
                     "expired idle Agent interaction reassembly state"
                 );
             }
-            retain
-        });
-        self.metrics.connection_expirations = self
-            .metrics
-            .connection_expirations
-            .saturating_add((before.saturating_sub(self.connections.len())) as u64);
+            if request_buffer_bytes == 0 && response_buffer_bytes == 0 && pending_requests == 0 {
+                self.metrics.connection_expirations =
+                    self.metrics.connection_expirations.saturating_add(1);
+                continue;
+            }
+            let direction = if response_buffer_bytes > request_buffer_bytes {
+                "read"
+            } else {
+                "write"
+            };
+            let reason = "reassembly_idle_expire_incomplete";
+            let fingerprint = format!(
+                "{}:{}:{}:{}:{}",
+                key.cgroup_id, key.pid, key.connection_id, direction, reason
+            );
+            if self.gap_evidence_fingerprints.len() >= self.max_connections.saturating_mul(4).max(4)
+                && !self.gap_evidence_fingerprints.contains(&fingerprint)
+            {
+                if let Some(oldest) = self.gap_evidence_fingerprints.iter().next().cloned() {
+                    self.gap_evidence_fingerprints.remove(&oldest);
+                    self.metrics.evidence_evictions =
+                        self.metrics.evidence_evictions.saturating_add(1);
+                }
+            }
+            if self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
+                let observed_at = state
+                    .responses
+                    .observed_at_unix_ns()
+                    .max(state.requests.observed_at_unix_ns());
+                let mut hash = Sha256::new();
+                hash.update(b"anysentry.agent_plaintext_evidence.v1");
+                hash.update(fingerprint.as_bytes());
+                hash.update(observed_at.to_ne_bytes());
+                hash.update(request_buffer_bytes.to_ne_bytes());
+                hash.update(response_buffer_bytes.to_ne_bytes());
+                hash.update(pending_requests.to_ne_bytes());
+                let evidence = CompletedPlaintextEvidence {
+                    schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
+                    evidence_id: format!("pe_{}", hex_prefix(&hash.finalize(), 24)),
+                    cgroup_id: key.cgroup_id,
+                    pid: key.pid,
+                    connection_id: format!("tls:{:x}", key.connection_id),
+                    direction: direction.to_string(),
+                    tls_adapter_id: state.adapter_id.clone(),
+                    transport_protocol: "http/1.1".to_string(),
+                    parse_state: "unparsed".to_string(),
+                    llm_likelihood: "unknown".to_string(),
+                    schema_fingerprint: None,
+                    observed_at_unix_ns: observed_at.to_string(),
+                    captured_bytes: (request_buffer_bytes + response_buffer_bytes) as u64,
+                    encoding: "metadata_only".to_string(),
+                    redacted_sample: None,
+                    sample_sha256: sha256_hex(fingerprint.as_bytes()),
+                    reasons: vec![
+                        reason.to_string(),
+                        format!("request_buffer_bytes={request_buffer_bytes}"),
+                        format!("response_buffer_bytes={response_buffer_bytes}"),
+                        format!("pending_requests={pending_requests}"),
+                    ],
+                    capture_source: state.source.clone(),
+                };
+                if self.pending_evidence.len() >= self.max_connections {
+                    self.pending_evidence.pop_front();
+                    self.metrics.evidence_evictions =
+                        self.metrics.evidence_evictions.saturating_add(1);
+                }
+                self.pending_evidence.push_back(evidence);
+            }
+            self.metrics.connection_expirations =
+                self.metrics.connection_expirations.saturating_add(1);
+        }
         self.retain_live_connection_aliases();
     }
 
@@ -4243,12 +4330,20 @@ fn build_interaction(
     if tool_route {
         let rpc_request = request_content.structured.as_ref();
         let rpc_response = response_content.structured.as_ref();
+        // Prefer explicit LLM tool_call id stamped by the agent runtime over body-local ids
+        // (MCP JSON-RPC id is often a fixed 1; sandbox execution_id is provider-local).
+        let header_tool_call_id =
+            bounded_correlation_header(&request, "x-anysentry-tool-call-id");
         let (tool_call_id, name, arguments, result, response_error) =
             if wire_match.template_id == "generic-http-tool" {
-                let tool_call_id = rpc_response
-                    .and_then(|value| value.get("tool_call_id"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
+                let tool_call_id = header_tool_call_id
+                    .clone()
+                    .or_else(|| {
+                        rpc_response
+                            .and_then(|value| value.get("tool_call_id"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
                     .or_else(|| {
                         rpc_response
                             .and_then(|value| value.get("execution_id"))
@@ -4268,6 +4363,8 @@ fn build_interaction(
                     .unwrap_or_else(|| {
                         if rpc_request.is_some_and(|value| value.get("code").is_some()) {
                             "http.code.execute"
+                        } else if rpc_request.is_some_and(|value| value.get("command").is_some()) {
+                            "http.bash.execute"
                         } else {
                             "http.request"
                         }
@@ -4286,6 +4383,7 @@ fn build_interaction(
                     .unwrap_or(Value::Null);
                 let response_error = rpc_response.is_some_and(|value| {
                     value.get("error").is_some()
+                        || value.get("ok").and_then(Value::as_bool) == Some(false)
                         || value
                             .get("exit_code")
                             .and_then(Value::as_i64)
@@ -4298,10 +4396,13 @@ fn build_interaction(
                 });
                 (tool_call_id, name, arguments, result, response_error)
             } else {
-                let tool_call_id = rpc_request
-                    .and_then(|value| value.get("id"))
-                    .map(json_scalar_id)
-                    .filter(|value| !value.is_empty())
+                let tool_call_id = header_tool_call_id
+                    .or_else(|| {
+                        rpc_request
+                            .and_then(|value| value.get("id"))
+                            .map(json_scalar_id)
+                            .filter(|value| !value.is_empty())
+                    })
                     .unwrap_or_else(|| format!("transport:{interaction_id}"));
                 let name = rpc_request
                     .and_then(|value| value.get("params"))
@@ -5375,6 +5476,19 @@ fn match_wire_protocol(
             interaction_kind: WireInteractionKind::Tool,
         });
     }
+    // Lab / mock bash proxy: {"command":"...","timeout_ms":N} → {"ok","exit_code","stdout",...}
+    if object.get("command").and_then(Value::as_str).is_some()
+        && (object.contains_key("timeout_ms")
+            || object.contains_key("cwd")
+            || object.contains_key("env"))
+    {
+        return Some(WireMatch {
+            template_id: "generic-http-tool",
+            likelihood: "likely",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::Tool,
+        });
+    }
     if object.contains_key("contents") {
         return Some(WireMatch {
             template_id: "gemini-generate-content",
@@ -5502,6 +5616,10 @@ fn response_matches_wire_template(
                     .is_some()
                     && response.get("exit_code").and_then(Value::as_i64).is_some()
                     && (response.get("stdout").is_some() || response.get("stderr").is_some()))
+                || (response.get("exit_code").and_then(Value::as_i64).is_some()
+                    && (response.get("stdout").is_some()
+                        || response.get("stderr").is_some()
+                        || response.get("ok").and_then(Value::as_bool).is_some()))
         }
         "openai-responses" => {
             json_has_key(response, "output", 0)
@@ -8148,6 +8266,60 @@ mod tests {
     }
 
     #[test]
+    fn bash_execute_http_shape_emits_tool_call_and_prefers_header_tool_call_id() {
+        let request_body = r#"{"command":"uname -a","timeout_ms":3000}"#;
+        let response_body = r#"{"ok":true,"exit_code":0,"stdout":"Linux fixture\n","stderr":"","command":"uname -a","duration_ms":1}"#;
+        let mut reassembler = InteractionReassembler::default();
+        let request = format!(
+            "POST /bash/execute HTTP/1.1\r\nHost: tool-mocks:18092\r\nContent-Type: application/json\r\nx-anysentry-tool-call-id: call_llm_bash_001\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 100));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+        ));
+
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "tool");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("generic-http-tool")
+        );
+        assert_eq!(interaction.tool_calls[0].tool_call_id, "call_llm_bash_001");
+        assert_eq!(interaction.tool_calls[0].name, "http.bash.execute");
+        assert_eq!(interaction.tool_calls[0].arguments["command"], "uname -a");
+        assert_eq!(interaction.tool_results[0].tool_call_id, "call_llm_bash_001");
+        assert!(!interaction.tool_results[0].is_error);
+    }
+
+    #[test]
+    fn mcp_jsonrpc_prefers_x_anysentry_tool_call_id_over_body_id() {
+        let mut reassembler = InteractionReassembler::default();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_lab_fact","arguments":{"topic":"deepseek"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: tool-mocks:18092\r\nContent-Type: application/json\r\nx-anysentry-tool-call-id: call_llm_mcp_001\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 10));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+            ),
+            20,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].tool_calls[0].tool_call_id, "call_llm_mcp_001");
+        assert_eq!(completed[0].tool_results[0].tool_call_id, "call_llm_mcp_001");
+        assert_eq!(completed[0].tool_calls[0].name, "get_lab_fact");
+    }
+
+    #[test]
     fn forced_single_function_schema_is_model_output_not_a_real_tool() {
         let progress_request = r#"{
           "model":"fixture-model",
@@ -8517,11 +8689,24 @@ mod tests {
 
     #[test]
     fn idle_orphan_request_cannot_poison_a_later_response() {
-        let request = r#"{"model":"gpt-test","messages":[{"role":"user","content":"orphan"}]}"#;
+        // Leave an incomplete request body in the stream buffer (Content-Length not satisfied)
+        // so idle expire must drop state without fabricating an LlmInteraction, while still
+        // emitting AgentPlaintextEvidence for the coverage gap.
+        let incomplete = b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: 120\r\n\r\n{\"model\":\"gpt-test\",\"messages\":[{\"role\":\"user\",\"content\":\"orphan\"}";
         let mut reassembler =
             InteractionReassembler::with_limits(8, 64 * 1024, Duration::from_millis(1));
-        reassembler.push(chunk(ChunkDirection::Request, http_request(request), 1));
+        reassembler.push(chunk(ChunkDirection::Request, incomplete.to_vec(), 1));
         reassembler.expire_idle(Instant::now() + Duration::from_millis(5));
+        let evidence = reassembler.take_evidence();
+        assert!(
+            evidence.iter().any(|item| {
+                item.reasons
+                    .iter()
+                    .any(|reason| reason == "reassembly_idle_expire_incomplete")
+                    && item.captured_bytes > 0
+            }),
+            "incomplete idle expire must emit AgentPlaintextEvidence gap record"
+        );
         let response =
             r#"{"choices":[{"message":{"role":"assistant","content":"must not pair"}}]}"#;
         assert!(reassembler
