@@ -859,6 +859,11 @@ pub struct FileEvent {
 /// `openat` flag combination equals `u32::MAX`, so userspace can tell them apart on one ring.
 pub const FILE_DELETE_FLAG: u32 = u32::MAX;
 
+/// Synthetic `open`-style flags for `renameat*` FileAccess records. Encoded as `O_WRONLY` so the
+/// existing userspace `file_access_mode` path classifies them as `write_only` without an ABI bump.
+/// Rename is a filesystem mutation, not an open; this keeps correlators working for atomic writes.
+pub const FILE_RENAME_AS_WRITE_FLAGS: u32 = 1;
+
 /// Metrics for one LLM call, emitted when its TLS socket closes. Bytes/timing are
 /// accumulated in-kernel per `(pid,fd)`; userspace joins this with the SNI/provider/peer it
 /// recorded at ClientHello time to build the full `LlmCall`.

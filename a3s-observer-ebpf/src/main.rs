@@ -29,8 +29,8 @@ use a3s_observer_common::{
     EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
     EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
     FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
-    FILE_ACCESS_MODE_UNKNOWN, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
-    FILE_FILTER_AUTHORITY_AUTHORITATIVE, HTTP_METHOD_PREFIX_COMPLETE,
+    FILE_ACCESS_MODE_UNKNOWN, FILE_ACCESS_MODE_WRITE_ONLY, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
+    FILE_FILTER_AUTHORITY_AUTHORITATIVE, FILE_RENAME_AS_WRITE_FLAGS, HTTP_METHOD_PREFIX_COMPLETE,
     HTTP_METHOD_PREFIX_INCOMPLETE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
@@ -4119,6 +4119,116 @@ fn try_open_common(flags: u64, filename: *const u8) -> Result<u32, i64> {
         },
     );
     Ok(0)
+}
+
+// ---- file renamed (sys_enter_rename/renameat/renameat2) ----
+// Same CAPTURE_PROBE_FILE_ACCESS decision path as write opens. Emit the *new* path so atomic
+// writers (tmp → final) produce a write_only FileAccess on the tool-declared destination.
+
+#[tracepoint]
+pub fn file_renameat(ctx: TracePointContext) -> u32 {
+    try_renameat(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_renameat2(ctx: TracePointContext) -> u32 {
+    try_renameat2(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_rename_legacy(ctx: TracePointContext) -> u32 {
+    try_rename_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_renameat(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_renameat: olddfd @16, oldname @24, newdfd @32, newname @40.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_renameat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_renameat2: olddfd @16, oldname @24, newdfd @32, newname @40, flags @48.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_rename_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_rename: oldname @16, newname @24.
+    let newname: *const u8 = unsafe { ctx.read_at(24)? };
+    try_rename_common(newname)
+}
+
+fn try_rename_common(newname: *const u8) -> Result<u32, i64> {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(
+            CAPTURE_PROBE_FILE_ACCESS,
+            cgroup_id,
+            pid,
+            0,
+            FILE_ACCESS_MODE_WRITE_ONLY,
+        )
+    } else {
+        legacy_file_access_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_ACCESS);
+    }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if newname.is_null() {
+        capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+        return Ok(0);
+    }
+    let Some(mut entry) = reserve_file_or_drop(&FILE_EVENTS, false) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
+        (*ev).flags = FILE_RENAME_AS_WRITE_FLAGS;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        (*ev).path = [0u8; PATH_SNAP_LEN];
+        if bpf_probe_read_user_str_bytes(newname, &mut (*ev).path).is_err() {
+            capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
+    }
+    submit_accounted(entry, PIPELINE_RING_FILE_ACCESS);
+    Ok(0)
+}
+
+// ---- file linked (sys_enter_link/linkat) ----
+// Low-volume atomic publish (memfd/O_TMPFILE → final name via linkat). Same FILE_ACCESS filter.
+
+#[tracepoint]
+pub fn file_linkat(ctx: TracePointContext) -> u32 {
+    try_linkat(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_link_legacy(ctx: TracePointContext) -> u32 {
+    try_link_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_linkat(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_linkat: olddfd @16, oldname @24, newdfd @32, newname @40, flags @48.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_link_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_link: oldname @16, newname @24.
+    let newname: *const u8 = unsafe { ctx.read_at(24)? };
+    try_rename_common(newname)
 }
 
 // ---- file deleted (sys_enter_unlinkat) — the "which files did the agent destroy" signal ----

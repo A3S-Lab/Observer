@@ -114,10 +114,18 @@ const DEFAULT_REORDER_CAPACITY: usize = 65_536;
 const DEFAULT_REORDER_WINDOW_NS: u64 = 2_000_000;
 const PROCESSOR_TICK: Duration = Duration::from_millis(2);
 const RING_READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const FILE_ACCESS_TRACEPOINTS: [(&str, &str); 3] = [
+const FILE_ACCESS_TRACEPOINTS: [(&str, &str); 8] = [
     ("file_open", "sys_enter_openat"),
     ("file_openat2", "sys_enter_openat2"),
     ("file_open_legacy", "sys_enter_open"),
+    // Atomic writes (Bun/Claude Write·Edit·NotebookEdit, Codex apply_patch, …) often land via
+    // renameat of a staging path. Same CAPTURE_PROBE_FILE_ACCESS filter/budget as open*.
+    ("file_renameat", "sys_enter_renameat"),
+    ("file_renameat2", "sys_enter_renameat2"),
+    ("file_rename_legacy", "sys_enter_rename"),
+    // memfd/O_TMPFILE publish paths (linkat AT_EMPTY_PATH → final name). Still FILE_ACCESS filtered.
+    ("file_linkat", "sys_enter_linkat"),
+    ("file_link_legacy", "sys_enter_link"),
 ];
 
 const DEFAULT_LLM_HTTP_ROUTES: &[&str] = &[
@@ -127,6 +135,9 @@ const DEFAULT_LLM_HTTP_ROUTES: &[&str] = &[
     "/responses",
     "/v1/messages",
     "/messages",
+    // Anthropic-compatible gateways (e.g. BigModel open.bigmodel.cn/api/anthropic).
+    "/api/anthropic/v1/messages",
+    "/api/anthropic/v1/messages/count_tokens",
     "/v1/completions",
     "/completions",
     "/api/chat",
@@ -6029,6 +6040,11 @@ mod tests {
                 ("file_open", "sys_enter_openat"),
                 ("file_openat2", "sys_enter_openat2"),
                 ("file_open_legacy", "sys_enter_open"),
+                ("file_renameat", "sys_enter_renameat"),
+                ("file_renameat2", "sys_enter_renameat2"),
+                ("file_rename_legacy", "sys_enter_rename"),
+                ("file_linkat", "sys_enter_linkat"),
+                ("file_link_legacy", "sys_enter_link"),
             ]
         );
     }
