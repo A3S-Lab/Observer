@@ -100,6 +100,11 @@ pub struct CompletedInteraction {
     pub run_id: Option<String>,
     pub session_id: Option<String>,
     pub invocation_id: Option<String>,
+    pub hop: Option<String>,
+    pub workflow_node: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub delegation_id: Option<String>,
+    pub agent_id_header: Option<String>,
     pub conversation_anchors: Vec<LlmConversationAnchor>,
     pub started_at_unix_ns: String,
     pub request_complete_at_unix_ns: String,
@@ -550,6 +555,8 @@ enum StreamKind {
 enum WireInteractionKind {
     Model,
     Tool,
+    /// Confirmed-agent → peer agent RPC (e.g. orchestrator POST /runs to a worker).
+    RemoteAgent,
     Unparsed,
 }
 
@@ -4168,6 +4175,7 @@ fn build_interaction(
             is_final
         });
     let tool_route = wire_match.interaction_kind == WireInteractionKind::Tool;
+    let remote_agent_route = wire_match.interaction_kind == WireInteractionKind::RemoteAgent;
 
     let mut messages = request_json
         .as_ref()
@@ -4219,6 +4227,13 @@ fn build_interaction(
     let session_id = bounded_correlation_header(&request, "x-anysentry-session-id");
     let invocation_id = bounded_correlation_header(&request, "x-anysentry-invocation-id")
         .or_else(|| run_id.clone());
+    let hop = bounded_correlation_header(&request, "x-anysentry-hop");
+    let workflow_node = bounded_correlation_header(&request, "x-anysentry-workflow-node");
+    let parent_session_id =
+        bounded_correlation_header(&request, "x-anysentry-parent-session-id");
+    let delegation_id = bounded_correlation_header(&request, "x-anysentry-delegation-id");
+    // Metadata only — cgroup / workload identity remains the source of truth for agentAssetId.
+    let agent_id_header = bounded_correlation_header(&request, "x-anysentry-agent-id");
     let request_schema_fingerprint = request_json.as_ref().map(schema_fingerprint);
     let usage = response_structured
         .as_ref()
@@ -4441,7 +4456,9 @@ fn build_interaction(
             observed_at_unix_ns: Some(response.completed_at_unix_ns.to_string()),
         }];
     }
-    let traffic_role = if run_id.is_some() && structured_output_final.is_some() {
+    let traffic_role = if remote_agent_route {
+        "delegation"
+    } else if run_id.is_some() && structured_output_final.is_some() {
         "conversation"
     } else {
         classify_traffic_role(
@@ -4485,6 +4502,7 @@ fn build_interaction(
         interaction_type: match wire_match.interaction_kind {
             WireInteractionKind::Model => "model",
             WireInteractionKind::Tool => "tool",
+            WireInteractionKind::RemoteAgent => "remote_agent",
             WireInteractionKind::Unparsed => "unparsed",
         }
         .to_string(),
@@ -4530,6 +4548,11 @@ fn build_interaction(
         run_id,
         session_id,
         invocation_id,
+        hop,
+        workflow_node,
+        parent_session_id,
+        delegation_id,
+        agent_id_header,
         conversation_anchors,
         started_at_unix_ns: request.started_at_unix_ns.to_string(),
         request_complete_at_unix_ns: request.completed_at_unix_ns.to_string(),
@@ -5452,6 +5475,33 @@ fn match_wire_protocol(
             interaction_kind: WireInteractionKind::Tool,
         });
     }
+    // Cross-agent RPC (orchestrator → worker): goal payload plus delegation / workflow markers.
+    let has_goal = object.get("goal").and_then(Value::as_str).is_some();
+    let has_agent_run_shape = object.contains_key("thread_id")
+        || object.contains_key("todos")
+        || object.contains_key("verify_status");
+    let has_delegation_marker = headers
+        .get("x-anysentry-delegation-id")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || headers
+            .get("x-anysentry-workflow-node")
+            .map(|value| value.eq_ignore_ascii_case("work"))
+            .unwrap_or(false)
+        || headers
+            .get("x-anysentry-hop")
+            .map(|value| {
+                value.eq_ignore_ascii_case("orchestrator") || value.eq_ignore_ascii_case("worker")
+            })
+            .unwrap_or(false);
+    if has_goal && (has_agent_run_shape || has_delegation_marker) {
+        return Some(WireMatch {
+            template_id: "remote-agent-run",
+            likelihood: "confirmed",
+            parse_state: "parsed",
+            interaction_kind: WireInteractionKind::RemoteAgent,
+        });
+    }
     if object.contains_key("instruction")
         && (object.contains_key("requested_by")
             || object.contains_key("tool")
@@ -5601,6 +5651,12 @@ fn response_matches_wire_template(
             response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
                 && response.get("id").is_some()
                 && (response.get("result").is_some() || response.get("error").is_some())
+        }
+        "remote-agent-run" => {
+            response.get("status").and_then(Value::as_str).is_some()
+                || response.get("result").is_some()
+                || response.get("thread_id").and_then(Value::as_str).is_some()
+                || response.get("ok").and_then(Value::as_bool).is_some()
         }
         "generic-http-tool" => {
             (response
@@ -6059,6 +6115,9 @@ fn classify_traffic_role(
     messages: &[LlmInteractionMessage],
     tool_results: &[LlmInteractionToolResult],
 ) -> &'static str {
+    if interaction_kind == WireInteractionKind::RemoteAgent {
+        return "delegation";
+    }
     if interaction_kind == WireInteractionKind::Tool {
         let method = request_json
             .and_then(|value| value.get("method"))
@@ -8294,6 +8353,67 @@ mod tests {
         assert_eq!(interaction.tool_calls[0].arguments["command"], "uname -a");
         assert_eq!(interaction.tool_results[0].tool_call_id, "call_llm_bash_001");
         assert!(!interaction.tool_results[0].is_error);
+    }
+
+    #[test]
+    fn remote_agent_run_shape_emits_delegation_interaction_with_hop_headers() {
+        let mut reassembler = InteractionReassembler::default();
+        let request_body =
+            r#"{"goal":"echo cross-orch","todos":[],"thread_id":"thread-1","verify_status":"pending"}"#;
+        let request = format!(
+            "POST /runs HTTP/1.1\r\nHost: worker-agent:18091\r\nContent-Type: application/json\r\ntraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nx-anysentry-run-id: run-cross-1\r\nx-anysentry-session-id: session-orch-1\r\nx-anysentry-parent-session-id: session-orch-1\r\nx-anysentry-delegation-id: del-1\r\nx-anysentry-hop: orchestrator\r\nx-anysentry-workflow-node: work\r\nx-anysentry-agent-id: customer-langgraph-sim-orchestrator\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 100));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(
+                r#"{"thread_id":"thread-1","status":"completed","result":{"summary":"done"}}"#,
+            ),
+            250,
+        ));
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "remote_agent");
+        assert_eq!(interaction.traffic_role, "delegation");
+        assert_eq!(
+            interaction.wire_template_id.as_deref(),
+            Some("remote-agent-run")
+        );
+        assert_eq!(interaction.parse_state, "parsed");
+        assert_eq!(interaction.run_id.as_deref(), Some("run-cross-1"));
+        assert_eq!(interaction.session_id.as_deref(), Some("session-orch-1"));
+        assert_eq!(interaction.hop.as_deref(), Some("orchestrator"));
+        assert_eq!(interaction.workflow_node.as_deref(), Some("work"));
+        assert_eq!(
+            interaction.parent_session_id.as_deref(),
+            Some("session-orch-1")
+        );
+        assert_eq!(interaction.delegation_id.as_deref(), Some("del-1"));
+        assert_eq!(
+            interaction.agent_id_header.as_deref(),
+            Some("customer-langgraph-sim-orchestrator")
+        );
+        assert_eq!(
+            interaction
+                .request
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("goal"))
+                .and_then(Value::as_str),
+            Some("echo cross-orch")
+        );
+        assert_eq!(
+            interaction
+                .response
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert!(interaction.tool_calls.is_empty());
     }
 
     #[test]

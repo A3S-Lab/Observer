@@ -185,6 +185,26 @@ fn install_plaintext_http_routes(
             0,
         )?;
     }
+    // Confirmed-agent → peer agent RPC paths (e.g. orchestrator POST /runs to a worker).
+    // Capture uses the same TOOL route class so plain-HTTP write/sendto probes admit the body;
+    // userspace then classifies the exchange as interactionType=remote_agent.
+    let configured_agent_rpc = std::env::var("A3S_OBSERVER_AGENT_RPC_ROUTES")
+        .unwrap_or_else(|_| "/runs".to_string());
+    for route in configured_agent_rpc
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !valid_plaintext_http_route(route) {
+            tracing::warn!(route = %route, "ignoring invalid configured agent RPC HTTP route");
+            continue;
+        }
+        map.insert(
+            plaintext_http_route_hash(route.as_bytes()),
+            PLAINTEXT_HTTP_ROUTE_TOOL,
+            0,
+        )?;
+    }
     Ok(map)
 }
 
@@ -4572,6 +4592,11 @@ fn emit_completed_interaction(
         run_id,
         session_id,
         invocation_id,
+        hop,
+        workflow_node,
+        parent_session_id,
+        delegation_id,
+        agent_id_header,
         conversation_anchors,
         started_at_unix_ns,
         request_complete_at_unix_ns,
@@ -4674,6 +4699,11 @@ fn emit_completed_interaction(
                 run_id,
                 session_id,
                 invocation_id,
+                hop,
+                workflow_node,
+                parent_session_id,
+                delegation_id,
+                agent_id_header,
                 conversation_anchors,
                 started_at_unix_ns,
                 request_complete_at_unix_ns,

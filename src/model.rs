@@ -713,6 +713,21 @@ pub struct LlmInteraction {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
+    /// Cross-agent hop label from `x-anysentry-hop` (e.g. orchestrator / worker).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<String>,
+    /// Workflow node from `x-anysentry-workflow-node` (e.g. plan / work / verify).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_node: Option<String>,
+    /// Parent Session stamped by the caller on a delegated hop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Per-delegation UUID from `x-anysentry-delegation-id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
+    /// Wire `x-anysentry-agent-id` header value (metadata only; does not override cgroup identity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id_header: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conversation_anchors: Vec<LlmConversationAnchor>,
     pub started_at_unix_ns: String,
