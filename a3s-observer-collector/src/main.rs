@@ -196,11 +196,12 @@ fn install_plaintext_http_routes(
             0,
         )?;
     }
-    // Confirmed-agent → peer agent RPC paths (e.g. orchestrator POST /runs to a worker).
-    // Capture uses the same TOOL route class so plain-HTTP write/sendto probes admit the body;
-    // userspace then classifies the exchange as interactionType=remote_agent.
-    let configured_agent_rpc = std::env::var("A3S_OBSERVER_AGENT_RPC_ROUTES")
-        .unwrap_or_else(|_| "/runs".to_string());
+    // Agent-to-agent RPC paths are deployment capabilities, not a protocol-wide endpoint name.
+    // Do not inject a default such as `/runs`: that would make cold-start discovery depend on a
+    // single framework route. Once a workload is admitted by the candidate/confirmed capture
+    // profile, its full bounded HTTP evidence is handled by the profile; this map is only an
+    // optional early plaintext admission hint supplied by the deployment.
+    let configured_agent_rpc = std::env::var("A3S_OBSERVER_AGENT_RPC_ROUTES").unwrap_or_default();
     for route in configured_agent_rpc
         .split(',')
         .map(str::trim)
