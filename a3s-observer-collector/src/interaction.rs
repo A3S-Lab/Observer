@@ -7,15 +7,16 @@
 //! (`:method`/`:path`/`:status`/`content-type`/`host`/`authority`) plus DATA bodies; HPACK desync
 //! surfaces as `h2_hpack_desync` while the DATA body-only lane continues.
 
+use crate::h2_hpack::{HpackDecoder, Http2HeaderBlock};
 use a3s_observer::{
     DefaultLlmFormatAdapter, LlmConversationAnchor, LlmFormatAdapter, LlmInteractionContent,
     LlmInteractionMessage, LlmInteractionSemanticItem, LlmInteractionToolCall,
     LlmInteractionToolResult, LlmTokenUsage,
 };
 use a3s_observer_common::{
-    classify_http_method_prefix, HTTP_METHOD_PREFIX_COMPLETE, TLS_BIND_QUALITY_FD,
+    classic_tls_sock_connection_id, classify_http_method_prefix, http_request_line_shaped,
+    HTTP_METHOD_PREFIX_COMPLETE, TLS_BIND_QUALITY_FD,
 };
-use crate::h2_hpack::{HpackDecoder, Http2HeaderBlock};
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -871,7 +872,11 @@ impl WebSocketFrameDecoder {
                             // Responses events are single FIN frames. Rejecting non-FIN starts
                             // avoids a forged fragment latch that later Err paths wipe.
                             0x1 | 0x2 => {
-                                frame.fin && self.frame_payload_plausible_json(&frame)
+                                // A recovered stream may begin at a fragmented data frame. The
+                                // first fragment can still be a valid JSON prefix; rejecting all
+                                // non-FIN starts prevents the continuation state from ever being
+                                // established and silently loses the later terminal event.
+                                self.frame_payload_plausible_json(&frame)
                             }
                             // Ignore control frames until the stream has produced application
                             // data; forged ping/close headers are common in mid-frame noise.
@@ -1135,7 +1140,11 @@ impl WebSocketFrameDecoder {
 
     fn try_resync_to_complete_plausible_event(&mut self) -> bool {
         let expect_masked = self.kind == StreamKind::Request;
-        let search_limit = self.buffer.len().min(self.max_bytes.saturating_add(64)).max(2);
+        let search_limit = self
+            .buffer
+            .len()
+            .min(self.max_bytes.saturating_add(64))
+            .max(2);
         for offset in 1..search_limit {
             let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
             else {
@@ -1404,7 +1413,6 @@ impl WebSocketConnectionState {
     }
 }
 
-
 #[derive(Debug, Default)]
 struct Http2StreamState {
     headers: Http2HeaderBlock,
@@ -1462,6 +1470,8 @@ struct ConnectionState {
     socket_cookie: u64,
     fd_generation: u32,
     last_activity: Instant,
+    /// Global + per-pid uprobes can emit the same SSL_write twice (~100µs apart).
+    last_probe_write: Option<(ChunkDirection, u64, [u8; 32], u128)>,
 }
 
 impl ConnectionState {
@@ -1490,6 +1500,7 @@ impl ConnectionState {
             socket_cookie: 0,
             fd_generation: 0,
             last_activity: now,
+            last_probe_write: None,
         }
     }
 
@@ -1537,12 +1548,16 @@ pub struct InteractionReassembler {
     connections: HashMap<ConnectionKey, ConnectionState>,
     connection_aliases: HashMap<ConnectionKey, ConnectionKey>,
     pending_evidence: VecDeque<CompletedPlaintextEvidence>,
+    pending_completed: VecDeque<CompletedInteraction>,
     max_connections: usize,
     max_body_bytes: usize,
     idle_timeout: Duration,
     websocket_idle_timeout: Duration,
     metrics: ReassemblyMetrics,
     gap_evidence_fingerprints: HashSet<String>,
+    /// Pointer-local sequence baselines retained for diagnostics even when resolver aliases the
+    /// pointer to another canonical stream. This is bounded and never controls ownership.
+    observed_fragment_sequences: HashMap<(ConnectionKey, ChunkDirection), u64>,
 }
 
 impl Default for InteractionReassembler {
@@ -1565,12 +1580,14 @@ impl InteractionReassembler {
             connections: HashMap::new(),
             connection_aliases: HashMap::new(),
             pending_evidence: VecDeque::new(),
+            pending_completed: VecDeque::new(),
             max_connections: max_connections.max(1),
             max_body_bytes: max_body_bytes.max(4 * 1024),
             idle_timeout,
             websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT.max(idle_timeout),
             metrics: ReassemblyMetrics::default(),
             gap_evidence_fingerprints: HashSet::new(),
+            observed_fragment_sequences: HashMap::new(),
         }
     }
 
@@ -1601,18 +1618,25 @@ impl InteractionReassembler {
                 return Vec::new();
             }
         }
-        // A decoder error from a previous fragment means the stream can no longer prove a complete
-        // exchange. Emit one bounded metadata-only evidence record before attempting recovery;
-        // the next valid KernelFact is still processed normally.
-        let prior_decode_gap = self.connections.get(&key).and_then(|state| {
-            state
-                .requests
-                .last_decode_error
-                .clone()
-                .or_else(|| state.responses.last_decode_error.clone())
-                .or_else(|| state.websocket.requests.last_decode_error.clone())
-                .or_else(|| state.websocket.responses.last_decode_error.clone())
-        });
+        // Sticky decode errors are direction-scoped. A request httparse failure must not stamp
+        // every later response fragment as `http_request_parse_error` metadata-only evidence
+        // (Claude classic SSL often keeps writing/reading on the same ConnectionKey after a
+        // poisoned prefix). Dedup still applies per fingerprint inside enqueue_gap_evidence.
+        let prior_decode_gap = self
+            .connections
+            .get(&key)
+            .and_then(|state| match chunk.direction {
+                ChunkDirection::Request => state
+                    .requests
+                    .last_decode_error
+                    .clone()
+                    .or_else(|| state.websocket.requests.last_decode_error.clone()),
+                ChunkDirection::Response => state
+                    .responses
+                    .last_decode_error
+                    .clone()
+                    .or_else(|| state.websocket.responses.last_decode_error.clone()),
+            });
         if let Some(reason) = prior_decode_gap {
             self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
         }
@@ -1650,6 +1674,15 @@ impl InteractionReassembler {
             state.last_activity = Instant::now();
             observe_socket_bind(state, &chunk);
         }
+        if binding_gap == Some("ambiguous_stream_binding")
+            && chunk.direction == ChunkDirection::Request
+            && looks_like_websocket_frame_prefix(&chunk.data)
+            && !state.websocket.active
+        {
+            // Keep an ambiguous moved-pointer frame in a provisional WebSocket state so later
+            // continuation/terminal frames can produce partial evidence with the gap reason.
+            state.websocket.recover_from_frame(&chunk.data);
+        }
         if binding_gap.is_some() {
             state.binding_uncertain = true;
             extend_unique(
@@ -1677,7 +1710,26 @@ impl InteractionReassembler {
             self.pending_evidence.push_back(evidence);
         }
 
-        let sequence_key = (observed_key.connection_id, chunk.direction);
+        // Sequence continuity belongs to the resolved physical stream. Tracking by the
+        // transient TLS pointer splits one connection whenever rustls moves its CommonState and
+        // hides real gaps behind a new per-pointer baseline.
+        let sequence_key = (key.connection_id, chunk.direction);
+        let observed_sequence_key = (observed_key, chunk.direction);
+        let observed_gap = self
+            .observed_fragment_sequences
+            .get(&observed_sequence_key)
+            .is_some_and(|previous| *previous != 0 && chunk.sequence != previous.wrapping_add(1));
+        if self.observed_fragment_sequences.len() >= 256
+            && !self
+                .observed_fragment_sequences
+                .contains_key(&observed_sequence_key)
+        {
+            if let Some(oldest) = self.observed_fragment_sequences.keys().next().copied() {
+                self.observed_fragment_sequences.remove(&oldest);
+            }
+        }
+        self.observed_fragment_sequences
+            .insert(observed_sequence_key, chunk.sequence);
         if state.fragment_sequences.len() >= 64
             && !state.fragment_sequences.contains_key(&sequence_key)
         {
@@ -1692,7 +1744,9 @@ impl InteractionReassembler {
             );
         }
         let previous_sequence = state.fragment_sequences.entry(sequence_key).or_insert(0);
-        if *previous_sequence != 0 && chunk.sequence != previous_sequence.wrapping_add(1) {
+        let canonical_gap =
+            *previous_sequence != 0 && chunk.sequence != previous_sequence.wrapping_add(1);
+        if (canonical_gap || observed_gap) && !sequence_gap_detected {
             self.metrics.sequence_gaps = self.metrics.sequence_gaps.saturating_add(1);
             sequence_gap_detected = true;
             extend_unique(
@@ -1701,6 +1755,9 @@ impl InteractionReassembler {
             );
         }
         *previous_sequence = chunk.sequence;
+        if duplicate_probe_write(state, &chunk) {
+            return Vec::new();
+        }
         if chunk
             .partial_reasons
             .iter()
@@ -1717,6 +1774,11 @@ impl InteractionReassembler {
         }
 
         let mut deferred_body_gap_reasons = Vec::new();
+        let websocket_upgrade_response = chunk.direction == ChunkDirection::Response
+            && state.websocket.upgrade_requested
+            && (chunk.data.starts_with(b"HTTP/")
+                || (!chunk.data.is_empty() && b"HTTP/".starts_with(&chunk.data))
+                || !state.responses.buffer.is_empty());
         let completed = if state.http2.active
             || chunk.data.starts_with(b"PRI * HTTP/2.0")
             || looks_like_http2_frame_prefix(&chunk.data)
@@ -1724,7 +1786,12 @@ impl InteractionReassembler {
             let (done, gaps) = process_http2_chunk(key, state, &chunk, self.max_body_bytes);
             deferred_body_gap_reasons.extend(gaps);
             done
-        } else if state.websocket.active {
+        } else if state.websocket.active
+            // The client offer activates frame discovery before the server's HTTP 101 arrives.
+            // Keep that response (including split headers) in the HTTP decoder so negotiation
+            // bytes cannot poison the WebSocket frame buffer.
+            && !websocket_upgrade_response
+        {
             if looks_like_websocket_upgrade(&chunk.data) {
                 // Duplicate upgrade GET on an already-activated connection (common when Rustls
                 // redelivers the handshake buffer); keep the existing deflate settings.
@@ -1788,6 +1855,26 @@ impl InteractionReassembler {
                             }
                         }
                     } else if !body_only_candidate {
+                        // Quarantine a sticky request-decode poison when a self-describing HTTP
+                        // request line arrives. Leaving the poisoned prefix in place permanently
+                        // blocks Claude POST /v1/messages reassembly on classic SSL.
+                        if state.requests.last_decode_error.is_some()
+                            && looks_like_http_request_prefix(&chunk.data)
+                        {
+                            let _ = state.requests.take_unparsed_tail();
+                            deferred_body_gap_reasons.push("http_request_decode_reset".to_string());
+                        }
+                        let skip_non_http_prefix = state.requests.buffer.is_empty()
+                            && !looks_like_http_request_prefix(&chunk.data)
+                            && !looks_like_split_http_method(&chunk.data)
+                            && !chunk.data.starts_with(b"PRI * HTTP/2.0")
+                            && !looks_like_http2_frame_prefix(&chunk.data);
+                        if skip_non_http_prefix {
+                            extend_unique(
+                                &mut deferred_body_gap_reasons,
+                                ["classic_non_http_prefix".to_string()],
+                            );
+                        } else {
                         for mut request in state.requests.push(
                             &chunk.data,
                             chunk.event_at_unix_ns,
@@ -1823,6 +1910,7 @@ impl InteractionReassembler {
                                 }
                             }
                         }
+                        }
                     } else {
                         // A candidate prefix which is not an LLM body is retained as bounded
                         // plaintext/gap evidence, never handed to the normal HTTP decoder.
@@ -1848,6 +1936,7 @@ impl InteractionReassembler {
                         && (!state.rustls_response_body.buffer.is_empty()
                             || maybe_body_only_response_prefix(&chunk.data));
                     let orphan_body_only_response = rustls_like_chunk(&chunk)
+                        && !websocket_upgrade_response
                         && !chunk.data.starts_with(b"HTTP/")
                         && state.responses.buffer.is_empty()
                         && state.pending_requests.is_empty();
@@ -1905,6 +1994,13 @@ impl InteractionReassembler {
                             }
                         }
                     } else if !body_only_candidate && !orphan_body_only_response {
+                        if state.responses.last_decode_error.is_some()
+                            && chunk.data.starts_with(b"HTTP/")
+                        {
+                            let _ = state.responses.take_unparsed_tail();
+                            deferred_body_gap_reasons
+                                .push("http_response_decode_reset".to_string());
+                        }
                         for mut response in state.responses.push(
                             &chunk.data,
                             chunk.event_at_unix_ns,
@@ -2001,13 +2097,18 @@ impl InteractionReassembler {
         {
             self.metrics.parser_failures = self.metrics.parser_failures.saturating_add(1);
         }
-        let current_decode_gap = state
-            .requests
-            .last_decode_error
-            .clone()
-            .or_else(|| state.responses.last_decode_error.clone())
-            .or_else(|| state.websocket.requests.last_decode_error.clone())
-            .or_else(|| state.websocket.responses.last_decode_error.clone());
+        let current_decode_gap = match chunk.direction {
+            ChunkDirection::Request => state
+                .requests
+                .last_decode_error
+                .clone()
+                .or_else(|| state.websocket.requests.last_decode_error.clone()),
+            ChunkDirection::Response => state
+                .responses
+                .last_decode_error
+                .clone()
+                .or_else(|| state.websocket.responses.last_decode_error.clone()),
+        };
         if interaction_diagnostics_enabled_for(chunk.pid) && rustls_like_chunk(&chunk) {
             // A streaming response can produce hundreds of TLS fragments in a few
             // milliseconds. Keep per-fragment state available for targeted debugging,
@@ -2035,6 +2136,27 @@ impl InteractionReassembler {
             );
         }
         if let Some(reason) = current_decode_gap {
+            if reason == "http_request_parse_error"
+                && chunk
+                    .adapter_id
+                    .to_ascii_lowercase()
+                    .contains("ssl-classic")
+            {
+                let preview = chunk.data.iter().take(48).copied().collect::<Vec<_>>();
+                tracing::warn!(
+                    pid = chunk.pid,
+                    observed_connection_id = format_args!("{:x}", chunk.connection_id),
+                    canonical_connection_id = format_args!("{:x}", key.connection_id),
+                    bind_quality = chunk.bind_quality,
+                    socket_fd = chunk.socket_fd,
+                    socket_cookie = format_args!("{:x}", chunk.socket_cookie),
+                    fragment_bytes = chunk.data.len(),
+                    request_buffer_bytes = state.requests.buffer.len(),
+                    fragment_kind = plaintext_fragment_kind(&chunk.data),
+                    preview_hex = format_args!("{}", hex_prefix(&preview, 96)),
+                    "classic SSL HTTP request parse error"
+                );
+            }
             self.enqueue_gap_evidence(key, &chunk, &reason, "http/1.1");
         }
         for reason in deferred_body_gap_reasons {
@@ -2063,8 +2185,28 @@ impl InteractionReassembler {
         chunk: &PlaintextChunk,
     ) -> (ConnectionKey, Option<&'static str>) {
         let observed = ConnectionKey::from(chunk);
+        // A complete WebSocket Upgrade request is a new application-level session boundary.
+        // Never consult pointer-migration aliases before this boundary, otherwise parallel
+        // upgrades on one pid can collapse into the previously active stream.
+        if chunk.direction == ChunkDirection::Request
+            && is_rustls_source(chunk)
+            && looks_like_websocket_upgrade(&chunk.data)
+        {
+            return (observed, None);
+        }
         if let Some(canonical) = self.connection_aliases.get(&observed).copied() {
             return (canonical, None);
+        }
+        // Classic / OpenSSL SSL* ↔ socket cookie remount (design §5.2 ConnectionIdentity).
+        // BoringSSL classic emits early unbound writes under ssl_ptr, then cookie-bound reads
+        // after tls_ctx↔socket adjacency. Without this bridge, Claude POST bodies expire with
+        // response_buffer_bytes=0 while response fragments land on an empty sibling key.
+        // Plain TCP is already keyed by (cgroup,pid,fd). Classic remount exists for TLS pointer
+        // migration; applying it to syscall HTTP crosses parallel POSTs on one process.
+        if !is_rustls_source(chunk) && !is_plain_tcp_http(chunk) {
+            if let Some(resolved) = self.resolve_classic_http_connection(observed, chunk) {
+                return resolved;
+            }
         }
         // Prefer kernel tls_ctx↔socket bind when present. Bound streams use a stable socket-
         // derived connection_id already filled by eBPF; still alias any provisional TLS-pointer
@@ -2087,6 +2229,18 @@ impl InteractionReassembler {
             .get(&observed)
             .is_some_and(|state| state.binding_uncertain);
         if self.connections.contains_key(&observed) && !observed_binding_uncertain {
+            // A complete, self-describing WebSocket data frame on an existing active owner is
+            // stronger than pointer recency or sibling pending state. Keep it local; only opaque
+            // continuation fragments may use moved-pointer arbitration.
+            if chunk.direction == ChunkDirection::Request
+                && looks_like_websocket_frame_prefix(&chunk.data)
+                && self
+                    .connections
+                    .get(&observed)
+                    .is_some_and(|state| state.websocket.active)
+            {
+                return (observed, None);
+            }
             if let Some(owner) = self.preferred_websocket_exchange_owner(observed, chunk) {
                 if owner != observed {
                     self.remember_connection_alias(observed, owner);
@@ -2157,6 +2311,351 @@ impl InteractionReassembler {
         }
     }
 
+    /// Classic BoringSSL/OpenSSL: join ssl_ptr-keyed provisional HTTP state with the unique
+    /// socket-cookie/fd sibling for the same pid (or the reverse). Prefer the bound socket key
+    /// as canonical when it is idle so subsequent cookie-keyed fragments stay put.
+    fn resolve_classic_http_connection(
+        &mut self,
+        observed: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<(ConnectionKey, Option<&'static str>)> {
+        // eBPF identity ladder is ssl_ptr → sock_key(cgroup,pid,fd) → socket_cookie. Claude often
+        // lands the first TLS record on the FD key and the rest on the cookie key; merge by the
+        // shared socket bind before falling back to unique-busy heuristics.
+        if let Some(owner) = self.preferred_classic_socket_owner(observed, chunk) {
+            if owner != observed {
+                return self.rehome_classic_http_connection(observed, owner, chunk);
+            }
+        }
+        let owner = self.preferred_classic_http_exchange_owner(observed, chunk)?;
+        if owner == observed {
+            return None;
+        }
+        self.rehome_classic_http_connection(observed, owner, chunk)
+    }
+
+    fn rehome_classic_http_connection(
+        &mut self,
+        observed: ConnectionKey,
+        owner: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<(ConnectionKey, Option<&'static str>)> {
+        let observed_idle = self
+            .connections
+            .get(&observed)
+            .map(classic_http_exchange_idle)
+            .unwrap_or(true);
+        let prefer_socket_home = chunk.bind_quality >= TLS_BIND_QUALITY_FD && observed_idle;
+        let owner_poisoned = self
+            .connections
+            .get(&owner)
+            .is_some_and(classic_http_request_poisoned);
+        if prefer_socket_home && !owner_poisoned {
+            if self.rebind_quiescent_connection(owner, observed)
+                || self.merge_classic_http_request_buffers(owner, observed)
+            {
+                self.remember_connection_alias(owner, observed);
+                return Some((observed, None));
+            }
+        }
+        if self.rebind_quiescent_connection(observed, owner)
+            || self.merge_classic_http_request_buffers(observed, owner)
+        {
+            self.remember_connection_alias(observed, owner);
+            return Some((owner, None));
+        }
+        // Same-fd remount must not drop a fresh POST onto a sibling that cannot absorb it.
+        // Merge already refuses two request-line buffers; aliasing anyway used to feed hop 2
+        // into hop 1's decoder (or the reverse) after 6-byte junk was skipped.
+        if looks_like_http_request_prefix(&chunk.data) {
+            return None;
+        }
+        // Keep-alive Claude: both POSTs can sit pending before any SSL_read is drained.
+        // A cookie-keyed response must pair the oldest pending request on the socket, not
+        // the later hop that already owns the cookie key. An idle sibling must not steal
+        // a response from a connection that already has its own pending request.
+        let observed_started = self
+            .connections
+            .get(&observed)
+            .filter(|state| classic_http_has_request(state))
+            .map(classic_http_request_started_at);
+        let owner_started = self
+            .connections
+            .get(&owner)
+            .filter(|state| classic_http_has_request(state))
+            .map(classic_http_request_started_at);
+        match (observed_started, owner_started) {
+            (Some(_), None) => return None,
+            (Some(observed_at), Some(owner_at)) if owner_at >= observed_at => return None,
+            (Some(_), Some(_)) => {
+                // FIFO: this one response belongs to the older pending POST. Do not sticky-
+                // alias the later hop's cookie key onto the older FD key.
+                return Some((owner, None));
+            }
+            (None, Some(_)) => {
+                self.remember_connection_alias(observed, owner);
+                return Some((owner, None));
+            }
+            (None, None) => {}
+        }
+        self.remember_connection_alias(observed, owner);
+        Some((owner, None))
+    }
+
+    /// Merge provisional→target when both already hold incomplete classic HTTP request bytes that
+    /// clearly belong to one POST (FD key then cookie key). `rebind_quiescent_connection` refuses
+    /// this case; without it Claude tool-schema turns expire request-only on two connection_ids.
+    fn merge_classic_http_request_buffers(
+        &mut self,
+        provisional_key: ConnectionKey,
+        target_key: ConnectionKey,
+    ) -> bool {
+        if provisional_key == target_key {
+            return false;
+        }
+        let Some(mut provisional) = self.connections.remove(&provisional_key) else {
+            return false;
+        };
+        let Some(target) = self.connections.get_mut(&target_key) else {
+            self.connections.insert(provisional_key, provisional);
+            return false;
+        };
+        if provisional.websocket.active
+            || target.websocket.active
+            || provisional.http2.active
+            || target.http2.active
+            || !provisional.pending_requests.is_empty()
+            || !target.pending_requests.is_empty()
+            || provisional.requests.buffer.is_empty()
+            || target.requests.buffer.is_empty()
+            || !provisional.responses.buffer.is_empty()
+            || !target.responses.buffer.is_empty()
+        {
+            self.connections.insert(provisional_key, provisional);
+            return false;
+        }
+        let provisional_started = provisional.requests.buffer_started_at_unix_ns.unwrap_or(0);
+        let target_started = target.requests.buffer_started_at_unix_ns.unwrap_or(0);
+        let (earlier, later, earlier_started) = if provisional_started <= target_started {
+            (
+                std::mem::take(&mut provisional.requests.buffer),
+                std::mem::take(&mut target.requests.buffer),
+                provisional_started,
+            )
+        } else {
+            (
+                std::mem::take(&mut target.requests.buffer),
+                std::mem::take(&mut provisional.requests.buffer),
+                target_started,
+            )
+        };
+        // Only join when the earlier fragment looks like an HTTP request and the later one does
+        // not start a second request line (body/header continuation).
+        if !looks_like_http_request_prefix(&earlier) || looks_like_http_request_prefix(&later) {
+            if provisional_started <= target_started {
+                provisional.requests.buffer = earlier;
+                target.requests.buffer = later;
+            } else {
+                target.requests.buffer = earlier;
+                provisional.requests.buffer = later;
+            }
+            self.connections.insert(provisional_key, provisional);
+            return false;
+        }
+        let mut merged = earlier;
+        merged.extend_from_slice(&later);
+        if merged.len() > target.requests.max_bytes {
+            merged.truncate(target.requests.max_bytes);
+            extend_unique(
+                &mut target.requests.partial_reasons,
+                ["reassembly_body_limit".to_string()],
+            );
+        }
+        target.requests.buffer = merged;
+        target.requests.buffer_started_at_unix_ns = Some(earlier_started.max(1));
+        target.requests.last_at_unix_ns = target
+            .requests
+            .last_at_unix_ns
+            .max(provisional.requests.last_at_unix_ns);
+        target.requests.last_decode_error = None;
+        extend_unique(
+            &mut target.requests.partial_reasons,
+            provisional.requests.partial_reasons,
+        );
+        if provisional.bind_quality > target.bind_quality
+            || (provisional.bind_quality == target.bind_quality
+                && provisional.socket_cookie != 0
+                && target.socket_cookie == 0)
+        {
+            target.bind_quality = provisional.bind_quality;
+            target.socket_fd = provisional.socket_fd;
+            target.socket_cookie = provisional.socket_cookie;
+            target.fd_generation = provisional.fd_generation;
+        }
+        if provisional.last_activity > target.last_activity {
+            target.last_activity = provisional.last_activity;
+        }
+        merge_bounded_label(&mut target.source, &provisional.source);
+        merge_bounded_label(&mut target.adapter_id, &provisional.adapter_id);
+        true
+    }
+
+    /// Prefer the unique same-pid classic stream that already shares this socket fd/cookie.
+    fn preferred_classic_socket_owner(
+        &self,
+        observed: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<ConnectionKey> {
+        if chunk.socket_fd <= 0 && chunk.socket_cookie == 0 {
+            return None;
+        }
+        let fd_connection_id = (chunk.socket_fd > 0).then(|| {
+            classic_tls_sock_connection_id(observed.cgroup_id, observed.pid, chunk.socket_fd as u64)
+        });
+        let mut owners = self
+            .connections
+            .iter()
+            .filter_map(|(key, sibling)| {
+                if *key == observed
+                    || key.cgroup_id != observed.cgroup_id
+                    || key.pid != observed.pid
+                    || sibling.websocket.active
+                    || sibling.http2.active
+                {
+                    return None;
+                }
+                let same_cookie = chunk.socket_cookie != 0
+                    && (sibling.socket_cookie == chunk.socket_cookie
+                        || key.connection_id == chunk.socket_cookie
+                        || observed.connection_id == sibling.socket_cookie);
+                let same_fd = chunk.socket_fd > 0
+                    && (sibling.socket_fd == chunk.socket_fd
+                        || fd_connection_id.is_some_and(|id| key.connection_id == id)
+                        || (sibling.socket_fd > 0
+                            && classic_tls_sock_connection_id(
+                                observed.cgroup_id,
+                                observed.pid,
+                                sibling.socket_fd as u64,
+                            ) == observed.connection_id));
+                (same_cookie || same_fd).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        if owners.len() == 1 {
+            owners.pop()
+        } else {
+            None
+        }
+    }
+
+    /// Prefer the unique same-pid classic HTTP/1.1 owner when request and response halves were
+    /// split across provisional TLS-context and socket-derived connection_ids.
+    fn preferred_classic_http_exchange_owner(
+        &self,
+        observed: ConnectionKey,
+        chunk: &PlaintextChunk,
+    ) -> Option<ConnectionKey> {
+        if let Some(state) = self.connections.get(&observed) {
+            if state.websocket.active || state.http2.active {
+                return Some(observed);
+            }
+            match chunk.direction {
+                ChunkDirection::Response
+                    if !state.pending_requests.is_empty() || !state.requests.buffer.is_empty() =>
+                {
+                    return Some(observed);
+                }
+                ChunkDirection::Request
+                    if !state.requests.buffer.is_empty()
+                        || !state.pending_requests.is_empty()
+                        || looks_like_http_request_prefix(&chunk.data) =>
+                {
+                    return Some(observed);
+                }
+                ChunkDirection::Response
+                    if !state.responses.buffer.is_empty() && state.pending_requests.is_empty() =>
+                {
+                    // Response-only observed key: fall through to find the request sibling.
+                }
+                ChunkDirection::Request if !state.responses.buffer.is_empty() => {
+                    return Some(observed);
+                }
+                _ if !classic_http_exchange_idle(state) => {
+                    return Some(observed);
+                }
+                _ => {}
+            }
+        }
+
+        let mut owners = self
+            .connections
+            .iter()
+            .filter_map(|(key, sibling)| {
+                if *key == observed
+                    || key.cgroup_id != observed.cgroup_id
+                    || key.pid != observed.pid
+                    || sibling.websocket.active
+                    || sibling.http2.active
+                {
+                    return None;
+                }
+                match chunk.direction {
+                    ChunkDirection::Response => (!sibling.pending_requests.is_empty()
+                        || !sibling.requests.buffer.is_empty())
+                    .then_some(*key),
+                    ChunkDirection::Request => {
+                        // Only remount mid-body fragments. A fresh request line on a new
+                        // connection_id must keep its own home (parallel POSTs are common for
+                        // Claude count_tokens + messages).
+                        (!looks_like_http_request_prefix(&chunk.data)
+                            && !sibling.requests.buffer.is_empty()
+                            && sibling.pending_requests.is_empty())
+                        .then_some(*key)
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        if owners.len() == 1 {
+            return owners.pop();
+        }
+        // Parallel incomplete POSTs: disambiguate mid-body / response fragments by socket identity
+        // so count_tokens cannot steal the messages body (or vice versa).
+        if owners.len() > 1 {
+            let fd_connection_id = (chunk.socket_fd > 0).then(|| {
+                classic_tls_sock_connection_id(
+                    observed.cgroup_id,
+                    observed.pid,
+                    chunk.socket_fd as u64,
+                )
+            });
+            let matched = owners
+                .iter()
+                .copied()
+                .filter(|key| {
+                    let Some(sibling) = self.connections.get(key) else {
+                        return false;
+                    };
+                    let same_cookie = chunk.socket_cookie != 0
+                        && (sibling.socket_cookie == chunk.socket_cookie
+                            || key.connection_id == chunk.socket_cookie);
+                    let same_fd = chunk.socket_fd > 0
+                        && (sibling.socket_fd == chunk.socket_fd
+                            || fd_connection_id.is_some_and(|id| key.connection_id == id));
+                    same_cookie || same_fd
+                })
+                .collect::<Vec<_>>();
+            if matched.len() == 1 {
+                return matched.into_iter().next();
+            }
+            let pool = if matched.is_empty() { owners } else { matched };
+            if chunk.direction == ChunkDirection::Response {
+                if let Some(owner) = prefer_classic_pending_post_owner(&self.connections, &pool) {
+                    return Some(owner);
+                }
+            }
+        }
+        None
+    }
+
     /// Prefer the unique active WebSocket on this pid that already owns a pending / in-flight
     /// Responses exchange when the observed pointer is idle or unknown.
     fn preferred_websocket_exchange_owner(
@@ -2164,6 +2663,13 @@ impl InteractionReassembler {
         observed: ConnectionKey,
         chunk: &PlaintextChunk,
     ) -> Option<ConnectionKey> {
+        // A self-describing Upgrade request starts a new physical stream. It must not be
+        // remounted onto the only existing WebSocket merely because the TLS pointer carries a
+        // strong socket bind; doing so collapses two concurrent sessions before their 101 replies
+        // can establish independent generation-safe owners.
+        if chunk.direction == ChunkDirection::Request && looks_like_websocket_upgrade(&chunk.data) {
+            return None;
+        }
         if let Some(state) = self.connections.get(&observed) {
             let observed_busy = !state.pending_requests.is_empty()
                 || state.websocket.response.started_at_unix_ns.is_some()
@@ -2221,7 +2727,7 @@ impl InteractionReassembler {
                     (key.cgroup_id == observed.cgroup_id
                         && key.pid == observed.pid
                         && state.websocket.upgrade_requested)
-                    .then_some(*key)
+                        .then_some(*key)
                 })
                 .collect::<Vec<_>>();
             narrow_connection_candidates(&mut candidates, probe.as_ref(), &self.connections);
@@ -2252,6 +2758,61 @@ impl InteractionReassembler {
 
         let is_continuation = looks_like_websocket_continuation_prefix(&chunk.data);
         let is_websocket_frame = looks_like_websocket_frame_prefix(&chunk.data);
+        if chunk.direction == ChunkDirection::Response && is_websocket_frame {
+            // A response frame may carry no conversation anchor. A single active pending
+            // exchange on this workload is therefore the only safe owner; several pending
+            // exchanges remain ambiguous and must not be collapsed into a fresh pointer state.
+            let pending = self
+                .connections
+                .iter()
+                .filter_map(|(key, state)| {
+                    (key.cgroup_id == observed.cgroup_id
+                        && key.pid == observed.pid
+                        && state.websocket.active
+                        && !state.pending_requests.is_empty())
+                    .then_some(*key)
+                })
+                .collect::<Vec<_>>();
+            if pending.len() == 1 {
+                return ConnectionResolution::Resolved(pending[0]);
+            }
+            if pending.len() > 1 {
+                return ConnectionResolution::Ambiguous(pending.len());
+            }
+            if chunk.direction == ChunkDirection::Response {
+                let recovered = self
+                    .connections
+                    .iter()
+                    .filter_map(|(key, state)| {
+                        (key.cgroup_id == observed.cgroup_id
+                            && key.pid == observed.pid
+                            && state.websocket.active
+                            && state.websocket.recovered_without_handshake)
+                            .then_some(*key)
+                    })
+                    .collect::<Vec<_>>();
+                if recovered.len() == 1 {
+                    return ConnectionResolution::Resolved(recovered[0]);
+                }
+                if recovered.len() > 1 {
+                    return ConnectionResolution::Ambiguous(recovered.len());
+                }
+            }
+            if chunk.direction == ChunkDirection::Request {
+                let active = self
+                    .connections
+                    .iter()
+                    .filter(|(key, state)| {
+                        key.cgroup_id == observed.cgroup_id
+                            && key.pid == observed.pid
+                            && state.websocket.active
+                    })
+                    .count();
+                if active > 1 {
+                    return ConnectionResolution::Ambiguous(active);
+                }
+            }
+        }
         if is_continuation || is_websocket_frame {
             let mut candidates = self
                 .connections
@@ -2543,91 +3104,107 @@ impl InteractionReassembler {
             let Some(state) = self.connections.remove(&key) else {
                 continue;
             };
-            let request_buffer_bytes = state.requests.buffered_bytes();
-            let response_buffer_bytes = state.responses.buffered_bytes();
-            let pending_requests = state.pending_requests.len();
-            if interaction_diagnostics_enabled_for(key.pid) {
-                tracing::warn!(
-                    pid = key.pid,
-                    connection_id = format_args!("{:x}", key.connection_id),
-                    pending_requests,
-                    request_buffer_bytes,
-                    response_buffer_bytes,
-                    "expired idle Agent interaction reassembly state"
-                );
-            }
-            if request_buffer_bytes == 0 && response_buffer_bytes == 0 && pending_requests == 0 {
-                self.metrics.connection_expirations =
-                    self.metrics.connection_expirations.saturating_add(1);
-                continue;
-            }
-            let direction = if response_buffer_bytes > request_buffer_bytes {
-                "read"
-            } else {
-                "write"
-            };
-            let reason = "reassembly_idle_expire_incomplete";
-            let fingerprint = format!(
-                "{}:{}:{}:{}:{}",
-                key.cgroup_id, key.pid, key.connection_id, direction, reason
+            self.retire_incomplete_connection(
+                key,
+                state,
+                "reassembly_idle_expire_incomplete",
             );
-            if self.gap_evidence_fingerprints.len() >= self.max_connections.saturating_mul(4).max(4)
-                && !self.gap_evidence_fingerprints.contains(&fingerprint)
-            {
-                if let Some(oldest) = self.gap_evidence_fingerprints.iter().next().cloned() {
-                    self.gap_evidence_fingerprints.remove(&oldest);
-                    self.metrics.evidence_evictions =
-                        self.metrics.evidence_evictions.saturating_add(1);
-                }
-            }
-            if self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
-                let observed_at = state
-                    .responses
-                    .observed_at_unix_ns()
-                    .max(state.requests.observed_at_unix_ns());
-                let mut hash = Sha256::new();
-                hash.update(b"anysentry.agent_plaintext_evidence.v1");
-                hash.update(fingerprint.as_bytes());
-                hash.update(observed_at.to_ne_bytes());
-                hash.update(request_buffer_bytes.to_ne_bytes());
-                hash.update(response_buffer_bytes.to_ne_bytes());
-                hash.update(pending_requests.to_ne_bytes());
-                let evidence = CompletedPlaintextEvidence {
-                    schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
-                    evidence_id: format!("pe_{}", hex_prefix(&hash.finalize(), 24)),
-                    cgroup_id: key.cgroup_id,
-                    pid: key.pid,
-                    connection_id: format!("tls:{:x}", key.connection_id),
-                    direction: direction.to_string(),
-                    tls_adapter_id: state.adapter_id.clone(),
-                    transport_protocol: "http/1.1".to_string(),
-                    parse_state: "unparsed".to_string(),
-                    llm_likelihood: "unknown".to_string(),
-                    schema_fingerprint: None,
-                    observed_at_unix_ns: observed_at.to_string(),
-                    captured_bytes: (request_buffer_bytes + response_buffer_bytes) as u64,
-                    encoding: "metadata_only".to_string(),
-                    redacted_sample: None,
-                    sample_sha256: sha256_hex(fingerprint.as_bytes()),
-                    reasons: vec![
-                        reason.to_string(),
-                        format!("request_buffer_bytes={request_buffer_bytes}"),
-                        format!("response_buffer_bytes={response_buffer_bytes}"),
-                        format!("pending_requests={pending_requests}"),
-                    ],
-                    capture_source: state.source.clone(),
-                };
-                if self.pending_evidence.len() >= self.max_connections {
-                    self.pending_evidence.pop_front();
-                    self.metrics.evidence_evictions =
-                        self.metrics.evidence_evictions.saturating_add(1);
-                }
-                self.pending_evidence.push_back(evidence);
-            }
-            self.metrics.connection_expirations =
-                self.metrics.connection_expirations.saturating_add(1);
         }
         self.retain_live_connection_aliases();
+    }
+
+    fn retire_incomplete_connection(
+        &mut self,
+        key: ConnectionKey,
+        mut state: ConnectionState,
+        reason: &'static str,
+    ) {
+        let pending_requests = state.pending_requests.len();
+        self.flush_pending_requests_as_partial(key, &mut state, reason);
+        let request_buffer_bytes = state.requests.buffered_bytes();
+        let response_buffer_bytes = state.responses.buffered_bytes();
+        if pending_requests > 0 || request_buffer_bytes > 0 || response_buffer_bytes > 0 {
+            tracing::warn!(
+                pid = key.pid,
+                connection_id = format_args!("{:x}", key.connection_id),
+                pending_requests,
+                request_buffer_bytes,
+                response_buffer_bytes,
+                reason,
+                "retired incomplete Agent HTTP reassembly state"
+            );
+        }
+        if request_buffer_bytes == 0 && response_buffer_bytes == 0 && pending_requests == 0 {
+            self.metrics.connection_expirations =
+                self.metrics.connection_expirations.saturating_add(1);
+            return;
+        }
+        let direction = if response_buffer_bytes > request_buffer_bytes {
+            "read"
+        } else {
+            "write"
+        };
+        let fingerprint = format!(
+            "{}:{}:{}:{}:{}",
+            key.cgroup_id, key.pid, key.connection_id, direction, reason
+        );
+        if self.gap_evidence_fingerprints.len() >= self.max_connections.saturating_mul(4).max(4)
+            && !self.gap_evidence_fingerprints.contains(&fingerprint)
+        {
+            if let Some(oldest) = self.gap_evidence_fingerprints.iter().next().cloned() {
+                self.gap_evidence_fingerprints.remove(&oldest);
+                self.metrics.evidence_evictions =
+                    self.metrics.evidence_evictions.saturating_add(1);
+            }
+        }
+        if self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
+            let observed_at = state
+                .responses
+                .observed_at_unix_ns()
+                .max(state.requests.observed_at_unix_ns());
+            let mut hash = Sha256::new();
+            hash.update(b"anysentry.agent_plaintext_evidence.v1");
+            hash.update(fingerprint.as_bytes());
+            hash.update(observed_at.to_ne_bytes());
+            hash.update(request_buffer_bytes.to_ne_bytes());
+            hash.update(response_buffer_bytes.to_ne_bytes());
+            hash.update(pending_requests.to_ne_bytes());
+            let evidence = CompletedPlaintextEvidence {
+                schema_version: "anysentry.agent_plaintext_evidence.v1".to_string(),
+                evidence_id: format!("pe_{}", hex_prefix(&hash.finalize(), 24)),
+                cgroup_id: key.cgroup_id,
+                pid: key.pid,
+                connection_id: format!("tls:{:x}", key.connection_id),
+                direction: direction.to_string(),
+                tls_adapter_id: state.adapter_id.clone(),
+                transport_protocol: "http/1.1".to_string(),
+                parse_state: "unparsed".to_string(),
+                llm_likelihood: "unknown".to_string(),
+                schema_fingerprint: None,
+                observed_at_unix_ns: observed_at.to_string(),
+                captured_bytes: (request_buffer_bytes
+                    + response_buffer_bytes
+                    + state.pending_request_bytes) as u64,
+                encoding: "metadata_only".to_string(),
+                redacted_sample: None,
+                sample_sha256: sha256_hex(fingerprint.as_bytes()),
+                reasons: vec![
+                    reason.to_string(),
+                    format!("request_buffer_bytes={request_buffer_bytes}"),
+                    format!("response_buffer_bytes={response_buffer_bytes}"),
+                    format!("pending_requests={pending_requests}"),
+                ],
+                capture_source: state.source.clone(),
+            };
+            if self.pending_evidence.len() >= self.max_connections {
+                self.pending_evidence.pop_front();
+                self.metrics.evidence_evictions =
+                    self.metrics.evidence_evictions.saturating_add(1);
+            }
+            self.pending_evidence.push_back(evidence);
+        }
+        self.metrics.connection_expirations =
+            self.metrics.connection_expirations.saturating_add(1);
     }
 
     /// Drop every protocol/alias state owned by a process generation as soon as its kernel Exit
@@ -2643,9 +3220,12 @@ impl InteractionReassembler {
             .filter(|key| key.pid == pid && key.cgroup_id == cgroup_id)
             .collect::<Vec<_>>();
         for key in keys {
-            if self.connections.remove(&key).is_some() {
-                self.metrics.connection_expirations =
-                    self.metrics.connection_expirations.saturating_add(1);
+            if let Some(state) = self.connections.remove(&key) {
+                self.retire_incomplete_connection(
+                    key,
+                    state,
+                    "reassembly_process_exit_incomplete",
+                );
             }
         }
         self.connection_aliases.retain(|observed, canonical| {
@@ -2657,12 +3237,71 @@ impl InteractionReassembler {
             .retain(|fingerprint| !fingerprint.starts_with(&prefix));
     }
 
+    pub fn expire_all(&mut self) {
+        let keys = self.connections.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            if let Some(state) = self.connections.remove(&key) {
+                self.retire_incomplete_connection(key, state, "reassembly_shutdown_incomplete");
+            }
+        }
+        self.connection_aliases.clear();
+    }
+
+    fn flush_pending_requests_as_partial(
+        &mut self,
+        key: ConnectionKey,
+        state: &mut ConnectionState,
+        reason: &'static str,
+    ) {
+        while let Some(mut request) = state.pop_pending_request() {
+            extend_unique(&mut request.partial_reasons, [reason.to_string()]);
+            add_binding_reasons(state, &mut request.partial_reasons);
+            let response = HttpMessage {
+                start_line: "HTTP/1.1 0 Unobserved".to_string(),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+                captured_body_bytes: 0,
+                started_at_unix_ns: request.completed_at_unix_ns,
+                completed_at_unix_ns: request.completed_at_unix_ns,
+                partial_reasons: vec![reason.to_string()],
+                metadata_inferred: true,
+                transport_protocol: request.transport_protocol.clone(),
+                derived_body: None,
+            };
+            state.sequence = state.sequence.wrapping_add(1);
+            let Some(interaction) = build_interaction(
+                key,
+                state.sequence,
+                &state.source,
+                &state.adapter_id,
+                request,
+                response,
+                state.bind_quality,
+                state.socket_fd,
+                state.socket_cookie,
+                state.fd_generation,
+            ) else {
+                continue;
+            };
+            if self.pending_completed.len() >= self.max_connections {
+                self.pending_completed.pop_front();
+                self.metrics.evidence_evictions =
+                    self.metrics.evidence_evictions.saturating_add(1);
+            }
+            self.pending_completed.push_back(interaction);
+        }
+    }
+
     pub fn active_connections(&self) -> usize {
         self.connections.len()
     }
 
     pub fn take_evidence(&mut self) -> Vec<CompletedPlaintextEvidence> {
         self.pending_evidence.drain(..).collect()
+    }
+
+    pub fn take_completed(&mut self) -> Vec<CompletedInteraction> {
+        self.pending_completed.drain(..).collect()
     }
 
     fn enqueue_gap_evidence(
@@ -2701,6 +3340,20 @@ impl InteractionReassembler {
         }
         if !self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
             return;
+        }
+        if chunk.adapter_id.to_ascii_lowercase().contains("ssl")
+            && chunk.direction == ChunkDirection::Request
+            && chunk.data.len() >= 16
+        {
+            let preview = chunk.data.iter().take(48).copied().collect::<Vec<_>>();
+            tracing::warn!(
+                pid = chunk.pid,
+                reason,
+                fragment_bytes = chunk.data.len(),
+                fragment_kind = plaintext_fragment_kind(&chunk.data),
+                preview_hex = format_args!("{}", hex_prefix(&preview, 96)),
+                "unparsed TLS plaintext write"
+            );
         }
         let mut hash = Sha256::new();
         hash.update(b"anysentry.agent_plaintext_evidence.v1");
@@ -2741,7 +3394,17 @@ impl InteractionReassembler {
         if let Some(oldest) = self
             .connections
             .iter()
-            .min_by_key(|(_, state)| state.last_activity)
+            // Several kernel fragments can share one clock tick. Use the stable physical key
+            // as a tie-breaker instead of HashMap iteration order, so bounded eviction cannot
+            // randomly discard an active stream and hide its sequence gap.
+            .min_by_key(|(key, state)| {
+                (
+                    state.last_activity,
+                    key.cgroup_id,
+                    key.pid,
+                    key.connection_id,
+                )
+            })
             .map(|(key, _)| *key)
         {
             self.connections.remove(&oldest);
@@ -3020,6 +3683,26 @@ fn interaction_diagnostics_enabled_for(pid: u32) -> bool {
         .is_none_or(|expected| expected == pid)
 }
 
+const DUPLICATE_PROBE_WRITE_NS: u128 = 5_000_000;
+
+fn duplicate_probe_write(state: &mut ConnectionState, chunk: &PlaintextChunk) -> bool {
+    if chunk.data.is_empty() {
+        return false;
+    }
+    let digest: [u8; 32] = Sha256::digest(&chunk.data).into();
+    let len = chunk.data.len() as u64;
+    let duplicate = state.last_probe_write.as_ref().is_some_and(
+        |(direction, previous_len, previous_hash, previous_at)| {
+            *direction == chunk.direction
+                && *previous_len == len
+                && *previous_hash == digest
+                && chunk.event_at_unix_ns.saturating_sub(*previous_at) < DUPLICATE_PROBE_WRITE_NS
+        },
+    );
+    state.last_probe_write = Some((chunk.direction, len, digest, chunk.event_at_unix_ns));
+    duplicate
+}
+
 fn plaintext_fragment_kind(data: &[u8]) -> &'static str {
     if data.starts_with(b"POST ") {
         "http_request"
@@ -3126,8 +3809,71 @@ fn looks_like_websocket_switching_protocols(data: &[u8]) -> bool {
         || find_bytes(&lowercase, b"\r\nconnection: upgrade").is_some()
 }
 
+fn looks_like_split_http_method(data: &[u8]) -> bool {
+    // Lone `P` (0x50) is a method-token prefix, but Claude's false-ABI classic
+    // writes start with exactly that byte. Require two uppercase letters that
+    // are a real method prefix (`PO`/`GE`/`HE`…) before opening the decoder.
+    if data.len() < 2 || data.len() > 7 || !data.iter().all(u8::is_ascii_uppercase) {
+        return false;
+    }
+    const METHODS: [&[u8]; 10] = [
+        b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE",
+        b"CONNECT", b"PRI",
+    ];
+    METHODS.iter().any(|method| method.starts_with(data) || data.starts_with(method))
+}
+
+fn classic_http_request_poisoned(state: &ConnectionState) -> bool {
+    state.requests.last_decode_error.is_some()
+        || (!state.requests.buffer.is_empty()
+            && !looks_like_http_request_prefix(&state.requests.buffer)
+            && !state.http2.active)
+}
+
+fn classic_http_has_request(state: &ConnectionState) -> bool {
+    !state.pending_requests.is_empty() || looks_like_http_request_prefix(&state.requests.buffer)
+}
+
+fn classic_http_has_pending_post(state: &ConnectionState) -> bool {
+    state
+        .pending_requests
+        .iter()
+        .any(|request| request.start_line.starts_with("POST "))
+        || state.requests.buffer.starts_with(b"POST ")
+}
+
+fn prefer_classic_pending_post_owner(
+    connections: &HashMap<ConnectionKey, ConnectionState>,
+    owners: &[ConnectionKey],
+) -> Option<ConnectionKey> {
+    let mut posts = owners
+        .iter()
+        .copied()
+        .filter(|key| connections.get(key).is_some_and(classic_http_has_pending_post))
+        .collect::<Vec<_>>();
+    match posts.len() {
+        1 => posts.pop(),
+        // Two live POSTs on one pid are parallel exchanges. Picking the oldest request
+        // cross-wires responses; wait for socket identity instead.
+        _ => None,
+    }
+}
+
+fn classic_http_request_started_at(state: &ConnectionState) -> u128 {
+    state
+        .pending_requests
+        .front()
+        .map(|request| request.started_at_unix_ns)
+        .or(state.requests.buffer_started_at_unix_ns)
+        .unwrap_or(u128::MAX)
+}
+
 fn looks_like_http_request_prefix(data: &[u8]) -> bool {
+    // Method-token + SP alone is not enough: Claude JSON bodies often start with English phrases
+    // such as `paths between them` that classify as COMPLETE and previously blocked FD/cookie
+    // remount of mid-body SSL_write fragments.
     classify_http_method_prefix(data) == HTTP_METHOD_PREFIX_COMPLETE
+        && http_request_line_shaped(data)
 }
 
 fn websocket_frame_opcode(data: &[u8]) -> Option<u8> {
@@ -3921,8 +4667,30 @@ fn sse_block_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
         .min_by_key(|(offset, _)| *offset)
 }
 
+fn is_rustls_source(chunk: &PlaintextChunk) -> bool {
+    chunk.source.to_ascii_lowercase().contains("rustls")
+}
+
+fn is_plain_tcp_http(chunk: &PlaintextChunk) -> bool {
+    chunk.source.eq_ignore_ascii_case("tcp_plaintext")
+        || chunk.adapter_id.eq_ignore_ascii_case("plain-http-syscall")
+}
+
 fn rustls_like_chunk(chunk: &PlaintextChunk) -> bool {
-    chunk.route_candidate || chunk.source.to_ascii_lowercase().contains("rustls")
+    if is_plain_tcp_http(chunk) {
+        return false;
+    }
+    chunk.route_candidate || is_rustls_source(chunk)
+}
+
+fn classic_http_exchange_idle(state: &ConnectionState) -> bool {
+    state.pending_requests.is_empty()
+        && state.requests.buffer.is_empty()
+        && state.responses.buffer.is_empty()
+        && !state.websocket.active
+        && !state.http2.active
+        && state.rustls_request_body.buffer.is_empty()
+        && state.rustls_response_body.buffer.is_empty()
 }
 
 fn websocket_payload_probe(
@@ -4054,7 +4822,6 @@ fn narrow_connection_candidates(
         *candidates = matching;
     }
 }
-
 
 fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
     if chunk.bind_quality < TLS_BIND_QUALITY_FD {
@@ -4229,8 +4996,7 @@ fn build_interaction(
         .or_else(|| run_id.clone());
     let hop = bounded_correlation_header(&request, "x-anysentry-hop");
     let workflow_node = bounded_correlation_header(&request, "x-anysentry-workflow-node");
-    let parent_session_id =
-        bounded_correlation_header(&request, "x-anysentry-parent-session-id");
+    let parent_session_id = bounded_correlation_header(&request, "x-anysentry-parent-session-id");
     let delegation_id = bounded_correlation_header(&request, "x-anysentry-delegation-id");
     // Metadata only — cgroup / workload identity remains the source of truth for agentAssetId.
     let agent_id_header = bounded_correlation_header(&request, "x-anysentry-agent-id");
@@ -4347,8 +5113,7 @@ fn build_interaction(
         let rpc_response = response_content.structured.as_ref();
         // Prefer explicit LLM tool_call id stamped by the agent runtime over body-local ids
         // (MCP JSON-RPC id is often a fixed 1; sandbox execution_id is provider-local).
-        let header_tool_call_id =
-            bounded_correlation_header(&request, "x-anysentry-tool-call-id");
+        let header_tool_call_id = bounded_correlation_header(&request, "x-anysentry-tool-call-id");
         let (tool_call_id, name, arguments, result, response_error) =
             if wire_match.template_id == "generic-http-tool" {
                 let tool_call_id = header_tool_call_id
@@ -4797,7 +5562,6 @@ fn make_content(
     }
 }
 
-
 const HTTP2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_FRAME_HEADER_LEN: usize = 9;
 const HTTP2_FRAME_DATA: u8 = 0x0;
@@ -4915,10 +5679,16 @@ fn http2_message_from_stream(
     };
     let mut partial_reasons = reasons.to_vec();
     if stream.headers.method.is_none() && matches!(direction, ChunkDirection::Request) {
-        extend_unique(&mut partial_reasons, ["http2_headers_method_missing".to_string()]);
+        extend_unique(
+            &mut partial_reasons,
+            ["http2_headers_method_missing".to_string()],
+        );
     }
     if stream.headers.path.is_none() && matches!(direction, ChunkDirection::Request) {
-        extend_unique(&mut partial_reasons, ["http2_headers_path_missing".to_string()]);
+        extend_unique(
+            &mut partial_reasons,
+            ["http2_headers_path_missing".to_string()],
+        );
     }
     HttpMessage {
         start_line,
@@ -4958,16 +5728,18 @@ fn process_http2_chunk(
             return (completed, gap_reasons);
         } else if looks_like_http2_frame_prefix(&buffer) {
             state.http2.active = true;
-            extend_unique(&mut gap_reasons, ["http2_frames_without_preface".to_string()]);
+            extend_unique(
+                &mut gap_reasons,
+                ["http2_frames_without_preface".to_string()],
+            );
         } else {
             state.http2.active = true;
         }
     }
 
     while buffer.len() >= HTTP2_FRAME_HEADER_LEN {
-        let length = ((buffer[0] as usize) << 16)
-            | ((buffer[1] as usize) << 8)
-            | (buffer[2] as usize);
+        let length =
+            ((buffer[0] as usize) << 16) | ((buffer[1] as usize) << 8) | (buffer[2] as usize);
         let frame_end = HTTP2_FRAME_HEADER_LEN.saturating_add(length);
         if buffer.len() < frame_end {
             break;
@@ -4979,12 +5751,7 @@ fn process_http2_chunk(
         }
         let frame_type = buffer[3];
         let flags = buffer[4];
-        let stream_id = u32::from_be_bytes([
-            buffer[5] & 0x7f,
-            buffer[6],
-            buffer[7],
-            buffer[8],
-        ]);
+        let stream_id = u32::from_be_bytes([buffer[5] & 0x7f, buffer[6], buffer[7], buffer[8]]);
         let payload = buffer[HTTP2_FRAME_HEADER_LEN..frame_end].to_vec();
         buffer.drain(..frame_end);
 
@@ -4999,7 +5766,10 @@ fn process_http2_chunk(
         }
         if frame_type == HTTP2_FRAME_HEADERS {
             let Some(block_bytes) = http2_strip_frame_payload(&payload, flags) else {
-                extend_unique(&mut gap_reasons, ["http2_headers_padding_invalid".to_string()]);
+                extend_unique(
+                    &mut gap_reasons,
+                    ["http2_headers_padding_invalid".to_string()],
+                );
                 continue;
             };
             let decoded = match chunk.direction {
@@ -5078,7 +5848,9 @@ fn process_http2_chunk(
                         request.transport_protocol = Some("http/2".to_string());
                     }
                 }
-                state.identity.observe_http(&request, ChunkDirection::Request);
+                state
+                    .identity
+                    .observe_http(&request, ChunkDirection::Request);
                 add_binding_reasons(state, &mut request.partial_reasons);
                 if !state.push_pending_request(request) {
                     extend_unique(&mut gap_reasons, ["pending_request_limit".to_string()]);
@@ -5098,23 +5870,23 @@ fn process_http2_chunk(
                 );
                 if response.headers.get("content-type").is_none() {
                     if looks_like_sse(&finished.body) {
-                        response.headers.insert(
-                            "content-type".to_string(),
-                            "text/event-stream".to_string(),
-                        );
+                        response
+                            .headers
+                            .insert("content-type".to_string(), "text/event-stream".to_string());
                     } else if finished
                         .body
                         .iter()
                         .find(|b| !b.is_ascii_whitespace())
                         .is_some_and(|b| matches!(*b, b'{' | b'['))
                     {
-                        response.headers.insert(
-                            "content-type".to_string(),
-                            "application/json".to_string(),
-                        );
+                        response
+                            .headers
+                            .insert("content-type".to_string(), "application/json".to_string());
                     }
                 }
-                state.identity.observe_http(&response, ChunkDirection::Response);
+                state
+                    .identity
+                    .observe_http(&response, ChunkDirection::Response);
                 add_binding_reasons(state, &mut request.partial_reasons);
                 add_binding_reasons(state, &mut response.partial_reasons);
                 state.sequence = state.sequence.wrapping_add(1);
@@ -5143,7 +5915,6 @@ fn process_http2_chunk(
     state.http2.leftover = buffer;
     (completed, gap_reasons)
 }
-
 
 fn decode_http_message(
     kind: StreamKind,
@@ -5266,6 +6037,17 @@ fn decode_http_message(
         // No explicit HTTP framing is available here. Once the decoded stream has a terminal
         // event, all currently observed compressed bytes belong to this response; consume the
         // raw body while keeping the decoded view for the later parser stage.
+        (body_bytes.to_vec(), body_bytes.len())
+    } else if matches!(kind, StreamKind::Response)
+        && content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        && serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok()
+    {
+        // A bounded, self-describing JSON response can delimit itself even when an HTTP/1.1
+        // peer omits both Content-Length and chunked framing. Incomplete JSON remains buffered;
+        // a complete value is safe to consume without waiting for a socket close event.
         (body_bytes.to_vec(), body_bytes.len())
     } else {
         // HTTP/1.x response bodies without framing end on connection close. A TLS fragment cannot
@@ -5475,26 +6257,29 @@ fn match_wire_protocol(
             interaction_kind: WireInteractionKind::Tool,
         });
     }
-    // Cross-agent RPC (orchestrator → worker): goal payload plus delegation / workflow markers.
-    let has_goal = object.get("goal").and_then(Value::as_str).is_some();
+    // Cross-agent RPC: a task-bearing JSON POST plus a hop/delegation/session marker.
+    // Field names and hop tokens are protocol-shaped, not product instance names.
+    let has_task = ["goal", "input", "task", "query"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
     let has_agent_run_shape = object.contains_key("thread_id")
+        || object.contains_key("session_key")
+        || object.contains_key("conversation_id")
         || object.contains_key("todos")
         || object.contains_key("verify_status");
-    let has_delegation_marker = headers
-        .get("x-anysentry-delegation-id")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-        || headers
-            .get("x-anysentry-workflow-node")
-            .map(|value| value.eq_ignore_ascii_case("work"))
+    let header_nonempty = |name: &str| {
+        headers
+            .get(name)
+            .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
-        || headers
-            .get("x-anysentry-hop")
-            .map(|value| {
-                value.eq_ignore_ascii_case("orchestrator") || value.eq_ignore_ascii_case("worker")
-            })
-            .unwrap_or(false);
-    if has_goal && (has_agent_run_shape || has_delegation_marker) {
+    };
+    let has_delegation_marker = header_nonempty("x-anysentry-delegation-id")
+        || header_nonempty("x-anysentry-parent-session-id")
+        || header_nonempty("x-anysentry-hop");
+    if has_task && (has_agent_run_shape || has_delegation_marker) {
         return Some(WireMatch {
             template_id: "remote-agent-run",
             likelihood: "confirmed",
@@ -7428,6 +8213,362 @@ mod tests {
         chunk
     }
 
+    fn classic_chunk_on(
+        direction: ChunkDirection,
+        data: impl Into<Vec<u8>>,
+        at: u128,
+        connection_id: u64,
+        bind_quality: u8,
+    ) -> PlaintextChunk {
+        let mut chunk = chunk(direction, data, at);
+        chunk.source = "tls_uprobe_ssl".to_string();
+        chunk.adapter_id = "ssl-classic".to_string();
+        chunk.connection_id = connection_id;
+        chunk.bind_quality = bind_quality;
+        if bind_quality >= TLS_BIND_QUALITY_FD {
+            chunk.socket_fd = 17;
+        }
+        if bind_quality >= a3s_observer_common::TLS_BIND_QUALITY_COOKIE {
+            chunk.socket_cookie = connection_id;
+        }
+        chunk
+    }
+
+    #[test]
+    fn classic_ssl_ptr_and_socket_cookie_halves_reassemble_http11() {
+        // Mirrors Claude BoringSSL: early unbound SSL_write under ssl_ptr, later cookie-bound
+        // SSL_read for the response.
+        let request_body = r#"{"model":"claude-fixture","messages":[{"role":"user","content":"classic-split"}],"stream":false}"#;
+        let response_body = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#;
+        let ssl_ptr = 0xa11ce_u64;
+        let cookie = 0xd6286c8b89ccdc66_u64;
+        let mut reassembler = InteractionReassembler::default();
+
+        let request_bytes = custom_http_request(
+            "POST",
+            "/api/anthropic/v1/messages",
+            "open.bigmodel.cn",
+            request_body,
+        );
+        let split = request_bytes.len() / 2;
+        let first = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[..split].to_vec(),
+            100,
+            ssl_ptr,
+            0,
+        );
+        assert!(reassembler.push(first).is_empty());
+
+        let second = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[split..].to_vec(),
+            110,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        assert!(reassembler.push(second).is_empty());
+
+        let response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].path, "/api/anthropic/v1/messages");
+        assert!(
+            completed[0].request.body.contains("classic-split"),
+            "{}",
+            completed[0].request.body
+        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("ok"));
+        assert_eq!(completed[0].tls_adapter_id, "ssl-classic");
+    }
+
+    #[test]
+    fn classic_fd_then_cookie_request_buffers_merge_and_complete() {
+        // eBPF ladder: first SSL_write under sock_key(fd), later records under socket_cookie.
+        // Both halves already carry request bytes before remount — rebind_quiescent alone refuses.
+        let request_body = r#"{"model":"claude-fixture","messages":[{"role":"user","content":"fd-cookie-merge"}],"stream":false}"#;
+        let response_body = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"merged"}],"stop_reason":"end_turn"}"#;
+        let fd_key = 0x525793e0900_u64;
+        let cookie = 0x37f0f2d20a826051_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let request_bytes = custom_http_request(
+            "POST",
+            "/api/anthropic/v1/messages",
+            "open.bigmodel.cn",
+            request_body,
+        );
+        let split = 16384.min(request_bytes.len() / 2).max(32);
+        let mut first = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[..split].to_vec(),
+            100,
+            fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        first.socket_fd = 17;
+        assert!(reassembler.push(first).is_empty());
+
+        let mut second = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[split..].to_vec(),
+            110,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        second.socket_fd = 17;
+        second.socket_cookie = cookie;
+        assert!(reassembler.push(second).is_empty());
+
+        let mut response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        response.socket_fd = 17;
+        response.socket_cookie = cookie;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(
+            completed[0].request.body.contains("fd-cookie-merge"),
+            "{}",
+            completed[0].request.body
+        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("merged"));
+    }
+
+    #[test]
+    fn classic_parallel_posts_cookie_body_follows_matching_fd_sock_key() {
+        // Claude often overlaps count_tokens + messages. Mid-body cookie fragments must follow the
+        // FD sock_key half even when that half never persisted socket_fd on ConnectionState.
+        let messages_body = r#"{"model":"claude-fixture","messages":[{"role":"user","content":"tools-turn"}],"stream":false}"#;
+        let tokens_body = r#"{"model":"claude-fixture","messages":[{"role":"user","content":"count"}],"stream":false}"#;
+        let response_body = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"tools-ok"}],"stop_reason":"end_turn"}"#;
+        let cgroup = 22110_u64;
+        let pid = 589075_u32;
+        let messages_fd = 19_i32;
+        let tokens_fd = 20_i32;
+        let messages_fd_key = classic_tls_sock_connection_id(cgroup, pid, messages_fd as u64);
+        let tokens_fd_key = classic_tls_sock_connection_id(cgroup, pid, tokens_fd as u64);
+        let messages_cookie = 0x37f0f2d20a826051_u64;
+        let mut reassembler = InteractionReassembler::default();
+
+        let messages_req = custom_http_request(
+            "POST",
+            "/api/anthropic/v1/messages",
+            "open.bigmodel.cn",
+            messages_body,
+        );
+        let tokens_req = custom_http_request(
+            "POST",
+            "/api/anthropic/v1/messages/count_tokens",
+            "open.bigmodel.cn",
+            tokens_body,
+        );
+        let split = 16384.min(messages_req.len() / 2).max(32);
+
+        let mut tokens_first = classic_chunk_on(
+            ChunkDirection::Request,
+            tokens_req[..tokens_req.len().saturating_div(2).max(32)].to_vec(),
+            90,
+            tokens_fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        tokens_first.cgroup_id = cgroup;
+        tokens_first.pid = pid;
+        tokens_first.socket_fd = 0; // bind metadata lost on state; identity is connection_id only
+        assert!(reassembler.push(tokens_first).is_empty());
+
+        let mut messages_first = classic_chunk_on(
+            ChunkDirection::Request,
+            messages_req[..split].to_vec(),
+            100,
+            messages_fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        messages_first.cgroup_id = cgroup;
+        messages_first.pid = pid;
+        messages_first.socket_fd = 0;
+        assert!(reassembler.push(messages_first).is_empty());
+
+        let mut messages_rest = classic_chunk_on(
+            ChunkDirection::Request,
+            messages_req[split..].to_vec(),
+            110,
+            messages_cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        messages_rest.cgroup_id = cgroup;
+        messages_rest.pid = pid;
+        messages_rest.socket_fd = messages_fd;
+        messages_rest.socket_cookie = messages_cookie;
+        assert!(reassembler.push(messages_rest).is_empty());
+
+        let mut response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+            messages_cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        response.cgroup_id = cgroup;
+        response.pid = pid;
+        response.socket_fd = messages_fd;
+        response.socket_cookie = messages_cookie;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(
+            completed[0].request.body.contains("tools-turn"),
+            "{}",
+            completed[0].request.body
+        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("tools-ok"));
+    }
+
+    #[test]
+    fn classic_mid_body_english_remounts_onto_header_sibling() {
+        // Live Claude failure: body chunk began with `paths between…` which classified as a
+        // COMPLETE method token and blocked remount onto the FD sock_key that held the headers.
+        let request_body = format!(
+            "{{\"model\":\"claude-fixture\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}],\"stream\":false}}",
+            "paths between them, including dynamic-dispatch helpers and nested tool schemas"
+        );
+        let response_body = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"remounted"}],"stop_reason":"end_turn"}"#;
+        let cgroup = 22110_u64;
+        let pid = 589075_u32;
+        let header_fd = 19_i32;
+        let body_fd = 21_i32;
+        let header_key = classic_tls_sock_connection_id(cgroup, pid, header_fd as u64);
+        let body_key = classic_tls_sock_connection_id(cgroup, pid, body_fd as u64);
+        assert_eq!(format!("{body_key:x}"), "fb81ff5f0bed6827");
+        let mut reassembler = InteractionReassembler::default();
+        let request_bytes = custom_http_request(
+            "POST",
+            "/api/anthropic/v1/messages",
+            "open.bigmodel.cn",
+            &request_body,
+        );
+        let marker = b"paths between them";
+        let split = request_bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("fixture must embed mid-body English");
+        assert!(
+            !looks_like_http_request_prefix(&request_bytes[split..]),
+            "fixture body must start with mid-JSON English"
+        );
+
+        let mut header = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[..split].to_vec(),
+            100,
+            header_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        header.cgroup_id = cgroup;
+        header.pid = pid;
+        header.socket_fd = header_fd;
+        assert!(reassembler.push(header).is_empty());
+
+        let mut body = classic_chunk_on(
+            ChunkDirection::Request,
+            request_bytes[split..].to_vec(),
+            110,
+            body_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        body.cgroup_id = cgroup;
+        body.pid = pid;
+        body.socket_fd = body_fd;
+        assert!(reassembler.push(body).is_empty());
+
+        let mut response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(response_body),
+            200,
+            header_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        response.cgroup_id = cgroup;
+        response.pid = pid;
+        response.socket_fd = header_fd;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(
+            completed[0].request.body.contains("paths between them"),
+            "{}",
+            completed[0].request.body
+        );
+        assert_eq!(completed[0].response.text.as_deref(), Some("remounted"));
+    }
+
+    #[test]
+    fn classic_sticky_request_parse_error_does_not_poison_response_gap() {
+        let mut reassembler = InteractionReassembler::default();
+        // NUL inside the request-line token forces httparse Token error → sticky decode poison.
+        let garbage = classic_chunk_on(
+            ChunkDirection::Request,
+            b"GET\x00 / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            50,
+            0x1111,
+            0,
+        );
+        let _ = reassembler.push(garbage);
+        let evidence = reassembler.take_evidence();
+        assert!(
+            evidence.iter().any(|item| {
+                item.reasons
+                    .iter()
+                    .any(|reason| reason == "http_request_parse_error")
+            }),
+            "{evidence:?}"
+        );
+
+        let request_body = r#"{"model":"m","messages":[{"role":"user","content":"recover"}]}"#;
+        let request = classic_chunk_on(
+            ChunkDirection::Request,
+            custom_http_request("POST", "/v1/messages", "api.anthropic.com", request_body),
+            100,
+            0x1111,
+            0,
+        );
+        assert!(reassembler.push(request).is_empty());
+        let response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(
+                r#"{"id":"msg_r","type":"message","role":"assistant","content":[{"type":"text","text":"recovered"}],"stop_reason":"end_turn"}"#,
+            ),
+            200,
+            0x1111,
+            0,
+        );
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(
+            completed[0].request.body.contains("recover"),
+            "{}",
+            completed[0].request.body
+        );
+        let response_gaps = reassembler.take_evidence();
+        assert!(
+            response_gaps.iter().all(|item| {
+                item.direction != "read"
+                    || !item
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "http_request_parse_error")
+            }),
+            "{response_gaps:?}"
+        );
+    }
+
     fn compressed_websocket_frame(
         compressor: &mut Compress,
         payload: &[u8],
@@ -8351,15 +9492,17 @@ mod tests {
         assert_eq!(interaction.tool_calls[0].tool_call_id, "call_llm_bash_001");
         assert_eq!(interaction.tool_calls[0].name, "http.bash.execute");
         assert_eq!(interaction.tool_calls[0].arguments["command"], "uname -a");
-        assert_eq!(interaction.tool_results[0].tool_call_id, "call_llm_bash_001");
+        assert_eq!(
+            interaction.tool_results[0].tool_call_id,
+            "call_llm_bash_001"
+        );
         assert!(!interaction.tool_results[0].is_error);
     }
 
     #[test]
     fn remote_agent_run_shape_emits_delegation_interaction_with_hop_headers() {
         let mut reassembler = InteractionReassembler::default();
-        let request_body =
-            r#"{"goal":"echo cross-orch","todos":[],"thread_id":"thread-1","verify_status":"pending"}"#;
+        let request_body = r#"{"goal":"echo cross-orch","todos":[],"thread_id":"thread-1","verify_status":"pending"}"#;
         let request = format!(
             "POST /runs HTTP/1.1\r\nHost: worker-agent:18091\r\nContent-Type: application/json\r\ntraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nx-anysentry-run-id: run-cross-1\r\nx-anysentry-session-id: session-orch-1\r\nx-anysentry-parent-session-id: session-orch-1\r\nx-anysentry-delegation-id: del-1\r\nx-anysentry-hop: orchestrator\r\nx-anysentry-workflow-node: work\r\nx-anysentry-agent-id: customer-langgraph-sim-orchestrator\r\nContent-Length: {}\r\n\r\n{}",
             request_body.len(),
@@ -8417,6 +9560,125 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_invoke_shape_does_not_require_named_hops_or_runs_path() {
+        let mut reassembler = InteractionReassembler::default();
+        let request_body = r#"{"input":"sum two branches","session_key":"fanout-1"}"#;
+        let request = format!(
+            "POST /invoke HTTP/1.1\r\nHost: specialist:18094\r\nContent-Type: application/json\r\ntraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nx-anysentry-run-id: run-fanout-1\r\nx-anysentry-session-id: session-sup-1\r\nx-anysentry-parent-session-id: session-sup-1\r\nx-anysentry-delegation-id: del-fanout-1\r\nx-anysentry-hop: supervisor\r\nx-anysentry-workflow-node: delegate\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+        reassembler.push(chunk(ChunkDirection::Request, request.into_bytes(), 100));
+        let completed = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(r#"{"status":"completed","result":{"ok":true}}"#),
+            250,
+        ));
+        assert_eq!(completed.len(), 1);
+        let interaction = &completed[0];
+        assert_eq!(interaction.interaction_type, "remote_agent");
+        assert_eq!(interaction.traffic_role, "delegation");
+        assert_eq!(interaction.hop.as_deref(), Some("supervisor"));
+        assert_eq!(interaction.workflow_node.as_deref(), Some("delegate"));
+        assert_eq!(interaction.delegation_id.as_deref(), Some("del-fanout-1"));
+        assert_eq!(
+            interaction
+                .request
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("input"))
+                .and_then(Value::as_str),
+            Some("sum two branches")
+        );
+        assert_eq!(
+            interaction
+                .response
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert!(interaction.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn plain_tcp_parallel_posts_do_not_swap_responses() {
+        let cgroup = 9_u64;
+        let pid = 4242_u32;
+        let invoke_fd = 11_i32;
+        let chat_fd = 12_i32;
+        let invoke_key = classic_tls_sock_connection_id(cgroup, pid, invoke_fd as u64);
+        let chat_key = classic_tls_sock_connection_id(cgroup, pid, chat_fd as u64);
+        let mut reassembler = InteractionReassembler::default();
+        let invoke_req = custom_http_request(
+            "POST",
+            "/invoke",
+            "peer:18094",
+            r#"{"input":"nested","session_key":"run-1"}"#,
+        );
+        let chat_req = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[{"role":"user","content":"10+11"}]}"#,
+        );
+        let invoke_resp = http_response(r#"{"status":"completed","result":{"stdout":"25"}}"#);
+        let chat_resp = http_response(r#"{"choices":[{"message":{"content":"21"}}]}"#);
+
+        let tcp = |direction, data: Vec<u8>, at, connection_id, fd, candidate| {
+            let mut item = chunk(direction, data, at);
+            item.cgroup_id = cgroup;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = connection_id;
+            item.socket_fd = fd;
+            item.route_candidate = candidate;
+            item
+        };
+
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Request, invoke_req, 10, invoke_key, invoke_fd, true))
+            .is_empty());
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Request, chat_req, 11, chat_key, chat_fd, false))
+            .is_empty());
+        let chat_done = reassembler.push(tcp(
+            ChunkDirection::Response,
+            chat_resp,
+            12,
+            chat_key,
+            chat_fd,
+            false,
+        ));
+        let invoke_done = reassembler.push(tcp(
+            ChunkDirection::Response,
+            invoke_resp,
+            13,
+            invoke_key,
+            invoke_fd,
+            true,
+        ));
+        assert_eq!(chat_done.len(), 1, "{chat_done:?}");
+        assert_eq!(invoke_done.len(), 1, "{invoke_done:?}");
+        assert_eq!(chat_done[0].path, "/v1/chat/completions");
+        assert_eq!(chat_done[0].interaction_type, "model");
+        assert!(
+            chat_done[0].response.body.contains("21"),
+            "{}",
+            chat_done[0].response.body
+        );
+        assert_eq!(invoke_done[0].path, "/invoke");
+        assert_eq!(invoke_done[0].interaction_type, "remote_agent");
+        assert!(
+            invoke_done[0].response.body.contains("completed"),
+            "{}",
+            invoke_done[0].response.body
+        );
+    }
+
+    #[test]
     fn mcp_jsonrpc_prefers_x_anysentry_tool_call_id_over_body_id() {
         let mut reassembler = InteractionReassembler::default();
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_lab_fact","arguments":{"topic":"deepseek"}}}"#;
@@ -8435,7 +9697,10 @@ mod tests {
         ));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].tool_calls[0].tool_call_id, "call_llm_mcp_001");
-        assert_eq!(completed[0].tool_results[0].tool_call_id, "call_llm_mcp_001");
+        assert_eq!(
+            completed[0].tool_results[0].tool_call_id,
+            "call_llm_mcp_001"
+        );
         assert_eq!(completed[0].tool_calls[0].name, "get_lab_fact");
     }
 
@@ -8549,6 +9814,14 @@ mod tests {
         }
         assert!(!looks_like_http_request_prefix(b"PROPFIND"));
         assert!(!looks_like_http_request_prefix(br#"{"model":"fixture"}"#));
+        // Mid-body English that happens to look like a method token must not count as a request.
+        assert!(!looks_like_http_request_prefix(
+            b"paths between them, including"
+        ));
+        assert_eq!(
+            classify_http_method_prefix(b"paths between them, including"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
         assert_eq!(
             classify_http_method_prefix(b"PROPFIND"),
             a3s_observer_common::HTTP_METHOD_PREFIX_INCOMPLETE
@@ -8725,6 +9998,65 @@ mod tests {
         assert_ne!(completed[0].interaction_id, completed[1].interaction_id);
         assert_eq!(completed[0].response.text.as_deref(), Some("A"));
         assert_eq!(completed[1].response.text.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn anthropic_keep_alive_emits_tool_pending_then_tool_result() {
+        let mut reassembler = InteractionReassembler::default();
+        let first_req = r#"{"model":"fixture-claude-model","max_tokens":32,"messages":[{"role":"user","content":"run bash"}]}"#;
+        let first_sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_claude_fixture\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let first_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{first_sse}",
+            first_sse.len()
+        );
+        let first_request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{first_req}",
+            first_req.len()
+        );
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            first_request.into_bytes(),
+            10,
+        ));
+        let first = reassembler.push(chunk(
+            ChunkDirection::Response,
+            first_response.into_bytes(),
+            20,
+        ));
+        assert_eq!(first.len(), 1, "first exchange must emit");
+        assert_eq!(first[0].path, "/v1/messages");
+        assert_eq!(first[0].conversation_completeness, "tool_pending");
+        assert_eq!(first[0].tool_calls.len(), 1);
+
+        let second_req = r#"{"model":"fixture-claude-model","max_tokens":32,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_claude_fixture","content":[{"type":"text","text":"ok"}]}]}]}"#;
+        let second_request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{second_req}",
+            second_req.len()
+        );
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            second_request.into_bytes(),
+            30,
+        ));
+        let second = reassembler.push(chunk(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg-final","content":[{"type":"text","text":"done"}]}"#),
+            40,
+        ));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].tool_results.len(), 1);
+        assert_eq!(
+            second[0].tool_results[0].tool_call_id,
+            "toolu_claude_fixture"
+        );
+        assert_ne!(first[0].interaction_id, second[0].interaction_id);
     }
 
     #[test]
@@ -9207,6 +10539,409 @@ mod tests {
     }
 
     #[test]
+    fn classic_http11_header_then_body_completes_then_keep_alive_second_post() {
+        // c2d7 Claude lab: first SSL_write can be headers-only (~4k), body arrives later
+        // on the same ssl_ptr. Both hops must become interactions once the body is admitted.
+        let ssl_ptr = 0x7ffc_d53e_64b8_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let first_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
+        let first_headers = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            first_body.len()
+        );
+        let mut header_chunk = classic_chunk_on(
+            ChunkDirection::Request,
+            first_headers.into_bytes(),
+            58,
+            ssl_ptr,
+            0,
+        );
+        header_chunk.sequence = 1;
+        assert!(reassembler.push(header_chunk).is_empty());
+
+        let mut body_chunk = classic_chunk_on(
+            ChunkDirection::Request,
+            first_body.as_bytes().to_vec(),
+            253,
+            ssl_ptr,
+            0,
+        );
+        body_chunk.sequence = 2;
+        assert!(reassembler.push(body_chunk).is_empty());
+
+        let first = reassembler.push(classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"ok"}]}"#),
+            254,
+            ssl_ptr,
+            0,
+        ));
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].path, "/v1/messages");
+
+        let second_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"done"}]}"#;
+        let second_request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{second_body}",
+            second_body.len()
+        );
+        let mut second_chunk = classic_chunk_on(
+            ChunkDirection::Request,
+            second_request.into_bytes(),
+            301,
+            ssl_ptr,
+            0,
+        );
+        second_chunk.sequence = 3;
+        assert!(reassembler.push(second_chunk).is_empty());
+        let second = reassembler.push(classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_final","content":[{"type":"text","text":"done"}]}"#),
+            302,
+            ssl_ptr,
+            0,
+        ));
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(second[0].path, "/v1/messages");
+        assert_ne!(first[0].interaction_id, second[0].interaction_id);
+    }
+
+    #[test]
+    fn duplicate_app_data_probe_does_not_double_pending_request() {
+        let ssl_ptr = 0x5898_e8f0_e40_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
+        let request = format!(
+            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut first = classic_chunk_on(
+            ChunkDirection::Request,
+            request.clone().into_bytes(),
+            700_000_000,
+            ssl_ptr,
+            0,
+        );
+        first.sequence = 1;
+        first.adapter_id = "ssl-app-data".to_string();
+        assert!(reassembler.push(first).is_empty());
+
+        let mut dup = classic_chunk_on(
+            ChunkDirection::Request,
+            request.into_bytes(),
+            700_100_000,
+            ssl_ptr,
+            0,
+        );
+        dup.sequence = 2;
+        dup.adapter_id = "ssl-app-data".to_string();
+        assert!(reassembler.push(dup).is_empty());
+
+        let completed = reassembler.push(classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"ok"}]}"#),
+            701_000_000,
+            ssl_ptr,
+            0,
+        ));
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].path, "/v1/messages?beta=true");
+        assert!(reassembler.take_evidence().is_empty());
+    }
+
+    #[test]
+    fn classic_fresh_post_does_not_rehome_onto_poisoned_fd_sibling() {
+        let ssl_ptr = 0x7ffe_ecd0_47b8_u64;
+        let fd_key = classic_tls_sock_connection_id(7, 42, 17);
+        let mut reassembler = InteractionReassembler::default();
+        let mut split = classic_chunk_on(
+            ChunkDirection::Request,
+            b"PO".to_vec(),
+            9,
+            ssl_ptr,
+            0,
+        );
+        split.sequence = 1;
+        assert!(reassembler.push(split).is_empty());
+        let mut junk = classic_chunk_on(
+            ChunkDirection::Request,
+            vec![0x50, 0x02, 0xb1, 0x00, 0x00, 0x02],
+            10,
+            ssl_ptr,
+            0,
+        );
+        junk.sequence = 2;
+        assert!(reassembler.push(junk).is_empty());
+
+        let mut junk_fd = classic_chunk_on(
+            ChunkDirection::Request,
+            vec![0x50, 0x02, 0xb1, 0x00, 0x00, 0x02],
+            11,
+            ssl_ptr,
+            a3s_observer_common::TLS_BIND_QUALITY_FD,
+        );
+        junk_fd.sequence = 3;
+        assert!(reassembler.push(junk_fd).is_empty());
+
+        let body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut post = classic_chunk_on(
+            ChunkDirection::Request,
+            request.into_bytes(),
+            20,
+            fd_key,
+            a3s_observer_common::TLS_BIND_QUALITY_FD,
+        );
+        post.sequence = 1;
+        assert!(reassembler.push(post).is_empty());
+
+        let mut response = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"ok"}]}"#),
+            30,
+            fd_key,
+            a3s_observer_common::TLS_BIND_QUALITY_FD,
+        );
+        response.sequence = 1;
+        let completed = reassembler.push(response);
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].path, "/v1/messages");
+    }
+
+    #[test]
+    fn classic_two_complete_posts_on_fd_and_cookie_stay_isolated() {
+        let fd_key = classic_tls_sock_connection_id(7, 42, 17);
+        let cookie = 0x525d_9b5f_e910_d211_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let final_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
+        let tool_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
+            tool_body.len()
+        );
+        let final_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{final_body}",
+            final_body.len()
+        );
+
+        let mut hop1 = classic_chunk_on(
+            ChunkDirection::Request,
+            tool_req.into_bytes(),
+            20,
+            fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        hop1.sequence = 1;
+        hop1.socket_fd = 17;
+        assert!(reassembler.push(hop1).is_empty());
+
+        let mut hop2 = classic_chunk_on(
+            ChunkDirection::Request,
+            final_req.into_bytes(),
+            21,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop2.sequence = 1;
+        hop2.socket_fd = 17;
+        hop2.socket_cookie = cookie;
+        assert!(reassembler.push(hop2).is_empty());
+
+        let mut hop1_resp = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"tool-ok"}]}"#),
+            30,
+            fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        hop1_resp.sequence = 1;
+        hop1_resp.socket_fd = 17;
+        let first = reassembler.push(hop1_resp);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+
+        let mut hop2_resp = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_final","content":[{"type":"text","text":"final-ok"}]}"#),
+            31,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop2_resp.sequence = 1;
+        hop2_resp.socket_fd = 17;
+        hop2_resp.socket_cookie = cookie;
+        let second = reassembler.push(hop2_resp);
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(
+            second[0].request.body.contains("final"),
+            "{}",
+            second[0].request.body
+        );
+    }
+
+    #[test]
+    fn classic_two_complete_posts_cookie_responses_fifo_oldest_request() {
+        let fd_key = classic_tls_sock_connection_id(7, 42, 17);
+        let cookie = 0x3c5d_2348_e910_d211_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let final_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
+        let tool_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
+            tool_body.len()
+        );
+        let final_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{final_body}",
+            final_body.len()
+        );
+
+        let mut hop1 = classic_chunk_on(
+            ChunkDirection::Request,
+            tool_req.into_bytes(),
+            20,
+            fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        hop1.sequence = 1;
+        hop1.socket_fd = 17;
+        assert!(reassembler.push(hop1).is_empty());
+
+        let mut hop2 = classic_chunk_on(
+            ChunkDirection::Request,
+            final_req.into_bytes(),
+            21,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop2.sequence = 1;
+        hop2.socket_fd = 17;
+        hop2.socket_cookie = cookie;
+        assert!(reassembler.push(hop2).is_empty());
+
+        let mut hop1_resp = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"tool-ok"}]}"#),
+            30,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop1_resp.sequence = 1;
+        hop1_resp.socket_fd = 17;
+        hop1_resp.socket_cookie = cookie;
+        let first = reassembler.push(hop1_resp);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+
+        let mut hop2_resp = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_final","content":[{"type":"text","text":"final-ok"}]}"#),
+            31,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop2_resp.sequence = 1;
+        hop2_resp.socket_fd = 17;
+        hop2_resp.socket_cookie = cookie;
+        let second = reassembler.push(hop2_resp);
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(
+            second[0].request.body.contains("final"),
+            "{}",
+            second[0].request.body
+        );
+    }
+
+    #[test]
+    fn expire_process_emits_partial_interaction_for_pending_http_request() {
+        let fd_key = classic_tls_sock_connection_id(7, 42, 17);
+        let mut reassembler = InteractionReassembler::default();
+        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let tool_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
+            tool_body.len()
+        );
+        let mut hop1 = classic_chunk_on(
+            ChunkDirection::Request,
+            tool_req.into_bytes(),
+            20,
+            fd_key,
+            TLS_BIND_QUALITY_FD,
+        );
+        hop1.sequence = 1;
+        hop1.socket_fd = 17;
+        assert!(reassembler.push(hop1).is_empty());
+
+        reassembler.expire_process(42, 7);
+        let completed = reassembler.take_completed();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].path, "/v1/messages");
+        assert!(
+            completed[0]
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "reassembly_process_exit_incomplete"),
+            "{:?}",
+            completed[0].partial_reasons
+        );
+        assert!(completed[0].request.body.contains("tool"), "{}", completed[0].request.body);
+        assert_eq!(reassembler.active_connections(), 0);
+    }
+
+    #[test]
+    fn classic_pending_head_does_not_block_cookie_response_onto_post() {
+        let head_fd = classic_tls_sock_connection_id(7, 42, 16);
+        let post_fd = classic_tls_sock_connection_id(7, 42, 17);
+        let cookie = 0x8532_91f9_6910_d211_u64;
+        let mut reassembler = InteractionReassembler::default();
+        let head = b"HEAD /api/hello HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".to_vec();
+        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let tool_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
+            tool_body.len()
+        );
+
+        let mut head_chunk = classic_chunk_on(
+            ChunkDirection::Request,
+            head,
+            10,
+            head_fd,
+            TLS_BIND_QUALITY_FD,
+        );
+        head_chunk.sequence = 1;
+        head_chunk.socket_fd = 16;
+        assert!(reassembler.push(head_chunk).is_empty());
+
+        let mut hop1 = classic_chunk_on(
+            ChunkDirection::Request,
+            tool_req.into_bytes(),
+            20,
+            post_fd,
+            TLS_BIND_QUALITY_FD,
+        );
+        hop1.sequence = 1;
+        hop1.socket_fd = 17;
+        assert!(reassembler.push(hop1).is_empty());
+
+        let mut hop1_resp = classic_chunk_on(
+            ChunkDirection::Response,
+            http_response(r#"{"id":"msg_tool","content":[{"type":"text","text":"tool-ok"}]}"#),
+            30,
+            cookie,
+            a3s_observer_common::TLS_BIND_QUALITY_COOKIE,
+        );
+        hop1_resp.sequence = 1;
+        hop1_resp.socket_fd = 0;
+        hop1_resp.socket_cookie = cookie;
+        hop1_resp.bind_quality = a3s_observer_common::TLS_BIND_QUALITY_COOKIE;
+        let first = reassembler.push(hop1_resp);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+        assert_eq!(first[0].path, "/v1/messages");
+    }
+
+    #[test]
     fn unsupported_http2_emits_metadata_evidence_without_false_interaction() {
         let mut reassembler = InteractionReassembler::default();
         let completed = reassembler.push(chunk(
@@ -9250,7 +10985,12 @@ mod tests {
         let mut preface = HTTP2_CLIENT_PREFACE.to_vec();
         preface.extend(http2_frame(0x4, 0, 0, &[]));
         preface.extend(http2_frame(HTTP2_FRAME_HEADERS, 0x4, 1, &request_headers));
-        preface.extend(http2_frame(HTTP2_FRAME_DATA, 0x1, 1, request_body.as_bytes()));
+        preface.extend(http2_frame(
+            HTTP2_FRAME_DATA,
+            0x1,
+            1,
+            request_body.as_bytes(),
+        ));
         assert!(reassembler
             .push(chunk(ChunkDirection::Request, preface, 10))
             .is_empty());
@@ -9290,7 +11030,10 @@ mod tests {
         let evidence = reassembler.take_evidence();
         assert!(evidence.iter().any(|item| {
             item.transport_protocol == "http/2"
-                && item.reasons.iter().any(|reason| reason == "h2_hpack_desync")
+                && item
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "h2_hpack_desync")
         }));
     }
 
@@ -9334,6 +11077,44 @@ mod tests {
         }
         reassembler.expire_idle(Instant::now());
         assert_eq!(reassembler.active_connections(), 1);
+    }
+
+    #[test]
+    fn websocket_upgrade_response_stays_http_at_every_fragment_boundary() {
+        let offer = b"GET /custom/ws HTTP/1.1\r\nHost: gateway.invalid\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+        // The client offers compression, but the server does not accept it. Its negotiated
+        // response must update the decoder even though frame discovery is already active.
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        for split in 1..response.len() {
+            let mut reassembler = InteractionReassembler::default();
+            reassembler.push(rustls_chunk_on(ChunkDirection::Request, offer, 10, 0x5100));
+            assert!(reassembler
+                .push(rustls_chunk_on(
+                    ChunkDirection::Response,
+                    &response[..split],
+                    20,
+                    0x5100,
+                ))
+                .is_empty());
+            assert!(reassembler
+                .push(rustls_chunk_on(
+                    ChunkDirection::Response,
+                    &response[split..],
+                    30,
+                    0x5100,
+                ))
+                .is_empty());
+            let state = reassembler.connections.values().next().unwrap();
+            assert!(state.quiescent_websocket(), "split={split}");
+            assert!(
+                !state.websocket.responses.compression_enabled,
+                "split={split}"
+            );
+            assert!(
+                state.websocket.responses.last_decode_error.is_none(),
+                "split={split}"
+            );
+        }
     }
 
     #[test]
@@ -9547,7 +11328,10 @@ mod tests {
             0x8100,
         ));
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].response.text.as_deref(), Some("RESYNCED_MARKER"));
+        assert_eq!(
+            completed[0].response.text.as_deref(),
+            Some("RESYNCED_MARKER")
+        );
         assert!(completed[0]
             .partial_reasons
             .iter()

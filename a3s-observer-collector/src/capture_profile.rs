@@ -1207,10 +1207,12 @@ pub(crate) fn parse_snapshot(
                 .and_then(|value| u32::try_from(value).ok()),
             optional_exact_u64(entry, "rootExecIdExact", "rootExecId")?,
         );
-        if root_scope.0.is_some() && root_scope.1.is_some() {
+        if root_scope.0.is_some() {
             // A shared cgroup/root binding enables reads only through the generation-fenced
             // promotion map. The cgroup profile remains default-off so sidecars and sibling roots
-            // cannot inherit the optional high-volume signal.
+            // cannot inherit the optional high-volume signal. Host CLI roots (Claude/Codex) often
+            // publish rootPid + rootProcessKey before the first ToolExec carries execIdExact;
+            // still install a promotion (expected_exec_id=0) so FileRead is not permanently dark.
             actions[CAPTURE_PROBE_FILE_READ as usize] = CAPTURE_ACTION_NOT_ENABLED;
             desired[CAPTURE_PROBE_FILE_READ as usize] = CAPTURE_ACTION_NOT_ENABLED;
         }
@@ -1239,7 +1241,8 @@ pub(crate) fn parse_snapshot(
                 .to_string(),
         });
 
-        if let (Some(root_pid), Some(root_exec_id)) = root_scope {
+        if let Some(root_pid) = root_scope.0 {
+            let root_exec_id = root_scope.1.unwrap_or(0);
             promotions.push((
                 CaptureProcessKey {
                     pid: root_pid,

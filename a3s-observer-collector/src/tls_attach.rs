@@ -33,6 +33,19 @@ const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
 const MAX_ANCHOR_MATCHES: usize = 128;
 const MAX_STATIC_CANDIDATES_PER_FAMILY: usize = 4;
+/// Write-prefix hits that the read-relative delta relation missed. Claude/BoringSSL ships
+/// several `SSL_write` clones; the first application write often uses an unpaired copy.
+const MAX_ADDITIONAL_STATIC_WRITES: usize = 16;
+/// `SSL_PROTOCOL_METHOD::write_app_data` slots discovered from a classic `SSL_write` that
+/// calls `[method+0x48]`. TLS+DTLS is the expected maximum.
+const MAX_PROTOCOL_METHOD_WRITES: usize = 4;
+/// Compilation-unit window from the public `SSL_write` clone to its method-table write.
+const PROTOCOL_METHOD_ANCHOR_WINDOW: u64 = 2 * 1024 * 1024;
+const PROTOCOL_METHOD_TABLE_SPAN: u64 = 0x50;
+const PROTOCOL_METHOD_WRITE_SLOT: usize = 0x48;
+const CLASSIC_WRITE_METHOD_SCAN: usize = 512;
+const WRITE_APP_DATA_PROLOGUE: [u8; 4] = [0x55, 0x48, 0x89, 0xe5];
+const OUT_NEEDS_HANDSHAKE_FALSE: [u8; 3] = [0xc6, 0x06, 0x00];
 const MAX_STABLE_MOUNT_ROOTS: usize = 1_024;
 const MAX_ATTACH_FAILURES: usize = 4_096;
 const MAX_PROC_NAMESPACE_SCAN: usize = 32_768;
@@ -45,6 +58,7 @@ pub enum TlsAbi {
     OpenSslEx,
     RustlsPayload,
     RustlsOutboundChunks,
+    BoringSslAppData,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +100,8 @@ pub enum TlsAttachKind {
         read_abi: TlsAbi,
         write_abi: TlsAbi,
         additional_pairs: Vec<TlsOffsetPair>,
+        additional_write_offsets: Vec<u64>,
+        app_data_write_offsets: Vec<u64>,
     },
 }
 
@@ -115,6 +131,8 @@ struct StaticSignatureFamily {
 struct StaticDiscoveryMatch {
     family_id: String,
     pairs: Vec<TlsOffsetPair>,
+    additional_write_offsets: Vec<u64>,
+    app_data_write_offsets: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -163,6 +181,8 @@ pub struct TlsAttachManager {
     process_patterns: Vec<String>,
     static_targets: Vec<PathBuf>,
     explicit_target: Option<PathBuf>,
+    deferred_stopped_pids: HashSet<i32>,
+    recent_runnable_pids: HashMap<i32, Instant>,
     metrics: TlsAttachMetrics,
 }
 
@@ -204,6 +224,8 @@ impl TlsAttachManager {
             process_patterns,
             static_targets,
             explicit_target,
+            deferred_stopped_pids: HashSet::new(),
+            recent_runnable_pids: HashMap::new(),
             metrics: TlsAttachMetrics::default(),
         }
     }
@@ -255,6 +277,43 @@ impl TlsAttachManager {
         let mut seen = HashSet::new();
         plans.retain(|plan| self.plan_is_available(&plan.key) && seen.insert(plan.key.clone()));
         plans
+    }
+
+    pub fn take_runnable_deferred_pids(&mut self) -> Vec<i32> {
+        let ready = drain_runnable_deferred_pids(
+            &mut self.deferred_stopped_pids,
+            process_is_stopped,
+            |pid| Path::new(&format!("/proc/{pid}")).exists(),
+        );
+        let now = Instant::now();
+        for pid in &ready {
+            self.recent_runnable_pids.insert(*pid, now);
+        }
+        self.expire_recent_runnable(now);
+        if !ready.is_empty() {
+            tracing::info!(pids = ?ready, "thawed stopped Agent TLS pids");
+        }
+        ready
+    }
+
+    pub fn allowlist_hold_pids(&self) -> Vec<i32> {
+        self.deferred_stopped_pids
+            .iter()
+            .copied()
+            .chain(self.recent_runnable_pids.keys().copied())
+            .collect()
+    }
+
+    pub fn recently_runnable(&self, pid: i32) -> bool {
+        self.recent_runnable_pids.contains_key(&pid)
+    }
+
+    fn expire_recent_runnable(&mut self, now: Instant) {
+        const RECENT_RUNNABLE_TTL: Duration = Duration::from_secs(2);
+        self.recent_runnable_pids.retain(|pid, seen| {
+            Path::new(&format!("/proc/{pid}")).exists()
+                && now.saturating_duration_since(*seen) < RECENT_RUNNABLE_TTL
+        });
     }
 
     pub fn discover_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
@@ -400,6 +459,21 @@ impl TlsAttachManager {
             .map(|pid| (pid, RuntimeRole::AgentRoot))
             .collect::<HashMap<_, _>>();
         self.retain_verified_runtime(&mut desired);
+        self.expire_recent_runnable(Instant::now());
+        // SIGSTOP → CONT → execve(claude.exe) changes the generation fence. Keep the live PID on
+        // the plaintext allowlist so inode probes already on the CLI binary are not gated out.
+        let hold_pids: Vec<i32> = self
+            .deferred_stopped_pids
+            .iter()
+            .copied()
+            .chain(self.recent_runnable_pids.keys().copied())
+            .chain(scan_named_agent_runtime_pids())
+            .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            .collect();
+        for pid in hold_pids {
+            desired.insert(pid, RuntimeRole::AgentRoot);
+            self.remember_verified_runtime(pid);
+        }
         self.verified_processes = desired;
         self.verified_processes.keys().copied().collect()
     }
@@ -498,6 +572,20 @@ impl TlsAttachManager {
     }
 
     fn plans_for_process(&mut self, pid: i32, runtime_role: RuntimeRole) -> Vec<TlsAttachPlan> {
+        // Uprobes installed while a lab/runtime has the task SIGSTOP'd can be marked attached
+        // and then miss the first SSL_write after SIGCONT. Defer planning until the task is
+        // runnable so exec-retry can attach against a live generation.
+        if process_is_stopped(pid) {
+            if self.deferred_stopped_pids.insert(pid) {
+                tracing::info!(
+                    pid,
+                    runtime_role = runtime_role.as_str(),
+                    "deferred Agent TLS attach until task is runnable"
+                );
+            }
+            return Vec::new();
+        }
+        self.deferred_stopped_pids.remove(&pid);
         let mut plans = Vec::new();
         let exe_probe_path = PathBuf::from(format!("/proc/{pid}/exe"));
         if let Ok(real_exe) = fs::read_link(&exe_probe_path) {
@@ -588,9 +676,24 @@ impl TlsAttachManager {
                 }
             }
         };
-        plans.extend(static_matches.into_iter().map(|discovery| {
-            static_discovery_plan(&static_probe_path, &metadata, discovery, runtime_role, None)
-        }));
+        for discovery in static_matches {
+            // Inode-wide first so a newly exec'd CLI is covered before its own PID is planned.
+            // Process-scoped second so CONT/exec-retry can still attach a live generation.
+            plans.push(static_discovery_plan(
+                &static_probe_path,
+                &metadata,
+                discovery.clone(),
+                runtime_role,
+                None,
+            ));
+            plans.push(static_discovery_plan(
+                &static_probe_path,
+                &metadata,
+                discovery,
+                runtime_role,
+                Some(pid),
+            ));
+        }
 
         // Interpreters commonly export OpenSSL symbols from the main ELF even when no separate
         // libssl mapping exists. This low-maintenance lane may coexist with a static-family
@@ -765,6 +868,8 @@ fn static_discovery_plan(
             read_abi: primary.read_abi,
             write_abi: primary.write_abi,
             additional_pairs: pairs.collect(),
+            additional_write_offsets: discovery.additional_write_offsets,
+            app_data_write_offsets: discovery.app_data_write_offsets,
         },
     }
 }
@@ -951,6 +1056,64 @@ fn parse_runtime_selection_hint_patterns(document: &str) -> anyhow::Result<Vec<S
     patterns.sort();
     patterns.dedup();
     Ok(patterns)
+}
+
+fn process_task_state_from_stat(stat: &str) -> Option<char> {
+    let close = stat.rfind(") ")?;
+    stat.get(close + 2..)?.chars().next()
+}
+
+fn drain_runnable_deferred_pids(
+    deferred: &mut HashSet<i32>,
+    is_stopped: impl Fn(i32) -> bool,
+    exists: impl Fn(i32) -> bool,
+) -> Vec<i32> {
+    let mut ready = Vec::new();
+    deferred.retain(|&pid| {
+        if !exists(pid) {
+            return false;
+        }
+        if is_stopped(pid) {
+            return true;
+        }
+        ready.push(pid);
+        false
+    });
+    ready
+}
+
+/// Cheap `/proc/<pid>/comm` sweep for host CLI roots. Used to open the plaintext allowlist
+/// before the first TLS write when exec-commit is late.
+pub fn scan_named_agent_runtime_pids() -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let comm = comm.trim().to_ascii_lowercase();
+        if matches!(comm.as_str(), "codex" | "claude" | "claude.exe" | "pi")
+            || comm.starts_with("codex-code-mode")
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn process_is_stopped(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(process_task_state_from_stat)
+        .is_some_and(|state| matches!(state, 'T' | 't'))
 }
 
 fn process_parent_pid(pid: i32) -> Option<i32> {
@@ -1311,7 +1474,54 @@ fn tls_abi_code(abi: TlsAbi) -> u8 {
         TlsAbi::OpenSslEx => 2,
         TlsAbi::RustlsPayload => 3,
         TlsAbi::RustlsOutboundChunks => 4,
+        TlsAbi::BoringSslAppData => 5,
     }
+}
+
+fn pair_static_family_offsets(
+    reads: &[u64],
+    write_offsets: &HashSet<u64>,
+    write_after_read: &[i64],
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+) -> (Vec<TlsOffsetPair>, Vec<u64>) {
+    let mut pairs = Vec::new();
+    for read_offset in reads {
+        for delta in write_after_read {
+            let candidate = i128::from(*read_offset) + i128::from(*delta);
+            if !(0..=i128::from(u64::MAX)).contains(&candidate) {
+                continue;
+            }
+            let write_offset = candidate as u64;
+            if write_offsets.contains(&write_offset) {
+                pairs.push(TlsOffsetPair {
+                    read_offset: *read_offset,
+                    write_offset,
+                    read_abi,
+                    write_abi,
+                });
+            }
+        }
+    }
+    pairs.sort_by_key(|pair| (pair.read_offset, pair.write_offset));
+    pairs.dedup_by_key(|pair| (pair.read_offset, pair.write_offset));
+    pairs.truncate(MAX_STATIC_CANDIDATES_PER_FAMILY);
+    if pairs.is_empty() {
+        return (pairs, Vec::new());
+    }
+    let paired_writes = pairs
+        .iter()
+        .map(|pair| pair.write_offset)
+        .collect::<HashSet<_>>();
+    let primary_read = pairs[0].read_offset;
+    let mut additional_write_offsets = write_offsets
+        .iter()
+        .copied()
+        .filter(|write_offset| !paired_writes.contains(write_offset))
+        .collect::<Vec<_>>();
+    additional_write_offsets.sort_by_key(|write_offset| write_offset.abs_diff(primary_read));
+    additional_write_offsets.truncate(MAX_ADDITIONAL_STATIC_WRITES);
+    (pairs, additional_write_offsets)
 }
 
 fn discover_static_signature_matches(path: &Path) -> anyhow::Result<Vec<StaticDiscoveryMatch>> {
@@ -1341,31 +1551,28 @@ fn discover_static_signature_matches(path: &Path) -> anyhow::Result<Vec<StaticDi
             continue;
         }
         let write_offsets = writes.into_iter().collect::<HashSet<_>>();
-        let mut pairs = Vec::new();
-        for read_offset in reads {
-            for delta in &family.write_after_read {
-                let candidate = i128::from(read_offset) + i128::from(*delta);
-                if !(0..=i128::from(u64::MAX)).contains(&candidate) {
-                    continue;
-                }
-                let write_offset = candidate as u64;
-                if write_offsets.contains(&write_offset) {
-                    pairs.push(TlsOffsetPair {
-                        read_offset,
-                        write_offset,
-                        read_abi: family.read_abi,
-                        write_abi: family.write_abi,
-                    });
-                }
-            }
-        }
-        pairs.sort_by_key(|pair| (pair.read_offset, pair.write_offset));
-        pairs.dedup_by_key(|pair| (pair.read_offset, pair.write_offset));
-        pairs.truncate(MAX_STATIC_CANDIDATES_PER_FAMILY);
+        let (pairs, additional_write_offsets) = pair_static_family_offsets(
+            &reads,
+            &write_offsets,
+            &family.write_after_read,
+            family.read_abi,
+            family.write_abi,
+        );
         if !pairs.is_empty() {
+            let app_data_write_offsets = if family.write_abi == TlsAbi::Classic {
+                pairs
+                    .first()
+                    .map(|pair| discover_protocol_method_write_offsets(path, pair.write_offset))
+                    .transpose()?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             discovered.push(StaticDiscoveryMatch {
                 family_id: family.family_id,
                 pairs,
+                additional_write_offsets,
+                app_data_write_offsets,
             });
         }
     }
@@ -1418,6 +1625,203 @@ fn executable_file_ranges(path: &Path) -> anyhow::Result<Vec<(u64, u64)>> {
     anyhow::ensure!(!ranges.is_empty(), "ELF has no executable load segment");
     ranges.sort_unstable();
     Ok(ranges)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ElfLoadSegment {
+    file_start: u64,
+    file_end: u64,
+    vaddr: u64,
+    executable: bool,
+}
+
+fn elf_load_segments(path: &Path) -> anyhow::Result<Vec<ElfLoadSegment>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    anyhow::ensure!(&header[..4] == b"\x7fELF", "not an ELF file");
+    anyhow::ensure!(header[4] == 2, "static TLS discovery requires ELF64");
+    anyhow::ensure!(
+        header[5] == 1,
+        "static TLS discovery requires little-endian ELF"
+    );
+    anyhow::ensure!(u16_le(&header, 18)? == 62, "unsupported ELF machine");
+    let program_header_offset = u64_le(&header, 32)?;
+    let program_header_size = usize::from(u16_le(&header, 54)?);
+    let program_header_count = usize::from(u16_le(&header, 56)?);
+    anyhow::ensure!(
+        program_header_size >= 56 && program_header_count <= MAX_ELF_PROGRAM_HEADERS,
+        "invalid ELF program-header table"
+    );
+
+    let mut segments = Vec::new();
+    let mut entry = vec![0u8; program_header_size];
+    for index in 0..program_header_count {
+        let offset = program_header_offset
+            .checked_add((index * program_header_size) as u64)
+            .context("ELF program-header offset overflow")?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut entry)?;
+        let segment_type = u32_le(&entry, 0)?;
+        if segment_type != 1 {
+            continue;
+        }
+        let flags = u32_le(&entry, 4)?;
+        let start = u64_le(&entry, 8)?;
+        let vaddr = u64_le(&entry, 16)?;
+        let length = u64_le(&entry, 32)?;
+        let end = start
+            .checked_add(length)
+            .context("ELF load segment overflow")?
+            .min(file_len);
+        if start < end {
+            segments.push(ElfLoadSegment {
+                file_start: start,
+                file_end: end,
+                vaddr,
+                executable: flags & 1 != 0,
+            });
+        }
+    }
+    anyhow::ensure!(!segments.is_empty(), "ELF has no PT_LOAD segment");
+    Ok(segments)
+}
+
+fn va_to_file_offset(segments: &[ElfLoadSegment], va: u64) -> Option<u64> {
+    segments.iter().find_map(|segment| {
+        if va < segment.vaddr {
+            return None;
+        }
+        let file = segment.file_start.checked_add(va - segment.vaddr)?;
+        (file < segment.file_end).then_some(file)
+    })
+}
+
+fn va_is_code(segments: &[ElfLoadSegment], va: u64) -> bool {
+    va_to_file_offset(segments, va).is_some_and(|file| {
+        segments.iter().any(|segment| {
+            segment.executable && file >= segment.file_start && file < segment.file_end
+        })
+    })
+}
+
+fn classic_write_calls_protocol_method_slot(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|window| {
+        window[0] == 0xff && (0x50..=0x57).contains(&window[1]) && window[2] == 0x48
+    })
+}
+
+fn read_file_exact(file: &mut File, offset: u64, buf: &mut [u8]) -> anyhow::Result<bool> {
+    file.seek(SeekFrom::Start(offset))?;
+    match file.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Locate `SSL_PROTOCOL_METHOD::write_app_data` from a classic `SSL_write` that
+/// invokes `[method+0x48]`. Tables must start with `is_dtls` 0/1, hold a run of
+/// code pointers through the write slot, sit near the public write, and the
+/// callee must clear `*out_needs_handshake` on entry.
+fn discover_protocol_method_write_offsets(
+    path: &Path,
+    classic_write: u64,
+) -> anyhow::Result<Vec<u64>> {
+    let segments = elf_load_segments(path)?;
+    let mut file = File::open(path)?;
+    let mut classic_head = vec![0u8; CLASSIC_WRITE_METHOD_SCAN];
+    if !read_file_exact(&mut file, classic_write, &mut classic_head)? {
+        return Ok(Vec::new());
+    }
+    if !classic_write_calls_protocol_method_slot(&classic_head) {
+        return Ok(Vec::new());
+    }
+
+    let mut found = Vec::new();
+    let overlap = PROTOCOL_METHOD_TABLE_SPAN.saturating_sub(8) as usize;
+    for segment in &segments {
+        if segment.executable {
+            continue;
+        }
+        let mut cursor = segment.file_start;
+        let mut carry = Vec::<u8>::new();
+        while cursor < segment.file_end && found.len() < MAX_PROTOCOL_METHOD_WRITES {
+            let requested = (segment.file_end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
+            let mut window = vec![0u8; carry.len() + requested];
+            window[..carry.len()].copy_from_slice(&carry);
+            if !read_file_exact(&mut file, cursor, &mut window[carry.len()..])? {
+                break;
+            }
+            let window_file = cursor.saturating_sub(carry.len() as u64);
+            let mut offset = ((8 - (window_file & 7)) & 7) as usize;
+            while offset + PROTOCOL_METHOD_TABLE_SPAN as usize <= window.len()
+                && found.len() < MAX_PROTOCOL_METHOD_WRITES
+            {
+                let _ = discover_protocol_method_write_in_table(
+                    &window[offset..offset + PROTOCOL_METHOD_TABLE_SPAN as usize],
+                    &segments,
+                    classic_write,
+                    &mut file,
+                    &mut found,
+                )?;
+                offset += 8;
+            }
+            let retained = overlap.min(window.len());
+            carry.clear();
+            carry.extend_from_slice(&window[window.len() - retained..]);
+            cursor += requested as u64;
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found.truncate(MAX_PROTOCOL_METHOD_WRITES);
+    Ok(found)
+}
+
+fn discover_protocol_method_write_in_table(
+    table: &[u8],
+    segments: &[ElfLoadSegment],
+    classic_write: u64,
+    file: &mut File,
+    found: &mut Vec<u64>,
+) -> anyhow::Result<bool> {
+    let is_dtls = u64::from_le_bytes(table[0..8].try_into().expect("table span checked"));
+    if is_dtls > 1 {
+        return Ok(false);
+    }
+    for slot in (8..PROTOCOL_METHOD_TABLE_SPAN as usize).step_by(8) {
+        let va = u64::from_le_bytes(table[slot..slot + 8].try_into().expect("slot span checked"));
+        if !va_is_code(segments, va) {
+            return Ok(false);
+        }
+    }
+    let write_va = u64::from_le_bytes(
+        table[PROTOCOL_METHOD_WRITE_SLOT..PROTOCOL_METHOD_WRITE_SLOT + 8]
+            .try_into()
+            .expect("write slot span checked"),
+    );
+    let Some(write_offset) = va_to_file_offset(segments, write_va) else {
+        return Ok(false);
+    };
+    if write_offset.abs_diff(classic_write) > PROTOCOL_METHOD_ANCHOR_WINDOW {
+        return Ok(false);
+    }
+    if found.contains(&write_offset) {
+        return Ok(false);
+    }
+    let mut head = [0u8; 32];
+    if !read_file_exact(file, write_offset, &mut head)? {
+        return Ok(false);
+    }
+    if !head.starts_with(&WRITE_APP_DATA_PROLOGUE)
+        || !head.windows(3).any(|window| window == OUT_NEEDS_HANDSHAKE_FALSE)
+    {
+        return Ok(false);
+    }
+    found.push(write_offset);
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1552,6 +1956,7 @@ fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
         "openssl_ex" => Ok(TlsAbi::OpenSslEx),
         "rustls_payload" => Ok(TlsAbi::RustlsPayload),
         "rustls_outbound_chunks" => Ok(TlsAbi::RustlsOutboundChunks),
+        "boringssl_app_data" => Ok(TlsAbi::BoringSslAppData),
         _ => anyhow::bail!("unsupported TLS ABI {value}"),
     }
 }
@@ -1591,6 +1996,75 @@ mod tests {
             "writeAbi": "classic",
             "writeAfterReadOffsets": [16]
         })
+    }
+
+    #[test]
+    fn process_task_state_reads_the_field_after_comm() {
+        assert_eq!(
+            process_task_state_from_stat("516940 (claude.exe) T 1 1 1 0 0"),
+            Some('T')
+        );
+        assert_eq!(
+            process_task_state_from_stat("42 (cla)ude) t 1 1 1 0 0"),
+            Some('t')
+        );
+        assert_eq!(
+            process_task_state_from_stat("1 (bash) R 0 0 0 0 0"),
+            Some('R')
+        );
+        assert!(process_task_state_from_stat("broken").is_none());
+    }
+
+    #[test]
+    fn drain_runnable_deferred_pids_keeps_stopped_and_drops_exited() {
+        let mut deferred = HashSet::from([11, 22, 33]);
+        let ready = drain_runnable_deferred_pids(
+            &mut deferred,
+            |pid| pid == 11,
+            |pid| pid != 33,
+        );
+        assert_eq!(ready, vec![22]);
+        assert_eq!(deferred, HashSet::from([11]));
+    }
+
+    #[test]
+    fn verified_pids_keeps_recently_runnable_after_fence_refresh() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let pid = std::process::id() as i32;
+        manager.recent_runnable_pids.insert(pid, Instant::now());
+        assert!(
+            manager.verified_pids().contains(&pid),
+            "thawed PID must stay on the plaintext allowlist through execve fence refresh"
+        );
+        assert!(manager.recently_runnable(pid));
+    }
+
+    #[test]
+    fn process_scoped_static_plan_keeps_pid_in_key_and_target() {
+        let meta = fs::metadata("/proc/self/exe").unwrap();
+        let plan = static_discovery_plan(
+            Path::new("/proc/self/exe"),
+            &meta,
+            StaticDiscoveryMatch {
+                family_id: "fixture-family".into(),
+                pairs: vec![TlsOffsetPair {
+                    read_offset: 1,
+                    write_offset: 2,
+                    read_abi: TlsAbi::Classic,
+                    write_abi: TlsAbi::Classic,
+                }],
+                additional_write_offsets: Vec::new(),
+                app_data_write_offsets: Vec::new(),
+            },
+            RuntimeRole::AgentRoot,
+            Some(564354),
+        );
+        assert!(
+            plan.key.starts_with("pid:564354:"),
+            "thaw attach must not reuse the global inode key: {}",
+            plan.key
+        );
+        assert_eq!(plan.pid, Some(564354));
     }
 
     #[test]
@@ -1645,6 +2119,141 @@ mod tests {
             .unwrap();
         assert_eq!(rustls.write_after_read, vec![-5248]);
         assert_eq!(rustls.write_abi, TlsAbi::RustlsOutboundChunks);
+    }
+
+    #[test]
+    fn static_family_pairs_keep_unpaired_write_clones_near_the_read() {
+        let reads = [0x2363e30_u64];
+        let writes = HashSet::from([0x2364220, 0x241a530, 0x39d2d50]);
+        let (pairs, extras) = pair_static_family_offsets(
+            &reads,
+            &writes,
+            &[912, 1008],
+            TlsAbi::Classic,
+            TlsAbi::Classic,
+        );
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].read_offset, 0x2363e30);
+        assert_eq!(pairs[0].write_offset, 0x2364220);
+        assert_eq!(extras, vec![0x241a530, 0x39d2d50]);
+        let all_writes = HashSet::from([
+            0x2364220, 0x241a530, 0x39d2d50, 0x39d5430, 0x3db6700, 0x3f0be20,
+            0x40769d0, 0x4076c90, 0x4076dd0, 0x4077090, 0x4077fb0, 0x40782e0,
+            0x40a7ee0, 0x40a81a0,
+        ]);
+        let (_, extras) = pair_static_family_offsets(
+            &reads,
+            &all_writes,
+            &[912, 1008],
+            TlsAbi::Classic,
+            TlsAbi::Classic,
+        );
+        assert!(
+            extras.contains(&0x40a81a0),
+            "farthest Claude write clone must stay attached: {extras:x?}"
+        );
+        assert_eq!(extras.len(), 13);
+    }
+
+    #[test]
+    fn classic_write_method_slot_scan_accepts_indirect_call_plus_0x48() {
+        assert!(classic_write_calls_protocol_method_slot(&[
+            0x4c, 0x89, 0xf1, 0x4d, 0x89, 0xf8, 0xff, 0x50, 0x48
+        ]));
+        assert!(!classic_write_calls_protocol_method_slot(&[
+            0xff, 0x50, 0x40, 0xff, 0x10
+        ]));
+    }
+
+    #[test]
+    fn protocol_method_table_near_classic_write_is_app_data_abi() {
+        let mut image = vec![0u8; 0x1800];
+        image[0x1100..0x1104].copy_from_slice(&WRITE_APP_DATA_PROLOGUE);
+        image[0x1110..0x1113].copy_from_slice(&OUT_NEEDS_HANDSHAKE_FALSE);
+        image[0x1200..0x1204].copy_from_slice(&WRITE_APP_DATA_PROLOGUE);
+        let write_va = 0x401100u64;
+        let dummy_va = 0x401200u64;
+        for slot in (8..PROTOCOL_METHOD_TABLE_SPAN as usize).step_by(8) {
+            let va = if slot == PROTOCOL_METHOD_WRITE_SLOT {
+                write_va
+            } else {
+                dummy_va
+            };
+            image[slot..slot + 8].copy_from_slice(&va.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!(
+            "a3s-observer-appdata-table-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, &image).unwrap();
+        let segments = [
+            ElfLoadSegment {
+                file_start: 0,
+                file_end: 0x80,
+                vaddr: 0x400000,
+                executable: false,
+            },
+            ElfLoadSegment {
+                file_start: 0x1000,
+                file_end: 0x1800,
+                vaddr: 0x401000,
+                executable: true,
+            },
+        ];
+        let mut file = File::open(&path).unwrap();
+        let mut found = Vec::new();
+        assert!(discover_protocol_method_write_in_table(
+            &image[..PROTOCOL_METHOD_TABLE_SPAN as usize],
+            &segments,
+            0x1000,
+            &mut file,
+            &mut found,
+        )
+        .unwrap());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(found, vec![0x1100]);
+    }
+
+    #[test]
+    fn installed_stripped_classic_cli_discovers_protocol_method_write() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_BINARIES") else {
+            return;
+        };
+        for path in candidates
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            let discoveries = discover_static_signature_matches(&path).unwrap();
+            let Some(classic) = discoveries.iter().find(|discovery| {
+                discovery
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.write_abi == TlsAbi::Classic)
+            }) else {
+                continue;
+            };
+            if classic.pairs.iter().any(|pair| {
+                let mut head = vec![0u8; CLASSIC_WRITE_METHOD_SCAN];
+                let Ok(mut file) = File::open(&path) else {
+                    return false;
+                };
+                read_file_exact(&mut file, pair.write_offset, &mut head).unwrap_or(false)
+                    && classic_write_calls_protocol_method_slot(&head)
+            }) {
+                assert!(
+                    !classic.app_data_write_offsets.is_empty(),
+                    "classic SSL_write that calls [method+0x48] must discover write_app_data: {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1943,6 +2552,20 @@ mod tests {
         ));
         assert!(!matches_trusted_network_runtime_text("bash", "bash"));
         assert!(!matches_trusted_network_runtime_text("python3", "python3"));
+    }
+
+    #[test]
+    fn verified_pids_keep_live_named_agent_runtimes_without_cgroup_scope() {
+        let mut manager = TlsAttachManager::from_env("1");
+        manager.set_scope_verified_pids(HashSet::new());
+        let named = scan_named_agent_runtime_pids();
+        let pids = manager.verified_pids();
+        for pid in named {
+            assert!(
+                pids.contains(&pid),
+                "named Agent pid {pid} must stay on the plaintext allowlist without a cgroup scope"
+            );
+        }
     }
 
     #[test]

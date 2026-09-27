@@ -929,10 +929,24 @@ pub const TLS_PLAINTEXT_API_GNUTLS: u8 = 3;
 pub const TLS_PLAINTEXT_API_NSS: u8 = 4;
 pub const TLS_PLAINTEXT_API_TCP: u8 = 5;
 pub const TLS_PLAINTEXT_API_RUSTLS: u8 = 6;
+/// BoringSSL `SSL_PROTOCOL_METHOD::write_app_data` (ssl, bool*, size_t*, buf, len).
+pub const TLS_PLAINTEXT_API_SSL_APP_DATA: u8 = 7;
 
 /// No tls_ctx↔socket bind observed for this fragment.
 pub const TLS_BIND_QUALITY_UNBOUND: u8 = 0;
 /// Bound via same-thread syscall adjacency to a socket `fd` (no cookie).
+/// Opaque `connection_id` used by classic BoringSSL/OpenSSL probes when bind quality is FD.
+///
+/// Must stay byte-identical to the eBPF `sock_key` helper so userspace remount can recognize the
+/// FD-keyed half of a stream after later records switch to `socket_cookie` identity.
+#[inline(always)]
+pub fn classic_tls_sock_connection_id(cgroup_id: u64, pid: u32, fd: u64) -> u64 {
+    let mut key = cgroup_id ^ (cgroup_id.rotate_left(17));
+    key ^= (pid as u64).rotate_left(31);
+    key ^= fd & 0xffff_ffff;
+    key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 pub const TLS_BIND_QUALITY_FD: u8 = 1;
 /// Bound with a kernel socket cookie when available.
 pub const TLS_BIND_QUALITY_COOKIE: u8 = 2;
@@ -991,12 +1005,49 @@ fn is_http_method_token_byte(byte: u8) -> bool {
     )
 }
 
+/// True when a complete method-token prefix is followed by a request-target that looks like an
+/// HTTP request-line (`/…`, `*`, or absolute-form `http(s):`). Mid-body English such as
+/// `paths between them` must not count as a fresh exchange.
+#[inline(always)]
+pub fn http_request_line_shaped(data: &[u8]) -> bool {
+    http_request_line_shaped_len(data, data.len())
+}
+
+/// Array-friendly variant for eBPF callers (see [`classify_http_method_prefix_len`]).
+#[inline(always)]
+pub fn http_request_line_shaped_len(data: &[u8], len: usize) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let len = if len > data.len() { data.len() } else { len };
+    let mut index = 0usize;
+    while index < len && index <= HTTP_METHOD_PREFIX_MAX_LEN {
+        let byte = unsafe { *data.get_unchecked(index) };
+        if byte == b' ' {
+            if index == 0 {
+                return false;
+            }
+            let next = index.saturating_add(1);
+            if next >= len {
+                return false;
+            }
+            let target = unsafe { *data.get_unchecked(next) };
+            return target == b'/' || target == b'*' || target == b'h' || target == b'H';
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
 /// Classify a bounded request-line prefix without requiring a registered method name.
 ///
-/// `HTTP_METHOD_PREFIX_INCOMPLETE` is deliberately fail-closed for admission: the caller should
-/// not retain a previous route while the token could still become a new request method.  The
-/// function accepts the RFC token grammar (rather than a product/provider method list), so methods
-/// such as `PROPFIND`, `M-SEARCH`, and future extension methods remain discoverable.
+/// `HTTP_METHOD_PREFIX_INCOMPLETE` means the snapshot is an RFC method-token run without a SP
+/// separator yet (split request line **or** mid-body alphanumeric text). Callers must not treat
+/// this as a fresh exchange and must not admit a new TLS route from it alone; they **should**
+/// retain an already-admitted route so multi-chunk `SSL_write` bodies (Claude/BoringSSL) still
+/// authorize subsequent `SSL_read` plaintext. Only an unreadable probe buffer should revoke.
+/// The function accepts the RFC token grammar (rather than a product/provider method list), so
+/// methods such as `PROPFIND`, `M-SEARCH`, and future extension methods remain discoverable.
 #[inline(always)]
 pub fn classify_http_method_prefix(data: &[u8]) -> u8 {
     classify_http_method_prefix_len(data, data.len())
@@ -1436,6 +1487,20 @@ mod tests {
         );
         assert_eq!(
             classify_http_method_prefix(b"POST\n/v1/responses"),
+            HTTP_METHOD_PREFIX_NONE
+        );
+        // Mid-body English / identifier runs look INCOMPLETE or COMPLETE-without-path; eBPF must
+        // retain an admitted TLS session for these rather than revoking on INCOMPLETE.
+        assert_eq!(
+            classify_http_method_prefix(b"tool_use_id_abc123def456"),
+            HTTP_METHOD_PREFIX_INCOMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"ello world from a prompt"),
+            HTTP_METHOD_PREFIX_COMPLETE
+        );
+        assert_eq!(
+            classify_http_method_prefix(b"\"content\":\"hello\""),
             HTTP_METHOD_PREFIX_NONE
         );
 

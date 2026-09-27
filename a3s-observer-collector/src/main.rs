@@ -45,8 +45,10 @@ use a3s_observer_common::{
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
     SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS,
-    TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP,
-    TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
+    TLS_PLAINTEXT_API_SSL_APP_DATA, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
+    TLS_PLAINTEXT_API_TCP,
+    TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
+    TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
 use anyhow::Context as _;
 use aya::{
@@ -88,7 +90,8 @@ use interaction::{
 };
 use tls_agent_scopes::TlsAgentScopeReloader;
 use tls_attach::{
-    SymbolFamily, TlsAbi, TlsAttachKind, TlsAttachManager, TlsAttachPlan, TlsOffsetPair,
+    scan_named_agent_runtime_pids, SymbolFamily, TlsAbi, TlsAttachKind, TlsAttachManager,
+    TlsAttachPlan, TlsOffsetPair,
 };
 
 const EXEC_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -228,49 +231,93 @@ type RingPipelineStatsBytes = [u8; 16];
 type CaptureProbeStatsBytes = [u8; 184];
 type PlaintextProcessKeyBytes = [u8; 16];
 
-struct VerifiedProcessMap {
+struct VerifiedProcessMapInner {
     map: BpfHashMap<MapData, PlaintextProcessKeyBytes, u8>,
     installed: HashSet<PlaintextProcessKeyBytes>,
+}
+
+struct VerifiedProcessMap {
+    inner: Mutex<VerifiedProcessMapInner>,
 }
 
 impl VerifiedProcessMap {
     fn new(map: BpfHashMap<MapData, PlaintextProcessKeyBytes, u8>) -> Self {
         Self {
-            map,
-            installed: HashSet::new(),
+            inner: Mutex::new(VerifiedProcessMapInner {
+                map,
+                installed: HashSet::new(),
+            }),
         }
     }
 
-    fn sync(&mut self, pids: impl IntoIterator<Item = i32>) -> anyhow::Result<usize> {
-        let desired = pids
-            .into_iter()
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, VerifiedProcessMapInner> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn installed_len(&self) -> usize {
+        self.lock_inner().installed.len()
+    }
+
+    fn desired_plaintext_keys(
+        pids: impl IntoIterator<Item = i32>,
+    ) -> HashSet<PlaintextProcessKeyBytes> {
+        pids.into_iter()
+            .chain(scan_named_agent_runtime_pids())
             .filter_map(plaintext_process_key)
-            .collect::<HashSet<_>>();
-        for key in self.installed.difference(&desired) {
-            let _ = self.map.remove(key);
+            .collect()
+    }
+
+    fn sync(&self, pids: impl IntoIterator<Item = i32>) -> anyhow::Result<usize> {
+        let desired = Self::desired_plaintext_keys(pids);
+        let mut inner = self.lock_inner();
+        let stale: Vec<_> = inner.installed.difference(&desired).copied().collect();
+        for key in stale {
+            let _ = inner.map.remove(&key);
         }
         for key in &desired {
-            self.map.insert(*key, 1, 0)?;
+            inner.map.insert(*key, 1, 0)?;
         }
-        let newly_installed = desired.difference(&self.installed).count();
-        self.installed = desired;
+        let newly_installed = desired.difference(&inner.installed).count();
+        inner.installed = desired;
         Ok(newly_installed)
     }
 
     /// Admit one PID immediately (e.g. named-agent exec) so the next TLS plaintext event in the
     /// same pipeline batch is not dropped before the periodic sync runs.
-    fn insert_pid(&mut self, pid: i32) -> bool {
+    fn insert_pid(&self, pid: i32) -> bool {
         let Some(key) = plaintext_process_key(pid) else {
+            tracing::warn!(pid, "plaintext PID allowlist key unavailable");
             return false;
         };
-        if self.installed.contains(&key) {
+        let mut inner = self.lock_inner();
+        if inner.installed.contains(&key) {
             return false;
         }
-        if self.map.insert(key, 1, 0).is_err() {
+        if inner.map.insert(key, 1, 0).is_err() {
+            tracing::warn!(pid, "plaintext PID allowlist map insert failed");
             return false;
         }
-        self.installed.insert(key);
+        inner.installed.insert(key);
         true
+    }
+
+    fn admit_named_agent_pids(&self, reason: &'static str) -> usize {
+        let mut admitted = Vec::new();
+        for pid in scan_named_agent_runtime_pids() {
+            if self.insert_pid(pid) {
+                admitted.push(pid);
+            }
+        }
+        if !admitted.is_empty() {
+            tracing::info!(
+                newly_installed = admitted.len(),
+                pids = ?admitted,
+                installed = self.installed_len(),
+                reason,
+                "admitted named Agent plaintext PIDs"
+            );
+        }
+        admitted.len()
     }
 }
 
@@ -1665,7 +1712,11 @@ async fn main() -> anyhow::Result<()> {
     // Logs go to STDERR so STDOUT stays pure NDJSON (the event stream a pipeline parses). The
     // explicit TLS diagnostics switch raises only the subscriber ceiling; call-level diagnostics
     // remain behind their own gate and are never enabled by a generic RUST_LOG value alone.
-    let diagnostic_level = if tls_diagnostics_enabled() {
+    // TLS diagnostics may be enabled in production to collect counters, but they must not raise
+    // the global subscriber to DEBUG: interaction reassembly can emit one line per fragment and
+    // a slow Kubernetes log pipe then returns EAGAIN, which previously caused exit 101. Opt into
+    // the high-volume trace explicitly for bounded local debugging only.
+    let diagnostic_level = if tls_trace_debug_enabled() {
         tracing::Level::DEBUG
     } else {
         tracing::Level::INFO
@@ -1798,6 +1849,7 @@ async fn main() -> anyhow::Result<()> {
         ("http_write", "sys_enter_write"),
         ("http_sendto", "sys_enter_sendto"),
         ("http_writev", "sys_enter_writev"),
+        ("http_sendmsg", "sys_enter_sendmsg"),
         ("connect", "sys_enter_connect"),
         ("dns_query", "sys_enter_sendto"),
         ("dns_sendmsg", "sys_enter_sendmsg"),
@@ -1881,7 +1933,17 @@ async fn main() -> anyhow::Result<()> {
         ebpf.take_map("VERIFIED_AGENT_PROCESSES")
             .context("`VERIFIED_AGENT_PROCESSES` missing")?,
     )?;
-    let mut verified_process_map = VerifiedProcessMap::new(verified_processes);
+    let verified_process_map = Arc::new(VerifiedProcessMap::new(verified_processes));
+    if ssl_setting.is_some() {
+        let allowlist = Arc::clone(&verified_process_map);
+        std::thread::Builder::new()
+            .name("named-agent-allowlist".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(10));
+                allowlist.admit_named_agent_pids("named-scan-thread");
+            })
+            .context("named-agent allowlist thread")?;
+    }
     // Install only exact, operator-auditable POST routes.  The map stores a closed route kind;
     // path/body/provider semantics remain in userspace and no product name enters eBPF.
     let _plaintext_http_routes = install_plaintext_http_routes(BpfHashMap::try_from(
@@ -1903,7 +1965,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(manager) = tls_attach_manager.as_mut() {
         attached = attached.saturating_add(refresh_tls_attachments(
             manager,
-            &mut verified_process_map,
+            &verified_process_map,
             &mut ebpf,
         ));
     }
@@ -2181,9 +2243,16 @@ async fn main() -> anyhow::Result<()> {
     let mut filter_reload = tokio::time::interval(FILTER_RULE_RELOAD_INTERVAL);
     filter_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     filter_reload.tick().await;
-    let mut tls_attach_scan = tokio::time::interval(Duration::from_secs(2));
+    // Host CLIs can emit the first TLS write ~800ms after exec. A 2s inode scan loses that
+    // hop when exec-commit is late or filtered; 200ms still bounds /proc walk cost.
+    let mut tls_attach_scan = tokio::time::interval(Duration::from_millis(200));
     tls_attach_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tls_attach_scan.tick().await;
+    // Allowlist-only. Do not attach TLS programs on this tick: a 30-program attach can
+    // block the loop past the first Claude/Codex write even when inode-wide probes exist.
+    let mut named_agent_scan = tokio::time::interval(Duration::from_millis(10));
+    named_agent_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    named_agent_scan.tick().await;
     let mut processor_tick = tokio::time::interval(PROCESSOR_TICK);
     processor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     processor_tick.tick().await;
@@ -2216,7 +2285,7 @@ async fn main() -> anyhow::Result<()> {
                     release_reorder_by_wall_clock(
                         &mut reorder,
                         &mut processor,
-                        &mut verified_process_map,
+                        &verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2231,6 +2300,7 @@ async fn main() -> anyhow::Result<()> {
                 let tls_profile_snapshot = tls_profile_diagnostic_snapshot(&tls_profile_diagnostics);
                 if tls_profile_snapshot != last_tls_profile_diagnostics
                     && (tls_profile_snapshot[0] > 0
+                        || tls_profile_snapshot[3] > 0
                         || tls_profile_snapshot[11] > 0
                         || tls_profile_snapshot[16] > 0)
                 {
@@ -2492,6 +2562,16 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            _ = named_agent_scan.tick(), if tls_attach_manager.is_some() => {
+                tokio::task::block_in_place(|| {
+                    for pid in scan_named_agent_runtime_pids() {
+                        processor.tls_verified_candidate_pids.insert(pid);
+                        processor.tls_fast_retry_candidate_pids.insert(pid);
+                        processor.pending_immediate_allowlist_pids.insert(pid);
+                    }
+                    processor.flush_immediate_allowlist(&verified_process_map);
+                });
+            }
             _ = tls_attach_scan.tick(), if tls_attach_manager.is_some() => {
                 if let Some(manager) = tls_attach_manager.as_mut() {
                     if let Some(reloader) = tls_agent_scope_reloader.as_mut() {
@@ -2530,7 +2610,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     let newly_attached = tokio::task::block_in_place(|| {
-                        refresh_tls_attachments(manager, &mut verified_process_map, &mut ebpf)
+                        refresh_tls_attachments(manager, &verified_process_map, &mut ebpf)
                     });
                     if newly_attached > 0 {
                         tracing::info!(
@@ -2543,7 +2623,12 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = exec_expire.tick() => {
                 tokio::task::block_in_place(|| {
-                    processor.expire_exec(exporter.as_ref(), &resolver, Instant::now());
+                    processor.expire_exec(
+                        exporter.as_ref(),
+                        &resolver,
+                        &classifier,
+                        Instant::now(),
+                    );
                 });
             }
             _ = processor_tick.tick() => {
@@ -2552,7 +2637,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut pipeline_receiver,
                         &mut reorder,
                         &mut processor,
-                        &mut verified_process_map,
+                        &verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2567,7 +2652,7 @@ async fn main() -> anyhow::Result<()> {
                     refresh_exec_tls_candidates(
                         &mut processor,
                         tls_attach_manager.as_mut(),
-                        &mut verified_process_map,
+                        &verified_process_map,
                         &mut ebpf,
                     )
                 });
@@ -2578,7 +2663,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut pipeline_receiver,
                         &mut reorder,
                         &mut processor,
-                        &mut verified_process_map,
+                        &verified_process_map,
                         exporter.as_ref(),
                         &resolver,
                         &classifier,
@@ -2593,7 +2678,7 @@ async fn main() -> anyhow::Result<()> {
                     refresh_exec_tls_candidates(
                         &mut processor,
                         tls_attach_manager.as_mut(),
-                        &mut verified_process_map,
+                        &verified_process_map,
                         &mut ebpf,
                     )
                 });
@@ -2641,7 +2726,7 @@ async fn main() -> anyhow::Result<()> {
             &mut pipeline_receiver,
             &mut reorder,
             &mut processor,
-            &mut verified_process_map,
+            &verified_process_map,
             exporter.as_ref(),
             &resolver,
             &classifier,
@@ -2654,7 +2739,7 @@ async fn main() -> anyhow::Result<()> {
     let ready = reorder.flush_all();
     process_ready_envelopes(
         &mut processor,
-        &mut verified_process_map,
+        &verified_process_map,
         ready,
         exporter.as_ref(),
         &resolver,
@@ -2663,8 +2748,11 @@ async fn main() -> anyhow::Result<()> {
     processor.expire_exec(
         exporter.as_ref(),
         &resolver,
+        &classifier,
         Instant::now() + EXEC_REASSEMBLY_TIMEOUT,
     );
+    processor.interactions.expire_all();
+    processor.flush_retired_reassembly_now(exporter.as_ref(), &resolver, &classifier);
 
     // Aggregate deltas enter the Bulk lane before the terminal Critical heartbeat. The priority
     // exporter's cross-lane barrier then guarantees every admitted delta is written before the
@@ -3012,6 +3100,8 @@ fn attach_tls_plan(ebpf: &mut Ebpf, plan: &TlsAttachPlan) -> anyhow::Result<usiz
             read_abi,
             write_abi,
             ref additional_pairs,
+            ref additional_write_offsets,
+            ref app_data_write_offsets,
         } => {
             attached_programs += attach_offset_pair(
                 ebpf,
@@ -3027,9 +3117,83 @@ fn attach_tls_plan(ebpf: &mut Ebpf, plan: &TlsAttachPlan) -> anyhow::Result<usiz
             for pair in additional_pairs {
                 attached_programs += attach_offset_pair(ebpf, pair, &plan.path, plan.pid)?;
             }
+            for write_offset in additional_write_offsets {
+                attached_programs += attach_write_offset(
+                    ebpf,
+                    write_abi,
+                    *write_offset,
+                    &plan.path,
+                    plan.pid,
+                )?;
+            }
+            for write_offset in app_data_write_offsets {
+                // The inode uprobe (pid=None) already fires for every process using this
+                // binary. A second per-pid attach double-emits the same POST ~100µs later.
+                if plan.pid.is_some() {
+                    continue;
+                }
+                attached_programs += attach_write_offset(
+                    ebpf,
+                    TlsAbi::BoringSslAppData,
+                    *write_offset,
+                    &plan.path,
+                    plan.pid,
+                )?;
+            }
         }
     }
     Ok(attached_programs)
+}
+
+fn attach_write_offset(
+    ebpf: &mut Ebpf,
+    write_abi: TlsAbi,
+    write_offset: u64,
+    target: &Path,
+    pid: Option<i32>,
+) -> anyhow::Result<usize> {
+    match write_abi {
+        TlsAbi::Classic => {
+            attach_tls_pair(
+                ebpf,
+                "ssl_write_enter",
+                "ssl_write_exit",
+                None,
+                write_offset,
+                target,
+                pid,
+            )?;
+            Ok(2)
+        }
+        TlsAbi::OpenSslEx => {
+            attach_tls_pair(
+                ebpf,
+                "ssl_write_ex_enter",
+                "ssl_write_ex_exit",
+                None,
+                write_offset,
+                target,
+                pid,
+            )?;
+            Ok(2)
+        }
+        TlsAbi::RustlsOutboundChunks => {
+            attach_uprobe_at(ebpf, "rustls_write_enter", None, write_offset, target, pid)?;
+            Ok(1)
+        }
+        TlsAbi::BoringSslAppData => {
+            attach_uprobe_at(
+                ebpf,
+                "ssl_write_app_data_enter",
+                None,
+                write_offset,
+                target,
+                pid,
+            )?;
+            Ok(1)
+        }
+        TlsAbi::RustlsPayload => anyhow::bail!("rustls payload ABI is invalid for writes"),
+    }
 }
 
 fn attach_offset_pair(
@@ -3038,37 +3202,7 @@ fn attach_offset_pair(
     target: &Path,
     pid: Option<i32>,
 ) -> anyhow::Result<usize> {
-    let mut attached = 0usize;
-    let (write_enter, write_exit) = match pair.write_abi {
-        TlsAbi::Classic => ("ssl_write_enter", "ssl_write_exit"),
-        TlsAbi::OpenSslEx => ("ssl_write_ex_enter", "ssl_write_ex_exit"),
-        TlsAbi::RustlsOutboundChunks => {
-            attach_uprobe_at(
-                ebpf,
-                "rustls_write_enter",
-                None,
-                pair.write_offset,
-                target,
-                pid,
-            )?;
-            ("", "")
-        }
-        TlsAbi::RustlsPayload => anyhow::bail!("rustls payload ABI is invalid for writes"),
-    };
-    if pair.write_abi == TlsAbi::RustlsOutboundChunks {
-        attached += 1;
-    } else {
-        attach_tls_pair(
-            ebpf,
-            write_enter,
-            write_exit,
-            None,
-            pair.write_offset,
-            target,
-            pid,
-        )?;
-        attached += 2;
-    }
+    let mut attached = attach_write_offset(ebpf, pair.write_abi, pair.write_offset, target, pid)?;
 
     match pair.read_abi {
         TlsAbi::Classic => {
@@ -3109,22 +3243,34 @@ fn attach_offset_pair(
         TlsAbi::RustlsOutboundChunks => {
             anyhow::bail!("rustls outbound-chunks ABI is invalid for reads")
         }
+        TlsAbi::BoringSslAppData => {
+            anyhow::bail!("BoringSSL app-data ABI is invalid for reads")
+        }
     }
     Ok(attached)
 }
 
 fn refresh_tls_attachments(
     manager: &mut TlsAttachManager,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     ebpf: &mut Ebpf,
 ) -> usize {
+    verified_process_map.admit_named_agent_pids("pre-discover");
     let plans = manager.discover();
+    for pid in manager.allowlist_hold_pids() {
+        if verified_process_map.insert_pid(pid) {
+            tracing::info!(
+                pid,
+                "admitted stopped/thawed Agent PID to plaintext allowlist"
+            );
+        }
+    }
     attach_tls_plans(manager, verified_process_map, ebpf, plans)
 }
 
 fn refresh_tls_attachment_for_pid(
     manager: &mut TlsAttachManager,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     ebpf: &mut Ebpf,
     pid: i32,
     identity_verified: bool,
@@ -3139,10 +3285,13 @@ fn refresh_tls_attachment_for_pid(
 
 fn attach_tls_plans(
     manager: &mut TlsAttachManager,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     ebpf: &mut Ebpf,
     plans: Vec<TlsAttachPlan>,
 ) -> usize {
+    // Admit named CLI roots before the (possibly 100s of ms) uprobe attach so inode-wide
+    // probes can see the first write even when this function is called from block_in_place.
+    verified_process_map.admit_named_agent_pids("pre-attach");
     let mut attached_programs = 0usize;
     for plan in plans {
         match attach_tls_plan(ebpf, &plan) {
@@ -3166,7 +3315,7 @@ fn attach_tls_plans(
     match verified_process_map.sync(manager.verified_pids()) {
         Ok(newly_installed) if newly_installed > 0 => tracing::info!(
             newly_installed,
-            installed = verified_process_map.installed.len(),
+            installed = verified_process_map.installed_len(),
             "synchronized identity-verified Agent plaintext PID allowlist"
         ),
         Ok(_) => {}
@@ -3181,13 +3330,20 @@ fn attach_tls_plans(
 fn refresh_exec_tls_candidates(
     processor: &mut CollectorProcessor,
     manager: Option<&mut TlsAttachManager>,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     ebpf: &mut Ebpf,
 ) {
-    let candidate_pids = processor.take_tls_attach_candidate_pids(Instant::now());
     let Some(manager) = manager else {
         return;
     };
+    let thawed = manager.take_runnable_deferred_pids();
+    for pid in &thawed {
+        processor.tls_verified_candidate_pids.insert(*pid);
+        processor.tls_fast_retry_candidate_pids.insert(*pid);
+        processor.pending_immediate_allowlist_pids.insert(*pid);
+    }
+    processor.flush_immediate_allowlist(verified_process_map);
+    let candidate_pids = processor.take_tls_attach_candidate_pids(Instant::now());
     for (pid, identity_verified, retry_attempt) in candidate_pids {
         let retry_attempt =
             retry_attempt.or_else(|| manager.is_named_agent_runtime_pid(pid).then_some(0));
@@ -3198,15 +3354,28 @@ fn refresh_exec_tls_candidates(
             pid,
             identity_verified,
         );
+        let keep_retrying_after_stop = manager.recently_runnable(pid);
         if newly_attached > 0 {
-            processor.cancel_tls_attach_retry(pid);
             tracing::info!(
                 pid,
                 identity_verified,
                 newly_attached,
+                keep_retrying_after_stop,
                 attached_targets = manager.attached_count(),
                 "attached Agent TLS probes from exec lifecycle signal"
             );
+            // A just-continued lab/runtime may still execve the real CLI (claude.exe) after the
+            // wrapper is first attached. Keep the 25ms ladder so the post-exec image is covered.
+            if keep_retrying_after_stop {
+                processor.schedule_tls_attach_retry(
+                    pid,
+                    identity_verified,
+                    retry_attempt.unwrap_or(0),
+                    Instant::now(),
+                );
+            } else {
+                processor.cancel_tls_attach_retry(pid);
+            }
         } else if let Some(attempt) = retry_attempt {
             processor.schedule_tls_attach_retry(pid, identity_verified, attempt, Instant::now());
         }
@@ -3833,6 +4002,7 @@ impl CollectorProcessor {
         &mut self,
         exporter: &dyn Exporter,
         resolver: &impl IdentityResolver,
+        classifier: &impl ServiceClassifier,
         now: Instant,
     ) {
         for completed in self.exec_assembler.expire(now) {
@@ -3847,6 +4017,85 @@ impl CollectorProcessor {
             );
         }
         self.interactions.expire_idle(now);
+        self.flush_retired_reassembly_now(exporter, resolver, classifier);
+    }
+
+    fn flush_retired_reassembly_now(
+        &mut self,
+        exporter: &dyn Exporter,
+        resolver: &impl IdentityResolver,
+        classifier: &impl ServiceClassifier,
+    ) {
+        let now = safe_unix_now_ns();
+        let timing = EventTiming::from_unix_ns(now, now);
+        let capture_decision = EventCaptureDecision::new(0, 0, 0, 0, 0, false, 0);
+        let raw_observation = fallback_raw_observation(
+            &AgentEvent::ProcessExit {
+                pid: 0,
+                exit_code: 0,
+                signal: 0,
+            },
+            Some(&timing),
+        );
+        self.flush_retired_reassembly(
+            exporter,
+            resolver,
+            classifier,
+            [0u8; 16],
+            timing,
+            capture_decision,
+            raw_observation,
+            Vec::new(),
+        );
+    }
+
+    fn flush_retired_reassembly(
+        &mut self,
+        exporter: &dyn Exporter,
+        resolver: &impl IdentityResolver,
+        classifier: &impl ServiceClassifier,
+        comm: [u8; 16],
+        timing: EventTiming,
+        capture_decision: EventCaptureDecision,
+        raw_observation: RawObservation,
+        coverage_gaps: Vec<CoverageGap>,
+    ) {
+        for interaction in self.interactions.take_completed() {
+            tracing::warn!(
+                pid = interaction.pid,
+                path = interaction.path.as_str(),
+                connection_id = interaction.connection_id.as_str(),
+                completeness = interaction.completeness.as_str(),
+                request_bytes = interaction.request.captured_bytes,
+                partial_reasons = ?interaction.partial_reasons,
+                "retired pending Agent HTTP request as partial interaction"
+            );
+            emit_completed_interaction(
+                exporter,
+                &mut self.stats,
+                resolver,
+                classifier,
+                comm,
+                timing.clone(),
+                capture_decision.clone(),
+                raw_observation.clone(),
+                coverage_gaps.clone(),
+                interaction,
+            );
+        }
+        for evidence in self.interactions.take_evidence() {
+            emit_plaintext_evidence(
+                exporter,
+                &mut self.stats,
+                resolver,
+                comm,
+                timing.clone(),
+                capture_decision.clone(),
+                raw_observation.clone(),
+                coverage_gaps.clone(),
+                evidence,
+            );
+        }
     }
 
     fn take_tls_attach_candidate_pids(&mut self, now: Instant) -> Vec<(i32, bool, Option<usize>)> {
@@ -3923,7 +4172,7 @@ impl CollectorProcessor {
         self.tls_attach_retries.remove(&pid);
     }
 
-    fn flush_immediate_allowlist(&mut self, verified_process_map: &mut VerifiedProcessMap) {
+    fn flush_immediate_allowlist(&mut self, verified_process_map: &VerifiedProcessMap) {
         let pending = std::mem::take(&mut self.pending_immediate_allowlist_pids);
         let mut newly = 0usize;
         for pid in pending {
@@ -3934,7 +4183,7 @@ impl CollectorProcessor {
         if newly > 0 {
             tracing::info!(
                 newly_installed = newly,
-                installed = verified_process_map.installed.len(),
+                installed = verified_process_map.installed_len(),
                 "immediately admitted Agent plaintext PID allowlist from exec"
             );
         }
@@ -4431,6 +4680,7 @@ impl CollectorProcessor {
                     TLS_PLAINTEXT_API_RUSTLS => ("tls_uprobe_rustls", "rustls-payload"),
                     TLS_PLAINTEXT_API_SSL_EX => ("tls_uprobe", "openssl-ex"),
                     TLS_PLAINTEXT_API_SSL_CLASSIC => ("tls_uprobe", "ssl-classic"),
+                    TLS_PLAINTEXT_API_SSL_APP_DATA => ("tls_uprobe", "ssl-app-data"),
                     _ => ("tls_uprobe", "unknown-tls-abi"),
                 };
                 chunk_raw_observation.source.source_type =
@@ -4460,6 +4710,41 @@ impl CollectorProcessor {
                         "TLS plaintext fragment admitted"
                     );
                 }
+                if header.direction == TLS_PLAINTEXT_DIRECTION_WRITE
+                    && plaintext.len() >= 16
+                    && matches!(
+                        header.api_kind,
+                        TLS_PLAINTEXT_API_SSL_CLASSIC
+                            | TLS_PLAINTEXT_API_SSL_APP_DATA
+                            | TLS_PLAINTEXT_API_SSL_EX
+                    )
+                {
+                    let preview = plaintext_preview_hex(plaintext, 24);
+                    tracing::warn!(
+                        pid = header.pid,
+                        api_kind = header.api_kind,
+                        call_seq = header.call_seq,
+                        connection_id = format_args!("{:x}", header.connection_id),
+                        original_len = header.original_len,
+                        captured_len = header.captured_len,
+                        preview_hex = preview.as_str(),
+                        "TLS plaintext write admitted"
+                    );
+                }
+                if header.direction == TLS_PLAINTEXT_DIRECTION_READ
+                    && plaintext.len() >= 12
+                    && plaintext.starts_with(b"HTTP/1.")
+                {
+                    tracing::warn!(
+                        pid = header.pid,
+                        api_kind = header.api_kind,
+                        call_seq = header.call_seq,
+                        connection_id = format_args!("{:x}", header.connection_id),
+                        original_len = header.original_len,
+                        captured_len = header.captured_len,
+                        "TLS plaintext HTTP response admitted"
+                    );
+                }
                 let completed = self.interactions.push(PlaintextChunk {
                     cgroup_id: header.cgroup_id,
                     pid: header.pid,
@@ -4482,6 +4767,14 @@ impl CollectorProcessor {
                     fd_generation: header.fd_generation,
                 });
                 for interaction in completed {
+                    tracing::warn!(
+                        pid = interaction.pid,
+                        path = interaction.path.as_str(),
+                        connection_id = interaction.connection_id.as_str(),
+                        completeness = interaction.completeness.as_str(),
+                        request_bytes = interaction.request.captured_bytes,
+                        "TLS plaintext interaction completed"
+                    );
                     emit_completed_interaction(
                         exporter,
                         &mut self.stats,
@@ -4530,8 +4823,8 @@ impl CollectorProcessor {
                     &mut self.stats,
                     PipelineRing::Exit,
                     EnrichedEvent {
-                        timing: Some(timing),
-                        capture_decision: Some(capture_decision),
+                        timing: Some(timing.clone()),
+                        capture_decision: Some(capture_decision.clone()),
                         identity: lifecycle.identity,
                         workload: lifecycle.workload,
                         observation: None,
@@ -4550,6 +4843,16 @@ impl CollectorProcessor {
                 // state. Purge TLS pointer/connection aliases immediately so a PID/SSL allocator
                 // reuse cannot inherit the previous Agent's pending request or response.
                 self.interactions.expire_process(ev.pid, ev.cgroup_id);
+                self.flush_retired_reassembly(
+                    exporter,
+                    resolver,
+                    classifier,
+                    ev.comm,
+                    timing,
+                    capture_decision,
+                    raw_observation,
+                    coverage_gaps,
+                );
                 forget_process_context(ev.pid);
             }
             PipelineOrigin::Bulk(_) => {
@@ -4838,7 +5141,7 @@ fn emit_plaintext_evidence(
 
 fn process_ready_envelopes(
     processor: &mut CollectorProcessor,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     ready: impl IntoIterator<Item = RawEnvelope>,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
@@ -4855,7 +5158,7 @@ fn process_ready_envelopes(
 fn push_reorder_envelope(
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     envelope: RawEnvelope,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
@@ -4914,7 +5217,7 @@ fn drain_pipeline(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -4941,7 +5244,7 @@ fn process_pipeline_cycle(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -4973,7 +5276,7 @@ fn process_pipeline_cycle(
 fn release_reorder_by_wall_clock(
     reorder: &mut ReorderCoordinator,
     processor: &mut CollectorProcessor,
-    verified_process_map: &mut VerifiedProcessMap,
+    verified_process_map: &VerifiedProcessMap,
     exporter: &dyn Exporter,
     resolver: &impl IdentityResolver,
     classifier: &impl ServiceClassifier,
@@ -5208,6 +5511,11 @@ fn tls_diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| env_enabled("A3S_OBSERVER_TLS_DIAGNOSTICS"))
 }
 
+fn tls_trace_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_enabled("A3S_OBSERVER_TLS_TRACE_DEBUG"))
+}
+
 fn tls_diagnostics_enabled_for(pid: u32) -> bool {
     if !tls_diagnostics_enabled() {
         return false;
@@ -5390,6 +5698,17 @@ fn collector_heartbeat(
             capture_profile: capture_profile.map(Box::new),
         },
     }
+}
+
+fn plaintext_preview_hex(bytes: &[u8], max_bytes: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let take = bytes.len().min(max_bytes);
+    let mut output = String::with_capacity(take * 2);
+    for byte in &bytes[..take] {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn hash_prefix(value: impl AsRef<[u8]>) -> String {
@@ -5915,6 +6234,7 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 mod tests {
     use super::{
         collector_heartbeat, cstr, emit, env_value_disabled, exec_ppid, exec_process_context,
+        plaintext_process_key, scan_named_agent_runtime_pids,
         exit_lifecycle_context, file_feature_flags_from, hash_prefix, monotonic_delta,
         nonzero_unix_ns, observe_exec_commit_lifecycle, parse_dns_qname,
         parse_filter_rule_snapshot, parse_llm_meta, parse_process_start_time_ticks,
@@ -5926,7 +6246,8 @@ mod tests {
         CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
         PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
         ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
-        Stats, UnknownFilePolicy, EXEC_REASSEMBLY_TIMEOUT, FILE_ACCESS_TRACEPOINTS,
+        Stats, UnknownFilePolicy, VerifiedProcessMap, EXEC_REASSEMBLY_TIMEOUT,
+        FILE_ACCESS_TRACEPOINTS,
         SOCKET_STATE_TTL, UNKNOWN_PEER,
     };
     use a3s_observer::{
@@ -5976,6 +6297,23 @@ mod tests {
         }
         for enabled in ["1", "true", "on", "/usr/lib/libssl.so"] {
             assert!(!env_value_disabled(enabled), "{enabled}");
+        }
+    }
+
+    #[test]
+    fn plaintext_desired_keys_union_named_runtime_pids() {
+        let self_pid = std::process::id() as i32;
+        let keys = VerifiedProcessMap::desired_plaintext_keys([self_pid]);
+        if let Some(self_key) = plaintext_process_key(self_pid) {
+            assert!(keys.contains(&self_key));
+        }
+        for pid in scan_named_agent_runtime_pids() {
+            if let Some(key) = plaintext_process_key(pid) {
+                assert!(
+                    keys.contains(&key),
+                    "named pid {pid} must stay in desired allowlist"
+                );
+            }
         }
     }
 

@@ -31,13 +31,15 @@ use a3s_observer_common::{
     FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
     FILE_ACCESS_MODE_UNKNOWN, FILE_ACCESS_MODE_WRITE_ONLY, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
     FILE_FILTER_AUTHORITY_AUTHORITATIVE, FILE_RENAME_AS_WRITE_FLAGS, HTTP_METHOD_PREFIX_COMPLETE,
-    HTTP_METHOD_PREFIX_INCOMPLETE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_NONE,
+    PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_CANDIDATE, PLAINTEXT_HTTP_ROUTE_LLM,
     PLAINTEXT_HTTP_ROUTE_MAX_LEN, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID,
-    TLS_PLAINTEXT_ABI_V2, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND,
-    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    classic_tls_sock_connection_id, http_request_line_shaped_len, TLS_PLAINTEXT_ABI_V2,
+    TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND,
+    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_APP_DATA, TLS_PLAINTEXT_API_SSL_CLASSIC,
     TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
     TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
     TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
@@ -370,6 +372,7 @@ struct SslCallArgs {
     api_kind: u8,
     route_kind: u8,
     _pad: [u8; 5],
+    syscall_fd: u32,
 }
 
 #[repr(C)]
@@ -408,10 +411,7 @@ struct LlmStat {
 fn sock_key(cgroup_id: u64, pid: u32, fd: u64) -> u64 {
     // Include the event-time cgroup in the opaque map key.  PID/FD values can be reused across
     // containers; retaining only `(pid,fd)` lets a stale socket summary bleed into a new runtime.
-    let mut key = cgroup_id ^ (cgroup_id.rotate_left(17));
-    key ^= (pid as u64).rotate_left(31);
-    key ^= fd & 0xffff_ffff;
-    key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    classic_tls_sock_connection_id(cgroup_id, pid, fd)
 }
 
 fn remember_last_tls_ctx(ssl_ptr: u64, api_kind: u8, direction: u8) {
@@ -2613,6 +2613,7 @@ fn remember_ssl_call(ctx: &ProbeContext, direction: u8, api_kind: u8, result_len
         api_kind,
         route_kind: 0,
         _pad: [0; 5],
+        syscall_fd: 0,
     };
     let _ = SSL_CALL_ARGS.insert(&pid_tgid, &args, 0);
     remember_last_tls_ctx(ssl_ptr, api_kind, direction);
@@ -2657,6 +2658,38 @@ pub fn ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
         TLS_PLAINTEXT_API_SSL_EX,
         ctx.arg::<u64>(3).unwrap_or(0),
     )
+}
+
+/// BoringSSL protocol-method write: `(ssl, bool *out_needs_handshake,
+/// size_t *out_bytes_written, const uint8_t *buf, size_t len)`.
+/// Capture on enter — the public `SSL_write` wrapper is not on the first-hop path
+/// for some static CLIs, and a uretprobe on this slot would miss tail-call-like
+/// record writers.
+#[uprobe]
+pub fn ssl_write_app_data_enter(ctx: ProbeContext) -> u32 {
+    bump_tls_profile_diagnostic(3);
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    let buf = ctx.arg::<u64>(3).unwrap_or(0);
+    let requested_len = ctx.arg::<u64>(4).unwrap_or(0);
+    if buf == 0 || requested_len == 0 {
+        bump_tls_profile_diagnostic(1);
+        return 0;
+    }
+    mark_classic_write_covered_by_app_data();
+    let args = SslCallArgs {
+        ssl_ptr,
+        buf,
+        requested_len,
+        result_len_ptr: ctx.arg::<u64>(2).unwrap_or(0),
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction: TLS_PLAINTEXT_DIRECTION_WRITE,
+        api_kind: TLS_PLAINTEXT_API_SSL_APP_DATA,
+        route_kind: 0,
+        _pad: [0; 5],
+        syscall_fd: 0,
+    };
+    remember_last_tls_ctx(ssl_ptr, args.api_kind, args.direction);
+    emit_tls_plaintext(args, requested_len)
 }
 
 #[uretprobe]
@@ -2729,6 +2762,7 @@ pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
         api_kind: TLS_PLAINTEXT_API_RUSTLS,
         route_kind: HTTP_PREFIX_UNKNOWN,
         _pad: [0; 5],
+        syscall_fd: 0,
     };
     // `buffer_plaintext` may tail-call its encryption implementation. Capturing at this stable
     // pre-encryption boundary avoids relying on a Rust uretprobe trampoline surviving that tail
@@ -2786,6 +2820,7 @@ pub fn rustls_read_enter(ctx: ProbeContext) -> u32 {
             api_kind: TLS_PLAINTEXT_API_RUSTLS,
             route_kind: 0,
             _pad: [0; 5],
+        syscall_fd: 0,
         },
         layout[2],
     )
@@ -2798,11 +2833,31 @@ fn take_ssl_call(expected_direction: u8) -> Option<SslCallArgs> {
     args.filter(|value| value.direction == expected_direction)
 }
 
+fn mark_classic_write_covered_by_app_data() {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(args) = unsafe { SSL_CALL_ARGS.get(&pid_tgid) }.copied() else {
+        return;
+    };
+    if args.direction != TLS_PLAINTEXT_DIRECTION_WRITE
+        || args.api_kind != TLS_PLAINTEXT_API_SSL_CLASSIC
+    {
+        return;
+    }
+    let mut updated = args;
+    updated._pad[0] = 1;
+    let _ = SSL_CALL_ARGS.insert(&pid_tgid, &updated, 0);
+}
+
 fn finish_ssl_classic(ctx: &RetProbeContext, direction: u8) -> u32 {
     let Some(args) = take_ssl_call(direction) else {
         return 0;
     };
     if args.api_kind != TLS_PLAINTEXT_API_SSL_CLASSIC {
+        return 0;
+    }
+    // The protocol-method probe already copied this write; skip the wrapper so hop 2
+    // is not emitted twice when both public SSL_write and write_app_data are attached.
+    if args._pad[0] != 0 {
         return 0;
     }
     // OpenSSL/BoringSSL classic SSL_read/SSL_write return C `int`. Reading the full 64-bit rax
@@ -2943,9 +2998,11 @@ fn bytes_at<const N: usize>(
     true
 }
 
-/// Detect an exact, configured POST route while keeping plain-syscall capture away from
-/// stdout/files.  The kernel only hashes the bounded path; body/provider semantics remain in
-/// userspace.
+/// Classify a POST request-line for plaintext admission.
+///
+/// Configured LLM/tool hashes stay exact. A complete POST path that is not in the map is a
+/// bounded candidate so verified-agent RPC is not limited to one deployment route name.
+/// Body/provider semantics remain in userspace. Non-request bytes stay UNKNOWN.
 #[inline(always)]
 fn http_request_route_kind(buf: u64, len: u64) -> u8 {
     if buf == 0 || len < 6 {
@@ -2997,8 +3054,16 @@ fn http_request_route_kind(buf: u64, len: u64) -> u8 {
     if route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL {
         route
     } else {
-        HTTP_PREFIX_UNKNOWN
+        PLAINTEXT_HTTP_ROUTE_CANDIDATE
     }
+}
+
+/// True when a COMPLETE method-prefix classification is shaped like an HTTP request line
+/// (`METHOD SP "/"|"*"|absolute-URI`). Body chunks that happen to contain `token + SP + word`
+/// (e.g. mid-prompt English) must not be treated as a fresh exchange.
+#[inline(always)]
+fn http_request_line_shaped(data: &[u8], len: usize) -> bool {
+    http_request_line_shaped_len(data, len)
 }
 
 #[inline(always)]
@@ -3025,12 +3090,42 @@ fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
         return None;
     }
     match classify_http_method_prefix_len(&data, captured) {
-        HTTP_METHOD_PREFIX_COMPLETE => Some(true),
-        // A bounded token with no separator may be a split/unknown request line. Do not retain a
-        // prior TLS route until the remaining bytes prove this is a body continuation.
-        HTTP_METHOD_PREFIX_INCOMPLETE => None,
+        HTTP_METHOD_PREFIX_COMPLETE if http_request_line_shaped(&data, captured) => Some(true),
+        // Incomplete tokens (split request-line OR mid-body alphanumeric runs) and non-method
+        // payloads must NOT revoke an admitted TLS session. Claude/BoringSSL large POSTs arrive as
+        // many SSL_write chunks; treating INCOMPLETE as revoke cleared the session before any
+        // SSL_read, producing userspace request_buffer_bytes>0 / response_buffer_bytes=0.
+        // Incomplete alone also must not admit a fresh route—callers only retain via admitted_*.
+        HTTP_METHOD_PREFIX_COMPLETE
+        | HTTP_METHOD_PREFIX_INCOMPLETE
+        | HTTP_METHOD_PREFIX_NONE => Some(false),
         _ => Some(false),
     }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn http_method_prefix_is_incomplete(buf: u64, len: u64) -> bool {
+    if buf == 0 || len == 0 {
+        return false;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return false;
+    }
+    classify_http_method_prefix_len(&data, captured) == HTTP_METHOD_PREFIX_INCOMPLETE
 }
 
 // Keep the optional WebSocket upgrade hint in its own BPF subprogram. Inlining a header parser
@@ -3128,6 +3223,13 @@ fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
         && state.saw_upgrade != 0
         && state.saw_websocket != 0
         && state.saw_connection != 0
+}
+
+#[inline(always)]
+fn tls_api_is_ssl_family(api_kind: u8) -> bool {
+    api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC
+        || api_kind == TLS_PLAINTEXT_API_SSL_EX
+        || api_kind == TLS_PLAINTEXT_API_SSL_APP_DATA
 }
 
 #[inline(always)]
@@ -3250,7 +3352,7 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
     // Plain TCP already passed the route gate in HTTP_SOCKS.  TLS contexts require a write-side
     // exact POST/path match before any response bytes are admitted.
     if args.api_kind == TLS_PLAINTEXT_API_TCP {
-        return valid_plaintext_route(args.route_kind).then_some(args.route_kind);
+        return valid_plaintext_capture_route(args.route_kind).then_some(args.route_kind);
     }
     if args.api_kind == TLS_PLAINTEXT_API_RUSTLS && args.ssl_ptr == 0 {
         // A zero Rustls pointer cannot identify a TLS session; sharing one map key across all
@@ -3270,9 +3372,9 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
     if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
         let detected = http_request_route_kind(args.buf, actual_len);
         // A TLS allocator may reuse the same pointer for a new HTTP exchange. Clear the prior
-        // admission before considering a non-exact Rustls candidate; otherwise an unrelated
-        // method could inherit the previous LLM route and its response would be copied as
-        // plaintext. Body-only continuations do not carry a method prefix and keep the admission.
+        // admission only for an unreadable buffer (revoke) or a real request-line shaped method.
+        // Body continuations—including INCOMPLETE alphanumeric runs that the method classifier
+        // cannot yet disambiguate—must keep the admission so SSL_read can still emit plaintext.
         let fresh_method = http_method_prefix(args.buf, actual_len);
         if fresh_method.is_none() || fresh_method == Some(true) {
             let _ = PLAINTEXT_TLS_SESSIONS.remove(&key);
@@ -3284,14 +3386,19 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
             return insert_tls_session(&key, detected, actual_len, now_boot_ns);
         }
         if fresh_method == Some(true) {
-            // A fresh unrecognised HTTP method is not enough to admit an entire TLS context on
-            // OpenSSL/plain-HTTP paths. Rustls CommonState observes the full request including
-            // WebSocket upgrades whose Upgrade/Connection headers often sit past the 64-byte
-            // hint snapshot (Authorization-first Codex requests). Admit those as candidates and
-            // let userspace validate the handshake / deflate negotiation.
-            return if args.api_kind == TLS_PLAINTEXT_API_RUSTLS
-                || http_websocket_upgrade_hint(args.buf, actual_len)
-            {
+            // Exact LLM/Tool path hashes are best-effort. Verified Agent TLS (Rustls, BoringSSL
+            // classic, OpenSSL-ex) must not depend on maintaining a global URL allowlist for every
+            // gateway prefix (e.g. /api/anthropic/v1/messages). Admit a bounded candidate session
+            // and let userspace Transport/LLM parsers accept or mark unparsed. WebSocket upgrades
+            // whose Upgrade/Connection headers sit past the 64-byte hint snapshot follow the same
+            // candidate path.
+            let admit_candidate = args.api_kind == TLS_PLAINTEXT_API_RUSTLS
+                || tls_api_is_ssl_family(args.api_kind)
+                || http_websocket_upgrade_hint(args.buf, actual_len);
+            return if admit_candidate {
+                if tls_api_is_ssl_family(args.api_kind) {
+                    bump_tls_profile_diagnostic(10);
+                }
                 insert_tls_session(
                     &key,
                     PLAINTEXT_HTTP_ROUTE_CANDIDATE,
@@ -3302,35 +3409,29 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
                 None
             };
         }
-        // Rustls' CommonState adapter observes application bytes before encryption/decryption,
-        // not necessarily the HTTP request line.  A WebSocket frame, a compressed continuation,
-        // or a body handed to the writer can therefore arrive without a route prefix.  Once the
-        // process-generation fence has admitted this Rustls target, retain a bounded candidate
-        // session and let the userspace Transport/LLM parser decide whether it is a model/tool
-        // exchange.  This is deliberately limited to the Rustls implementation-family ABI;
-        // OpenSSL/plain-HTTP paths remain exact-route gated below.
-        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
-            let existing = (fresh_method != Some(true))
-                .then(|| admitted_tls_session_route(&key, actual_len, now_boot_ns))
-                .flatten();
-            let route = existing.unwrap_or(PLAINTEXT_HTTP_ROUTE_CANDIDATE);
-            if route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
-                bump_tls_profile_diagnostic(10);
-            }
-            return if existing.is_some() {
-                Some(route)
-            } else {
-                insert_tls_session(&key, route, actual_len, now_boot_ns)
-            };
+        if let Some(route) = admitted_tls_session_route(&key, actual_len, now_boot_ns)
+            .filter(|route| valid_plaintext_capture_route(*route))
+        {
+            return Some(route);
         }
-        // A later write on an admitted keep-alive context may carry only a body/continuation.
-        return admitted_tls_session_route(&key, actual_len, now_boot_ns)
-            .filter(|route| valid_plaintext_route(*route));
+        // Rustls CommonState and split Classic/OpenSSL writes may observe body, HTTP/2
+        // frames, or a first record that is not a request-line. Verified-agent sessions
+        // must still open a bounded candidate; otherwise Claude's first hop (headers on
+        // one SSL_write, JSON/H2 on the next, or H2 frames with no POST prefix) is
+        // dropped before userspace can reassemble.
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS || tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(10);
+            return insert_tls_session(
+                &key,
+                PLAINTEXT_HTTP_ROUTE_CANDIDATE,
+                actual_len,
+                now_boot_ns,
+            );
+        }
+        return None;
     }
     admitted_tls_session_route(&key, actual_len, now_boot_ns).filter(|route| {
-        valid_plaintext_route(*route)
-            || (args.api_kind == TLS_PLAINTEXT_API_RUSTLS
-                && *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE)
+        valid_plaintext_route(*route) || *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE
     })
 }
 
@@ -3348,14 +3449,20 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
             bump_tls_profile_diagnostic(8);
         } else if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
             bump_tls_profile_diagnostic(13);
-        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC {
+        } else if tls_api_is_ssl_family(args.api_kind) {
             bump_tls_profile_diagnostic(18);
         }
         return 0;
     }
     let Some(route_kind) = tls_session_route(&args, actual_len, pid, cgroup_id) else {
+        // Route miss used to be silent for Classic/OpenSSL-ex, which made "uprobes fire but
+        // ssl=0 / no interactions" undiagnosable for gateway paths outside the exact allowlist.
         if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
             bump_tls_profile_diagnostic(9);
+        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
+            bump_tls_profile_diagnostic(14);
+        } else if tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(19);
         }
         return 0;
     };
@@ -3369,14 +3476,14 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
     if !capture_decision.selected() {
         if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
             bump_tls_profile_diagnostic(15);
-        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC {
+        } else if tls_api_is_ssl_family(args.api_kind) {
             bump_tls_profile_diagnostic(20);
         }
         return 0;
     }
     capture_payload_candidate(CAPTURE_PROBE_SSL);
     let bind = lookup_tls_ctx_bind(cgroup_id, pid, args.ssl_ptr);
-    let (bind_quality, socket_fd, socket_cookie, fd_generation) = match bind {
+    let (bind_quality, mut socket_fd, socket_cookie, fd_generation) = match bind {
         Some(value) => (
             value.bind_quality,
             value.fd as i32,
@@ -3385,6 +3492,9 @@ fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
         ),
         None => (TLS_BIND_QUALITY_UNBOUND, 0i32, 0u64, 0u32),
     };
+    if args.api_kind == TLS_PLAINTEXT_API_TCP && args.syscall_fd > 0 {
+        socket_fd = args.syscall_fd as i32;
+    }
     // Prefer a stable socket-derived identity when bound so rustls CommonState moves alias to one
     // stream. Unbound TLS contexts keep the observed SSL*/CommonState pointer as connection_id.
     let connection_id = if bind_quality >= TLS_BIND_QUALITY_COOKIE && socket_cookie != 0 {
@@ -3493,21 +3603,19 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
         .unwrap_or(HTTP_PREFIX_UNKNOWN);
     let detected = http_request_route_kind(buf as u64, len);
     match detected {
-        PLAINTEXT_HTTP_ROUTE_LLM | PLAINTEXT_HTTP_ROUTE_TOOL => {
+        PLAINTEXT_HTTP_ROUTE_LLM | PLAINTEXT_HTTP_ROUTE_TOOL | PLAINTEXT_HTTP_ROUTE_CANDIDATE => {
             route_kind = detected;
             let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
         }
         _ => {
-            // The TLS ClientHello tracepoint also calls this helper before the userspace
-            // reassembler sees HTTP request lines. Keep this hot path limited to the exact route
-            // hash gate; generic extension-method classification runs in the uprobe/userspace
-            // paths, where it cannot make the ClientHello program exceed verifier complexity.
-            if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
+            // ClientHello and body continuations are not POST request-lines. Keep an already
+            // admitted socket; otherwise fail closed so stdout/files stay off this probe.
+            if !valid_plaintext_capture_route(route_kind) {
                 return;
             }
         }
     }
-    if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
+    if !valid_plaintext_capture_route(route_kind) {
         return;
     }
 
@@ -3521,6 +3629,7 @@ fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
         api_kind: TLS_PLAINTEXT_API_TCP,
         route_kind,
         _pad: [0; 5],
+        syscall_fd: fd as u32,
     };
     let _ = emit_tls_plaintext(args, len);
 }
@@ -3575,6 +3684,53 @@ pub fn http_writev(ctx: TracePointContext) -> u32 {
         return 0;
     };
     let Ok(iov_count) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    if iov_ptr == 0 || iov_count == 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    for index in 0..4u64 {
+        if index >= iov_count {
+            break;
+        }
+        let mut iov = UserIovec { base: 0, len: 0 };
+        let address = iov_ptr.saturating_add(index * core::mem::size_of::<UserIovec>() as u64);
+        if unsafe {
+            bpf_probe_read_user(
+                &mut iov as *mut UserIovec as *mut c_void,
+                core::mem::size_of::<UserIovec>() as u32,
+                address as *const c_void,
+            )
+        } < 0
+        {
+            break;
+        }
+        try_plain_http_write(pid, fd, iov.base as *const u8, iov.len);
+    }
+    0
+}
+
+/// Python asyncio/httpx and a number of native HTTP clients use `sendmsg` for a
+/// socket write.  Treat the first bounded iovec entries exactly like writev so
+/// plain HTTP discovery does not depend on one libc send implementation.
+#[tracepoint]
+pub fn http_sendmsg(ctx: TracePointContext) -> u32 {
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(hdr) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    if hdr == 0 {
+        return 0;
+    }
+    let base = hdr as *const u8;
+    let Some(iov_ptr) = read_user_u64(unsafe { base.add(16) }) else {
+        return 0;
+    };
+    let Some(iov_count) = read_user_u64(unsafe { base.add(24) }) else {
         return 0;
     };
     if iov_ptr == 0 || iov_count == 0 {
@@ -4425,7 +4581,7 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
         let route_kind = unsafe { HTTP_SOCKS.get(&key) }
             .copied()
             .unwrap_or(HTTP_PREFIX_UNKNOWN);
-        if route_kind != PLAINTEXT_HTTP_ROUTE_LLM && route_kind != PLAINTEXT_HTTP_ROUTE_TOOL {
+        if !valid_plaintext_capture_route(route_kind) {
             let _ = HTTP_READ_ARGS.remove(&tgid);
             return 0;
         }
@@ -4439,6 +4595,7 @@ fn on_read_exit(ctx: &TracePointContext) -> u32 {
             api_kind: TLS_PLAINTEXT_API_TCP,
             route_kind,
             _pad: [0; 5],
+            syscall_fd: http_args.fd,
         };
         let _ = emit_tls_plaintext(args, ret as u64);
     }
