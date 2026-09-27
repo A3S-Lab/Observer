@@ -6,6 +6,10 @@ All notable changes to a3s-observer will be documented in this file.
 
 ### Added
 
+- Provider-reported token usage on completed `LlmInteraction` records, including input, output,
+  total, cached-input, cache-creation, and reasoning-output counters. Streaming usage is merged by
+  cumulative maximum per model call so repeated SSE/WebSocket events cannot inflate totals.
+
 - A provider-neutral workload attribution contract: `WorkloadIdentity` requires stable workload,
   deployment, immutable revision, logical replica, provider-unit, and node IDs. Each
   `WorkloadIdentityValue` is bounded to 128 ASCII bytes and rejects whitespace, control
@@ -22,6 +26,13 @@ All notable changes to a3s-observer will be documented in this file.
 This contract is the first slice of workload metrics support. Multi-replica Linux collection,
 resource/restart/availability measurements, lifecycle fixtures, and OTLP/Prometheus metric parity
 are not included yet.
+
+### Fixed
+
+- Keep quiescent Agent WebSocket protocol state for a bounded 24-hour window and recover from a
+  strongly framed JSON client message when the HTTP 101 handshake predates a Collector restart.
+  Fresh HTTP requests still reset reused Rustls pointers, and incomplete model exchanges retain
+  the shorter 90-second safety timeout.
 
 ## [0.11.0] — SecurityAction: privesc / injection / open-port
 

@@ -167,7 +167,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         Box::new(LogExporter)
     };
     let resolver = KubeResolver;
-    let mut collector = CollectorMeta::from_env(files, false, attached.len());
+    let mut collector = CollectorMeta::from_env(
+        super::FileFeatureFlags {
+            access: files,
+            delete: files,
+            read: false,
+        },
+        false,
+        attached.len(),
+    );
     collector.mode = "perf-kprobe-legacy".to_string();
     collector.enabled_features = vec![
         "exec".to_string(),
@@ -187,14 +195,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut report = tokio::time::interval(Duration::from_secs(60));
     report.tick().await;
     let mut stats = Stats::default();
-    super::emit_collector_heartbeat(
-        exporter.as_ref(),
-        &collector,
-        0,
-        &stats,
-        0,
-        exporter.output_drops(),
-    );
+    emit_legacy_heartbeat(exporter.as_ref(), &collector, 0, &stats, 0);
 
     loop {
         tokio::select! {
@@ -204,7 +205,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let _ = std::fs::write(&heartbeat_path, b"ok");
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
                 let dropped = map_drops + perf_lost.load(Ordering::Relaxed);
-                super::emit_collector_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped, exporter.output_drops());
+                emit_legacy_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped);
                 stats = Stats::default();
             }
             raw = rx.recv() => {
@@ -322,15 +323,14 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
                     .iter()
                     .any(|arg| arg[LEGACY_ARG_LEN - 1] != 0);
             let ppid = read_ppid(ev.pid);
-            EnrichedEvent {
-                // The UOS 4.19 exec perf ABI intentionally has no cgroup field. Passing zero
-                // keeps that proven ABI stable and lets the resolver fall back to /proc by pid.
-                identity: identity_for(resolver, ev.pid, 0, &ev.comm),
-                workload: resolver.resolve_workload(ev.pid, 0, 0),
-                observation: None,
-                process: Some(process_context(ev.pid, 0, &ev.comm)),
-                provider: None,
-                event: AgentEvent::ToolExec {
+            legacy_enriched(
+                identity_for(resolver, ev.pid, 0, &ev.comm),
+                resolver.resolve_workload(ev.pid, 0, 0),
+                Some(process_context(ev.pid, 0, &ev.comm)),
+                AgentEvent::ToolExec {
+                    // Linux 4.19 perf ABI has no kernel exec generation. Zero marks that absence.
+                    exec_id: 0,
+                    exec_id_exact: "0".to_string(),
                     pid: ev.pid,
                     ppid,
                     uid: ev.uid,
@@ -345,67 +345,59 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
                     observed_bytes: captured_bytes,
                     cwd: super::read_cwd(ev.pid),
                 },
-            }
+            )
         }
-        RawEvent::Exit(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-            observation: None,
-            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-            provider: None,
-            event: AgentEvent::ProcessExit {
+        RawEvent::Exit(ev) => legacy_enriched(
+            identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
+            Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
+            AgentEvent::ProcessExit {
                 pid: ev.pid,
                 exit_code: ev.exit_code,
                 signal: ev.signal,
             },
-        },
-        RawEvent::Connect(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-            observation: None,
-            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-            provider: None,
-            event: AgentEvent::Egress {
+        ),
+        RawEvent::Connect(ev) => legacy_enriched(
+            identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
+            Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
+            AgentEvent::Egress {
                 pid: ev.pid,
                 sni: None,
                 peer: peer_ip(&ev),
                 port: ev.port,
                 bytes: 0,
+                fd: None,
             },
-        },
+        ),
         RawEvent::File(ev) => {
             let path = cstr(&ev.path);
             if ev.flags == FILE_DELETE_FLAG {
-                EnrichedEvent {
-                    identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
-                    workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                    observation: None,
-                    process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-                    provider: None,
-                    event: AgentEvent::FileDelete { pid: ev.pid, path },
-                }
+                legacy_enriched(
+                    identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                    resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
+                    Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
+                    AgentEvent::FileDelete { pid: ev.pid, path },
+                )
             } else {
-                EnrichedEvent {
-                    identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
-                    workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-                    observation: None,
-                    process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-                    provider: None,
-                    event: AgentEvent::FileAccess {
+                legacy_enriched(
+                    identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+                    resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
+                    Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
+                    AgentEvent::FileAccess {
                         pid: ev.pid,
                         path,
                         write: true,
+                        access_mode: "write".to_string(),
                     },
-                }
+                )
             }
         }
-        RawEvent::Security(ev) => EnrichedEvent {
-            identity: identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
-            workload: resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
-            observation: None,
-            process: Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
-            provider: None,
-            event: AgentEvent::SecurityAction {
+        RawEvent::Security(ev) => legacy_enriched(
+            identity_for(resolver, ev.pid, ev.cgroup_id, &ev.comm),
+            resolver.resolve_workload(ev.pid, ev.cgroup_id, 0),
+            Some(process_context(ev.pid, ev.cgroup_id, &ev.comm)),
+            AgentEvent::SecurityAction {
                 pid: ev.pid,
                 kind: match ev.kind {
                     SEC_SETUID => "setuid-root",
@@ -415,7 +407,59 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
                 },
                 detail: ev.detail,
             },
-        },
+        ),
     };
-    emit(exporter, stats, enriched);
+    let ring = match &enriched.event {
+        AgentEvent::ToolExec { .. } => super::PipelineRing::Exec,
+        AgentEvent::ProcessExit { .. } => super::PipelineRing::Exit,
+        AgentEvent::Egress { .. } => super::PipelineRing::Connect,
+        AgentEvent::FileAccess { .. } => super::PipelineRing::FileAccess,
+        AgentEvent::FileDelete { .. } => super::PipelineRing::FileDelete,
+        AgentEvent::SecurityAction { .. } => super::PipelineRing::Security,
+        _ => super::PipelineRing::Security,
+    };
+    emit(exporter, stats, ring, enriched);
+}
+
+fn emit_legacy_heartbeat(
+    exporter: &dyn Exporter,
+    collector: &CollectorMeta,
+    interval_secs: u64,
+    stats: &Stats,
+    dropped: u64,
+) {
+    let event = super::collector_heartbeat(
+        collector,
+        interval_secs,
+        stats,
+        dropped,
+        exporter.output_drops(),
+        super::FileFilterHeartbeatSnapshot::default(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        false,
+    );
+    exporter.export(&event);
+}
+
+fn legacy_enriched(
+    identity: a3s_observer::Identity,
+    workload: Option<a3s_observer::WorkloadIdentity>,
+    process: Option<a3s_observer::ProcessContext>,
+    event: AgentEvent,
+) -> EnrichedEvent {
+    EnrichedEvent {
+        timing: None,
+        capture_decision: None,
+        identity,
+        workload,
+        observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
+        process,
+        provider: None,
+        event,
+    }
 }

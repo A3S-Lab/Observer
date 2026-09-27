@@ -9,8 +9,20 @@ publish = false
 aya-ebpf = "0.1"
 a3s-observer-common = { path = "../a3s-observer-common" }
 
+[features]
+# The probe is an eBPF object, not a host executable. Keep it out of ordinary workspace builds;
+# the collector's aya-build step opts into this feature explicitly when embedding the object.
+default = []
+build-ebpf = []
+
 # Bin name differs from the package name so aya-build's target-dir
 # (OUT_DIR/<package>) and copy destination (OUT_DIR/<bin>) don't collide.
 [[bin]]
 name = "probes"
 path = "src/main.rs"
+required-features = ["build-ebpf"]
+# The probe crate is a no_std/no_main eBPF object. Cargo's host test harness cannot link it as an
+# executable (there is intentionally no `main`); unit/ABI tests live in the common and collector
+# crates, while the collector build still compiles this target into the BPF object.
+test = false
+bench = false

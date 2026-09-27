@@ -14,8 +14,13 @@ fn install_verified_legacy_object() -> anyhow::Result<()> {
     if !source.is_file() {
         anyhow::bail!("A3S_LEGACY_BPF_OBJECT is not a file: {}", source.display());
     }
-    let destination = PathBuf::from(std::env::var("OUT_DIR")?).join("probes-legacy");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let destination = out_dir.join("probes-legacy");
     std::fs::copy(source, &destination)?;
+    // src/bin/enforce.rs still embeds the CO-RE object name. The legacy feature build does not
+    // ship that binary; give the typecheck the same verified object so the package build can
+    // compile the collector target without a BTF toolchain.
+    std::fs::copy(source, out_dir.join("probes"))?;
     println!("cargo:rerun-if-changed={}", source.display());
     Ok(())
 }
@@ -35,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             name: "a3s-observer-ebpf",
             root_dir: &ebpf_dir,
             no_default_features: false,
-            features: &[],
+            features: &["build-ebpf"],
         }],
         Toolchain::default(), // Nightly
     )?;

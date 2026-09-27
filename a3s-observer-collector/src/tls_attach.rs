@@ -1,0 +1,2600 @@
+//! Runtime TLS-library and static executable discovery for selected Agent processes.
+//!
+//! Products, CLI versions, provider URLs and whole-file fingerprints are not discovery gates.
+//! Exported TLS symbols are preferred; stripped static binaries are matched against bounded TLS
+//! implementation-family anchors and call-pair relations, then validated by real plaintext framing.
+
+use anyhow::Context as _;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const SIGNATURE_FAMILY_DOCUMENT: &str = include_str!("tls-signature-families.json");
+const RUNTIME_SELECTION_HINT_DOCUMENT: &str = include_str!("tls-runtime-selection-hints.json");
+/// The base static-signature registry is intentionally scoped to implementation/ABI families.
+/// Product or CLI-version selectors belong to a separately reviewed capability extension and
+/// must never become an implicit attach gate in this module.
+const TLS_SIGNATURE_FAMILY_SCHEMA: &str = "anysentry.tls_signature_families.v2";
+const TLS_SIGNATURE_VERSION_POLICY: &str = "implementation-family";
+const TLS_SIGNATURE_EXTENSION_POLICY: &str = "explicit-capability-registry";
+const RUNTIME_SELECTION_HINT_SCHEMA: &str = "anysentry.tls_runtime_selection_hints.v1";
+const RUNTIME_SELECTION_HINT_PURPOSE: &str = "discovery-hint-only";
+const MAX_RUNTIME_SELECTION_HINTS: usize = 64;
+const MAX_RUNTIME_SELECTION_PATTERNS: usize = 128;
+const MAX_RUNTIME_SELECTION_TEXT: usize = 128;
+const MAX_RUNTIME_SELECTION_INPUT_BYTES: usize =
+    MAX_RUNTIME_SELECTION_PATTERNS * (MAX_RUNTIME_SELECTION_TEXT + 1);
+const STATIC_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ELF_PROGRAM_HEADERS: usize = 128;
+const MAX_ANCHOR_MATCHES: usize = 128;
+const MAX_STATIC_CANDIDATES_PER_FAMILY: usize = 4;
+/// Write-prefix hits that the read-relative delta relation missed. Claude/BoringSSL ships
+/// several `SSL_write` clones; the first application write often uses an unpaired copy.
+const MAX_ADDITIONAL_STATIC_WRITES: usize = 16;
+/// `SSL_PROTOCOL_METHOD::write_app_data` slots discovered from a classic `SSL_write` that
+/// calls `[method+0x48]`. TLS+DTLS is the expected maximum.
+const MAX_PROTOCOL_METHOD_WRITES: usize = 4;
+/// Compilation-unit window from the public `SSL_write` clone to its method-table write.
+const PROTOCOL_METHOD_ANCHOR_WINDOW: u64 = 2 * 1024 * 1024;
+const PROTOCOL_METHOD_TABLE_SPAN: u64 = 0x50;
+const PROTOCOL_METHOD_WRITE_SLOT: usize = 0x48;
+const CLASSIC_WRITE_METHOD_SCAN: usize = 512;
+const WRITE_APP_DATA_PROLOGUE: [u8; 4] = [0x55, 0x48, 0x89, 0xe5];
+const OUT_NEEDS_HANDSHAKE_FALSE: [u8; 3] = [0xc6, 0x06, 0x00];
+const MAX_STABLE_MOUNT_ROOTS: usize = 1_024;
+const MAX_ATTACH_FAILURES: usize = 4_096;
+const MAX_PROC_NAMESPACE_SCAN: usize = 32_768;
+const ATTACH_RETRY_DELAYS_MS: [u64; 10] =
+    [25, 50, 100, 200, 400, 800, 1_600, 5_000, 15_000, 30_000];
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TlsAbi {
+    Classic,
+    OpenSslEx,
+    RustlsPayload,
+    RustlsOutboundChunks,
+    BoringSslAppData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolFamily {
+    OpenSsl,
+    GnuTls,
+    Nss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeRole {
+    AgentRoot,
+    NetworkRuntime,
+}
+
+impl RuntimeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentRoot => "agent_root",
+            Self::NetworkRuntime => "network_runtime",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TlsOffsetPair {
+    pub read_offset: u64,
+    pub write_offset: u64,
+    pub read_abi: TlsAbi,
+    pub write_abi: TlsAbi,
+}
+
+#[derive(Clone, Debug)]
+pub enum TlsAttachKind {
+    Symbols(SymbolFamily),
+    Offsets {
+        read_offset: u64,
+        write_offset: u64,
+        read_abi: TlsAbi,
+        write_abi: TlsAbi,
+        additional_pairs: Vec<TlsOffsetPair>,
+        additional_write_offsets: Vec<u64>,
+        app_data_write_offsets: Vec<u64>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct TlsAttachPlan {
+    pub key: String,
+    pub pid: Option<i32>,
+    pub path: PathBuf,
+    pub product: String,
+    pub runtime_role: RuntimeRole,
+    pub transport_scope: String,
+    pub excluded_transport_scope: Option<String>,
+    pub kind: TlsAttachKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticSignatureFamily {
+    family_id: String,
+    read_prefix: Vec<u8>,
+    write_prefix: Vec<u8>,
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+    write_after_read: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticDiscoveryMatch {
+    family_id: String,
+    pairs: Vec<TlsOffsetPair>,
+    additional_write_offsets: Vec<u64>,
+    app_data_write_offsets: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct AttachFailure {
+    attempts: usize,
+    next_retry_at: Instant,
+    last_failed_at: Instant,
+}
+
+/// Cumulative attachment health.  A failed/unsupported attach is an explicit coverage gap; it
+/// never authorizes a guessed offset or suppresses the independent KernelFact lane.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TlsAttachMetrics {
+    pub attempted: u64,
+    pub attached: u64,
+    pub failed: u64,
+    pub rejected: u64,
+    pub retry_scheduled: u64,
+    pub failure_evictions: u64,
+}
+
+/// A process-generation fence for a PID that has already been admitted as an Agent runtime.
+///
+/// Process names and argv are mutable (Tokio/Rustls workers routinely rename their threads), and
+/// the control-plane cgroup snapshot can legitimately lag while a CLI is idle. Retaining the
+/// positive identity until the process generation ends avoids dropping every later TLS turn. The
+/// executable inode and `/proc/<pid>/stat` start time make that retention safe across PID reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedRuntimeFence {
+    executable_dev: u64,
+    executable_ino: u64,
+    start_time_ticks: u64,
+    cgroup_id: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct TlsAttachManager {
+    attached: HashSet<String>,
+    rejected: HashSet<String>,
+    attach_failures: HashMap<String, AttachFailure>,
+    verified_processes: HashMap<i32, RuntimeRole>,
+    verified_runtime_fences: HashMap<i32, VerifiedRuntimeFence>,
+    scope_verified_processes: HashSet<i32>,
+    static_discovery_cache: HashMap<(u64, u64), Vec<StaticDiscoveryMatch>>,
+    stable_mount_roots: HashMap<u64, i32>,
+    process_patterns: Vec<String>,
+    static_targets: Vec<PathBuf>,
+    explicit_target: Option<PathBuf>,
+    deferred_stopped_pids: HashSet<i32>,
+    recent_runnable_pids: HashMap<i32, Instant>,
+    metrics: TlsAttachMetrics,
+}
+
+impl TlsAttachManager {
+    pub fn from_env(ssl_setting: &str) -> Self {
+        // These product-labelled values are declarative runtime discovery hints only.  They do
+        // not select a TLS ABI, authorize plaintext, or identify a LogicalAgent.  The actual
+        // Agent Scope/capture decision remains control-plane and generation fenced.
+        let mut process_patterns = runtime_selection_hint_patterns();
+        if let Ok(extra) = std::env::var("A3S_OBSERVER_TLS_PROCESS_PATTERNS") {
+            append_extra_runtime_selection_patterns(&mut process_patterns, &extra);
+        }
+        process_patterns.sort();
+        process_patterns.dedup();
+        let explicit_target = ssl_setting
+            .contains('/')
+            .then(|| PathBuf::from(ssl_setting));
+        let static_targets = std::env::var("A3S_OBSERVER_TLS_STATIC_TARGETS")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Self {
+            attached: HashSet::new(),
+            rejected: HashSet::new(),
+            attach_failures: HashMap::new(),
+            verified_processes: HashMap::new(),
+            verified_runtime_fences: HashMap::new(),
+            scope_verified_processes: HashSet::new(),
+            static_discovery_cache: HashMap::new(),
+            stable_mount_roots: HashMap::new(),
+            process_patterns,
+            static_targets,
+            explicit_target,
+            deferred_stopped_pids: HashSet::new(),
+            recent_runnable_pids: HashMap::new(),
+            metrics: TlsAttachMetrics::default(),
+        }
+    }
+
+    pub fn discover(&mut self) -> Vec<TlsAttachPlan> {
+        let mut plans = Vec::new();
+        if let Some(path) = self.explicit_target.clone() {
+            if let Some(plan) = self.plan_for_explicit(path) {
+                plans.push(plan);
+            }
+        }
+        for path in self.static_targets.clone() {
+            plans.extend(self.plans_for_static_target(path));
+        }
+
+        let Ok(proc_entries) = fs::read_dir("/proc") else {
+            return plans;
+        };
+        let mut verified_processes = HashMap::new();
+        for entry in proc_entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Some(runtime_role) = self.runtime_role(pid) else {
+                continue;
+            };
+            verified_processes.insert(pid, runtime_role);
+            self.remember_verified_runtime(pid);
+            plans.extend(self.plans_for_process(pid, runtime_role));
+        }
+        self.scope_verified_processes
+            .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        for pid in self.scope_verified_processes.clone() {
+            verified_processes.insert(pid, RuntimeRole::AgentRoot);
+            // A cgroup scope is authoritative for its current membership. If the process also
+            // carries a registry-matched Agent identity, retain that stronger process-generation
+            // fact when the next scope snapshot is briefly empty.
+            if self.process_matches_patterns(pid) {
+                self.remember_verified_runtime(pid);
+            }
+            plans.extend(self.plans_for_process(pid, RuntimeRole::AgentRoot));
+        }
+        self.retain_verified_runtime(&mut verified_processes);
+        self.verified_processes = verified_processes;
+        let mut seen = HashSet::new();
+        plans.retain(|plan| self.plan_is_available(&plan.key) && seen.insert(plan.key.clone()));
+        plans
+    }
+
+    pub fn take_runnable_deferred_pids(&mut self) -> Vec<i32> {
+        let ready = drain_runnable_deferred_pids(
+            &mut self.deferred_stopped_pids,
+            process_is_stopped,
+            |pid| Path::new(&format!("/proc/{pid}")).exists(),
+        );
+        let now = Instant::now();
+        for pid in &ready {
+            self.recent_runnable_pids.insert(*pid, now);
+        }
+        self.expire_recent_runnable(now);
+        if !ready.is_empty() {
+            tracing::info!(pids = ?ready, "thawed stopped Agent TLS pids");
+        }
+        ready
+    }
+
+    pub fn allowlist_hold_pids(&self) -> Vec<i32> {
+        self.deferred_stopped_pids
+            .iter()
+            .copied()
+            .chain(self.recent_runnable_pids.keys().copied())
+            .collect()
+    }
+
+    pub fn recently_runnable(&self, pid: i32) -> bool {
+        self.recent_runnable_pids.contains_key(&pid)
+    }
+
+    fn expire_recent_runnable(&mut self, now: Instant) {
+        const RECENT_RUNNABLE_TTL: Duration = Duration::from_secs(2);
+        self.recent_runnable_pids.retain(|pid, seen| {
+            Path::new(&format!("/proc/{pid}")).exists()
+                && now.saturating_duration_since(*seen) < RECENT_RUNNABLE_TTL
+        });
+    }
+
+    pub fn discover_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
+        let Some(runtime_role) = self.runtime_role(pid) else {
+            self.verified_processes.remove(&pid);
+            self.retain_one_verified_runtime(pid);
+            return Vec::new();
+        };
+        self.verified_processes.insert(pid, runtime_role);
+        self.remember_verified_runtime(pid);
+        self.plans_for_process(pid, runtime_role)
+            .into_iter()
+            .filter(|plan| self.plan_is_available(&plan.key))
+            .collect()
+    }
+
+    /// Control-plane identity/capture evidence is authoritative for scope membership. This path
+    /// lets any candidate/confirmed Agent runtime enter TLS discovery without adding its product
+    /// name to the Collector. URL and protocol semantics remain userspace-only.
+    pub fn discover_verified_pid(&mut self, pid: i32) -> Vec<TlsAttachPlan> {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            self.verified_processes.remove(&pid);
+            return Vec::new();
+        }
+        let runtime_role = RuntimeRole::AgentRoot;
+        self.verified_processes.insert(pid, runtime_role);
+        if self.process_matches_patterns(pid) {
+            self.remember_verified_runtime(pid);
+        }
+        self.plans_for_process(pid, runtime_role)
+            .into_iter()
+            .filter(|plan| self.plan_is_available(&plan.key))
+            .collect()
+    }
+
+    pub fn mark_attached(&mut self, key: String, _pid: Option<i32>) {
+        self.metrics.attempted = self.metrics.attempted.saturating_add(1);
+        self.attach_failures.remove(&key);
+        self.attached.insert(key);
+        self.metrics.attached = self.metrics.attached.saturating_add(1);
+    }
+
+    pub fn mark_attach_failed(&mut self, key: String, reason: &str) {
+        self.metrics.attempted = self.metrics.attempted.saturating_add(1);
+        // The exported-symbol lane is speculative for interpreter main ELFs. Once the loader has
+        // proved that no complete OpenSSL read/write pair exists, repeating the same symbol lookup
+        // for an immutable inode cannot recover; mapped-library and static-family lanes remain
+        // independent. Path/proc-root and uprobe lifecycle failures stay retryable below.
+        if reason == "no complete OpenSSL read/write pair attached" {
+            self.metrics.failed = self.metrics.failed.saturating_add(1);
+            self.mark_rejected(key, reason);
+            return;
+        }
+        let now = Instant::now();
+        let attempts = self
+            .attach_failures
+            .get(&key)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let delay_index = attempts
+            .saturating_sub(1)
+            .min(ATTACH_RETRY_DELAYS_MS.len() - 1);
+        if !self.attach_failures.contains_key(&key)
+            && self.attach_failures.len() >= MAX_ATTACH_FAILURES
+        {
+            if let Some(oldest) = self
+                .attach_failures
+                .iter()
+                .min_by_key(|(_, failure)| failure.last_failed_at)
+                .map(|(failure_key, _)| failure_key.clone())
+            {
+                self.attach_failures.remove(&oldest);
+                self.metrics.failure_evictions = self.metrics.failure_evictions.saturating_add(1);
+            }
+        }
+        self.attach_failures.insert(
+            key.clone(),
+            AttachFailure {
+                attempts,
+                next_retry_at: now + Duration::from_millis(ATTACH_RETRY_DELAYS_MS[delay_index]),
+                last_failed_at: now,
+            },
+        );
+        self.metrics.failed = self.metrics.failed.saturating_add(1);
+        self.metrics.retry_scheduled = self.metrics.retry_scheduled.saturating_add(1);
+        // Keep enough verifier output to reach the terminal rejection reason while remaining
+        // bounded.  A 2 KiB prefix ends in the middle of the map-value copy for TLS uprobes and
+        // makes a targeted verifier fix impossible to diagnose.
+        const MAX_REASON_BYTES: usize = 16 * 1024;
+        let reason_summary = if reason.len() > MAX_REASON_BYTES {
+            format!("{}...[truncated]", &reason[..MAX_REASON_BYTES])
+        } else {
+            reason.to_string()
+        };
+        tracing::warn!(
+            target = %key,
+            reason = %reason_summary,
+            attempts,
+            retry_ms = ATTACH_RETRY_DELAYS_MS[delay_index],
+            "TLS target attach failed; bounded retry remains eligible"
+        );
+    }
+
+    pub fn mark_rejected(&mut self, key: String, reason: &str) {
+        if self.rejected.insert(key.clone()) {
+            self.metrics.rejected = self.metrics.rejected.saturating_add(1);
+            tracing::warn!(target = %key, reason, "TLS target rejected; plaintext capture remains unavailable");
+        }
+    }
+
+    pub fn attached_count(&self) -> usize {
+        self.attached.len()
+    }
+
+    pub fn metrics(&self) -> TlsAttachMetrics {
+        self.metrics
+    }
+
+    fn plan_is_available(&self, key: &str) -> bool {
+        !self.attached.contains(key)
+            && !self.rejected.contains(key)
+            && self
+                .attach_failures
+                .get(key)
+                .is_none_or(|failure| failure.next_retry_at <= Instant::now())
+    }
+
+    /// Replace the product-neutral Agent Scope membership published by the co-located identity
+    /// forwarder. Named/static discovery remains independent and is merged again by `discover`.
+    pub fn set_scope_verified_pids(&mut self, pids: HashSet<i32>) {
+        self.scope_verified_processes = pids
+            .into_iter()
+            .filter(|pid| *pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
+            .collect();
+    }
+
+    pub fn verified_pids(&mut self) -> Vec<i32> {
+        self.scope_verified_processes
+            .retain(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        let mut desired = self
+            .scope_verified_processes
+            .iter()
+            .copied()
+            .map(|pid| (pid, RuntimeRole::AgentRoot))
+            .collect::<HashMap<_, _>>();
+        self.retain_verified_runtime(&mut desired);
+        self.expire_recent_runnable(Instant::now());
+        // SIGSTOP → CONT → execve(claude.exe) changes the generation fence. Keep the live PID on
+        // the plaintext allowlist so inode probes already on the CLI binary are not gated out.
+        let hold_pids: Vec<i32> = self
+            .deferred_stopped_pids
+            .iter()
+            .copied()
+            .chain(self.recent_runnable_pids.keys().copied())
+            .chain(scan_named_agent_runtime_pids())
+            .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            .collect();
+        for pid in hold_pids {
+            desired.insert(pid, RuntimeRole::AgentRoot);
+            self.remember_verified_runtime(pid);
+        }
+        self.verified_processes = desired;
+        self.verified_processes.keys().copied().collect()
+    }
+
+    fn remember_verified_runtime(&mut self, pid: i32) {
+        if let Some(fence) = verified_runtime_fence(pid) {
+            self.verified_runtime_fences.insert(pid, fence);
+        }
+    }
+
+    fn retain_one_verified_runtime(&mut self, pid: i32) {
+        let Some(fence) = self.verified_runtime_fences.get(&pid).copied() else {
+            return;
+        };
+        if !verified_runtime_fence(pid).is_some_and(|current| current == fence) {
+            self.verified_runtime_fences.remove(&pid);
+        }
+    }
+
+    /// Merge generation-fenced named runtimes back into the current discovery result. The optional
+    /// output map keeps the role in one place for `discover`; `verified_pids` only needs the side
+    /// effect on `self.verified_processes`.
+    fn retain_verified_runtime(&mut self, output: &mut HashMap<i32, RuntimeRole>) {
+        let retained = self
+            .verified_runtime_fences
+            .iter()
+            .filter_map(|(pid, fence)| {
+                verified_runtime_fence(*pid)
+                    .is_some_and(|current| current == *fence)
+                    .then_some(*pid)
+            })
+            .collect::<Vec<_>>();
+        let retained_set = retained.iter().copied().collect::<HashSet<_>>();
+        self.verified_runtime_fences
+            .retain(|pid, _| retained_set.contains(pid));
+        for pid in retained {
+            output.insert(pid, RuntimeRole::AgentRoot);
+        }
+    }
+
+    pub fn is_named_agent_runtime_pid(&self, pid: i32) -> bool {
+        self.process_matches_patterns(pid)
+    }
+
+    fn runtime_role(&self, pid: i32) -> Option<RuntimeRole> {
+        if self.process_matches_patterns(pid) {
+            return Some(RuntimeRole::AgentRoot);
+        }
+        let mut current = pid;
+        for _ in 0..6 {
+            if current <= 1 {
+                break;
+            }
+            // Dify provider/tool workers are separate runtimes below the plugin daemon. They stay
+            // in the same bounded Agent Scope; userspace content classification separates model,
+            // tool and unrelated TLS streams without a URL allowlist.
+            if process_contains_pattern(current, "dify-plugin-daemon") {
+                return Some(RuntimeRole::NetworkRuntime);
+            }
+            // Codex may delegate network work to this exact packaged runtime. Do not inherit
+            // trust to arbitrary shell/git/python descendants of the Agent root.
+            if current == pid
+                && process_matches_trusted_network_runtime(pid)
+                && ancestor_contains_pattern(pid, "codex")
+            {
+                return Some(RuntimeRole::NetworkRuntime);
+            }
+            let Some(parent) = process_parent_pid(current) else {
+                break;
+            };
+            if parent == current {
+                break;
+            }
+            current = parent;
+        }
+        None
+    }
+
+    fn process_matches_patterns(&self, pid: i32) -> bool {
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter_map(|part| std::str::from_utf8(part).ok())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        matches_selected_agent_text(&comm, &cmdline, &self.process_patterns)
+    }
+
+    fn plans_for_process(&mut self, pid: i32, runtime_role: RuntimeRole) -> Vec<TlsAttachPlan> {
+        // Uprobes installed while a lab/runtime has the task SIGSTOP'd can be marked attached
+        // and then miss the first SSL_write after SIGCONT. Defer planning until the task is
+        // runnable so exec-retry can attach against a live generation.
+        if process_is_stopped(pid) {
+            if self.deferred_stopped_pids.insert(pid) {
+                tracing::info!(
+                    pid,
+                    runtime_role = runtime_role.as_str(),
+                    "deferred Agent TLS attach until task is runnable"
+                );
+            }
+            return Vec::new();
+        }
+        self.deferred_stopped_pids.remove(&pid);
+        let mut plans = Vec::new();
+        let exe_probe_path = PathBuf::from(format!("/proc/{pid}/exe"));
+        if let Ok(real_exe) = fs::read_link(&exe_probe_path) {
+            plans.extend(self.plans_for_executable(pid, &exe_probe_path, &real_exe, runtime_role));
+        }
+
+        let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+        let mut seen = HashSet::<(u64, u64)>::new();
+        for line in maps.lines() {
+            let Some(mapped) = line.split_whitespace().last() else {
+                continue;
+            };
+            if !mapped.starts_with('/') {
+                continue;
+            }
+            let mapped = mapped.strip_suffix(" (deleted)").unwrap_or(mapped);
+            let family = classify_library(mapped);
+            let Some(family) = family else {
+                continue;
+            };
+            let rooted =
+                PathBuf::from(format!("/proc/{pid}/root")).join(mapped.trim_start_matches('/'));
+            let Ok(metadata) = fs::metadata(&rooted) else {
+                continue;
+            };
+            if !seen.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            let key = format!(
+                "global:dev:{}:ino:{}:symbols:{family:?}",
+                metadata.dev(),
+                metadata.ino()
+            );
+            let stable_path = self
+                .stable_executable_probe_path(pid, &rooted, Path::new(mapped), &metadata)
+                .unwrap_or(rooted);
+            plans.push(TlsAttachPlan {
+                key,
+                pid: None,
+                path: stable_path,
+                product: "mapped-tls-library".to_string(),
+                runtime_role,
+                transport_scope: format!("{family:?}").to_ascii_lowercase(),
+                excluded_transport_scope: None,
+                kind: TlsAttachKind::Symbols(family),
+            });
+        }
+        plans
+    }
+
+    fn plans_for_executable(
+        &mut self,
+        pid: i32,
+        probe_path: &Path,
+        real_exe: &Path,
+        runtime_role: RuntimeRole,
+    ) -> Vec<TlsAttachPlan> {
+        let Ok(metadata) = fs::metadata(probe_path) else {
+            return Vec::new();
+        };
+        let Some(file_name) = real_exe.file_name() else {
+            return Vec::new();
+        };
+        let basename = file_name.to_string_lossy().to_ascii_lowercase();
+        let identity = format!("pid:{pid}:dev:{}:ino:{}", metadata.dev(), metadata.ino());
+        let mut plans = Vec::new();
+        let cache_key = (metadata.dev(), metadata.ino());
+        let static_probe_path = self
+            .stable_executable_probe_path(pid, probe_path, real_exe, &metadata)
+            .unwrap_or_else(|| probe_path.to_path_buf());
+        let static_matches = if is_interpreter_or_shell(&basename) {
+            Vec::new()
+        } else if let Some(cached) = self.static_discovery_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            match discover_static_signature_matches(&static_probe_path) {
+                Ok(matches) => {
+                    self.static_discovery_cache
+                        .insert(cache_key, matches.clone());
+                    matches
+                }
+                Err(error) => {
+                    self.mark_rejected(
+                        format!("{identity}:static-discovery"),
+                        &format!("static_signature_discovery_failed:{error}"),
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        for discovery in static_matches {
+            // Inode-wide first so a newly exec'd CLI is covered before its own PID is planned.
+            // Process-scoped second so CONT/exec-retry can still attach a live generation.
+            plans.push(static_discovery_plan(
+                &static_probe_path,
+                &metadata,
+                discovery.clone(),
+                runtime_role,
+                None,
+            ));
+            plans.push(static_discovery_plan(
+                &static_probe_path,
+                &metadata,
+                discovery,
+                runtime_role,
+                Some(pid),
+            ));
+        }
+
+        // Interpreters commonly export OpenSSL symbols from the main ELF even when no separate
+        // libssl mapping exists. This low-maintenance lane may coexist with a static-family
+        // candidate; attach failures are isolated by plan key.
+        if matches!(basename.as_str(), "node" | "nodejs")
+            || basename.starts_with("python3.")
+            || basename == "python"
+        {
+            plans.push(TlsAttachPlan {
+                key: format!(
+                    "global:dev:{}:ino:{}:main-exported-openssl",
+                    metadata.dev(),
+                    metadata.ino()
+                ),
+                pid: None,
+                path: static_probe_path,
+                product: format!("{basename}-main-elf"),
+                runtime_role,
+                transport_scope: "main-executable-exported-openssl".to_string(),
+                excluded_transport_scope: None,
+                kind: TlsAttachKind::Symbols(SymbolFamily::OpenSsl),
+            });
+        }
+
+        if plans.is_empty() && !is_interpreter_or_shell(&basename) {
+            self.mark_rejected(
+                format!("{identity}:static-signature-not-found"),
+                "static_tls_family_not_discovered",
+            );
+        }
+        plans
+    }
+
+    fn stable_executable_probe_path(
+        &mut self,
+        pid: i32,
+        probe_path: &Path,
+        real_exe: &Path,
+        expected: &fs::Metadata,
+    ) -> Option<PathBuf> {
+        if real_exe.is_absolute() && same_file_identity(real_exe, expected) {
+            return Some(real_exe.to_path_buf());
+        }
+        let relative = real_exe.strip_prefix("/").ok()?;
+        let mount_namespace = fs::metadata(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|metadata| metadata.ino());
+        if let Some(namespace) = mount_namespace {
+            if let Some(root_pid) = self.stable_mount_roots.get(&namespace).copied() {
+                let rooted = PathBuf::from(format!("/proc/{root_pid}/root")).join(relative);
+                if same_file_identity(&rooted, expected) {
+                    return Some(rooted);
+                }
+                self.stable_mount_roots.remove(&namespace);
+            }
+            if let Some(root_pid) = stable_mount_namespace_root(pid, relative, expected) {
+                if !self.stable_mount_roots.contains_key(&namespace)
+                    && self.stable_mount_roots.len() >= MAX_STABLE_MOUNT_ROOTS
+                {
+                    if let Some(oldest_namespace) = self.stable_mount_roots.keys().next().copied() {
+                        self.stable_mount_roots.remove(&oldest_namespace);
+                    }
+                }
+                self.stable_mount_roots.insert(namespace, root_pid);
+                return Some(PathBuf::from(format!("/proc/{root_pid}/root")).join(relative));
+            }
+        }
+        stable_executable_probe_path(pid, probe_path, real_exe, expected)
+    }
+
+    fn plans_for_static_target(&mut self, path: PathBuf) -> Vec<TlsAttachPlan> {
+        let Ok(metadata) = fs::metadata(&path) else {
+            return Vec::new();
+        };
+        let cache_key = (metadata.dev(), metadata.ino());
+        let matches = if let Some(cached) = self.static_discovery_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            match discover_static_signature_matches(&path) {
+                Ok(matches) => {
+                    self.static_discovery_cache
+                        .insert(cache_key, matches.clone());
+                    matches
+                }
+                Err(error) => {
+                    self.mark_rejected(
+                        format!(
+                            "global:dev:{}:ino:{}:static-target",
+                            metadata.dev(),
+                            metadata.ino()
+                        ),
+                        &format!("static_signature_discovery_failed:{error}"),
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        let mut plans = matches
+            .into_iter()
+            .map(|discovery| {
+                static_discovery_plan(&path, &metadata, discovery, RuntimeRole::AgentRoot, None)
+            })
+            .collect::<Vec<_>>();
+        if let Some(family) = classify_library(path.to_string_lossy().as_ref()) {
+            plans.push(TlsAttachPlan {
+                key: format!(
+                    "global:dev:{}:ino:{}:symbols:{family:?}",
+                    metadata.dev(),
+                    metadata.ino()
+                ),
+                pid: None,
+                path,
+                product: "static-tls-library".to_string(),
+                runtime_role: RuntimeRole::AgentRoot,
+                transport_scope: format!("{family:?}").to_ascii_lowercase(),
+                excluded_transport_scope: None,
+                kind: TlsAttachKind::Symbols(family),
+            });
+        }
+        plans
+    }
+
+    fn plan_for_explicit(&mut self, path: PathBuf) -> Option<TlsAttachPlan> {
+        let metadata = fs::metadata(&path).ok()?;
+        let family =
+            classify_library(path.to_string_lossy().as_ref()).unwrap_or(SymbolFamily::OpenSsl);
+        Some(TlsAttachPlan {
+            key: format!(
+                "explicit:dev:{}:ino:{}:{family:?}",
+                metadata.dev(),
+                metadata.ino()
+            ),
+            pid: None,
+            path,
+            product: "explicit-tls-target".to_string(),
+            runtime_role: RuntimeRole::AgentRoot,
+            transport_scope: format!("{family:?}").to_ascii_lowercase(),
+            excluded_transport_scope: None,
+            kind: TlsAttachKind::Symbols(family),
+        })
+    }
+}
+
+fn static_discovery_plan(
+    path: &Path,
+    metadata: &fs::Metadata,
+    discovery: StaticDiscoveryMatch,
+    runtime_role: RuntimeRole,
+    pid: Option<i32>,
+) -> TlsAttachPlan {
+    let mut pairs = discovery.pairs.into_iter();
+    let primary = pairs
+        .next()
+        .expect("static discovery matches always contain a primary pair");
+    TlsAttachPlan {
+        key: format!(
+            "{}dev:{}:ino:{}:static-family:{}",
+            pid.map(|value| format!("pid:{value}:")).unwrap_or_default(),
+            metadata.dev(),
+            metadata.ino(),
+            discovery.family_id,
+        ),
+        pid,
+        path: path.to_path_buf(),
+        product: format!("tls-family:{}", discovery.family_id),
+        runtime_role,
+        transport_scope: "static-abi-discovery".to_string(),
+        excluded_transport_scope: None,
+        kind: TlsAttachKind::Offsets {
+            read_offset: primary.read_offset,
+            write_offset: primary.write_offset,
+            read_abi: primary.read_abi,
+            write_abi: primary.write_abi,
+            additional_pairs: pairs.collect(),
+            additional_write_offsets: discovery.additional_write_offsets,
+            app_data_write_offsets: discovery.app_data_write_offsets,
+        },
+    }
+}
+
+fn matches_selected_agent_text(comm: &str, cmdline: &str, process_patterns: &[String]) -> bool {
+    // Node running as PID 1 can retain `MainThread` in /proc/<pid>/comm even after Pi sets
+    // process.title. The title still replaces argv in cmdline, so admit the exact `pi` title
+    // without adding a broad `pi` substring pattern that would match unrelated Python processes.
+    let mut argv = cmdline.split_whitespace();
+    let executable = argv
+        .next()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let node_entrypoint = argv
+        .next()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let exact_node_pi = matches!(executable, "node" | "nodejs") && node_entrypoint == "pi";
+    matches!(comm, "codex" | "claude" | "claude.exe" | "pi")
+        || cmdline.trim() == "pi"
+        || exact_node_pi
+        || process_patterns
+            .iter()
+            .any(|pattern| comm.contains(pattern.as_str()) || cmdline.contains(pattern.as_str()))
+}
+
+/// Load the small built-in runtime hint catalogue.  Hints are intentionally separate from the
+/// TLS implementation-family registry: they only reduce the set of `/proc` entries considered
+/// for discovery and can never authorize a probe by themselves.  A malformed catalogue fails
+/// closed to scope-driven discovery instead of falling back to a broad process scan.
+fn runtime_selection_hint_patterns() -> Vec<String> {
+    match parse_runtime_selection_hint_patterns(RUNTIME_SELECTION_HINT_DOCUMENT) {
+        Ok(patterns) => patterns,
+        Err(error) => {
+            tracing::error!(error = %error, "TLS runtime-selection hints rejected; waiting for scope-verified discovery");
+            Vec::new()
+        }
+    }
+}
+
+/// Append operator-supplied process-name/argv fragments under the same bounds as the packaged
+/// discovery catalogue. Invalid entries are ignored individually so one malformed environment
+/// value cannot disable otherwise valid scope discovery; the warning intentionally omits the raw
+/// fragment because process patterns may contain sensitive deployment labels.
+fn append_extra_runtime_selection_patterns(patterns: &mut Vec<String>, raw: &str) {
+    if raw.len() > MAX_RUNTIME_SELECTION_INPUT_BYTES {
+        tracing::warn!(
+            bytes = raw.len(),
+            max_bytes = MAX_RUNTIME_SELECTION_INPUT_BYTES,
+            "ignoring oversized TLS runtime-selection pattern environment value"
+        );
+        return;
+    }
+    let mut seen = patterns.iter().cloned().collect::<HashSet<_>>();
+    for (index, candidate) in raw.split(',').enumerate() {
+        if candidate.bytes().any(|byte| byte.is_ascii_control()) {
+            tracing::warn!(
+                index,
+                "ignoring TLS runtime-selection pattern containing control bytes"
+            );
+            continue;
+        }
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.len() > MAX_RUNTIME_SELECTION_TEXT {
+            tracing::warn!(
+                index,
+                bytes = candidate.len(),
+                max_bytes = MAX_RUNTIME_SELECTION_TEXT,
+                "ignoring oversized TLS runtime-selection pattern"
+            );
+            continue;
+        }
+        let normalized = candidate.to_ascii_lowercase();
+        if seen.contains(&normalized) {
+            continue;
+        }
+        if seen.len() >= MAX_RUNTIME_SELECTION_PATTERNS {
+            tracing::warn!(
+                index,
+                max_patterns = MAX_RUNTIME_SELECTION_PATTERNS,
+                "ignoring TLS runtime-selection pattern after bounded catalogue is full"
+            );
+            break;
+        }
+        seen.insert(normalized.clone());
+        patterns.push(normalized);
+    }
+    patterns.sort();
+}
+
+fn parse_runtime_selection_hint_patterns(document: &str) -> anyhow::Result<Vec<String>> {
+    let root: Value =
+        serde_json::from_str(document).context("parse TLS runtime-selection hint document")?;
+    anyhow::ensure!(
+        root.get("schemaVersion").and_then(Value::as_str) == Some(RUNTIME_SELECTION_HINT_SCHEMA),
+        "unsupported TLS runtime-selection hint schema"
+    );
+    anyhow::ensure!(
+        root.get("purpose").and_then(Value::as_str) == Some(RUNTIME_SELECTION_HINT_PURPOSE),
+        "TLS runtime-selection hints must be discovery-only"
+    );
+    anyhow::ensure!(
+        root.get("versionPolicy").and_then(Value::as_str) == Some(TLS_SIGNATURE_VERSION_POLICY),
+        "TLS runtime-selection hints must use implementation-family policy"
+    );
+    let hints = root
+        .get("hints")
+        .and_then(Value::as_array)
+        .context("TLS runtime-selection hint document has no hints")?;
+    anyhow::ensure!(
+        !hints.is_empty() && hints.len() <= MAX_RUNTIME_SELECTION_HINTS,
+        "TLS runtime-selection hint count is outside the configured bound"
+    );
+    let mut ids = HashSet::new();
+    let mut patterns = Vec::new();
+    for hint in hints {
+        let id = hint
+            .get("id")
+            .and_then(Value::as_str)
+            .context("TLS runtime-selection hint id is missing")?;
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= MAX_RUNTIME_SELECTION_TEXT
+                && id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                }),
+            "TLS runtime-selection hint id is not a bounded slug"
+        );
+        anyhow::ensure!(ids.insert(id), "duplicate TLS runtime-selection hint id");
+        anyhow::ensure!(
+            hint.get("role").and_then(Value::as_str) == Some("agent_root"),
+            "TLS runtime-selection hints may only select agent roots"
+        );
+        // A hint document is not a place to smuggle a product/version gate.  The product
+        // label lives in `id` for operator diagnostics; matching remains an opaque fragment.
+        for field in [
+            "product",
+            "version",
+            "productVersion",
+            "versionRange",
+            "versionSelector",
+            "versions",
+            "wholeFileSha256",
+            "head64kSha256",
+            "binaryFingerprint",
+        ] {
+            anyhow::ensure!(
+                hint.get(field).is_none(),
+                "TLS runtime-selection hint cannot contain selector `{field}`"
+            );
+        }
+        let hint_patterns = hint
+            .get("patterns")
+            .and_then(Value::as_array)
+            .context("TLS runtime-selection hint patterns are missing")?;
+        anyhow::ensure!(
+            !hint_patterns.is_empty(),
+            "TLS runtime-selection hint must contain a pattern"
+        );
+        for pattern in hint_patterns {
+            let pattern = pattern
+                .as_str()
+                .context("TLS runtime-selection hint pattern must be a string")?
+                .trim()
+                .to_ascii_lowercase();
+            anyhow::ensure!(
+                !pattern.is_empty()
+                    && pattern.len() <= MAX_RUNTIME_SELECTION_TEXT
+                    && !pattern.bytes().any(|byte| byte.is_ascii_control()),
+                "TLS runtime-selection hint pattern is outside the configured bound"
+            );
+            patterns.push(pattern);
+        }
+    }
+    anyhow::ensure!(
+        patterns.len() <= MAX_RUNTIME_SELECTION_PATTERNS,
+        "TLS runtime-selection pattern count is outside the configured bound"
+    );
+    patterns.sort();
+    patterns.dedup();
+    Ok(patterns)
+}
+
+fn process_task_state_from_stat(stat: &str) -> Option<char> {
+    let close = stat.rfind(") ")?;
+    stat.get(close + 2..)?.chars().next()
+}
+
+fn drain_runnable_deferred_pids(
+    deferred: &mut HashSet<i32>,
+    is_stopped: impl Fn(i32) -> bool,
+    exists: impl Fn(i32) -> bool,
+) -> Vec<i32> {
+    let mut ready = Vec::new();
+    deferred.retain(|&pid| {
+        if !exists(pid) {
+            return false;
+        }
+        if is_stopped(pid) {
+            return true;
+        }
+        ready.push(pid);
+        false
+    });
+    ready
+}
+
+/// Cheap `/proc/<pid>/comm` sweep for host CLI roots. Used to open the plaintext allowlist
+/// before the first TLS write when exec-commit is late.
+pub fn scan_named_agent_runtime_pids() -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let comm = comm.trim().to_ascii_lowercase();
+        if matches!(comm.as_str(), "codex" | "claude" | "claude.exe" | "pi")
+            || comm.starts_with("codex-code-mode")
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn process_is_stopped(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(process_task_state_from_stat)
+        .is_some_and(|state| matches!(state, 'T' | 't'))
+}
+
+fn process_parent_pid(pid: i32) -> Option<i32> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn verified_runtime_fence(pid: i32) -> Option<VerifiedRuntimeFence> {
+    let executable = fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/<pid>/stat` keeps comm in parentheses and comm itself may contain spaces or `)`.
+    // The start-time field is field 22, hence index 19 after the state field (field 3).
+    let close = stat.rfind(") ")?;
+    let start_time_ticks = stat
+        .get(close + 2..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let cgroup_id = process_cgroup_id(pid);
+    Some(VerifiedRuntimeFence {
+        executable_dev: executable.dev(),
+        executable_ino: executable.ino(),
+        start_time_ticks,
+        cgroup_id,
+    })
+}
+
+fn process_cgroup_id(pid: i32) -> Option<u64> {
+    let membership = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .trim_start_matches('/');
+    let path = Path::new(relative);
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    fs::metadata(PathBuf::from("/sys/fs/cgroup").join(path))
+        .ok()
+        .map(|metadata| metadata.ino())
+}
+
+fn stable_executable_probe_path(
+    pid: i32,
+    probe_path: &Path,
+    real_exe: &Path,
+    expected: &fs::Metadata,
+) -> Option<PathBuf> {
+    if real_exe.is_absolute() && same_file_identity(real_exe, expected) {
+        return Some(real_exe.to_path_buf());
+    }
+
+    let relative = real_exe.strip_prefix("/").ok()?;
+    let mut current = pid;
+    let mut stable = same_file_identity(probe_path, expected).then(|| probe_path.to_path_buf());
+    for _ in 0..12 {
+        if current <= 1 {
+            break;
+        }
+        let rooted = PathBuf::from(format!("/proc/{current}/root")).join(relative);
+        if same_file_identity(&rooted, expected) {
+            stable = Some(rooted);
+        }
+        let Some(parent) = process_parent_pid(current) else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    stable
+}
+
+fn same_file_identity(path: &Path, expected: &fs::Metadata) -> bool {
+    fs::metadata(path).ok().is_some_and(|metadata| {
+        metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
+    })
+}
+
+/// Find the longest-lived `/proc/<pid>/root` in the same mount namespace that still resolves the
+/// exact executable inode. Container exec processes are often siblings of PID 1 rather than its
+/// descendants, so ancestry alone cannot yield a stable global-uprobe target. The smallest host
+/// PID in one mount namespace is the best bounded proxy for its init process.
+fn stable_mount_namespace_root(
+    pid: i32,
+    executable_relative_path: &Path,
+    expected: &fs::Metadata,
+) -> Option<i32> {
+    let namespace_inode = fs::metadata(format!("/proc/{pid}/ns/mnt")).ok()?.ino();
+    let entries = fs::read_dir("/proc").ok()?;
+    entries
+        .flatten()
+        .take(MAX_PROC_NAMESPACE_SCAN)
+        .filter_map(|entry| {
+            let candidate = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let candidate_namespace = fs::metadata(format!("/proc/{candidate}/ns/mnt"))
+                .ok()?
+                .ino();
+            if candidate_namespace != namespace_inode {
+                return None;
+            }
+            let rooted =
+                PathBuf::from(format!("/proc/{candidate}/root")).join(executable_relative_path);
+            same_file_identity(&rooted, expected).then_some(candidate)
+        })
+        .min()
+}
+
+fn ancestor_contains_pattern(pid: i32, pattern: &str) -> bool {
+    let mut current = pid;
+    for _ in 0..6 {
+        let Some(parent) = process_parent_pid(current) else {
+            return false;
+        };
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        if process_contains_pattern(parent, pattern) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn process_matches_trusted_network_runtime(pid: i32) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|value| value.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches_trusted_network_runtime_text(&comm, &executable)
+}
+
+/// Legacy packaged-runtime discovery hint.  This is intentionally not a TLS ABI/version gate;
+/// the process still needs a scope/generation fence and a validated implementation-family pair.
+fn matches_trusted_network_runtime_text(comm: &str, executable: &str) -> bool {
+    comm == "codex-code-mode" || executable == "codex-code-mode-host"
+}
+
+fn process_contains_pattern(pid: i32, pattern: &str) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if comm.contains(pattern) {
+        return true;
+    }
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|cmdline| cmdline.to_ascii_lowercase().contains(pattern))
+}
+
+fn classify_library(path: &str) -> Option<SymbolFamily> {
+    let name = Path::new(path).file_name()?.to_string_lossy();
+    if name.starts_with("libssl.so") || name.starts_with("libssl-") {
+        Some(SymbolFamily::OpenSsl)
+    } else if name.starts_with("libgnutls.so") || name.starts_with("libgnutls-") {
+        Some(SymbolFamily::GnuTls)
+    } else if name.starts_with("libnspr4.so") || name.starts_with("libnspr4-") {
+        Some(SymbolFamily::Nss)
+    } else {
+        None
+    }
+}
+
+fn is_interpreter_or_shell(basename: &str) -> bool {
+    matches!(
+        basename,
+        "node"
+            | "nodejs"
+            | "python"
+            | "python3"
+            | "bash"
+            | "sh"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "java"
+            | "ruby"
+            | "perl"
+    ) || basename.starts_with("python3.")
+}
+
+fn static_signature_families() -> anyhow::Result<Vec<StaticSignatureFamily>> {
+    let root: Value = serde_json::from_str(SIGNATURE_FAMILY_DOCUMENT)?;
+    anyhow::ensure!(
+        root.get("schemaVersion").and_then(Value::as_str) == Some(TLS_SIGNATURE_FAMILY_SCHEMA),
+        "unsupported TLS signature-family schema"
+    );
+    validate_signature_registry_metadata(&root)?;
+    let values = root
+        .get("families")
+        .and_then(Value::as_array)
+        .context("TLS signature-family document has no families")?;
+    let mut families = values
+        .iter()
+        .map(parse_signature_family)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    families.sort_by(|left, right| left.family_id.cmp(&right.family_id));
+    anyhow::ensure!(
+        families
+            .windows(2)
+            .all(|pair| pair[0].family_id != pair[1].family_id),
+        "TLS signature-family identifiers must be unique"
+    );
+    Ok(families)
+}
+
+fn parse_signature_family(value: &Value) -> anyhow::Result<StaticSignatureFamily> {
+    validate_signature_family_metadata(value)?;
+    let string = |name: &str| -> anyhow::Result<&str> {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("TLS signature-family field {name} is missing"))
+    };
+    let implementation_family = string("implementationFamily")?;
+    anyhow::ensure!(
+        !implementation_family.is_empty()
+            && implementation_family
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+        "TLS implementation-family name must be a lowercase slug"
+    );
+    let read_prefix = decode_hex(string("readExpectedPrefixHex")?)?;
+    let write_prefix = decode_hex(string("writeExpectedPrefixHex")?)?;
+    let read_abi = parse_abi(string("readAbi")?)?;
+    let write_abi = parse_abi(string("writeAbi")?)?;
+    let mut write_after_read = value
+        .get("writeAfterReadOffsets")
+        .and_then(Value::as_array)
+        .context("TLS signature-family writeAfterReadOffsets must be an array")?
+        .iter()
+        .map(|offset| {
+            offset
+                .as_i64()
+                .context("TLS signature-family offset must fit i64")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        read_prefix.len() >= 12 && write_prefix.len() >= 12,
+        "static TLS anchors must be at least 12 bytes"
+    );
+    anyhow::ensure!(
+        !write_after_read.is_empty() && write_after_read.len() <= 8,
+        "TLS signature family must contain between one and eight offset relations"
+    );
+    write_after_read.sort_unstable();
+    write_after_read.dedup();
+    let fingerprint =
+        signature_family_fingerprint(&read_prefix, &write_prefix, read_abi, write_abi);
+    Ok(StaticSignatureFamily {
+        family_id: format!("{implementation_family}-{fingerprint}"),
+        read_prefix,
+        write_prefix,
+        read_abi,
+        write_abi,
+        write_after_read,
+    })
+}
+
+/// Validate the policy boundary before parsing any offsets.  The embedded registry is a
+/// reusable implementation-family catalogue, not a product/version profile list.  Keeping this
+/// check explicit prevents a future contributor from adding a `version` selector that silently
+/// turns a generic TLS family into a Codex/Claude-specific hard gate.
+fn validate_signature_registry_metadata(root: &Value) -> anyhow::Result<()> {
+    let version_policy = root
+        .get("versionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_VERSION_POLICY);
+    anyhow::ensure!(
+        version_policy == TLS_SIGNATURE_VERSION_POLICY,
+        "TLS signature registry must use implementation-family policy; version-specific entries belong to an explicit capability extension"
+    );
+    let extension_policy = root
+        .get("extensionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_EXTENSION_POLICY);
+    anyhow::ensure!(
+        extension_policy == TLS_SIGNATURE_EXTENSION_POLICY,
+        "unsupported TLS signature extension policy"
+    );
+    Ok(())
+}
+
+fn validate_signature_family_metadata(value: &Value) -> anyhow::Result<()> {
+    let version_policy = value
+        .get("versionPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(TLS_SIGNATURE_VERSION_POLICY);
+    anyhow::ensure!(
+        version_policy == TLS_SIGNATURE_VERSION_POLICY,
+        "version-specific TLS signatures must be registered as an explicit capability extension"
+    );
+    // These fields were present in the retired product/version profile document.  Rejecting
+    // them in the base registry is deliberate: an accidental addition must fail closed instead
+    // of looking like a supported generic family.  A future extension may carry such metadata in
+    // its own signed registry and still reuse TlsAttachKind/attach_offset_pair.
+    for field in [
+        "product",
+        "version",
+        "productVersion",
+        "versionRange",
+        "versionSelector",
+        "versions",
+        "minVersion",
+        "maxVersion",
+        "fileSize",
+        "binaryFingerprint",
+        "head64kSha256",
+        "wholeFileSha256",
+        "capabilityExtension",
+    ] {
+        anyhow::ensure!(
+            value.get(field).is_none(),
+            "TLS base signature family cannot contain product/version selector `{field}`"
+        );
+    }
+    Ok(())
+}
+
+fn signature_family_fingerprint(
+    read_prefix: &[u8],
+    write_prefix: &[u8],
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"anysentry.static_tls_family.v1");
+    hash.update([tls_abi_code(read_abi), tls_abi_code(write_abi)]);
+    hash.update(read_prefix);
+    hash.update(write_prefix);
+    hex(&hash.finalize())[..16].to_string()
+}
+
+fn tls_abi_code(abi: TlsAbi) -> u8 {
+    match abi {
+        TlsAbi::Classic => 1,
+        TlsAbi::OpenSslEx => 2,
+        TlsAbi::RustlsPayload => 3,
+        TlsAbi::RustlsOutboundChunks => 4,
+        TlsAbi::BoringSslAppData => 5,
+    }
+}
+
+fn pair_static_family_offsets(
+    reads: &[u64],
+    write_offsets: &HashSet<u64>,
+    write_after_read: &[i64],
+    read_abi: TlsAbi,
+    write_abi: TlsAbi,
+) -> (Vec<TlsOffsetPair>, Vec<u64>) {
+    let mut pairs = Vec::new();
+    for read_offset in reads {
+        for delta in write_after_read {
+            let candidate = i128::from(*read_offset) + i128::from(*delta);
+            if !(0..=i128::from(u64::MAX)).contains(&candidate) {
+                continue;
+            }
+            let write_offset = candidate as u64;
+            if write_offsets.contains(&write_offset) {
+                pairs.push(TlsOffsetPair {
+                    read_offset: *read_offset,
+                    write_offset,
+                    read_abi,
+                    write_abi,
+                });
+            }
+        }
+    }
+    pairs.sort_by_key(|pair| (pair.read_offset, pair.write_offset));
+    pairs.dedup_by_key(|pair| (pair.read_offset, pair.write_offset));
+    pairs.truncate(MAX_STATIC_CANDIDATES_PER_FAMILY);
+    if pairs.is_empty() {
+        return (pairs, Vec::new());
+    }
+    let paired_writes = pairs
+        .iter()
+        .map(|pair| pair.write_offset)
+        .collect::<HashSet<_>>();
+    let primary_read = pairs[0].read_offset;
+    let mut additional_write_offsets = write_offsets
+        .iter()
+        .copied()
+        .filter(|write_offset| !paired_writes.contains(write_offset))
+        .collect::<Vec<_>>();
+    additional_write_offsets.sort_by_key(|write_offset| write_offset.abs_diff(primary_read));
+    additional_write_offsets.truncate(MAX_ADDITIONAL_STATIC_WRITES);
+    (pairs, additional_write_offsets)
+}
+
+fn discover_static_signature_matches(path: &Path) -> anyhow::Result<Vec<StaticDiscoveryMatch>> {
+    let ranges = executable_file_ranges(path)?;
+    let families = static_signature_families()?;
+    let mut patterns = families
+        .iter()
+        .flat_map(|family| [family.read_prefix.clone(), family.write_prefix.clone()])
+        .collect::<Vec<_>>();
+    patterns.sort();
+    patterns.dedup();
+    let anchor_matches = find_pattern_set_offsets(path, &ranges, &patterns, MAX_ANCHOR_MATCHES)?;
+    let mut discovered = Vec::new();
+    for family in families {
+        let reads = anchor_matches
+            .get(&family.read_prefix)
+            .cloned()
+            .unwrap_or_default();
+        if reads.is_empty() {
+            continue;
+        }
+        let writes = anchor_matches
+            .get(&family.write_prefix)
+            .cloned()
+            .unwrap_or_default();
+        if writes.is_empty() {
+            continue;
+        }
+        let write_offsets = writes.into_iter().collect::<HashSet<_>>();
+        let (pairs, additional_write_offsets) = pair_static_family_offsets(
+            &reads,
+            &write_offsets,
+            &family.write_after_read,
+            family.read_abi,
+            family.write_abi,
+        );
+        if !pairs.is_empty() {
+            let app_data_write_offsets = if family.write_abi == TlsAbi::Classic {
+                pairs
+                    .first()
+                    .map(|pair| discover_protocol_method_write_offsets(path, pair.write_offset))
+                    .transpose()?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            discovered.push(StaticDiscoveryMatch {
+                family_id: family.family_id,
+                pairs,
+                additional_write_offsets,
+                app_data_write_offsets,
+            });
+        }
+    }
+    Ok(discovered)
+}
+
+fn executable_file_ranges(path: &Path) -> anyhow::Result<Vec<(u64, u64)>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    anyhow::ensure!(&header[..4] == b"\x7fELF", "not an ELF file");
+    anyhow::ensure!(header[4] == 2, "static TLS discovery requires ELF64");
+    anyhow::ensure!(
+        header[5] == 1,
+        "static TLS discovery requires little-endian ELF"
+    );
+    anyhow::ensure!(u16_le(&header, 18)? == 62, "unsupported ELF machine");
+    let program_header_offset = u64_le(&header, 32)?;
+    let program_header_size = usize::from(u16_le(&header, 54)?);
+    let program_header_count = usize::from(u16_le(&header, 56)?);
+    anyhow::ensure!(
+        program_header_size >= 56 && program_header_count <= MAX_ELF_PROGRAM_HEADERS,
+        "invalid ELF program-header table"
+    );
+
+    let mut ranges = Vec::new();
+    let mut entry = vec![0u8; program_header_size];
+    for index in 0..program_header_count {
+        let offset = program_header_offset
+            .checked_add((index * program_header_size) as u64)
+            .context("ELF program-header offset overflow")?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut entry)?;
+        let segment_type = u32_le(&entry, 0)?;
+        let flags = u32_le(&entry, 4)?;
+        if segment_type != 1 || flags & 1 == 0 {
+            continue;
+        }
+        let start = u64_le(&entry, 8)?;
+        let length = u64_le(&entry, 32)?;
+        let end = start
+            .checked_add(length)
+            .context("ELF executable segment overflow")?
+            .min(file_len);
+        if start < end {
+            ranges.push((start, end));
+        }
+    }
+    anyhow::ensure!(!ranges.is_empty(), "ELF has no executable load segment");
+    ranges.sort_unstable();
+    Ok(ranges)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ElfLoadSegment {
+    file_start: u64,
+    file_end: u64,
+    vaddr: u64,
+    executable: bool,
+}
+
+fn elf_load_segments(path: &Path) -> anyhow::Result<Vec<ElfLoadSegment>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    anyhow::ensure!(&header[..4] == b"\x7fELF", "not an ELF file");
+    anyhow::ensure!(header[4] == 2, "static TLS discovery requires ELF64");
+    anyhow::ensure!(
+        header[5] == 1,
+        "static TLS discovery requires little-endian ELF"
+    );
+    anyhow::ensure!(u16_le(&header, 18)? == 62, "unsupported ELF machine");
+    let program_header_offset = u64_le(&header, 32)?;
+    let program_header_size = usize::from(u16_le(&header, 54)?);
+    let program_header_count = usize::from(u16_le(&header, 56)?);
+    anyhow::ensure!(
+        program_header_size >= 56 && program_header_count <= MAX_ELF_PROGRAM_HEADERS,
+        "invalid ELF program-header table"
+    );
+
+    let mut segments = Vec::new();
+    let mut entry = vec![0u8; program_header_size];
+    for index in 0..program_header_count {
+        let offset = program_header_offset
+            .checked_add((index * program_header_size) as u64)
+            .context("ELF program-header offset overflow")?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut entry)?;
+        let segment_type = u32_le(&entry, 0)?;
+        if segment_type != 1 {
+            continue;
+        }
+        let flags = u32_le(&entry, 4)?;
+        let start = u64_le(&entry, 8)?;
+        let vaddr = u64_le(&entry, 16)?;
+        let length = u64_le(&entry, 32)?;
+        let end = start
+            .checked_add(length)
+            .context("ELF load segment overflow")?
+            .min(file_len);
+        if start < end {
+            segments.push(ElfLoadSegment {
+                file_start: start,
+                file_end: end,
+                vaddr,
+                executable: flags & 1 != 0,
+            });
+        }
+    }
+    anyhow::ensure!(!segments.is_empty(), "ELF has no PT_LOAD segment");
+    Ok(segments)
+}
+
+fn va_to_file_offset(segments: &[ElfLoadSegment], va: u64) -> Option<u64> {
+    segments.iter().find_map(|segment| {
+        if va < segment.vaddr {
+            return None;
+        }
+        let file = segment.file_start.checked_add(va - segment.vaddr)?;
+        (file < segment.file_end).then_some(file)
+    })
+}
+
+fn va_is_code(segments: &[ElfLoadSegment], va: u64) -> bool {
+    va_to_file_offset(segments, va).is_some_and(|file| {
+        segments.iter().any(|segment| {
+            segment.executable && file >= segment.file_start && file < segment.file_end
+        })
+    })
+}
+
+fn classic_write_calls_protocol_method_slot(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|window| {
+        window[0] == 0xff && (0x50..=0x57).contains(&window[1]) && window[2] == 0x48
+    })
+}
+
+fn read_file_exact(file: &mut File, offset: u64, buf: &mut [u8]) -> anyhow::Result<bool> {
+    file.seek(SeekFrom::Start(offset))?;
+    match file.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Locate `SSL_PROTOCOL_METHOD::write_app_data` from a classic `SSL_write` that
+/// invokes `[method+0x48]`. Tables must start with `is_dtls` 0/1, hold a run of
+/// code pointers through the write slot, sit near the public write, and the
+/// callee must clear `*out_needs_handshake` on entry.
+fn discover_protocol_method_write_offsets(
+    path: &Path,
+    classic_write: u64,
+) -> anyhow::Result<Vec<u64>> {
+    let segments = elf_load_segments(path)?;
+    let mut file = File::open(path)?;
+    let mut classic_head = vec![0u8; CLASSIC_WRITE_METHOD_SCAN];
+    if !read_file_exact(&mut file, classic_write, &mut classic_head)? {
+        return Ok(Vec::new());
+    }
+    if !classic_write_calls_protocol_method_slot(&classic_head) {
+        return Ok(Vec::new());
+    }
+
+    let mut found = Vec::new();
+    let overlap = PROTOCOL_METHOD_TABLE_SPAN.saturating_sub(8) as usize;
+    for segment in &segments {
+        if segment.executable {
+            continue;
+        }
+        let mut cursor = segment.file_start;
+        let mut carry = Vec::<u8>::new();
+        while cursor < segment.file_end && found.len() < MAX_PROTOCOL_METHOD_WRITES {
+            let requested = (segment.file_end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
+            let mut window = vec![0u8; carry.len() + requested];
+            window[..carry.len()].copy_from_slice(&carry);
+            if !read_file_exact(&mut file, cursor, &mut window[carry.len()..])? {
+                break;
+            }
+            let window_file = cursor.saturating_sub(carry.len() as u64);
+            let mut offset = ((8 - (window_file & 7)) & 7) as usize;
+            while offset + PROTOCOL_METHOD_TABLE_SPAN as usize <= window.len()
+                && found.len() < MAX_PROTOCOL_METHOD_WRITES
+            {
+                let _ = discover_protocol_method_write_in_table(
+                    &window[offset..offset + PROTOCOL_METHOD_TABLE_SPAN as usize],
+                    &segments,
+                    classic_write,
+                    &mut file,
+                    &mut found,
+                )?;
+                offset += 8;
+            }
+            let retained = overlap.min(window.len());
+            carry.clear();
+            carry.extend_from_slice(&window[window.len() - retained..]);
+            cursor += requested as u64;
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found.truncate(MAX_PROTOCOL_METHOD_WRITES);
+    Ok(found)
+}
+
+fn discover_protocol_method_write_in_table(
+    table: &[u8],
+    segments: &[ElfLoadSegment],
+    classic_write: u64,
+    file: &mut File,
+    found: &mut Vec<u64>,
+) -> anyhow::Result<bool> {
+    let is_dtls = u64::from_le_bytes(table[0..8].try_into().expect("table span checked"));
+    if is_dtls > 1 {
+        return Ok(false);
+    }
+    for slot in (8..PROTOCOL_METHOD_TABLE_SPAN as usize).step_by(8) {
+        let va = u64::from_le_bytes(table[slot..slot + 8].try_into().expect("slot span checked"));
+        if !va_is_code(segments, va) {
+            return Ok(false);
+        }
+    }
+    let write_va = u64::from_le_bytes(
+        table[PROTOCOL_METHOD_WRITE_SLOT..PROTOCOL_METHOD_WRITE_SLOT + 8]
+            .try_into()
+            .expect("write slot span checked"),
+    );
+    let Some(write_offset) = va_to_file_offset(segments, write_va) else {
+        return Ok(false);
+    };
+    if write_offset.abs_diff(classic_write) > PROTOCOL_METHOD_ANCHOR_WINDOW {
+        return Ok(false);
+    }
+    if found.contains(&write_offset) {
+        return Ok(false);
+    }
+    let mut head = [0u8; 32];
+    if !read_file_exact(file, write_offset, &mut head)? {
+        return Ok(false);
+    }
+    if !head.starts_with(&WRITE_APP_DATA_PROLOGUE)
+        || !head.windows(3).any(|window| window == OUT_NEEDS_HANDSHAKE_FALSE)
+    {
+        return Ok(false);
+    }
+    found.push(write_offset);
+    Ok(true)
+}
+
+#[cfg(test)]
+fn find_pattern_offsets(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    pattern: &[u8],
+    limit: usize,
+) -> anyhow::Result<Vec<u64>> {
+    Ok(
+        find_pattern_set_offsets(path, ranges, &[pattern.to_vec()], limit)?
+            .remove(pattern)
+            .unwrap_or_default(),
+    )
+}
+
+fn find_pattern_set_offsets(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    patterns: &[Vec<u8>],
+    limit: usize,
+) -> anyhow::Result<HashMap<Vec<u8>, Vec<u64>>> {
+    anyhow::ensure!(
+        !patterns.is_empty() && patterns.iter().all(|pattern| !pattern.is_empty()),
+        "empty TLS anchor set"
+    );
+    let mut file = File::open(path)?;
+    let overlap = patterns
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let mut matches = patterns
+        .iter()
+        .cloned()
+        .map(|pattern| (pattern, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for (start, end) in ranges {
+        let mut cursor = *start;
+        let mut carry = Vec::<u8>::new();
+        while cursor < *end {
+            let requested = (*end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
+            let mut window = vec![0u8; carry.len() + requested];
+            window[..carry.len()].copy_from_slice(&carry);
+            file.seek(SeekFrom::Start(cursor))?;
+            file.read_exact(&mut window[carry.len()..])?;
+            let window_offset = cursor.saturating_sub(carry.len() as u64);
+            for pattern in patterns {
+                let Some(offsets) = matches.get_mut(pattern) else {
+                    continue;
+                };
+                if offsets.len() >= limit {
+                    continue;
+                }
+                find_pattern_positions(&window, pattern, limit - offsets.len(), |position| {
+                    offsets.push(window_offset + position as u64);
+                });
+            }
+            let retained = overlap.min(window.len());
+            carry.clear();
+            carry.extend_from_slice(&window[window.len() - retained..]);
+            cursor += requested as u64;
+        }
+    }
+    for offsets in matches.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.truncate(limit);
+    }
+    Ok(matches)
+}
+
+fn find_pattern_positions(
+    bytes: &[u8],
+    pattern: &[u8],
+    limit: usize,
+    mut found: impl FnMut(usize),
+) {
+    if pattern.is_empty() || bytes.len() < pattern.len() || limit == 0 {
+        return;
+    }
+    let first = pattern[0];
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    while cursor + pattern.len() <= bytes.len() && count < limit {
+        let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == first) else {
+            break;
+        };
+        let position = cursor + relative;
+        if position + pattern.len() > bytes.len() {
+            break;
+        }
+        if &bytes[position..position + pattern.len()] == pattern {
+            found(position);
+            count += 1;
+        }
+        cursor = position + 1;
+    }
+}
+
+fn u16_le(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let raw: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .context("ELF u16 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let raw: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .context("ELF u32 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn u64_le(bytes: &[u8], offset: usize) -> anyhow::Result<u64> {
+    let raw: [u8; 8] = bytes
+        .get(offset..offset + 8)
+        .context("ELF u64 field out of bounds")?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn parse_abi(value: &str) -> anyhow::Result<TlsAbi> {
+    match value {
+        "classic" => Ok(TlsAbi::Classic),
+        "openssl_ex" => Ok(TlsAbi::OpenSslEx),
+        "rustls_payload" => Ok(TlsAbi::RustlsPayload),
+        "rustls_outbound_chunks" => Ok(TlsAbi::RustlsOutboundChunks),
+        "boringssl_app_data" => Ok(TlsAbi::BoringSslAppData),
+        _ => anyhow::bail!("unsupported TLS ABI {value}"),
+    }
+}
+
+fn decode_hex(value: &str) -> anyhow::Result<Vec<u8>> {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    anyhow::ensure!(remainder.is_empty(), "hex string has odd length");
+    pairs
+        .iter()
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)?;
+            Ok(u8::from_str_radix(text, 16)?)
+        })
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature_family_fixture() -> Value {
+        serde_json::json!({
+            "implementationFamily": "fixture-tls-x86-64",
+            "readExpectedPrefixHex": "00112233445566778899aabb",
+            "writeExpectedPrefixHex": "ffeeddccbbaa998877665544",
+            "readAbi": "classic",
+            "writeAbi": "classic",
+            "writeAfterReadOffsets": [16]
+        })
+    }
+
+    #[test]
+    fn process_task_state_reads_the_field_after_comm() {
+        assert_eq!(
+            process_task_state_from_stat("516940 (claude.exe) T 1 1 1 0 0"),
+            Some('T')
+        );
+        assert_eq!(
+            process_task_state_from_stat("42 (cla)ude) t 1 1 1 0 0"),
+            Some('t')
+        );
+        assert_eq!(
+            process_task_state_from_stat("1 (bash) R 0 0 0 0 0"),
+            Some('R')
+        );
+        assert!(process_task_state_from_stat("broken").is_none());
+    }
+
+    #[test]
+    fn drain_runnable_deferred_pids_keeps_stopped_and_drops_exited() {
+        let mut deferred = HashSet::from([11, 22, 33]);
+        let ready = drain_runnable_deferred_pids(
+            &mut deferred,
+            |pid| pid == 11,
+            |pid| pid != 33,
+        );
+        assert_eq!(ready, vec![22]);
+        assert_eq!(deferred, HashSet::from([11]));
+    }
+
+    #[test]
+    fn verified_pids_keeps_recently_runnable_after_fence_refresh() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let pid = std::process::id() as i32;
+        manager.recent_runnable_pids.insert(pid, Instant::now());
+        assert!(
+            manager.verified_pids().contains(&pid),
+            "thawed PID must stay on the plaintext allowlist through execve fence refresh"
+        );
+        assert!(manager.recently_runnable(pid));
+    }
+
+    #[test]
+    fn process_scoped_static_plan_keeps_pid_in_key_and_target() {
+        let meta = fs::metadata("/proc/self/exe").unwrap();
+        let plan = static_discovery_plan(
+            Path::new("/proc/self/exe"),
+            &meta,
+            StaticDiscoveryMatch {
+                family_id: "fixture-family".into(),
+                pairs: vec![TlsOffsetPair {
+                    read_offset: 1,
+                    write_offset: 2,
+                    read_abi: TlsAbi::Classic,
+                    write_abi: TlsAbi::Classic,
+                }],
+                additional_write_offsets: Vec::new(),
+                app_data_write_offsets: Vec::new(),
+            },
+            RuntimeRole::AgentRoot,
+            Some(564354),
+        );
+        assert!(
+            plan.key.starts_with("pid:564354:"),
+            "thaw attach must not reuse the global inode key: {}",
+            plan.key
+        );
+        assert_eq!(plan.pid, Some(564354));
+    }
+
+    #[test]
+    fn static_document_contains_only_tls_implementation_families() {
+        let document: Value = serde_json::from_str(SIGNATURE_FAMILY_DOCUMENT).unwrap();
+        assert_eq!(
+            document.get("versionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_VERSION_POLICY)
+        );
+        assert_eq!(
+            document.get("extensionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_EXTENSION_POLICY)
+        );
+        let families = static_signature_families().unwrap();
+        assert_eq!(families.len(), 3);
+        let family_values = document.get("families").unwrap().as_array().unwrap();
+        assert!(family_values.iter().all(|family| {
+            [
+                "product",
+                "version",
+                "productVersion",
+                "versionRange",
+                "versionSelector",
+                "versions",
+                "minVersion",
+                "maxVersion",
+                "fileSize",
+                "binaryFingerprint",
+                "head64kSha256",
+                "wholeFileSha256",
+                "capabilityExtension",
+            ]
+            .iter()
+            .all(|field| family.get(*field).is_none())
+        }));
+        assert!(families.iter().all(|family| family.read_prefix.len() >= 12
+            && family.write_prefix.len() >= 12
+            && !family.write_after_read.is_empty()));
+        let openssl = families
+            .iter()
+            .find(|family| family.read_abi == TlsAbi::OpenSslEx)
+            .unwrap();
+        assert_eq!(openssl.write_after_read, vec![592]);
+        let classic = families
+            .iter()
+            .find(|family| family.read_abi == TlsAbi::Classic)
+            .unwrap();
+        assert_eq!(classic.write_after_read, vec![912, 1008]);
+        let rustls = families
+            .iter()
+            .find(|family| family.read_abi == TlsAbi::RustlsPayload)
+            .unwrap();
+        assert_eq!(rustls.write_after_read, vec![-5248]);
+        assert_eq!(rustls.write_abi, TlsAbi::RustlsOutboundChunks);
+    }
+
+    #[test]
+    fn static_family_pairs_keep_unpaired_write_clones_near_the_read() {
+        let reads = [0x2363e30_u64];
+        let writes = HashSet::from([0x2364220, 0x241a530, 0x39d2d50]);
+        let (pairs, extras) = pair_static_family_offsets(
+            &reads,
+            &writes,
+            &[912, 1008],
+            TlsAbi::Classic,
+            TlsAbi::Classic,
+        );
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].read_offset, 0x2363e30);
+        assert_eq!(pairs[0].write_offset, 0x2364220);
+        assert_eq!(extras, vec![0x241a530, 0x39d2d50]);
+        let all_writes = HashSet::from([
+            0x2364220, 0x241a530, 0x39d2d50, 0x39d5430, 0x3db6700, 0x3f0be20,
+            0x40769d0, 0x4076c90, 0x4076dd0, 0x4077090, 0x4077fb0, 0x40782e0,
+            0x40a7ee0, 0x40a81a0,
+        ]);
+        let (_, extras) = pair_static_family_offsets(
+            &reads,
+            &all_writes,
+            &[912, 1008],
+            TlsAbi::Classic,
+            TlsAbi::Classic,
+        );
+        assert!(
+            extras.contains(&0x40a81a0),
+            "farthest Claude write clone must stay attached: {extras:x?}"
+        );
+        assert_eq!(extras.len(), 13);
+    }
+
+    #[test]
+    fn classic_write_method_slot_scan_accepts_indirect_call_plus_0x48() {
+        assert!(classic_write_calls_protocol_method_slot(&[
+            0x4c, 0x89, 0xf1, 0x4d, 0x89, 0xf8, 0xff, 0x50, 0x48
+        ]));
+        assert!(!classic_write_calls_protocol_method_slot(&[
+            0xff, 0x50, 0x40, 0xff, 0x10
+        ]));
+    }
+
+    #[test]
+    fn protocol_method_table_near_classic_write_is_app_data_abi() {
+        let mut image = vec![0u8; 0x1800];
+        image[0x1100..0x1104].copy_from_slice(&WRITE_APP_DATA_PROLOGUE);
+        image[0x1110..0x1113].copy_from_slice(&OUT_NEEDS_HANDSHAKE_FALSE);
+        image[0x1200..0x1204].copy_from_slice(&WRITE_APP_DATA_PROLOGUE);
+        let write_va = 0x401100u64;
+        let dummy_va = 0x401200u64;
+        for slot in (8..PROTOCOL_METHOD_TABLE_SPAN as usize).step_by(8) {
+            let va = if slot == PROTOCOL_METHOD_WRITE_SLOT {
+                write_va
+            } else {
+                dummy_va
+            };
+            image[slot..slot + 8].copy_from_slice(&va.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!(
+            "a3s-observer-appdata-table-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, &image).unwrap();
+        let segments = [
+            ElfLoadSegment {
+                file_start: 0,
+                file_end: 0x80,
+                vaddr: 0x400000,
+                executable: false,
+            },
+            ElfLoadSegment {
+                file_start: 0x1000,
+                file_end: 0x1800,
+                vaddr: 0x401000,
+                executable: true,
+            },
+        ];
+        let mut file = File::open(&path).unwrap();
+        let mut found = Vec::new();
+        assert!(discover_protocol_method_write_in_table(
+            &image[..PROTOCOL_METHOD_TABLE_SPAN as usize],
+            &segments,
+            0x1000,
+            &mut file,
+            &mut found,
+        )
+        .unwrap());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(found, vec![0x1100]);
+    }
+
+    #[test]
+    fn installed_stripped_classic_cli_discovers_protocol_method_write() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_BINARIES") else {
+            return;
+        };
+        for path in candidates
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            let discoveries = discover_static_signature_matches(&path).unwrap();
+            let Some(classic) = discoveries.iter().find(|discovery| {
+                discovery
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.write_abi == TlsAbi::Classic)
+            }) else {
+                continue;
+            };
+            if classic.pairs.iter().any(|pair| {
+                let mut head = vec![0u8; CLASSIC_WRITE_METHOD_SCAN];
+                let Ok(mut file) = File::open(&path) else {
+                    return false;
+                };
+                read_file_exact(&mut file, pair.write_offset, &mut head).unwrap_or(false)
+                    && classic_write_calls_protocol_method_slot(&head)
+            }) {
+                assert!(
+                    !classic.app_data_write_offsets.is_empty(),
+                    "classic SSL_write that calls [method+0x48] must discover write_app_data: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_selection_catalogue_is_explicitly_discovery_only() {
+        let patterns = runtime_selection_hint_patterns();
+        assert!(patterns.contains(&"codex".to_string()));
+        assert!(patterns.contains(&"claude".to_string()));
+        assert!(patterns.contains(&"langchain".to_string()));
+        assert!(patterns.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn extra_runtime_selection_patterns_are_bounded_like_builtin_hints() {
+        let mut patterns = runtime_selection_hint_patterns();
+        append_extra_runtime_selection_patterns(
+            &mut patterns,
+            " Custom-Agent , duplicate ,duplicate, bad\u{0001}pattern,\ntrimmed ",
+        );
+        assert!(patterns.contains(&"custom-agent".to_string()));
+        assert!(patterns.contains(&"duplicate".to_string()));
+        assert!(!patterns.iter().any(|value| value.contains("bad")));
+        assert!(!patterns.iter().any(|value| value.contains("trimmed")));
+        assert!(patterns.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let too_long = "x".repeat(MAX_RUNTIME_SELECTION_TEXT + 1);
+        let before_too_long = patterns.clone();
+        append_extra_runtime_selection_patterns(&mut patterns, &too_long);
+        assert_eq!(patterns, before_too_long);
+
+        let mut many = String::new();
+        for index in 0..(MAX_RUNTIME_SELECTION_PATTERNS + 10) {
+            if index > 0 {
+                many.push(',');
+            }
+            many.push_str(&format!("extra-pattern-{index}"));
+        }
+        append_extra_runtime_selection_patterns(&mut patterns, &many);
+        assert!(patterns.len() <= MAX_RUNTIME_SELECTION_PATTERNS);
+
+        let before_oversized = patterns.clone();
+        append_extra_runtime_selection_patterns(
+            &mut patterns,
+            &"z".repeat(MAX_RUNTIME_SELECTION_INPUT_BYTES + 1),
+        );
+        assert_eq!(patterns, before_oversized);
+    }
+
+    #[test]
+    fn malformed_runtime_selection_metadata_fails_closed_without_broad_defaults() {
+        let root: Value = serde_json::from_str(RUNTIME_SELECTION_HINT_DOCUMENT).unwrap();
+        assert_eq!(
+            root.get("purpose").and_then(Value::as_str),
+            Some(RUNTIME_SELECTION_HINT_PURPOSE)
+        );
+        assert_eq!(
+            root.get("versionPolicy").and_then(Value::as_str),
+            Some(TLS_SIGNATURE_VERSION_POLICY)
+        );
+        let mut invalid = root;
+        invalid["purpose"] = Value::String("capture-authority".to_string());
+        let result = parse_runtime_selection_hint_patterns(&invalid.to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn product_and_version_selectors_are_rejected_from_base_family_registry() {
+        for field in [
+            "product",
+            "version",
+            "productVersion",
+            "versionRange",
+            "versionSelector",
+            "versions",
+            "minVersion",
+            "maxVersion",
+            "fileSize",
+            "binaryFingerprint",
+            "wholeFileSha256",
+            "capabilityExtension",
+        ] {
+            let mut fixture = signature_family_fixture();
+            fixture[field] = Value::String("must-live-in-explicit-extension".to_string());
+            assert!(
+                parse_signature_family(&fixture).is_err(),
+                "base family unexpectedly accepted selector {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_specific_policy_is_rejected_without_an_explicit_extension_loader() {
+        let mut fixture = signature_family_fixture();
+        fixture["versionPolicy"] = Value::String("version-range".to_string());
+        assert!(parse_signature_family(&fixture).is_err());
+
+        let mut document = serde_json::json!({
+            "schemaVersion": TLS_SIGNATURE_FAMILY_SCHEMA,
+            "versionPolicy": "version-range",
+            "extensionPolicy": TLS_SIGNATURE_EXTENSION_POLICY,
+            "families": []
+        });
+        assert!(validate_signature_registry_metadata(&document).is_err());
+        document["versionPolicy"] = Value::String(TLS_SIGNATURE_VERSION_POLICY.to_string());
+        document["extensionPolicy"] = Value::String("implicit-product-switch".to_string());
+        assert!(validate_signature_registry_metadata(&document).is_err());
+    }
+
+    #[test]
+    fn unknown_abi_is_fail_closed_without_an_offset_fallback() {
+        let mut fixture = signature_family_fixture();
+        fixture["readAbi"] = Value::String("future-abi".to_string());
+        let error = parse_signature_family(&fixture).unwrap_err().to_string();
+        assert!(error.contains("unsupported TLS ABI"));
+
+        fixture["readAbi"] = Value::String("classic".to_string());
+        fixture["writeAbi"] = Value::String("future-abi".to_string());
+        assert!(parse_signature_family(&fixture).is_err());
+        assert!(parse_abi("future-abi").is_err());
+    }
+
+    #[test]
+    fn configured_local_cli_binaries_match_without_version_or_fingerprint() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_BINARIES") else {
+            return;
+        };
+        for path in candidates
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            assert!(
+                !discover_static_signature_matches(&path).unwrap().is_empty(),
+                "installed target did not match a TLS implementation family: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn configured_rustls_binaries_match_common_state_abi_family() {
+        let Some(candidates) = std::env::var_os("A3S_OBSERVER_TLS_TEST_RUSTLS_BINARIES") else {
+            return;
+        };
+        for path in candidates
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            let discoveries = discover_static_signature_matches(&path).unwrap();
+            assert!(
+                discoveries
+                    .iter()
+                    .any(|discovery| discovery.pairs.iter().any(|pair| {
+                        pair.read_abi == TlsAbi::RustlsPayload
+                            && pair.write_abi == TlsAbi::RustlsOutboundChunks
+                    })),
+                "installed target did not match the Rustls CommonState ABI family: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_stream_scanner_finds_anchors_across_chunk_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "a3s-observer-static-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pattern = b"stable-static-tls-anchor";
+        let offset = STATIC_SCAN_CHUNK_BYTES - 7;
+        let mut bytes = vec![0x90; STATIC_SCAN_CHUNK_BYTES + pattern.len() + 32];
+        bytes[offset..offset + pattern.len()].copy_from_slice(pattern);
+        fs::write(&path, &bytes).unwrap();
+        let matches = find_pattern_offsets(
+            &path,
+            &[(0, bytes.len() as u64)],
+            pattern,
+            MAX_ANCHOR_MATCHES,
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(matches, vec![offset as u64]);
+    }
+
+    #[test]
+    fn current_test_executable_has_bounded_executable_elf_ranges() {
+        let path = std::env::current_exe().unwrap();
+        let ranges = executable_file_ranges(&path).unwrap();
+        assert!(!ranges.is_empty());
+        assert!(ranges.iter().all(|(start, end)| start < end));
+    }
+
+    #[test]
+    fn mount_namespace_root_keeps_a_stable_exact_inode_path() {
+        let path = std::env::current_exe().unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let relative = path.strip_prefix("/").unwrap();
+        let root_pid = stable_mount_namespace_root(std::process::id() as i32, relative, &metadata)
+            .expect("the current mount namespace must expose its own executable inode");
+        let rooted = PathBuf::from(format!("/proc/{root_pid}/root")).join(relative);
+        assert!(same_file_identity(&rooted, &metadata));
+        assert!(root_pid > 0);
+    }
+
+    #[test]
+    fn attach_failure_is_backed_off_but_never_permanently_rejected() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:1:ino:2:static-family:test".to_string();
+        assert!(manager.plan_is_available(&key));
+        manager.mark_attach_failed(key.clone(), "transient proc-root race");
+        assert!(!manager.plan_is_available(&key));
+        assert!(!manager.rejected.contains(&key));
+        manager.attach_failures.get_mut(&key).unwrap().next_retry_at =
+            Instant::now() - Duration::from_millis(1);
+        assert!(manager.plan_is_available(&key));
+        manager.mark_attached(key.clone(), None);
+        assert!(manager.attached.contains(&key));
+        assert!(!manager.attach_failures.contains_key(&key));
+    }
+
+    #[test]
+    fn deterministic_missing_exported_symbol_pair_is_rejected_once() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:3:ino:4:main-exported-openssl".to_string();
+        manager.mark_attach_failed(key.clone(), "no complete OpenSSL read/write pair attached");
+        assert!(manager.rejected.contains(&key));
+        assert!(!manager.attach_failures.contains_key(&key));
+        assert!(!manager.plan_is_available(&key));
+    }
+
+    #[test]
+    fn attachment_failures_are_explicitly_counted_and_bounded() {
+        let mut manager = TlsAttachManager::from_env("auto");
+        let key = "global:dev:9:ino:10:transient".to_string();
+        manager.mark_attach_failed(key.clone(), "temporary attach race");
+        let first = manager.metrics();
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.failed, 1);
+        assert_eq!(first.retry_scheduled, 1);
+        manager
+            .attach_failures
+            .get_mut(&key)
+            .expect("retry state")
+            .next_retry_at = Instant::now() - Duration::from_secs(1);
+        manager.mark_attached(key, None);
+        let second = manager.metrics();
+        assert_eq!(second.attempted, 2);
+        assert_eq!(second.attached, 1);
+    }
+
+    #[test]
+    fn hex_decoder_rejects_invalid_input() {
+        assert_eq!(decode_hex("00ff").unwrap(), vec![0, 255]);
+        assert!(decode_hex("0").is_err());
+        assert!(decode_hex("zz").is_err());
+    }
+
+    #[test]
+    fn exact_pi_process_title_is_selected_without_broad_pi_substring_matching() {
+        let patterns = vec!["run-pi-".to_string(), "pi-coding-agent".to_string()];
+        assert!(matches_selected_agent_text(
+            "mainthread",
+            "pi   ",
+            &patterns
+        ));
+        assert!(matches_selected_agent_text(
+            "node",
+            "node /usr/local/bin/pi --mode json",
+            &patterns
+        ));
+        assert!(!matches_selected_agent_text(
+            "python3",
+            "python3 pillow_worker.py",
+            &patterns
+        ));
+        assert!(!matches_selected_agent_text(
+            "node",
+            "node /app/pillow_worker.js",
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn only_the_packaged_codex_network_runtime_signature_is_inherited() {
+        assert!(matches_trusted_network_runtime_text(
+            "codex-code-mode",
+            "codex-code-mode-host"
+        ));
+        assert!(!matches_trusted_network_runtime_text("bash", "bash"));
+        assert!(!matches_trusted_network_runtime_text("python3", "python3"));
+    }
+
+    #[test]
+    fn verified_pids_keep_live_named_agent_runtimes_without_cgroup_scope() {
+        let mut manager = TlsAttachManager::from_env("1");
+        manager.set_scope_verified_pids(HashSet::new());
+        let named = scan_named_agent_runtime_pids();
+        let pids = manager.verified_pids();
+        for pid in named {
+            assert!(
+                pids.contains(&pid),
+                "named Agent pid {pid} must stay on the plaintext allowlist without a cgroup scope"
+            );
+        }
+    }
+
+    #[test]
+    fn product_neutral_scope_membership_survives_periodic_named_discovery() {
+        let mut manager = TlsAttachManager::from_env("1");
+        let pid = std::process::id() as i32;
+        manager.set_scope_verified_pids(HashSet::from([pid]));
+        let _ = manager.discover();
+        assert!(manager.verified_pids().contains(&pid));
+
+        manager.set_scope_verified_pids(HashSet::new());
+        let _ = manager.discover();
+        assert!(!manager.verified_pids().contains(&pid));
+    }
+
+    #[test]
+    fn verified_runtime_fence_keeps_a_live_process_admitted_when_name_temporarily_changes() {
+        let pid = std::process::id() as i32;
+        let fence =
+            verified_runtime_fence(pid).expect("test process must expose a generation fence");
+        let mut manager = TlsAttachManager::from_env("1");
+        manager.verified_runtime_fences.insert(pid, fence);
+
+        // Simulate a discovery pass in which the process title/argv no longer matches the Agent
+        // pattern (Tokio workers do this in real Codex/Claude processes). The exact PID generation
+        // is still admitted; a later PID reuse would fail the fence comparison and be removed.
+        manager.verified_processes.clear();
+        let pids = manager.verified_pids();
+        assert!(pids.contains(&pid));
+        assert_eq!(manager.verified_runtime_fences.get(&pid), Some(&fence));
+    }
+}

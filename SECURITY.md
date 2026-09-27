@@ -13,9 +13,11 @@ within 72 hours.
 
 - **Privileged probe load.** The collector needs root / `CAP_BPF`+`CAP_PERFMON`; treat the
   binary and image as privileged components.
-- **Content capture (`A3S_OBSERVER_SSL=1`).** Off by default. When on, it captures TLS
-  **plaintext** (prompts/completions) via OpenSSL uprobes — sensitive data. Enable only where
-  capturing that content is acceptable, and secure the NDJSON sink accordingly.
+- **Content capture (`A3S_OBSERVER_SSL=1`).** Off by default. When on, it captures bounded TLS
+  **plaintext** through discovered TLS-library/runtime boundaries — sensitive data. Credential
+  headers are removed before semantic export; unknown binary transports export metadata only.
+  Enable only where capturing Agent/model content is acceptable, and secure the NDJSON sink and
+  downstream retention accordingly.
 - **Enforcement (`a3s-observer-enforce` / `a3s-observer-fileguard`).** Opt-in. A bad policy can
   block legitimate egress / file access; the default is fail-open, and policies should be
   validated on a non-prod box (`scripts/validate-enforcement.sh`).

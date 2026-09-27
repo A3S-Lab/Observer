@@ -2,67 +2,207 @@
 #![no_main]
 
 use a3s_observer_common::{
-    ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent, LlmEvent, SecEvent, SslEvent,
-    TlsEvent, ARGV_SLOTS, DNS_SNAP_LEN, EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE,
-    EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS, EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT,
-    EXEC_RECORD_END, EXEC_RECORD_HEADER, FILE_DELETE_FLAG, PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID, SSL_SNAP_LEN, TLS_SNAP_LEN,
+    capture_cpu_sample_quota, capture_probe_is_protected, capture_probe_is_security,
+    capture_profile_default_actions, capture_profile_is_agent_family,
+    capture_profile_is_infrastructure_family, capture_sample_partitions,
+    classify_http_method_prefix_len, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
+    CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
+    CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
+    CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
+    FileFilterConfig, FileFilterKey, FileFilterSampleWindow, FileFilterStats, FileFilterValue,
+    FileProcessFilterKey, LlmEvent, RingPipelineStats, SecEvent, TlsEvent, TlsPlaintextEventHeader,
+    TlsPlaintextEventLarge, TlsPlaintextEventMedium, TlsPlaintextEventSmall, ARGV_SLOTS,
+    CAPTURE_ACTION_AGGREGATE, CAPTURE_ACTION_DROP, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+    CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_DESTRUCTIVE_GRANTED,
+    CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE, CAPTURE_DECISION_FLAG_LEGACY,
+    CAPTURE_DECISION_FLAG_PROMOTED, CAPTURE_DECISION_FLAG_PROTECTED,
+    CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_DECISION_FLAG_SHADOW,
+    CAPTURE_DECISION_FLAG_VERIFIED_AGENT, CAPTURE_DISPOSITION_MISS, CAPTURE_DISPOSITION_RULE,
+    CAPTURE_DISPOSITION_STALE, CAPTURE_MODE_SHADOW, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_DNS,
+    CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS, CAPTURE_PROBE_FILE_DELETE,
+    CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM, CAPTURE_PROBE_SECURITY, CAPTURE_PROBE_SSL,
+    CAPTURE_PROBE_TLS, CAPTURE_PROFILE_AGENT_FULL, CAPTURE_PROFILE_FLAG_AGENT,
+    CAPTURE_PROFILE_FLAG_CONFLICT, CAPTURE_PROFILE_INVESTIGATION_FULL,
+    CAPTURE_PROFILE_PROBABLE_INVESTIGATION, CAPTURE_PROFILE_SECURITY_FULL,
+    CAPTURE_PROFILE_UNKNOWN_DISCOVERY, CAPTURE_PROMOTION_FLAG_DESCENDANT,
+    CAPTURE_PROMOTION_FLAG_INVESTIGATION, CAPTURE_PROMOTION_FLAG_ROOT, DNS_SNAP_LEN,
+    EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
+    EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
+    FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
+    FILE_ACCESS_MODE_UNKNOWN, FILE_ACCESS_MODE_WRITE_ONLY, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
+    FILE_FILTER_AUTHORITY_AUTHORITATIVE, FILE_RENAME_AS_WRITE_FLAGS, HTTP_METHOD_PREFIX_COMPLETE,
+    HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_NONE,
+    PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
+    PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
+    PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_CANDIDATE, PLAINTEXT_HTTP_ROUTE_LLM,
+    PLAINTEXT_HTTP_ROUTE_MAX_LEN, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    classic_tls_sock_connection_id, http_request_line_shaped_len, TLS_PLAINTEXT_ABI_V2,
+    TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND,
+    TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_APP_DATA, TLS_PLAINTEXT_API_SSL_CLASSIC,
+    TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
+    TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
+    TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TOOL_ROUTE,
+    TLS_PLAINTEXT_FLAG_TRUNCATED, TLS_PLAINTEXT_TIER_LARGE, TLS_PLAINTEXT_TIER_MEDIUM,
+    TLS_PLAINTEXT_TIER_SMALL, TLS_SNAP_LEN,
 };
 use aya_ebpf::{
     cty::c_void,
     helpers::gen::bpf_probe_read_user,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_loop, bpf_probe_read_user_buf,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_uid_gid, bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_loop,
+        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
-    maps::{ring_buf::RingBufEntry, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{
+        ring_buf::RingBufEntry, Array, HashMap, LruHashMap, PerCpuArray, PerCpuHashMap, RingBuf,
+    },
     programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 
-// Exec records are fixed at 184 B. Typical commands need one header, a few argument chunks and
-// one end record; long argv values can use up to EXEC_MAX_CHUNKS records without inflating every
-// short exec event.
+// Exec records are fixed at 216 B after the additive S4 event-time and D1 decision tails. Typical commands need
+// one header, a few argument chunks and one end record; long argv values can use up to
+// EXEC_MAX_CHUNKS records without inflating every short exec event.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+// Exec carries the highest sustained burst on a shared development node. Keep enough kernel
+// ring headroom for short scheduler/HTTP stalls so a file canary cannot evict lifecycle records.
+static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
 #[map]
-static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
-static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
 #[map]
-static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 #[map]
-static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 #[map]
-static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+// Confirmed Agent workloads bypass Unknown sampling and can legitimately open thousands of files
+// in a short build/tool burst. One MiB keeps that burst isolated without returning to an unbounded
+// shared ring; FileDelete remains on its own high-priority channel below.
+static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+
+// Read-only opens are opt-in for exact Agent Runtime/Root scopes and intentionally use a separate
+// bulk channel. A repository scan must never consume the write/delete/security ring capacity.
+#[map]
+static FILE_READ_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+// Package managers and container cleanup can unlink thousands of files in milliseconds. A
+// dedicated 4 MiB ring prevents access traffic from starving those bursts while preserving an
+// independent loss counter.
+#[map]
+static FILE_DELETE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+// Userspace fills an entire epoch before switching FILE_FILTER_CONFIG.active_epoch. Keeping epoch
+// in the key makes that switch atomic even when the same cgroup exists in both generations.
+#[map]
+static FILE_FILTER_RULES: HashMap<FileFilterKey, FileFilterValue> =
+    HashMap::with_max_entries(131_072, 0);
 
 #[map]
-static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static FILE_FILTER_CONFIG: Array<FileFilterConfig> = Array::with_max_entries(1, 0);
+
+#[map]
+static FILE_FILTER_STATS: PerCpuArray<FileFilterStats> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static UNKNOWN_FILE_WINDOWS: LruHashMap<u64, FileFilterSampleWindow> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+#[map]
+static UNKNOWN_FILE_GLOBAL_WINDOW: PerCpuArray<FileFilterSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// Host ProcessTree shadow skeleton. V1 deliberately does not consult it: a PID-only enforcement
+// decision would be unsafe until start-generation synchronization is available to the kernel side.
+#[map]
+static TRACKED_FILE_PROCESSES: LruHashMap<FileProcessFilterKey, FileFilterValue> =
+    LruHashMap::with_max_entries(1_024, 0);
+
+// S5 is entirely additive to the v1 File filter. Userspace enables exactly one path: legacy keeps
+// these maps disabled; shadow/enforce disable FILE_FILTER_CONFIG and switch this epoch atomically.
+#[map]
+static CAPTURE_PROFILE_RULES: HashMap<CaptureProfileKey, CaptureProfileValue> =
+    // Two complete generations coexist until the config array atomically switches epoch.
+    HashMap::with_max_entries(131_072, 0);
+
+#[map]
+static CAPTURE_PROFILE_CONFIG: Array<CaptureProfileConfig> = Array::with_max_entries(1, 0);
+
+#[map]
+static CAPTURE_PROFILE_STATS: PerCpuArray<CaptureProbeStats> =
+    PerCpuArray::with_max_entries(PIPELINE_RING_COUNT as u32, 0);
+
+#[map]
+static CAPTURE_SAMPLE_WINDOWS: LruHashMap<CaptureSampleKey, CaptureSampleWindow> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+#[map]
+static CAPTURE_GLOBAL_SAMPLE_WINDOWS: PerCpuArray<CaptureSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// A separate, bounded reserve protects first discovery samples from established noisy scopes while
+// still enforcing a hard node/CPU cap. It is a partition of, not an addition to, the global limit.
+#[map]
+static CAPTURE_FIRST_SAMPLE_WINDOWS: PerCpuArray<CaptureSampleWindow> =
+    PerCpuArray::with_max_entries(1, 0);
+
+// Deliberately bounded to 4096 keys: as a per-CPU map, a 65k capacity would multiply memory by the
+// host CPU count. Insert failure is visible and falls back to the bounded emergency sample lane.
+#[map]
+static CAPTURE_AGGREGATES: PerCpuHashMap<CaptureAggregateKey, CaptureAggregateValue> =
+    PerCpuHashMap::with_max_entries(4_096, 0);
+
+#[map]
+static CAPTURE_PROMOTED_PROCESSES: LruHashMap<CaptureProcessKey, CapturePromotionValue> =
+    LruHashMap::with_max_entries(131_072, 0);
+
+#[map]
+static LLM_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 // Security-sensitive actions (privesc / injection / open-port). In-kernel-filtered to the loud
 // cases, so this stays near-empty — a small ring is plenty.
 #[map]
-static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+static SEC_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 // Count of events dropped because a ring was full — data-loss visibility under extreme load.
 #[map]
 static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// Per-ring physical-record accounting. This is additive to `DROPS`: the legacy aggregate remains
+// byte-for-byte compatible while userspace can now identify which ring admitted or lost records.
+#[map]
+static PIPELINE_ACCOUNTING: PerCpuArray<RingPipelineStats> =
+    PerCpuArray::with_max_entries(PIPELINE_RING_COUNT as u32, 0);
 
 // child tgid -> parent tgid, captured before the child runs (with syscall-exit fallback). Exec must carry
 // this in-kernel snapshot because short-lived tools can exit before userspace reads /proc.
 #[map]
 static PARENTS: LruHashMap<u32, u32> = LruHashMap::with_max_entries(65_536, 0);
 
-// tgid -> latest syscall-entry capture. `sched_process_exec` consumes it only after a successful
-// exec, so userspace can distinguish committed images from failed execve attempts.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PendingExecState {
+    exec_id: u64,
+    capture_decision: CaptureDecisionContext,
+}
+
+// tgid -> latest syscall-entry generation and its exact capture decision. `sched_process_exec`
+// consumes both only after a successful exec, so every physical fragment and COMMIT carries one
+// identical D1 decision even if the active profile changes while execve is in progress.
 #[map]
-static EXEC_IDS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(65_536, 0);
+static EXEC_IDS: LruHashMap<u32, PendingExecState> = LruHashMap::with_max_entries(65_536, 0);
+
+// tgid -> latest successfully committed exec generation. Unlike EXEC_IDS this survives the
+// sched_process_exec commit and is consumed only by do_exit, giving ProcessExit an event-time
+// generation key that cannot be confused by later `/proc/<pid>` reuse.
+#[map]
+static COMMITTED_EXEC_IDS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(65_536, 0);
 
 // Egress deny-list (dest IPv4, host byte order). Populated by userspace from an external
 // policy; the cgroup/connect4 guard denies connect() to any IP present here. Cgroup-scoped.
@@ -79,14 +219,185 @@ static LLM_SOCKS: HashMap<u64, LlmStat> = HashMap::with_max_entries(4096, 0);
 #[map]
 static READ_FD: HashMap<u64, u32> = HashMap::with_max_entries(10240, 0);
 
-// Opt-in OpenSSL content (uprobe). Bigger ring — payloads are up to SSL_SNAP_LEN each.
+// Opt-in TLS plaintext (uprobes). Tiered records capture common small calls without padding every
+// reservation to the 512 KiB ceiling while retaining bounded large request/response bodies.
 #[map]
-static SSL_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
+static SSL_EVENTS: RingBuf = RingBuf::with_byte_size(32 * 1024 * 1024, 0);
 
-// SSL_read entry saves the caller's buffer ptr by tid so the uretprobe (which knows how many
-// bytes were decrypted into it) can snapshot the plaintext.
 #[map]
-static SSL_READ_BUF: HashMap<u64, u64> = HashMap::with_max_entries(10240, 0);
+static SSL_CALL_ARGS: HashMap<u64, SslCallArgs> = HashMap::with_max_entries(10240, 0);
+
+#[map]
+static SSL_CALL_SEQUENCES: LruHashMap<u64, u64> = LruHashMap::with_max_entries(16_384, 0);
+
+// Metadata-only diagnostics for implementation-family Rustls probes. No plaintext bytes or
+// pointers leave eBPF through this map; userspace uses the counters to distinguish an unused
+// boundary from an ABI-layout rejection or process-admission miss.
+#[map]
+static TLS_PROFILE_DIAGNOSTICS: PerCpuArray<u64> = PerCpuArray::with_max_entries(21, 0);
+
+#[inline(always)]
+fn bump_tls_profile_diagnostic(index: u32) {
+    if let Some(value) = TLS_PROFILE_DIAGNOSTICS.get_ptr_mut(index) {
+        unsafe { *value = (*value).wrapping_add(1) };
+    }
+}
+
+// Userspace inserts only identity-verified Agent roots and explicitly trusted network runtimes.
+// TLS success is a separate condition enforced by PID-scoped uprobe attachment. URL, Host, route,
+// model and provider configuration are deliberately absent from this kernel admission boundary.
+#[map]
+static VERIFIED_AGENT_PROCESSES: LruHashMap<PlaintextProcessKey, u8> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+// Generation fence paired with VERIFIED_AGENT_PROCESSES.  Userspace can only publish PID/cgroup
+// membership, while the kernel records the committed exec generation and removes it on exit; a
+// reused PID therefore cannot inherit a previous Agent plaintext grant.
+#[map]
+static VERIFIED_AGENT_EXEC_IDS: LruHashMap<PlaintextProcessKey, u64> =
+    LruHashMap::with_max_entries(16_384, 0);
+
+// Plain HTTP is different from a TLS-library boundary: generic write/writev also sees stdout and
+// files. Admit a socket only after a selected process writes any syntactically valid HTTP request
+// line. The Collector, not eBPF, decides whether its body is an LLM interaction.
+#[map]
+static HTTP_SOCKS: LruHashMap<u64, u8> = LruHashMap::with_max_entries(8_192, 0);
+
+// TLS context → socket bind (Codex rustls CommonState pointer moves / OpenSSL SSL*→fd).
+// LAST_TLS_CTX is written on SSL/rustls write enter; sys_enter_write/sendto/writev consumes it.
+// LAST_SOCKET_READ is written on successful read/recv exit; SSL/rustls read consumes it.
+// Window must cover rustls decrypt latency (not just same-syscall proximity). Keys are stored
+// under both pid_tgid (preferred) and pid (tokio worker threads often split read vs uprobe).
+const TLS_CTX_BIND_WINDOW_NS: u64 = 100_000_000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LastTlsCtx {
+    ssl_ptr: u64,
+    started_at_boot_ns: u64,
+    api_kind: u8,
+    direction: u8,
+    _pad: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LastSocketIo {
+    fd: u32,
+    _pad: u32,
+    observed_at_boot_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TlsCtxSocketKey {
+    cgroup_id: u64,
+    pid: u32,
+    _reserved: u32,
+    tls_context_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TlsCtxSocketValue {
+    fd: u32,
+    fd_generation: u32,
+    socket_cookie: u64,
+    bound_at_boot_ns: u64,
+    bind_quality: u8,
+    _pad: [u8; 7],
+}
+
+#[map]
+static LAST_TLS_CTX: HashMap<u64, LastTlsCtx> = HashMap::with_max_entries(10_240, 0);
+#[map]
+static LAST_SOCKET_READ: HashMap<u64, LastSocketIo> = HashMap::with_max_entries(10_240, 0);
+#[map]
+static TLS_CTX_SOCKET: LruHashMap<TlsCtxSocketKey, TlsCtxSocketValue> =
+    LruHashMap::with_max_entries(8_192, 0);
+/// Per-(cgroup,pid,fd) generation; bumped on close so reused fds do not inherit binds.
+#[map]
+static SOCKET_FD_GENERATION: LruHashMap<u64, u32> = LruHashMap::with_max_entries(8_192, 0);
+
+// Exact POST path admission for the generic plain-HTTP lane.  Userspace installs the default
+// model routes and any explicitly authorised tool routes; the kernel stores only FNV-1a hashes and
+// a closed route kind, never product names or JSON.
+#[map]
+static PLAINTEXT_HTTP_ROUTES: HashMap<u64, u8> = HashMap::with_max_entries(512, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextTlsSessionKey {
+    cgroup_id: u64,
+    pid: u32,
+    _reserved: u32,
+    tls_context_id: u64,
+    exec_id: u64,
+}
+
+const TLS_SESSION_CANDIDATE_TTL_NS: u64 = 60_000_000_000;
+const TLS_SESSION_EXACT_TTL_NS: u64 = 86_400_000_000_000;
+const TLS_SESSION_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TLS_SESSION_ROUTE_BLOCKED: u8 = u8::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextTlsSessionValue {
+    route: u8,
+    _pad: [u8; 7],
+    expires_at_boot_ns: u64,
+    captured_bytes: u64,
+}
+
+// A write-side route match authorizes subsequent reads on the same TLS context. The key keeps
+// cgroup + PID + TLS pointer together so allocator/PID reuse cannot inherit an old route. Values
+// carry a bounded idle lease and byte budget; LRU eviction is an additional bound and a missing /
+// expired entry is fail-closed for plaintext capture.
+#[map]
+static PLAINTEXT_TLS_SESSIONS: LruHashMap<PlaintextTlsSessionKey, PlaintextTlsSessionValue> =
+    LruHashMap::with_max_entries(8_192, 0);
+
+#[map]
+static HTTP_READ_ARGS: HashMap<u64, HttpReadArgs> = HashMap::with_max_entries(10_240, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SslCallArgs {
+    ssl_ptr: u64,
+    buf: u64,
+    requested_len: u64,
+    result_len_ptr: u64,
+    started_at_boot_ns: u64,
+    direction: u8,
+    api_kind: u8,
+    route_kind: u8,
+    _pad: [u8; 5],
+    syscall_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaintextProcessKey {
+    cgroup_id: u64,
+    pid: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HttpReadArgs {
+    fd: u32,
+    _pad: u32,
+    buf: u64,
+    started_at_boot_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserIovec {
+    base: u64,
+    len: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -97,22 +408,1611 @@ struct LlmStat {
     resp_bytes: u64,
 }
 
-fn sock_key(pid: u32, fd: u64) -> u64 {
-    ((pid as u64) << 32) | (fd & 0xffff_ffff)
+fn sock_key(cgroup_id: u64, pid: u32, fd: u64) -> u64 {
+    // Include the event-time cgroup in the opaque map key.  PID/FD values can be reused across
+    // containers; retaining only `(pid,fd)` lets a stale socket summary bleed into a new runtime.
+    classic_tls_sock_connection_id(cgroup_id, pid, fd)
+}
+
+fn remember_last_tls_ctx(ssl_ptr: u64, api_kind: u8, direction: u8) {
+    if ssl_ptr == 0 {
+        return;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u64;
+    let entry = LastTlsCtx {
+        ssl_ptr,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        api_kind,
+        direction,
+        _pad: [0; 6],
+    };
+    let _ = LAST_TLS_CTX.insert(&pid_tgid, &entry, 0);
+    let _ = LAST_TLS_CTX.insert(&pid, &entry, 0);
+}
+
+fn socket_fd_generation(cgroup_id: u64, pid: u32, fd: u64) -> u32 {
+    let key = sock_key(cgroup_id, pid, fd);
+    unsafe { SOCKET_FD_GENERATION.get(&key) }
+        .copied()
+        .unwrap_or(0)
+}
+
+fn bump_socket_fd_generation(cgroup_id: u64, pid: u32, fd: u64) {
+    let key = sock_key(cgroup_id, pid, fd);
+    let next = socket_fd_generation(cgroup_id, pid, fd).wrapping_add(1);
+    let _ = SOCKET_FD_GENERATION.insert(&key, &next, 0);
+}
+
+fn bind_tls_ctx_to_socket(ssl_ptr: u64, fd: u64) {
+    if ssl_ptr == 0 || fd == 0 || fd > 0xffff_ffff {
+        return;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !verified_agent_process(pid, cgroup_id) {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let key = TlsCtxSocketKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: ssl_ptr,
+    };
+    let value = TlsCtxSocketValue {
+        fd: fd as u32,
+        fd_generation: socket_fd_generation(cgroup_id, pid, fd),
+        socket_cookie: 0,
+        bound_at_boot_ns: now,
+        bind_quality: TLS_BIND_QUALITY_FD,
+        _pad: [0; 7],
+    };
+    let _ = TLS_CTX_SOCKET.insert(&key, &value, 0);
+}
+
+fn take_last_tls_ctx() -> Option<LastTlsCtx> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u64;
+    let now = unsafe { bpf_ktime_get_ns() };
+    let last = unsafe { LAST_TLS_CTX.get(&pid_tgid) }
+        .copied()
+        .or_else(|| unsafe { LAST_TLS_CTX.get(&pid) }.copied())?;
+    if now.saturating_sub(last.started_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
+        let _ = LAST_TLS_CTX.remove(&pid_tgid);
+        let _ = LAST_TLS_CTX.remove(&pid);
+        return None;
+    }
+    Some(last)
+}
+
+fn try_bind_tls_write_to_fd(fd: u64) {
+    let Some(last) = take_last_tls_ctx() else {
+        return;
+    };
+    if last.direction != TLS_PLAINTEXT_DIRECTION_WRITE || last.ssl_ptr == 0 {
+        return;
+    }
+    bind_tls_ctx_to_socket(last.ssl_ptr, fd);
+    // Keep LAST_TLS_CTX for the window: rustls CommonState may move and need re-bind.
+}
+
+fn peek_last_socket_read() -> Option<LastSocketIo> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u64;
+    let now = unsafe { bpf_ktime_get_ns() };
+    let last = unsafe { LAST_SOCKET_READ.get(&pid_tgid) }
+        .copied()
+        .or_else(|| unsafe { LAST_SOCKET_READ.get(&pid) }.copied())?;
+    if now.saturating_sub(last.observed_at_boot_ns) > TLS_CTX_BIND_WINDOW_NS {
+        let _ = LAST_SOCKET_READ.remove(&pid_tgid);
+        let _ = LAST_SOCKET_READ.remove(&pid);
+        return None;
+    }
+    Some(last)
+}
+
+fn try_bind_tls_read_from_last_socket(ssl_ptr: u64) {
+    if ssl_ptr == 0 {
+        return;
+    }
+    let Some(last) = peek_last_socket_read() else {
+        return;
+    };
+    // Re-bind on every plaintext read so moved rustls CommonState pointers alias the same fd.
+    bind_tls_ctx_to_socket(ssl_ptr, last.fd as u64);
+}
+
+fn lookup_tls_ctx_bind(cgroup_id: u64, pid: u32, ssl_ptr: u64) -> Option<TlsCtxSocketValue> {
+    if ssl_ptr == 0 {
+        return None;
+    }
+    let key = TlsCtxSocketKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: ssl_ptr,
+    };
+    unsafe { TLS_CTX_SOCKET.get(&key) }.copied()
 }
 
 /// Reserve a ring-buffer slot, counting a drop if the ring is full (so userspace can report
-/// data loss instead of losing events silently).
-fn reserve_or_drop<T>(ring: &RingBuf) -> Option<RingBufEntry<T>> {
+/// data loss instead of losing events silently). A successful reservation is not a submitted
+/// physical record until `submit_accounted` commits it; probes may still discard the slot.
+fn reserve_or_drop<T>(ring: &RingBuf, ring_index: u32) -> Option<RingBufEntry<T>> {
     let entry = ring.reserve::<T>(0);
-    if entry.is_none() {
-        unsafe {
+    unsafe {
+        if let Some(stats) = PIPELINE_ACCOUNTING.get_ptr_mut(ring_index) {
+            if entry.is_none() {
+                (*stats).dropped = (*stats).dropped.wrapping_add(1);
+            }
+        }
+        if entry.is_none() {
+            if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(ring_index) {
+                (*stats).ring_dropped = (*stats).ring_dropped.wrapping_add(1);
+            }
+        }
+        if entry.is_none() {
             if let Some(c) = DROPS.get_ptr_mut(0) {
                 *c = (*c).wrapping_add(1);
             }
         }
     }
     entry
+}
+
+#[inline(always)]
+fn submit_accounted<T>(entry: RingBufEntry<T>, ring_index: u32) {
+    unsafe {
+        if let Some(stats) = PIPELINE_ACCOUNTING.get_ptr_mut(ring_index) {
+            (*stats).submitted = (*stats).submitted.wrapping_add(1);
+        }
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(ring_index) {
+            (*stats).ring_submitted = (*stats).ring_submitted.wrapping_add(1);
+        }
+    }
+    entry.submit(0);
+}
+
+const CAPTURE_STAT_ATTEMPTED: u8 = 1;
+const CAPTURE_STAT_FULL: u8 = 2;
+const CAPTURE_STAT_AGGREGATE: u8 = 3;
+const CAPTURE_STAT_SAMPLE: u8 = 4;
+const CAPTURE_STAT_SAMPLE_REJECTED: u8 = 5;
+const CAPTURE_STAT_DROP: u8 = 6;
+const CAPTURE_STAT_DECISION_ERROR: u8 = 7;
+const CAPTURE_STAT_PAYLOAD_SELECTED: u8 = 8;
+const CAPTURE_STAT_PAYLOAD_ERROR: u8 = 9;
+const CAPTURE_STAT_WOULD_FULL: u8 = 10;
+const CAPTURE_STAT_WOULD_AGGREGATE: u8 = 11;
+const CAPTURE_STAT_WOULD_SAMPLE: u8 = 12;
+const CAPTURE_STAT_WOULD_DROP: u8 = 13;
+const CAPTURE_STAT_RULE_HIT: u8 = 14;
+const CAPTURE_STAT_RULE_MISS: u8 = 15;
+const CAPTURE_STAT_STALE: u8 = 16;
+const CAPTURE_STAT_PROMOTION_HIT: u8 = 17;
+const CAPTURE_STAT_AGGREGATE_ERROR: u8 = 18;
+const CAPTURE_STAT_PROMOTION_ERROR: u8 = 19;
+const CAPTURE_STAT_PROBE_ERROR: u8 = 20;
+const CAPTURE_STAT_NOT_ENABLED: u8 = 21;
+
+#[inline(always)]
+fn increment_capture_stat(probe: u8, kind: u8) {
+    if probe as usize >= PIPELINE_RING_COUNT {
+        return;
+    }
+    unsafe {
+        let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) else {
+            return;
+        };
+        match kind {
+            CAPTURE_STAT_ATTEMPTED => (*stats).attempted = (*stats).attempted.wrapping_add(1),
+            CAPTURE_STAT_FULL => (*stats).full_selected = (*stats).full_selected.wrapping_add(1),
+            CAPTURE_STAT_AGGREGATE => {
+                (*stats).aggregate_selected = (*stats).aggregate_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_SAMPLE => {
+                (*stats).sample_selected = (*stats).sample_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_SAMPLE_REJECTED => {
+                (*stats).sample_rejected = (*stats).sample_rejected.wrapping_add(1)
+            }
+            CAPTURE_STAT_DROP => (*stats).drop_selected = (*stats).drop_selected.wrapping_add(1),
+            CAPTURE_STAT_DECISION_ERROR => {
+                (*stats).decision_error = (*stats).decision_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PAYLOAD_SELECTED => {
+                (*stats).payload_selected = (*stats).payload_selected.wrapping_add(1)
+            }
+            CAPTURE_STAT_PAYLOAD_ERROR => {
+                (*stats).payload_error = (*stats).payload_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_FULL => (*stats).would_full = (*stats).would_full.wrapping_add(1),
+            CAPTURE_STAT_WOULD_AGGREGATE => {
+                (*stats).would_aggregate = (*stats).would_aggregate.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_SAMPLE => {
+                (*stats).would_sample = (*stats).would_sample.wrapping_add(1)
+            }
+            CAPTURE_STAT_WOULD_DROP => (*stats).would_drop = (*stats).would_drop.wrapping_add(1),
+            CAPTURE_STAT_RULE_HIT => (*stats).rule_hit = (*stats).rule_hit.wrapping_add(1),
+            CAPTURE_STAT_RULE_MISS => (*stats).rule_miss = (*stats).rule_miss.wrapping_add(1),
+            CAPTURE_STAT_STALE => (*stats).stale_rule = (*stats).stale_rule.wrapping_add(1),
+            CAPTURE_STAT_PROMOTION_HIT => {
+                (*stats).promotion_hit = (*stats).promotion_hit.wrapping_add(1)
+            }
+            CAPTURE_STAT_AGGREGATE_ERROR => {
+                (*stats).aggregate_error = (*stats).aggregate_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PROMOTION_ERROR => {
+                (*stats).promotion_error = (*stats).promotion_error.wrapping_add(1)
+            }
+            CAPTURE_STAT_PROBE_ERROR => (*stats).probe_error = (*stats).probe_error.wrapping_add(1),
+            CAPTURE_STAT_NOT_ENABLED => (*stats).not_enabled = (*stats).not_enabled.wrapping_add(1),
+            _ => {}
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_payload_candidate(probe: u8) {
+    if capture_profile_enabled() {
+        increment_capture_stat(probe, CAPTURE_STAT_PAYLOAD_SELECTED);
+    }
+}
+
+#[inline(always)]
+fn capture_payload_error(probe: u8) {
+    if capture_profile_enabled() {
+        increment_capture_stat(probe, CAPTURE_STAT_PAYLOAD_ERROR);
+    }
+}
+
+#[inline(always)]
+fn capture_profile_enabled() -> bool {
+    CAPTURE_PROFILE_CONFIG
+        .get(0)
+        .copied()
+        .is_some_and(|config| config.enabled())
+}
+
+#[inline(always)]
+fn file_read_capture_enabled() -> bool {
+    FILE_FILTER_CONFIG
+        .get(0)
+        .copied()
+        .is_some_and(|config| config.file_read_enabled())
+}
+
+#[inline(always)]
+fn capture_would(probe: u8, action: u8) {
+    // Keep the map-value offsets statically visible to the verifier. Passing the untrusted action
+    // through the generic `kind` switch lets LLVM synthesize `base + action * 8`; the verifier then
+    // has to admit action=255 and rejects an apparent access beyond CaptureProbeStats.
+    if action == CAPTURE_ACTION_AGGREGATE {
+        increment_capture_would_aggregate(probe);
+        return;
+    }
+    if action == CAPTURE_ACTION_SAMPLE {
+        increment_capture_would_sample(probe);
+        return;
+    }
+    if action == CAPTURE_ACTION_DROP {
+        increment_capture_would_drop(probe);
+        return;
+    }
+    increment_capture_would_full(probe);
+}
+
+#[inline(never)]
+fn increment_capture_would_full(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_full = (*stats).would_full.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_aggregate(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_aggregate = (*stats).would_aggregate.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_sample(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_sample = (*stats).would_sample.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+fn increment_capture_would_drop(probe: u8) {
+    unsafe {
+        if let Some(stats) = CAPTURE_PROFILE_STATS.get_ptr_mut(probe as u32) {
+            (*stats).would_drop = (*stats).would_drop.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn capture_window_allows(
+    state: *mut CaptureSampleWindow,
+    now: u64,
+    window_ns: u64,
+    limit: u32,
+) -> bool {
+    if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+        (*state).started_at_boot_ns = now;
+        (*state).count = 0;
+    }
+    if (*state).count >= limit {
+        return false;
+    }
+    (*state).count = (*state).count.saturating_add(1);
+    true
+}
+
+/// 1=allowed, 0=rejected, -1=state error (caller uses the bounded emergency lane).
+#[inline(always)]
+fn capture_sample_allowed(key: &CaptureSampleKey, config: &CaptureProfileConfig, now: u64) -> i8 {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let scope_limit = config.sample_per_scope_limit.max(1);
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    // CPU hotplug beyond the collector-observed count gets no lossy sample budget until the next
+    // snapshot; protected events remain FULL.
+    let global_limit =
+        capture_cpu_sample_quota(config.sample_node_limit, config.sample_cpu_count, cpu);
+    let first_samples = config.first_samples.max(1) as u32;
+
+    let scope_count = unsafe {
+        if let Some(state) = CAPTURE_SAMPLE_WINDOWS.get_ptr_mut(key) {
+            if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+                (*state).started_at_boot_ns = now;
+                (*state).count = 0;
+            }
+            if (*state).count >= scope_limit {
+                return 0;
+            }
+            (*state).count = (*state).count.saturating_add(1);
+            (*state).count
+        } else {
+            let initial = CaptureSampleWindow {
+                started_at_boot_ns: now,
+                count: 1,
+                _reserved: 0,
+            };
+            if CAPTURE_SAMPLE_WINDOWS.insert(key, &initial, 0).is_err() {
+                return -1;
+            }
+            1
+        }
+    };
+
+    if global_limit == 0 {
+        return 0;
+    }
+    let (first_reserve, regular_limit) = capture_sample_partitions(global_limit);
+    // First samples use their own fixed partition, so established noisy scopes cannot consume the
+    // discovery reserve. The two partitions sum to the hard configured global limit.
+    if scope_count <= first_samples {
+        return unsafe {
+            match CAPTURE_FIRST_SAMPLE_WINDOWS.get_ptr_mut(0) {
+                Some(state) => {
+                    i8::from(capture_window_allows(state, now, window_ns, first_reserve))
+                }
+                None => -1,
+            }
+        };
+    }
+    if regular_limit == 0 {
+        return 0;
+    }
+    unsafe {
+        match CAPTURE_GLOBAL_SAMPLE_WINDOWS.get_ptr_mut(0) {
+            Some(state) => i8::from(capture_window_allows(state, now, window_ns, regular_limit)),
+            None => -1,
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_emergency_sample_allowed(_probe: u8, config: &CaptureProfileConfig, now: u64) -> i8 {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    let quota = capture_cpu_sample_quota(config.sample_node_limit, config.sample_cpu_count, cpu);
+    let (_, regular_limit) = capture_sample_partitions(quota);
+    if regular_limit == 0 {
+        return 0;
+    }
+    unsafe {
+        match CAPTURE_GLOBAL_SAMPLE_WINDOWS.get_ptr_mut(0) {
+            Some(state) => i8::from(capture_window_allows(state, now, window_ns, regular_limit)),
+            None => -1,
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_aggregate_attempt(
+    cgroup_id: u64,
+    epoch: u64,
+    probe: u8,
+    action: u8,
+    qualifier: u8,
+    profile: u8,
+    authority: u8,
+    disposition: u8,
+    bytes: u64,
+) -> bool {
+    let key = CaptureAggregateKey {
+        cgroup_id,
+        epoch,
+        probe,
+        action,
+        qualifier,
+        profile,
+        authority,
+        disposition,
+        _reserved: [0; 2],
+    };
+    unsafe {
+        if let Some(value) = CAPTURE_AGGREGATES.get_ptr_mut(&key) {
+            (*value).count = (*value).count.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            true
+        } else {
+            CAPTURE_AGGREGATES
+                .insert(&key, &CaptureAggregateValue { count: 1, bytes }, 0)
+                .is_ok()
+        }
+    }
+}
+
+#[inline(always)]
+fn capture_promotion_valid(
+    pid: u32,
+    cgroup_id: u64,
+    config: &CaptureProfileConfig,
+    now: u64,
+) -> bool {
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&key).copied() }) else {
+        return false;
+    };
+    if value.cgroup_id != cgroup_id
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return false;
+    }
+    if value.expected_exec_id != 0 {
+        let committed = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+        if committed != value.expected_exec_id {
+            if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+                increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn inherit_capture_promotion(parent: u32, child: u32) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !capture_promotion_valid(parent, cgroup_id, &config, now) {
+        return;
+    }
+    let parent_key = CaptureProcessKey {
+        pid: parent,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(parent_value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&parent_key).copied() })
+    else {
+        return;
+    };
+    let child_key = CaptureProcessKey {
+        pid: child,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let child_value = CapturePromotionValue {
+        cgroup_id,
+        expected_exec_id: 0,
+        root_exec_id: parent_value.root_exec_id,
+        expires_at_boot_ns: parent_value.expires_at_boot_ns,
+        root_pid: parent_value.root_pid,
+        flags: (parent_value.flags & CAPTURE_PROMOTION_FLAG_INVESTIGATION)
+            | CAPTURE_PROMOTION_FLAG_DESCENDANT,
+    };
+    if CAPTURE_PROMOTED_PROCESSES
+        .insert(&child_key, &child_value, 0)
+        .is_err()
+    {
+        increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn commit_capture_promotion(pid: u32, exec_id: u64, cgroup_id: u64) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let Some(mut value) = (unsafe { CAPTURE_PROMOTED_PROCESSES.get(&key).copied() }) else {
+        return;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    if value.cgroup_id != cgroup_id
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return;
+    }
+    // A configured root is fenced to the exact commit generation. A descendant begins with zero
+    // at fork and is advanced to its own generation only after this successful commit hook.
+    if value.flags & CAPTURE_PROMOTION_FLAG_ROOT != 0
+        && value.expected_exec_id != 0
+        && value.expected_exec_id != exec_id
+    {
+        if CAPTURE_PROMOTED_PROCESSES.remove(&key).is_err() {
+            increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+        }
+        return;
+    }
+    value.expected_exec_id = exec_id;
+    if CAPTURE_PROMOTED_PROCESSES.insert(&key, &value, 0).is_err() {
+        increment_capture_stat(CAPTURE_PROBE_EXEC, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn promote_security_runtime(pid: u32, cgroup_id: u64) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() || config.active_epoch == 0 {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let exec_id = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let value = CapturePromotionValue {
+        cgroup_id,
+        expected_exec_id: exec_id,
+        root_exec_id: exec_id,
+        expires_at_boot_ns: now.saturating_add(config.investigation_ttl_ns.max(1)),
+        root_pid: pid,
+        flags: CAPTURE_PROMOTION_FLAG_ROOT | CAPTURE_PROMOTION_FLAG_INVESTIGATION,
+    };
+    if CAPTURE_PROMOTED_PROCESSES.insert(&key, &value, 0).is_err() {
+        increment_capture_stat(CAPTURE_PROBE_SECURITY, CAPTURE_STAT_PROMOTION_ERROR);
+    }
+}
+
+#[inline(always)]
+fn remove_capture_promotion(pid: u32) {
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if config.active_epoch == 0 {
+        return;
+    }
+    let key = CaptureProcessKey {
+        pid,
+        _reserved: 0,
+        epoch: config.active_epoch,
+    };
+    let _ = CAPTURE_PROMOTED_PROCESSES.remove(&key);
+}
+
+#[inline(always)]
+fn capture_decision(
+    epoch: u64,
+    profile: u8,
+    action: u8,
+    authority: u8,
+    disposition: u8,
+    flags: u8,
+) -> CaptureDecisionContext {
+    CaptureDecisionContext {
+        capture_epoch: epoch,
+        capture_profile: profile,
+        capture_action: action,
+        capture_authority: authority,
+        capture_disposition: disposition,
+        flags,
+        _reserved: [0; 3],
+    }
+}
+
+#[inline(always)]
+fn selected_capture_decision(
+    epoch: u64,
+    profile: u8,
+    action: u8,
+    authority: u8,
+    disposition: u8,
+    flags: u8,
+) -> CaptureDecisionContext {
+    capture_decision(
+        epoch,
+        profile,
+        action,
+        authority,
+        disposition,
+        flags | CAPTURE_DECISION_FLAG_SELECTED,
+    )
+}
+
+#[inline(always)]
+fn legacy_selected_capture_decision() -> CaptureDecisionContext {
+    selected_capture_decision(
+        0,
+        CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+        CAPTURE_ACTION_FULL,
+        0,
+        CAPTURE_DISPOSITION_MISS,
+        CAPTURE_DECISION_FLAG_LEGACY,
+    )
+}
+
+#[inline(always)]
+fn capture_scope_exec_discovery_active(
+    cgroup_id: u64,
+    epoch: u64,
+    now: u64,
+    window_ns: u64,
+) -> bool {
+    let key = CaptureSampleKey {
+        cgroup_id,
+        epoch,
+        probe: CAPTURE_PROBE_EXEC,
+        _reserved: [0; 7],
+    };
+    let Some(state) = CAPTURE_SAMPLE_WINDOWS.get_ptr_mut(&key) else {
+        return false;
+    };
+    unsafe {
+        if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+            return false;
+        }
+        (*state).count > 0
+    }
+}
+
+/// Returns the exact decision made before raw payload construction and Ring reservation.
+/// AGGREGATE/DROP/sample rejection return an unselected context and terminate at the caller.
+#[inline(always)]
+fn capture_raw_decision(
+    probe: u8,
+    cgroup_id: u64,
+    pid: u32,
+    bytes: u64,
+    qualifier: u8,
+) -> CaptureDecisionContext {
+    if probe as usize >= PIPELINE_RING_COUNT {
+        return legacy_selected_capture_decision();
+    }
+    let config = CAPTURE_PROFILE_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        return legacy_selected_capture_decision();
+    }
+    increment_capture_stat(probe, CAPTURE_STAT_ATTEMPTED);
+    let now = unsafe { bpf_ktime_get_ns() };
+    let protected_kind = capture_probe_is_protected(probe);
+    let bounded = config.bounded_unknown_lifecycle_enabled();
+    // The Collector's verified-process map is a generation-fenced positive Agent identity. It
+    // intentionally outlives short cgroup/profile leases, which may be refreshed asynchronously
+    // while a CLI is idle. Plaintext TLS is the interaction payload we promised to observe, so a
+    // verified Agent must not fall back to the Unknown/probable sample matrix for this probe.
+    let verified_agent = verified_agent_process(pid, cgroup_id);
+    // Promotions must be visible to Exec/Exit even though those probes are "protected kinds".
+    // The legacy `!protected && promotion` gate permanently hid Agent root promotions from the
+    // lifecycle path and is what forced unknown Exec/Exit through the unconditional FULL bypass.
+    let promotion_valid = capture_promotion_valid(pid, cgroup_id, &config, now);
+
+    let key = CaptureProfileKey {
+        cgroup_id,
+        epoch: config.active_epoch,
+    };
+    let rule = unsafe { CAPTURE_PROFILE_RULES.get(&key).copied() };
+    let mut profile = CAPTURE_PROFILE_UNKNOWN_DISCOVERY;
+    let mut action = capture_profile_default_actions(profile)[probe as usize];
+    let mut desired = action;
+    let mut authority = 0;
+    let mut disposition = CAPTURE_DISPOSITION_MISS;
+    let mut rule_agent_flag = false;
+    if config.expires_at_boot_ns != 0 && now >= config.expires_at_boot_ns {
+        if !protected_kind && !promotion_valid {
+            increment_capture_stat(probe, CAPTURE_STAT_STALE);
+        }
+        disposition = CAPTURE_DISPOSITION_STALE;
+    } else if let Some(value) = rule {
+        if value.epoch != config.active_epoch
+            || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+        {
+            if !protected_kind && !promotion_valid {
+                increment_capture_stat(probe, CAPTURE_STAT_STALE);
+            }
+            disposition = CAPTURE_DISPOSITION_STALE;
+        } else {
+            if !protected_kind && !promotion_valid {
+                increment_capture_stat(probe, CAPTURE_STAT_RULE_HIT);
+            }
+            profile = value.profile;
+            authority = value.authority;
+            disposition = CAPTURE_DISPOSITION_RULE;
+            action = value.actions[probe as usize];
+            desired = value.desired_actions[probe as usize];
+            rule_agent_flag =
+                value.flags & (CAPTURE_PROFILE_FLAG_AGENT | CAPTURE_PROFILE_FLAG_CONFLICT) != 0;
+            if rule_agent_flag
+                && !matches!(
+                    probe,
+                    CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_DELETE | CAPTURE_PROBE_FILE_READ
+                )
+            {
+                action = CAPTURE_ACTION_FULL;
+                desired = CAPTURE_ACTION_FULL;
+            }
+        }
+    } else {
+        if !protected_kind && !promotion_valid {
+            increment_capture_stat(probe, CAPTURE_STAT_RULE_MISS);
+        }
+        // TLS profiles are attached only to an identity-verified Agent PID, and plaintext reaches
+        // this decision only after an exact LLM route/schema gate. A short-lived CLI can issue its
+        // first model request before the control-plane cgroup snapshot catches up; treating that
+        // race as unknown_discovery (where SSL is disabled) permanently loses the first turn.
+        // Use the same FULL SSL policy as probable_investigation for this rule-miss window. A
+        // generation-fenced process identity is the positive observation authority; it is allowed
+        // to bridge a stale/unknown cgroup lease without waiting for another control-plane round.
+        if probe == CAPTURE_PROBE_SSL && verified_agent {
+            profile = CAPTURE_PROFILE_PROBABLE_INVESTIGATION;
+            action = CAPTURE_ACTION_FULL;
+            desired = CAPTURE_ACTION_FULL;
+        }
+    }
+
+    let agent_admitted = verified_agent
+        || promotion_valid
+        || (disposition == CAPTURE_DISPOSITION_RULE
+            && (rule_agent_flag || capture_profile_is_agent_family(profile)));
+    let promoted = promotion_valid;
+
+    // Optional FileRead is Agent/Candidate-only. Even if a mis-published profile names SAMPLE/FULL
+    // for unknown/infrastructure, never copy a path or reserve Ring space for non-admitted reads.
+    // The userspace `A3S_OBSERVER_FILE_READ` flag still gates probe entry; this is the identity gate.
+    if probe == CAPTURE_PROBE_FILE_READ && !agent_admitted {
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            0,
+        );
+    }
+
+    // Strict unknown policy is deliberately scoped to file operations only.  It is evaluated
+    // before any file path copy or Ring reservation, while all other probes retain their normal
+    // discovery/fail-open matrix.  A generation-fenced verified/promoted Agent remains eligible
+    // during a short cgroup-rule refresh race.
+    let file_probe = matches!(
+        probe,
+        CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ | CAPTURE_PROBE_FILE_DELETE
+    );
+    let file_filter_config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    let file_rule_present = if file_filter_config.enabled() {
+        let key = FileFilterKey {
+            cgroup_id,
+            epoch: file_filter_config.active_epoch,
+        };
+        unsafe {
+            FILE_FILTER_RULES.get(&key).is_some_and(|value| {
+                value.epoch == file_filter_config.active_epoch
+                    && (value.expires_at_boot_ns == 0 || now < value.expires_at_boot_ns)
+            })
+        }
+    } else {
+        false
+    };
+    if file_probe
+        && file_filter_config.enabled()
+        && file_filter_config.unknown_drop_enabled()
+        && !file_rule_present
+        && !verified_agent
+        && !promoted
+    {
+        increment_capture_stat(probe, CAPTURE_STAT_DROP);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            0,
+        );
+    }
+
+    // Admitted Agent identities normally bypass lossy sampling. File reads/accesses are
+    // deliberately different: even an explicitly identified Agent can generate an unbounded
+    // stream of open/read syscalls. Apply the same bounded per-cgroup/per-node budget before the
+    // caller copies a path or reserves Ring space, while keeping the event selected when budget
+    // remains. This closes the high-volume bypass observed during file canaries.
+    if file_probe && agent_admitted {
+        let sample_key = CaptureSampleKey {
+            cgroup_id,
+            epoch: config.active_epoch,
+            probe,
+            _reserved: [0; 7],
+        };
+        if capture_sample_allowed(&sample_key, &config, now) != 1 {
+            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+            return capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_SAMPLE,
+                authority,
+                disposition,
+                0,
+            );
+        }
+        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+        return selected_capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            if promoted {
+                CAPTURE_DECISION_FLAG_PROMOTED
+            } else if verified_agent {
+                CAPTURE_DECISION_FLAG_VERIFIED_AGENT
+            } else {
+                0
+            },
+        );
+    }
+
+    // Security evidence stays FULL for every workload.
+    if capture_probe_is_security(probe) {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_SECURITY_FULL,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROTECTED,
+        );
+    }
+
+    // Legacy mode: Exec/Exit remain unconditionally FULL (historical protected invariant).
+    // Bounded mode: only admitted Agent/Candidate Exec/Exit take the protected FULL path.
+    if matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_EXIT) && (agent_admitted || !bounded) {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        if promoted {
+            increment_capture_stat(probe, CAPTURE_STAT_PROMOTION_HIT);
+        }
+        return selected_capture_decision(
+            config.active_epoch,
+            if agent_admitted && capture_profile_is_agent_family(profile) {
+                profile
+            } else if agent_admitted {
+                CAPTURE_PROFILE_AGENT_FULL
+            } else {
+                profile
+            },
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROTECTED
+                | if promoted {
+                    CAPTURE_DECISION_FLAG_PROMOTED
+                } else if verified_agent {
+                    CAPTURE_DECISION_FLAG_VERIFIED_AGENT
+                } else {
+                    0
+                },
+        );
+    }
+
+    // Bounded unknown/infrastructure remapping happens before the shared SAMPLE/AGGREGATE path so
+    // unknown lifecycle never falls through to a FULL default from the legacy matrix.
+    if bounded && !agent_admitted {
+        if disposition == CAPTURE_DISPOSITION_RULE
+            && capture_profile_is_infrastructure_family(profile)
+        {
+            if matches!(
+                probe,
+                CAPTURE_PROBE_EXEC
+                    | CAPTURE_PROBE_EXIT
+                    | CAPTURE_PROBE_TLS
+                    | CAPTURE_PROBE_CONNECT
+                    | CAPTURE_PROBE_DNS
+                    | CAPTURE_PROBE_LLM
+            ) {
+                action = CAPTURE_ACTION_AGGREGATE;
+                desired = CAPTURE_ACTION_AGGREGATE;
+            }
+        } else if matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_LLM) {
+            action = CAPTURE_ACTION_SAMPLE;
+            desired = CAPTURE_ACTION_SAMPLE;
+        } else if probe == CAPTURE_PROBE_EXIT {
+            let window_ns = if config.sample_window_ns == 0 {
+                DEFAULT_FILE_SAMPLE_WINDOW_NS
+            } else {
+                config.sample_window_ns
+            };
+            // Exit only keeps a discovery raw sample when this cgroup already spent Exec budget in
+            // the current window; otherwise aggregate so unpaired unknown exits do not flood Critical.
+            if capture_scope_exec_discovery_active(cgroup_id, config.active_epoch, now, window_ns) {
+                action = CAPTURE_ACTION_SAMPLE;
+                desired = CAPTURE_ACTION_SAMPLE;
+            } else {
+                action = CAPTURE_ACTION_AGGREGATE;
+                desired = CAPTURE_ACTION_AGGREGATE;
+            }
+        }
+    }
+
+    if probe == CAPTURE_PROBE_SSL
+        && verified_agent
+        // A valid explicit infrastructure/security profile remains authoritative. The bridge is
+        // only for a missing/stale/default scope (or an Agent profile that is already positive).
+        && (disposition != CAPTURE_DISPOSITION_RULE
+            || matches!(
+                profile,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY
+                    | CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+                    | CAPTURE_PROFILE_AGENT_FULL
+                    | CAPTURE_PROFILE_INVESTIGATION_FULL
+            ))
+    {
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            // Keep the profile label useful to operators while the cgroup lease is absent or
+            // stale; the process-level identity is what authorized this full-fidelity payload.
+            if profile == CAPTURE_PROFILE_UNKNOWN_DISCOVERY {
+                CAPTURE_PROFILE_PROBABLE_INVESTIGATION
+            } else {
+                profile
+            },
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_VERIFIED_AGENT,
+        );
+    }
+    // `file_read` is a default-off signal. Ordinary capture shadow semantics force FULL to expose
+    // would-drop differences, but doing that here would send every node read into the Ring. Shadow
+    // therefore records the desired decision only and preserves the baseline-off transport.
+    if probe == CAPTURE_PROBE_FILE_READ && config.mode == CAPTURE_MODE_SHADOW {
+        let shadow_desired = if promoted {
+            CAPTURE_ACTION_FULL
+        } else {
+            desired
+        };
+        if shadow_desired != CAPTURE_ACTION_NOT_ENABLED {
+            capture_would(probe, shadow_desired);
+        }
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_SHADOW,
+        );
+    }
+
+    if promoted && !matches!(probe, CAPTURE_PROBE_EXEC | CAPTURE_PROBE_EXIT) {
+        increment_capture_stat(probe, CAPTURE_STAT_PROMOTION_HIT);
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        let promotion_key = CaptureProcessKey {
+            pid,
+            _reserved: 0,
+            epoch: config.active_epoch,
+        };
+        let promoted_profile = unsafe { CAPTURE_PROMOTED_PROCESSES.get(&promotion_key) }
+            .map(|value| {
+                if value.flags & CAPTURE_PROMOTION_FLAG_INVESTIGATION != 0 {
+                    CAPTURE_PROFILE_INVESTIGATION_FULL
+                } else {
+                    CAPTURE_PROFILE_AGENT_FULL
+                }
+            })
+            .unwrap_or(CAPTURE_PROFILE_AGENT_FULL);
+        let promoted_action =
+            if matches!(probe, CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ) {
+                CAPTURE_ACTION_SAMPLE
+            } else {
+                CAPTURE_ACTION_FULL
+            };
+        return selected_capture_decision(
+            config.active_epoch,
+            promoted_profile,
+            promoted_action,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_PROMOTED,
+        );
+    }
+
+    if config.mode == CAPTURE_MODE_SHADOW {
+        capture_would(probe, desired);
+        increment_capture_stat(probe, CAPTURE_STAT_FULL);
+        return selected_capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_SHADOW,
+        );
+    }
+    if action == CAPTURE_ACTION_NOT_ENABLED {
+        increment_capture_stat(probe, CAPTURE_STAT_NOT_ENABLED);
+        return capture_decision(
+            config.active_epoch,
+            profile,
+            CAPTURE_ACTION_NOT_ENABLED,
+            authority,
+            disposition,
+            0,
+        );
+    }
+    if action == CAPTURE_ACTION_DROP
+        && (authority != FILE_FILTER_AUTHORITY_AUTHORITATIVE
+            || config.flags & CAPTURE_CONFIG_DESTRUCTIVE_GRANTED == 0)
+    {
+        action = capture_profile_default_actions(profile)[probe as usize];
+        if action == CAPTURE_ACTION_DROP {
+            action = CAPTURE_ACTION_SAMPLE;
+        }
+    }
+
+    match action {
+        CAPTURE_ACTION_FULL => {
+            if matches!(probe, CAPTURE_PROBE_FILE_ACCESS | CAPTURE_PROBE_FILE_READ) {
+                // A profile may request FULL for an Agent cgroup, but file operations are
+                // intrinsically unbounded.  Converting FULL to SAMPLE without consulting the
+                // shared quota would still reserve one Ring record for every read, which is the
+                // exact high-volume path this gate is meant to stop.  Apply the same bounded
+                // per-scope/node budget used by protected and promoted identities before the
+                // caller copies the path or reserves Ring space.
+                let sample_key = CaptureSampleKey {
+                    cgroup_id,
+                    epoch: config.active_epoch,
+                    probe,
+                    _reserved: [0; 7],
+                };
+                if capture_sample_allowed(&sample_key, &config, now) != 1 {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                    return capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    );
+                }
+                increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                return selected_capture_decision(
+                    config.active_epoch,
+                    profile,
+                    CAPTURE_ACTION_SAMPLE,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
+            increment_capture_stat(probe, CAPTURE_STAT_FULL);
+            selected_capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_FULL,
+                authority,
+                disposition,
+                0,
+            )
+        }
+        CAPTURE_ACTION_AGGREGATE | CAPTURE_ACTION_SAMPLE | CAPTURE_ACTION_DROP => {
+            if !capture_aggregate_attempt(
+                cgroup_id,
+                config.active_epoch,
+                probe,
+                action,
+                qualifier,
+                profile,
+                authority,
+                disposition,
+                bytes,
+            ) {
+                increment_capture_stat(probe, CAPTURE_STAT_AGGREGATE_ERROR);
+                // A full aggregate map must not turn a low-value workload back into an unbounded
+                // raw stream. Use the regular global sample partition as a fixed emergency lane.
+                return match capture_emergency_sample_allowed(probe, &config, now) {
+                    1 => {
+                        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                        selected_capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+                        )
+                    }
+                    0 => {
+                        increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                        capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        )
+                    }
+                    _ => {
+                        increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+                        capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        )
+                    }
+                };
+            }
+            if action == CAPTURE_ACTION_AGGREGATE {
+                increment_capture_stat(probe, CAPTURE_STAT_AGGREGATE);
+                return capture_decision(
+                    config.active_epoch,
+                    profile,
+                    CAPTURE_ACTION_AGGREGATE,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
+            if action == CAPTURE_ACTION_DROP {
+                increment_capture_stat(probe, CAPTURE_STAT_DROP);
+                return capture_decision(
+                    config.active_epoch,
+                    profile,
+                    CAPTURE_ACTION_DROP,
+                    authority,
+                    disposition,
+                    0,
+                );
+            }
+            let sample_key = CaptureSampleKey {
+                cgroup_id,
+                epoch: config.active_epoch,
+                probe,
+                _reserved: [0; 7],
+            };
+            match capture_sample_allowed(&sample_key, &config, now) {
+                1 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                    selected_capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+                0 => {
+                    increment_capture_stat(probe, CAPTURE_STAT_SAMPLE_REJECTED);
+                    capture_decision(
+                        config.active_epoch,
+                        profile,
+                        CAPTURE_ACTION_SAMPLE,
+                        authority,
+                        disposition,
+                        0,
+                    )
+                }
+                _ => {
+                    increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+                    match capture_emergency_sample_allowed(probe, &config, now) {
+                        1 => {
+                            increment_capture_stat(probe, CAPTURE_STAT_SAMPLE);
+                            selected_capture_decision(
+                                config.active_epoch,
+                                profile,
+                                CAPTURE_ACTION_SAMPLE,
+                                authority,
+                                disposition,
+                                CAPTURE_DECISION_FLAG_EMERGENCY_SAMPLE,
+                            )
+                        }
+                        _ => capture_decision(
+                            config.active_epoch,
+                            profile,
+                            CAPTURE_ACTION_SAMPLE,
+                            authority,
+                            disposition,
+                            0,
+                        ),
+                    }
+                }
+            }
+        }
+        _ => {
+            increment_capture_stat(probe, CAPTURE_STAT_DECISION_ERROR);
+            capture_decision(
+                config.active_epoch,
+                profile,
+                CAPTURE_ACTION_SAMPLE,
+                authority,
+                disposition,
+                0,
+            )
+        }
+    }
+}
+const FILE_STAT_ACCESS_KEPT: u8 = 1;
+const FILE_STAT_ACCESS_UNKNOWN_KEPT: u8 = 2;
+const FILE_STAT_ACCESS_SAMPLED: u8 = 3;
+const FILE_STAT_ACCESS_DROPPED: u8 = 4;
+const FILE_STAT_ACCESS_SUPPRESSED: u8 = 5;
+const FILE_STAT_DELETE_KEPT: u8 = 6;
+const FILE_STAT_DELETE_UNKNOWN_KEPT: u8 = 7;
+const FILE_STAT_DELETE_DROPPED: u8 = 8;
+const FILE_STAT_RULE_HIT: u8 = 9;
+const FILE_STAT_RULE_MISS: u8 = 10;
+const FILE_STAT_STALE_RULE: u8 = 11;
+const FILE_STAT_ACCESS_RING_DROP: u8 = 12;
+const FILE_STAT_DELETE_RING_DROP: u8 = 13;
+
+const DEFAULT_FILE_SAMPLE_WINDOW_NS: u64 = 1_000_000_000;
+const DEFAULT_FILE_SAMPLE_PER_CGROUP: u32 = 20;
+const DEFAULT_FILE_SAMPLE_PER_CPU: u32 = 64;
+
+#[inline(always)]
+fn increment_file_stat(kind: u8) {
+    unsafe {
+        let Some(stats) = FILE_FILTER_STATS.get_ptr_mut(0) else {
+            return;
+        };
+        match kind {
+            FILE_STAT_ACCESS_KEPT => (*stats).access_kept = (*stats).access_kept.wrapping_add(1),
+            FILE_STAT_ACCESS_UNKNOWN_KEPT => {
+                (*stats).access_unknown_kept = (*stats).access_unknown_kept.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_SAMPLED => {
+                (*stats).access_sampled = (*stats).access_sampled.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_DROPPED => {
+                (*stats).access_dropped = (*stats).access_dropped.wrapping_add(1)
+            }
+            FILE_STAT_ACCESS_SUPPRESSED => {
+                (*stats).access_sample_suppressed =
+                    (*stats).access_sample_suppressed.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_KEPT => (*stats).delete_kept = (*stats).delete_kept.wrapping_add(1),
+            FILE_STAT_DELETE_UNKNOWN_KEPT => {
+                (*stats).delete_unknown_kept = (*stats).delete_unknown_kept.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_DROPPED => {
+                (*stats).delete_dropped = (*stats).delete_dropped.wrapping_add(1)
+            }
+            FILE_STAT_RULE_HIT => (*stats).rule_hits = (*stats).rule_hits.wrapping_add(1),
+            FILE_STAT_RULE_MISS => (*stats).rule_misses = (*stats).rule_misses.wrapping_add(1),
+            FILE_STAT_STALE_RULE => (*stats).stale_rules = (*stats).stale_rules.wrapping_add(1),
+            FILE_STAT_ACCESS_RING_DROP => {
+                (*stats).access_ring_dropped = (*stats).access_ring_dropped.wrapping_add(1)
+            }
+            FILE_STAT_DELETE_RING_DROP => {
+                (*stats).delete_ring_dropped = (*stats).delete_ring_dropped.wrapping_add(1)
+            }
+            _ => {}
+        }
+    }
+}
+
+#[inline(always)]
+fn reserve_file_or_drop(ring: &RingBuf, delete: bool) -> Option<RingBufEntry<FileEvent>> {
+    let entry = reserve_or_drop::<FileEvent>(
+        ring,
+        if delete {
+            PIPELINE_RING_FILE_DELETE
+        } else {
+            PIPELINE_RING_FILE_ACCESS
+        },
+    );
+    if entry.is_none() {
+        increment_file_stat(if delete {
+            FILE_STAT_DELETE_RING_DROP
+        } else {
+            FILE_STAT_ACCESS_RING_DROP
+        });
+    }
+    entry
+}
+
+#[inline(always)]
+unsafe fn sample_window_allows(
+    state: *mut FileFilterSampleWindow,
+    now: u64,
+    window_ns: u64,
+    limit: u32,
+) -> bool {
+    if now.wrapping_sub((*state).started_at_boot_ns) >= window_ns {
+        (*state).started_at_boot_ns = now;
+        (*state).count = 0;
+    }
+    if (*state).count >= limit {
+        return false;
+    }
+    (*state).count = (*state).count.saturating_add(1);
+    true
+}
+
+#[inline(always)]
+fn unknown_sample_allowed(cgroup_id: u64, config: &FileFilterConfig, now: u64) -> bool {
+    let window_ns = if config.sample_window_ns == 0 {
+        DEFAULT_FILE_SAMPLE_WINDOW_NS
+    } else {
+        config.sample_window_ns
+    };
+    let cgroup_limit = if config.unknown_per_cgroup_limit == 0 {
+        DEFAULT_FILE_SAMPLE_PER_CGROUP
+    } else {
+        config.unknown_per_cgroup_limit
+    };
+    let per_cpu_limit = if config.unknown_per_cpu_limit == 0 {
+        DEFAULT_FILE_SAMPLE_PER_CPU
+    } else {
+        config.unknown_per_cpu_limit
+    };
+
+    let cgroup_allowed = unsafe {
+        if let Some(state) = UNKNOWN_FILE_WINDOWS.get_ptr_mut(&cgroup_id) {
+            sample_window_allows(state, now, window_ns, cgroup_limit)
+        } else {
+            let initial = FileFilterSampleWindow {
+                started_at_boot_ns: now,
+                count: 1,
+                _reserved: 0,
+            };
+            UNKNOWN_FILE_WINDOWS.insert(&cgroup_id, &initial, 0).is_ok()
+        }
+    };
+    if !cgroup_allowed {
+        return false;
+    }
+    unsafe {
+        UNKNOWN_FILE_GLOBAL_WINDOW
+            .get_ptr_mut(0)
+            .is_some_and(|state| sample_window_allows(state, now, window_ns, per_cpu_limit))
+    }
+}
+
+#[inline(always)]
+fn active_file_rule(
+    cgroup_id: u64,
+    config: &FileFilterConfig,
+    now: u64,
+) -> Option<FileFilterValue> {
+    let key = FileFilterKey {
+        cgroup_id,
+        epoch: config.active_epoch,
+    };
+    let value = unsafe { FILE_FILTER_RULES.get(&key).copied() };
+    let Some(value) = value else {
+        increment_file_stat(FILE_STAT_RULE_MISS);
+        return None;
+    };
+    if value.epoch != config.active_epoch
+        || (value.expires_at_boot_ns != 0 && now >= value.expires_at_boot_ns)
+    {
+        increment_file_stat(FILE_STAT_STALE_RULE);
+        return None;
+    }
+    increment_file_stat(FILE_STAT_RULE_HIT);
+    Some(value)
+}
+
+#[inline(always)]
+fn legacy_file_access_decision(cgroup_id: u64) -> CaptureDecisionContext {
+    let config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_KEPT);
+        return legacy_selected_capture_decision();
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let rule = active_file_rule(cgroup_id, &config, now);
+    if let Some(rule) = rule {
+        if rule.action == FILE_FILTER_ACTION_KEEP {
+            increment_file_stat(FILE_STAT_ACCESS_KEPT);
+            return selected_capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_FULL,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        if rule.action == FILE_FILTER_ACTION_DROP
+            && rule.authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE
+        {
+            increment_file_stat(FILE_STAT_ACCESS_DROPPED);
+            return capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_DROP,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        // SAMPLE, an unknown action, or a candidate DROP all use the configured Unknown policy.
+    }
+    let authority = rule.map(|value| value.authority).unwrap_or(0);
+    let disposition = if rule.is_some() {
+        CAPTURE_DISPOSITION_RULE
+    } else {
+        CAPTURE_DISPOSITION_MISS
+    };
+    if config.unknown_drop_enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_DROPPED);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
+    if !config.unknown_sampling_enabled() {
+        increment_file_stat(FILE_STAT_ACCESS_KEPT);
+        increment_file_stat(FILE_STAT_ACCESS_UNKNOWN_KEPT);
+        return selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_FULL,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
+    if unknown_sample_allowed(cgroup_id, &config, now) {
+        increment_file_stat(FILE_STAT_ACCESS_SAMPLED);
+        selected_capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        )
+    } else {
+        increment_file_stat(FILE_STAT_ACCESS_SUPPRESSED);
+        capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_SAMPLE,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        )
+    }
+}
+
+#[inline(always)]
+fn legacy_file_delete_decision(cgroup_id: u64) -> CaptureDecisionContext {
+    let config = FILE_FILTER_CONFIG.get(0).copied().unwrap_or_default();
+    if !config.enabled() {
+        increment_file_stat(FILE_STAT_DELETE_KEPT);
+        return legacy_selected_capture_decision();
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let rule = active_file_rule(cgroup_id, &config, now);
+    if let Some(rule) = rule {
+        if rule.action == FILE_FILTER_ACTION_DROP
+            && rule.authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE
+        {
+            increment_file_stat(FILE_STAT_DELETE_DROPPED);
+            return capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_DROP,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+        if rule.action == FILE_FILTER_ACTION_KEEP {
+            increment_file_stat(FILE_STAT_DELETE_KEPT);
+            return selected_capture_decision(
+                config.active_epoch,
+                CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+                CAPTURE_ACTION_FULL,
+                rule.authority,
+                CAPTURE_DISPOSITION_RULE,
+                CAPTURE_DECISION_FLAG_LEGACY,
+            );
+        }
+    }
+    let authority = rule.map(|value| value.authority).unwrap_or(0);
+    let disposition = if rule.is_some() {
+        CAPTURE_DISPOSITION_RULE
+    } else {
+        CAPTURE_DISPOSITION_MISS
+    };
+    if config.unknown_drop_enabled() {
+        increment_file_stat(FILE_STAT_DELETE_DROPPED);
+        return capture_decision(
+            config.active_epoch,
+            CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+            CAPTURE_ACTION_DROP,
+            authority,
+            disposition,
+            CAPTURE_DECISION_FLAG_LEGACY,
+        );
+    }
+    // FileDelete is fail-open for KEEP, SAMPLE, candidate DROP, misses, and stale rules unless
+    // the explicit file-only strict unknown policy is enabled.
+    increment_file_stat(FILE_STAT_DELETE_KEPT);
+    increment_file_stat(FILE_STAT_DELETE_UNKNOWN_KEPT);
+    selected_capture_decision(
+        config.active_epoch,
+        CAPTURE_PROFILE_UNKNOWN_DISCOVERY,
+        CAPTURE_ACTION_FULL,
+        authority,
+        disposition,
+        CAPTURE_DECISION_FLAG_LEGACY,
+    )
 }
 
 /// Read a `u64` (e.g. a pointer or length) from a user-space address.
@@ -133,6 +2033,8 @@ unsafe fn init_exec_record(
     ppid: u32,
     uid: u32,
     comm: [u8; 16],
+    captured_at_boot_ns: u64,
+    capture_decision: CaptureDecisionContext,
 ) {
     (*record).exec_id = exec_id;
     (*record).cgroup_id = cgroup_id;
@@ -149,6 +2051,9 @@ unsafe fn init_exec_record(
     (*record)._pad = [0; 2];
     (*record).comm = comm;
     zero_exec_data(record);
+    (*record)._event_time_pad = [0; 4];
+    (*record).captured_at_boot_ns = captured_at_boot_ns;
+    (*record).capture_decision = capture_decision;
 }
 
 #[inline(always)]
@@ -181,6 +2086,8 @@ struct ExecLoopContext {
     argv: u64,
     exec_id: u64,
     cgroup_id: u64,
+    captured_at_boot_ns: u64,
+    capture_decision: CaptureDecisionContext,
     argp: u64,
     arg_offset: u32,
     captured_bytes: u32,
@@ -226,7 +2133,7 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         state.captured_argc += 1;
     }
 
-    let Some(mut chunk_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+    let Some(mut chunk_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
         state.flags |= EXEC_FLAG_ARGV_INCOMPLETE;
         state.done = 1;
         return 1;
@@ -240,6 +2147,8 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         state.ppid,
         state.uid,
         state.comm,
+        state.captured_at_boot_ns,
+        state.capture_decision,
     );
     (*chunk).kind = EXEC_RECORD_ARG_CHUNK;
     (*chunk).arg_index = state.arg_index;
@@ -258,7 +2167,7 @@ unsafe extern "C" fn capture_exec_chunk(_iteration: u32, raw_ctx: *mut c_void) -
         }
     };
     (*chunk).data_len = len as u16;
-    chunk_entry.submit(0);
+    submit_accounted(chunk_entry, PIPELINE_RING_EXEC);
     state.captured_bytes += len as u32;
 
     if len < EXEC_ARG_CHUNK_PAYLOAD {
@@ -286,6 +2195,7 @@ pub fn track_process_fork(ctx: TracePointContext) -> u32 {
     };
     if parent > 0 && child > 0 {
         let _ = PARENTS.insert(&(child as u32), &(parent as u32), 0);
+        inherit_capture_promotion(parent as u32, child as u32);
     }
     0
 }
@@ -320,6 +2230,7 @@ fn track_child(ctx: &TracePointContext) -> u32 {
     }
     let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
     let _ = PARENTS.insert(&(child as u32), &parent, 0);
+    inherit_capture_promotion(parent, child as u32);
     0
 }
 
@@ -335,16 +2246,51 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
-    let exec_id = unsafe { bpf_ktime_get_ns() } ^ pid_tgid;
+    // Every syscall-entry fragment shares one timestamp. This lets userspace reassemble a logical
+    // exec without manufacturing order from the time each physical ring record was drained.
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let exec_id = captured_at_boot_ns ^ pid_tgid;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_EXEC, cgroup_id, pid, 0, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_EXEC);
     let mut flags = 0u8;
-    let _ = EXEC_IDS.insert(&pid, &exec_id, 0);
+    if EXEC_IDS
+        .insert(
+            &pid,
+            &PendingExecState {
+                exec_id,
+                capture_decision,
+            },
+            0,
+        )
+        .is_err()
+    {
+        // Never leave an older pending/committed generation behind under this PID. Losing
+        // attribution is safe; attributing the next exit to a stale generation is not.
+        let _ = EXEC_IDS.remove(&pid);
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
+        capture_payload_error(CAPTURE_PROBE_EXEC);
+        return Ok(0);
+    }
 
-    let Some(mut header_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+    let Some(mut header_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
         return Ok(0);
     };
     let header = header_entry.as_mut_ptr();
     unsafe {
-        init_exec_record(header, exec_id, cgroup_id, pid, ppid, uid, comm);
+        init_exec_record(
+            header,
+            exec_id,
+            cgroup_id,
+            pid,
+            ppid,
+            uid,
+            comm,
+            captured_at_boot_ns,
+            capture_decision,
+        );
         (*header).kind = EXEC_RECORD_HEADER;
         // sys_enter_execve: `const char *filename` at offset 16.
         if let Ok(filename_ptr) = ctx.read_at::<*const u8>(16) {
@@ -357,7 +2303,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
         }
         (*header).flags = flags;
     }
-    header_entry.submit(0);
+    submit_accounted(header_entry, PIPELINE_RING_EXEC);
 
     let captured_argc: u16;
     let captured_bytes: u32;
@@ -370,6 +2316,8 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
                 argv: argv as u64,
                 exec_id,
                 cgroup_id,
+                captured_at_boot_ns,
+                capture_decision,
                 argp: 0,
                 arg_offset: 0,
                 captured_bytes: 0,
@@ -403,16 +2351,26 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
             captured_bytes = 0;
         }
 
-        let Some(mut end_entry) = reserve_or_drop::<ExecRecord>(&EVENTS) else {
+        let Some(mut end_entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) else {
             return Ok(0);
         };
         let end = end_entry.as_mut_ptr();
-        init_exec_record(end, exec_id, cgroup_id, pid, ppid, uid, comm);
+        init_exec_record(
+            end,
+            exec_id,
+            cgroup_id,
+            pid,
+            ppid,
+            uid,
+            comm,
+            captured_at_boot_ns,
+            capture_decision,
+        );
         (*end).kind = EXEC_RECORD_END;
         (*end).flags = flags;
         (*end).argc = captured_argc;
         (*end).captured_bytes = captured_bytes;
-        end_entry.submit(0);
+        submit_accounted(end_entry, PIPELINE_RING_EXEC);
     }
     Ok(0)
 }
@@ -422,20 +2380,49 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
 #[tracepoint]
 pub fn track_process_exec(_ctx: TracePointContext) -> u32 {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let Some(exec_id) = (unsafe { EXEC_IDS.get(&pid).copied() }) else {
+    let Some(pending) = (unsafe { EXEC_IDS.get(&pid).copied() }) else {
+        // A commit without its syscall-entry generation (for example after bounded-map loss)
+        // invalidates any older generation for the same PID.
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
         return 0;
     };
+    let exec_id = pending.exec_id;
     let uid = bpf_get_current_uid_gid() as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let ppid = unsafe { PARENTS.get(&pid).copied().unwrap_or(0) };
     let comm = bpf_get_current_comm().unwrap_or_default();
-    if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS) {
+    // Commit is a separate kernel fact from syscall entry and therefore carries the time at which
+    // the new image was successfully installed. `exec_id` preserves their generation relation.
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if COMMITTED_EXEC_IDS.insert(&pid, &exec_id, 0).is_err() {
+        let _ = COMMITTED_EXEC_IDS.remove(&pid);
+    }
+    let process_key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    if unsafe { VERIFIED_AGENT_PROCESSES.get(&process_key) }.is_some() {
+        let _ = VERIFIED_AGENT_EXEC_IDS.insert(&process_key, &exec_id, 0);
+    }
+    commit_capture_promotion(pid, exec_id, cgroup_id);
+    if let Some(mut entry) = reserve_or_drop::<ExecRecord>(&EVENTS, PIPELINE_RING_EXEC) {
         let record = entry.as_mut_ptr();
         unsafe {
-            init_exec_record(record, exec_id, cgroup_id, pid, ppid, uid, comm);
+            init_exec_record(
+                record,
+                exec_id,
+                cgroup_id,
+                pid,
+                ppid,
+                uid,
+                comm,
+                captured_at_boot_ns,
+                pending.capture_decision,
+            );
             (*record).kind = EXEC_RECORD_COMMIT;
         }
-        entry.submit(0);
+        submit_accounted(entry, PIPELINE_RING_EXEC);
     }
     let _ = EXEC_IDS.remove(&pid);
     0
@@ -458,22 +2445,44 @@ fn try_proc_exit(ctx: &ProbeContext) -> Result<u32, i64> {
     if (id >> 32) as u32 != id as u32 {
         return Ok(0);
     }
-    let code: u64 = ctx.arg(0).unwrap_or(0);
-    let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS) else {
-        return Ok(0);
-    };
-    let ev = entry.as_mut_ptr();
-    unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (id >> 32) as u32;
-        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        (*ev).exit_code = ((code >> 8) & 0xff) as u32;
-        (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
-    }
-    entry.submit(0);
     let pid = (id >> 32) as u32;
+    let code: u64 = ctx.arg(0).unwrap_or(0);
+    let exec_id = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let process_key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    // Scope cleanup is unconditional: an exit that is itself filtered must still revoke the
+    // process admission before PID/SSL-pointer reuse can occur.
+    let _ = VERIFIED_AGENT_PROCESSES.remove(&process_key);
+    let _ = VERIFIED_AGENT_EXEC_IDS.remove(&process_key);
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_EXIT, cgroup_id, pid, 0, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_EXIT);
+    if let Some(mut entry) = reserve_or_drop::<ExitEvent>(&EXIT_EVENTS, PIPELINE_RING_EXIT) {
+        let ev = entry.as_mut_ptr();
+        unsafe {
+            (*ev).cgroup_id = cgroup_id;
+            (*ev).pid = pid;
+            (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+            (*ev).exit_code = ((code >> 8) & 0xff) as u32;
+            (*ev).signal = (code & 0x7f) as u32; // & 0x7f intentionally drops the 0x80 core-dump bit
+            (*ev)._pad = 0;
+            (*ev).exec_id = exec_id;
+            (*ev).captured_at_boot_ns = captured_at_boot_ns;
+            (*ev).capture_decision = capture_decision;
+        }
+        submit_accounted(entry, PIPELINE_RING_EXIT);
+    }
     let _ = PARENTS.remove(&pid);
     let _ = EXEC_IDS.remove(&pid);
+    let _ = COMMITTED_EXEC_IDS.remove(&pid);
+    remove_capture_promotion(pid);
     Ok(0)
 }
 
@@ -498,7 +2507,12 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     let count: u64 = unsafe { ctx.read_at(32)? };
     let fd: u64 = unsafe { ctx.read_at(16)? };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let key = sock_key(pid, fd);
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, pid, fd);
+    // This tracepoint is shared by TLS ClientHello discovery and legacy syscall capture. Keep
+    // the program limited to the small handshake classifier: the plain HTTP route hash path is
+    // userspace/eBPF-uProbe scoped and must not make the always-on TLS metadata probe fail the
+    // kernel verifier. TLS plaintext still uses its own exact session route gate below.
     // Already tracking this LLM socket → this write is request payload; accumulate + done.
     if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
         unsafe {
@@ -517,23 +2531,29 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
     if hdr[0] != 0x16 || hdr[1] != 0x03 || hdr[5] != 0x01 {
         return Ok(0);
     }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
     // New LLM call: start the metrics accumulator and emit the SNI snapshot.
     let _ = LLM_SOCKS.insert(
         &key,
         &LlmStat {
-            start_ns: unsafe { bpf_ktime_get_ns() },
+            start_ns: captured_at_boot_ns,
             first_resp_ns: 0,
             req_bytes: 0,
             resp_bytes: 0,
         },
         0,
     );
-    let Some(mut entry) = reserve_or_drop::<TlsEvent>(&TLS_EVENTS) else {
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_TLS, cgroup_id, pid, count, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_TLS);
+    let Some(mut entry) = reserve_or_drop::<TlsEvent>(&TLS_EVENTS, PIPELINE_RING_TLS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
+        (*ev).cgroup_id = cgroup_id;
         (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev)._pad = 0;
@@ -546,84 +2566,1196 @@ fn try_tls(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; TLS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_TLS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev)._event_time_pad = [0; 4];
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_TLS);
     Ok(0)
 }
 
-// ---- OPT-IN OpenSSL content (uprobes on SSL_write / SSL_read) ----
+// ---- OPT-IN TLS plaintext (OpenSSL/BoringSSL-compatible uprobes) ----
 //
-// NOT language-agnostic (a uprobe binds to OpenSSL symbols) and captures real plaintext, so the
-// collector only attaches these when A3S_OBSERVER_SSL=1. SSL_write(ssl, buf, num): the request
-// plaintext is in `buf` at entry. SSL_read(ssl, buf, num): `buf` is filled during the call, so
-// snapshot it at return, with the byte count from the return value.
+// Entry probes remember pointers only. Return probes use the API's actual successful byte count,
+// then copy into the smallest fixed ring-record tier. This handles partial writes and the OpenSSL
+// 3 `_ex` ABI without blocking the Agent on userspace parsing or storage.
+
+fn remember_ssl_call(ctx: &ProbeContext, direction: u8, api_kind: u8, result_len_ptr: u64) -> u32 {
+    if api_kind == TLS_PLAINTEXT_API_SSL_EX {
+        bump_tls_profile_diagnostic(11);
+    } else if api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC {
+        bump_tls_profile_diagnostic(16);
+    }
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    let buf = ctx.arg::<u64>(1).unwrap_or(0);
+    let requested_len = ctx.arg::<u64>(2).unwrap_or(0);
+    if buf == 0 || requested_len == 0 {
+        return 0;
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = SslCallArgs {
+        ssl_ptr,
+        buf,
+        requested_len,
+        result_len_ptr,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction,
+        api_kind,
+        route_kind: 0,
+        _pad: [0; 5],
+        syscall_fd: 0,
+    };
+    let _ = SSL_CALL_ARGS.insert(&pid_tgid, &args, 0);
+    remember_last_tls_ctx(ssl_ptr, api_kind, direction);
+    0
+}
 
 #[uprobe]
-pub fn ssl_write(ctx: ProbeContext) -> u32 {
-    // SSL_write(ssl, buf, num): read args as raw register values (pointers carried as u64).
-    let buf = ctx.arg::<u64>(1).unwrap_or(0);
-    let num = ctx.arg::<u64>(2).unwrap_or(0);
-    emit_ssl(buf as *const u8, num, 0)
+pub fn ssl_write_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_WRITE,
+        TLS_PLAINTEXT_API_SSL_CLASSIC,
+        0,
+    )
+}
+
+#[uretprobe]
+pub fn ssl_write_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_classic(&ctx, TLS_PLAINTEXT_DIRECTION_WRITE)
 }
 
 #[uprobe]
 pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
-    let buf = ctx.arg::<u64>(1).unwrap_or(0);
-    if buf != 0 {
-        let tid = bpf_get_current_pid_tgid();
-        let _ = SSL_READ_BUF.insert(&tid, &buf, 0);
-    }
-    0
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_READ,
+        TLS_PLAINTEXT_API_SSL_CLASSIC,
+        0,
+    )
 }
 
 #[uretprobe]
 pub fn ssl_read_exit(ctx: RetProbeContext) -> u32 {
-    let tid = bpf_get_current_pid_tgid();
-    let ret = ctx.ret::<i32>().unwrap_or(0) as i64; // SSL_read return value = bytes decrypted
-    let buf = unsafe { SSL_READ_BUF.get(&tid) }.copied();
-    let _ = SSL_READ_BUF.remove(&tid);
-    if ret <= 0 {
+    finish_ssl_classic(&ctx, TLS_PLAINTEXT_DIRECTION_READ)
+}
+
+#[uprobe]
+pub fn ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_WRITE,
+        TLS_PLAINTEXT_API_SSL_EX,
+        ctx.arg::<u64>(3).unwrap_or(0),
+    )
+}
+
+/// BoringSSL protocol-method write: `(ssl, bool *out_needs_handshake,
+/// size_t *out_bytes_written, const uint8_t *buf, size_t len)`.
+/// Capture on enter — the public `SSL_write` wrapper is not on the first-hop path
+/// for some static CLIs, and a uretprobe on this slot would miss tail-call-like
+/// record writers.
+#[uprobe]
+pub fn ssl_write_app_data_enter(ctx: ProbeContext) -> u32 {
+    bump_tls_profile_diagnostic(3);
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    let buf = ctx.arg::<u64>(3).unwrap_or(0);
+    let requested_len = ctx.arg::<u64>(4).unwrap_or(0);
+    if buf == 0 || requested_len == 0 {
+        bump_tls_profile_diagnostic(1);
         return 0;
     }
-    match buf {
-        Some(addr) => emit_ssl(addr as *const u8, ret as u64, 1),
-        None => 0,
+    mark_classic_write_covered_by_app_data();
+    let args = SslCallArgs {
+        ssl_ptr,
+        buf,
+        requested_len,
+        result_len_ptr: ctx.arg::<u64>(2).unwrap_or(0),
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction: TLS_PLAINTEXT_DIRECTION_WRITE,
+        api_kind: TLS_PLAINTEXT_API_SSL_APP_DATA,
+        route_kind: 0,
+        _pad: [0; 5],
+        syscall_fd: 0,
+    };
+    remember_last_tls_ctx(ssl_ptr, args.api_kind, args.direction);
+    emit_tls_plaintext(args, requested_len)
+}
+
+#[uretprobe]
+pub fn ssl_write_ex_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_ex(&ctx, TLS_PLAINTEXT_DIRECTION_WRITE)
+}
+
+#[uprobe]
+pub fn ssl_read_ex_enter(ctx: ProbeContext) -> u32 {
+    remember_ssl_call(
+        &ctx,
+        TLS_PLAINTEXT_DIRECTION_READ,
+        TLS_PLAINTEXT_API_SSL_EX,
+        ctx.arg::<u64>(3).unwrap_or(0),
+    )
+}
+
+#[uretprobe]
+pub fn ssl_read_ex_exit(ctx: RetProbeContext) -> u32 {
+    finish_ssl_ex(&ctx, TLS_PLAINTEXT_DIRECTION_READ)
+}
+
+// The observed rustls CommonState ABI family keeps application bytes in two internal boundaries:
+// `CommonState::buffer_plaintext` receives an `OutboundChunks` value before encryption, while
+// `CommonState::take_received_plaintext` receives a `Payload` immediately after record
+// decryption. Userspace discovers both anchors and their relative relation in stripped static
+// executables without checking a product, version, provider URL or whole-file fingerprint. The
+// layouts remain part of that implementation-family ABI and are validated before capture.
+//
+// OutboundChunks::Single layout (observed x86_64 CommonState ABI family):
+//   [0] = zero/niche tag, [1] = byte pointer, [2] = byte length, [3] = unused
+// Payload::{Borrowed,Owned} layout:
+//   [0] = tag/capacity, [1] = byte pointer, [2] = byte length
+
+// Vectored `OutboundChunks::Multiple` is recorded by diagnostics but not dereferenced as a flat
+// slice. A bounded scatter/gather decoder can be added as another ABI adapter without weakening
+// the validated `Single` memory contract.
+#[uprobe]
+pub fn rustls_write_enter(ctx: ProbeContext) -> u32 {
+    bump_tls_profile_diagnostic(0);
+    let payload = ctx.arg::<u64>(1).unwrap_or(0);
+    if payload == 0 {
+        bump_tls_profile_diagnostic(1);
+        return 0;
+    }
+    let mut layout = [0u64; 4];
+    let read = unsafe {
+        bpf_probe_read_user(
+            layout.as_mut_ptr() as *mut c_void,
+            core::mem::size_of_val(&layout) as u32,
+            payload as *const c_void,
+        )
+    };
+    if read < 0 || layout[1] == 0 || layout[2] == 0 {
+        bump_tls_profile_diagnostic(1);
+        return 0;
+    }
+    if layout[0] != 0 {
+        bump_tls_profile_diagnostic(2);
+        return 0;
+    }
+    bump_tls_profile_diagnostic(3);
+    let args = SslCallArgs {
+        ssl_ptr: ctx.arg::<u64>(0).unwrap_or(0),
+        buf: layout[1],
+        requested_len: layout[2],
+        result_len_ptr: 0,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction: TLS_PLAINTEXT_DIRECTION_WRITE,
+        api_kind: TLS_PLAINTEXT_API_RUSTLS,
+        route_kind: HTTP_PREFIX_UNKNOWN,
+        _pad: [0; 5],
+        syscall_fd: 0,
+    };
+    // `buffer_plaintext` may tail-call its encryption implementation. Capturing at this stable
+    // pre-encryption boundary avoids relying on a Rust uretprobe trampoline surviving that tail
+    // call. rustls normally accepts the full slice; if a future profile observes backpressure,
+    // duplicate HTTP bytes are rejected by userspace framing/sequence quality rather than read
+    // from encrypted socket buffers.
+    remember_last_tls_ctx(args.ssl_ptr, args.api_kind, args.direction);
+    bump_tls_profile_diagnostic(4);
+    emit_tls_plaintext(args, layout[2])
+}
+
+#[uretprobe]
+pub fn rustls_write_exit(ctx: RetProbeContext) -> u32 {
+    let Some(args) = take_ssl_call(TLS_PLAINTEXT_DIRECTION_WRITE) else {
+        return 0;
+    };
+    if args.api_kind != TLS_PLAINTEXT_API_RUSTLS {
+        return 0;
+    }
+    let actual = ctx.ret::<u64>().unwrap_or(0).min(args.requested_len);
+    emit_tls_plaintext(args, actual)
+}
+
+#[uprobe]
+pub fn rustls_read_enter(ctx: ProbeContext) -> u32 {
+    bump_tls_profile_diagnostic(5);
+    let payload = ctx.arg::<u64>(1).unwrap_or(0);
+    if payload == 0 {
+        bump_tls_profile_diagnostic(6);
+        return 0;
+    }
+    let mut layout = [0u64; 3];
+    let read = unsafe {
+        bpf_probe_read_user(
+            layout.as_mut_ptr() as *mut c_void,
+            core::mem::size_of_val(&layout) as u32,
+            payload as *const c_void,
+        )
+    };
+    if read < 0 || layout[1] == 0 || layout[2] == 0 {
+        bump_tls_profile_diagnostic(6);
+        return 0;
+    }
+    bump_tls_profile_diagnostic(7);
+    let ssl_ptr = ctx.arg::<u64>(0).unwrap_or(0);
+    try_bind_tls_read_from_last_socket(ssl_ptr);
+    emit_tls_plaintext(
+        SslCallArgs {
+            ssl_ptr,
+            buf: layout[1],
+            requested_len: layout[2],
+            result_len_ptr: 0,
+            started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+            direction: TLS_PLAINTEXT_DIRECTION_READ,
+            api_kind: TLS_PLAINTEXT_API_RUSTLS,
+            route_kind: 0,
+            _pad: [0; 5],
+        syscall_fd: 0,
+        },
+        layout[2],
+    )
+}
+
+fn take_ssl_call(expected_direction: u8) -> Option<SslCallArgs> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = unsafe { SSL_CALL_ARGS.get(&pid_tgid) }.copied();
+    let _ = SSL_CALL_ARGS.remove(&pid_tgid);
+    args.filter(|value| value.direction == expected_direction)
+}
+
+fn mark_classic_write_covered_by_app_data() {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(args) = unsafe { SSL_CALL_ARGS.get(&pid_tgid) }.copied() else {
+        return;
+    };
+    if args.direction != TLS_PLAINTEXT_DIRECTION_WRITE
+        || args.api_kind != TLS_PLAINTEXT_API_SSL_CLASSIC
+    {
+        return;
+    }
+    let mut updated = args;
+    updated._pad[0] = 1;
+    let _ = SSL_CALL_ARGS.insert(&pid_tgid, &updated, 0);
+}
+
+fn finish_ssl_classic(ctx: &RetProbeContext, direction: u8) -> u32 {
+    let Some(args) = take_ssl_call(direction) else {
+        return 0;
+    };
+    if args.api_kind != TLS_PLAINTEXT_API_SSL_CLASSIC {
+        return 0;
+    }
+    // The protocol-method probe already copied this write; skip the wrapper so hop 2
+    // is not emitted twice when both public SSL_write and write_app_data are attached.
+    if args._pad[0] != 0 {
+        return 0;
+    }
+    // OpenSSL/BoringSSL classic SSL_read/SSL_write return C `int`. Reading the full 64-bit rax
+    // leaks undefined high bits on x86_64 and can turn a small successful read into the requested
+    // buffer size after clamping, duplicating uninitialized bytes into the HTTP stream.
+    let result = ctx.ret::<i32>().unwrap_or(0) as i64;
+    if result <= 0 {
+        return 0;
+    }
+    let actual = (result as u64).min(args.requested_len);
+    if direction == TLS_PLAINTEXT_DIRECTION_READ {
+        try_bind_tls_read_from_last_socket(args.ssl_ptr);
+    }
+    bump_tls_profile_diagnostic(17);
+    emit_tls_plaintext(args, actual)
+}
+
+fn finish_ssl_ex(ctx: &RetProbeContext, direction: u8) -> u32 {
+    let Some(args) = take_ssl_call(direction) else {
+        return 0;
+    };
+    if args.api_kind != TLS_PLAINTEXT_API_SSL_EX || ctx.ret::<i32>().unwrap_or(0) != 1 {
+        return 0;
+    }
+    if args.result_len_ptr == 0 {
+        return 0;
+    }
+    let mut actual = 0u64;
+    let result = unsafe {
+        bpf_probe_read_user(
+            &mut actual as *mut u64 as *mut c_void,
+            core::mem::size_of::<u64>() as u32,
+            args.result_len_ptr as *const c_void,
+        )
+    };
+    if result < 0 || actual == 0 {
+        return 0;
+    }
+    if direction == TLS_PLAINTEXT_DIRECTION_READ {
+        try_bind_tls_read_from_last_socket(args.ssl_ptr);
+    }
+    bump_tls_profile_diagnostic(12);
+    emit_tls_plaintext(args, actual.min(args.requested_len))
+}
+
+fn next_ssl_call_sequence(cgroup_id: u64, pid: u32, connection_id: u64, direction: u8) -> u64 {
+    // Do not XOR the raw `(pid<<32)|fd` TCP connection id with `pid<<32`: that cancels the PID
+    // bits and makes unrelated processes sharing the same fd corrupt each other's sequence.
+    let key = cgroup_id.rotate_left(17)
+        ^ connection_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (pid as u64).rotate_left(23)
+        ^ ((direction as u64) << 63);
+    if let Some(value) = SSL_CALL_SEQUENCES.get_ptr_mut(&key) {
+        unsafe {
+            *value = (*value).wrapping_add(1);
+            *value
+        }
+    } else {
+        let value = 1u64;
+        let _ = SSL_CALL_SEQUENCES.insert(&key, &value, 0);
+        value
     }
 }
 
-fn emit_ssl(buf: *const u8, len: u64, is_read: u32) -> u32 {
-    if buf.is_null() || len == 0 {
+const HTTP_PREFIX_UNKNOWN: u8 = 0;
+const HTTP_REQUEST_LINE_SNAPSHOT: usize = 64;
+
+#[repr(C)]
+struct HttpRouteHashContext {
+    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    hash: u64,
+    captured: u32,
+    index: u32,
+    complete: u8,
+    invalid: u8,
+    _pad: [u8; 6],
+}
+
+// Hash one request-line byte per helper iteration.  Keeping the bounded scan in bpf_loop is
+// important: this function is reached from several syscall/TLS probes, and an ordinary Rust loop
+// over the variable-length path gets duplicated into each caller and exhausts the verifier state
+// budget.  The callback performs only fixed-array reads and FNV arithmetic; HTTP framing and body
+// semantics remain in userspace.
+unsafe extern "C" fn hash_http_route_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut HttpRouteHashContext);
+    let index = state.index as usize;
+    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
+        state.invalid = 1;
+        return 1;
+    }
+
+    let byte = state.data[index];
+    if index == 5 && byte != b'/' {
+        state.invalid = 1;
+        return 1;
+    }
+    // CR/LF before the request-target separator is malformed; unlike `?`/`#`, they must not
+    // authorize a route match.  Userspace still performs the complete HTTP-line validation.
+    if byte == b'\r' || byte == b'\n' {
+        state.invalid = 1;
+        return 1;
+    }
+    if byte == b' ' || byte == b'?' || byte == b'#' {
+        if index == 5 || index.saturating_sub(5) > PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+            state.invalid = 1;
+        } else {
+            state.complete = 1;
+        }
+        return 1;
+    }
+    if index.saturating_sub(5) >= PLAINTEXT_HTTP_ROUTE_MAX_LEN {
+        state.invalid = 1;
+        return 1;
+    }
+    state.hash ^= byte as u64;
+    state.hash = state.hash.wrapping_mul(0x0000_0100_0000_01b3);
+    state.index = state.index.saturating_add(1);
+    0
+}
+
+#[inline(always)]
+fn bytes_at<const N: usize>(
+    data: &[u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    captured: usize,
+    offset: usize,
+    expected: &[u8; N],
+) -> bool {
+    if offset.saturating_add(N) > captured {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < N {
+        if data[offset + index] != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Classify a POST request-line for plaintext admission.
+///
+/// Configured LLM/tool hashes stay exact. A complete POST path that is not in the map is a
+/// bounded candidate so verified-agent RPC is not limited to one deployment route name.
+/// Body/provider semantics remain in userspace. Non-request bytes stay UNKNOWN.
+#[inline(always)]
+fn http_request_route_kind(buf: u64, len: u64) -> u8 {
+    if buf == 0 || len < 6 {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+
+    if !bytes_at(&data, captured, 0, b"POST ") {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let mut route = HttpRouteHashContext {
+        data,
+        hash: 0xcbf2_9ce4_8422_2325u64,
+        captured: captured as u32,
+        index: 5,
+        complete: 0,
+        invalid: 0,
+        _pad: [0; 6],
+    };
+    let iterations = unsafe {
+        bpf_loop(
+            (HTTP_REQUEST_LINE_SNAPSHOT - 5) as u32,
+            hash_http_route_byte as *mut c_void,
+            &mut route as *mut HttpRouteHashContext as *mut c_void,
+            0,
+        )
+    };
+    if iterations < 0 || route.complete == 0 || route.invalid != 0 {
+        return HTTP_PREFIX_UNKNOWN;
+    }
+    let route = unsafe { PLAINTEXT_HTTP_ROUTES.get(&route.hash) }
+        .copied()
+        .unwrap_or(HTTP_PREFIX_UNKNOWN);
+    if route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL {
+        route
+    } else {
+        PLAINTEXT_HTTP_ROUTE_CANDIDATE
+    }
+}
+
+/// True when a COMPLETE method-prefix classification is shaped like an HTTP request line
+/// (`METHOD SP "/"|"*"|absolute-URI`). Body chunks that happen to contain `token + SP + word`
+/// (e.g. mid-prompt English) must not be treated as a fresh exchange.
+#[inline(always)]
+fn http_request_line_shaped(data: &[u8], len: usize) -> bool {
+    http_request_line_shaped_len(data, len)
+}
+
+#[inline(always)]
+fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
+    if buf == 0 || len == 0 {
+        return Some(false);
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        // Distinguish an unreadable callback buffer from a valid non-method payload. The former
+        // must revoke any prior route admission rather than silently inheriting it.
+        return None;
+    }
+    match classify_http_method_prefix_len(&data, captured) {
+        HTTP_METHOD_PREFIX_COMPLETE if http_request_line_shaped(&data, captured) => Some(true),
+        // Incomplete tokens (split request-line OR mid-body alphanumeric runs) and non-method
+        // payloads must NOT revoke an admitted TLS session. Claude/BoringSSL large POSTs arrive as
+        // many SSL_write chunks; treating INCOMPLETE as revoke cleared the session before any
+        // SSL_read, producing userspace request_buffer_bytes>0 / response_buffer_bytes=0.
+        // Incomplete alone also must not admit a fresh route—callers only retain via admitted_*.
+        HTTP_METHOD_PREFIX_COMPLETE
+        | HTTP_METHOD_PREFIX_INCOMPLETE
+        | HTTP_METHOD_PREFIX_NONE => Some(false),
+        _ => Some(false),
+    }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn http_method_prefix_is_incomplete(buf: u64, len: u64) -> bool {
+    if buf == 0 || len == 0 {
+        return false;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return false;
+    }
+    classify_http_method_prefix_len(&data, captured) == HTTP_METHOD_PREFIX_INCOMPLETE
+}
+
+// Keep the optional WebSocket upgrade hint in its own BPF subprogram. Inlining a header parser
+// with nested line/value loops into `emit_tls_plaintext` exhausts the verifier state budget for
+// every TLS ABI caller. This callback performs one linear, bounded scan through a fixed snapshot;
+// it is only an admission hint and userspace remains authoritative for HTTP/WebSocket validity.
+#[repr(C)]
+struct WebSocketHintContext {
+    data: [u8; HTTP_REQUEST_LINE_SNAPSHOT],
+    captured: u32,
+    index: u32,
+    rolling: u32,
+    saw_upgrade: u8,
+    saw_websocket: u8,
+    saw_connection: u8,
+    _pad: u8,
+}
+
+unsafe extern "C" fn scan_websocket_hint_byte(_iteration: u32, raw_ctx: *mut c_void) -> i64 {
+    let state = &mut *(raw_ctx as *mut WebSocketHintContext);
+    let index = state.index as usize;
+    // Keep both bounds explicit: the verifier/compiler cannot infer that the userspace-derived
+    // `captured` value is no larger than the fixed array solely from the caller's clamp.
+    if index >= HTTP_REQUEST_LINE_SNAPSHOT || index >= state.captured as usize {
+        return 1;
+    }
+    let raw = state.data[index];
+    let byte = if raw >= b'A' && raw <= b'Z' {
+        raw + (b'a' - b'A')
+    } else {
+        raw
+    };
+    state.rolling = (state.rolling << 8) | byte as u32;
+    state.index = state.index.saturating_add(1);
+    // Prefixes are intentionally used only as a cheap candidate hint. The userspace Transport
+    // decoder validates complete header names/values before producing a WebSocket relation.
+    if state.rolling == u32::from_be_bytes(*b"upgr") {
+        state.saw_upgrade = 1;
+    }
+    if state.rolling == u32::from_be_bytes(*b"webs") {
+        state.saw_websocket = 1;
+    }
+    if state.rolling == u32::from_be_bytes(*b"conn") {
+        state.saw_connection = 1;
+    }
+    if state.saw_upgrade != 0 && state.saw_websocket != 0 && state.saw_connection != 0 {
+        return 1;
+    }
+    0
+}
+
+#[inline(always)]
+fn http_websocket_upgrade_hint(buf: u64, len: u64) -> bool {
+    if buf == 0 || len < 16 {
+        return false;
+    }
+    let mut data = [0u8; HTTP_REQUEST_LINE_SNAPSHOT];
+    let captured = if len > HTTP_REQUEST_LINE_SNAPSHOT as u64 {
+        HTTP_REQUEST_LINE_SNAPSHOT
+    } else {
+        len as usize
+    };
+    if unsafe {
+        bpf_probe_read_user(
+            data.as_mut_ptr() as *mut c_void,
+            captured as u32,
+            buf as *const c_void,
+        )
+    } < 0
+    {
+        return false;
+    }
+    if !bytes_at(&data, captured, 0, b"GET ") {
+        return false;
+    }
+    let mut state = WebSocketHintContext {
+        data,
+        captured: captured as u32,
+        index: 0,
+        rolling: 0,
+        saw_upgrade: 0,
+        saw_websocket: 0,
+        saw_connection: 0,
+        _pad: 0,
+    };
+    let iterations = unsafe {
+        bpf_loop(
+            HTTP_REQUEST_LINE_SNAPSHOT as u32,
+            scan_websocket_hint_byte as *mut c_void,
+            &mut state as *mut WebSocketHintContext as *mut c_void,
+            0,
+        )
+    };
+    iterations >= 0
+        && state.saw_upgrade != 0
+        && state.saw_websocket != 0
+        && state.saw_connection != 0
+}
+
+#[inline(always)]
+fn tls_api_is_ssl_family(api_kind: u8) -> bool {
+    api_kind == TLS_PLAINTEXT_API_SSL_CLASSIC
+        || api_kind == TLS_PLAINTEXT_API_SSL_EX
+        || api_kind == TLS_PLAINTEXT_API_SSL_APP_DATA
+}
+
+#[inline(always)]
+fn verified_agent_process(pid: u32, cgroup_id: u64) -> bool {
+    let key = PlaintextProcessKey {
+        cgroup_id,
+        pid,
+        _pad: 0,
+    };
+    if unsafe { VERIFIED_AGENT_PROCESSES.get(&key) }.is_none() {
+        return false;
+    }
+    // Before the first committed exec, retain the legacy positive scope decision.  Once a commit
+    // marker exists, require it to match the current generation fence.
+    let committed = unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) };
+    let fenced = unsafe { VERIFIED_AGENT_EXEC_IDS.get(&key).copied().unwrap_or(0) };
+    if fenced == 0 {
+        return true;
+    }
+    committed != 0 && fenced == committed
+}
+
+#[inline(always)]
+fn valid_plaintext_route(route: u8) -> bool {
+    route == PLAINTEXT_HTTP_ROUTE_LLM || route == PLAINTEXT_HTTP_ROUTE_TOOL
+}
+
+#[inline(always)]
+fn valid_plaintext_capture_route(route: u8) -> bool {
+    valid_plaintext_route(route) || route == PLAINTEXT_HTTP_ROUTE_CANDIDATE
+}
+
+#[inline(always)]
+fn admitted_tls_session_route(
+    key: &PlaintextTlsSessionKey,
+    actual_len: u64,
+    now_boot_ns: u64,
+) -> Option<u8> {
+    let current = unsafe { PLAINTEXT_TLS_SESSIONS.get(key) }.copied();
+    let Some(current) = current else {
+        return None;
+    };
+    if current.route == TLS_SESSION_ROUTE_BLOCKED
+        && (current.expires_at_boot_ns == 0 || now_boot_ns < current.expires_at_boot_ns)
+    {
+        return None;
+    }
+    if !valid_plaintext_capture_route(current.route)
+        || (current.expires_at_boot_ns != 0 && now_boot_ns >= current.expires_at_boot_ns)
+    {
+        let _ = PLAINTEXT_TLS_SESSIONS.remove(key);
+        return None;
+    }
+    let captured_bytes = current.captured_bytes.saturating_add(actual_len);
+    if captured_bytes > TLS_SESSION_MAX_BYTES {
+        let blocked = PlaintextTlsSessionValue {
+            route: TLS_SESSION_ROUTE_BLOCKED,
+            _pad: [0; 7],
+            expires_at_boot_ns: now_boot_ns.saturating_add(TLS_SESSION_CANDIDATE_TTL_NS),
+            captured_bytes: TLS_SESSION_MAX_BYTES,
+        };
+        let _ = PLAINTEXT_TLS_SESSIONS.insert(key, &blocked, 0);
+        return None;
+    }
+    let ttl = if current.route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+        TLS_SESSION_CANDIDATE_TTL_NS
+    } else {
+        TLS_SESSION_EXACT_TTL_NS
+    };
+    let refreshed = PlaintextTlsSessionValue {
+        route: current.route,
+        _pad: [0; 7],
+        expires_at_boot_ns: now_boot_ns.saturating_add(ttl),
+        captured_bytes,
+    };
+    if PLAINTEXT_TLS_SESSIONS.insert(key, &refreshed, 0).is_err() {
+        bump_tls_profile_diagnostic(11);
+        return None;
+    }
+    Some(current.route)
+}
+
+#[inline(always)]
+fn insert_tls_session(
+    key: &PlaintextTlsSessionKey,
+    route: u8,
+    actual_len: u64,
+    now_boot_ns: u64,
+) -> Option<u8> {
+    if !valid_plaintext_capture_route(route) || actual_len > TLS_SESSION_MAX_BYTES {
+        return None;
+    }
+    if let Some(current) = unsafe { PLAINTEXT_TLS_SESSIONS.get(key) }.copied() {
+        if current.route == TLS_SESSION_ROUTE_BLOCKED
+            && (current.expires_at_boot_ns == 0 || now_boot_ns < current.expires_at_boot_ns)
+        {
+            return None;
+        }
+    }
+    let ttl = if route == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+        TLS_SESSION_CANDIDATE_TTL_NS
+    } else {
+        TLS_SESSION_EXACT_TTL_NS
+    };
+    let value = PlaintextTlsSessionValue {
+        route,
+        _pad: [0; 7],
+        expires_at_boot_ns: now_boot_ns.saturating_add(ttl),
+        captured_bytes: actual_len,
+    };
+    if PLAINTEXT_TLS_SESSIONS.insert(key, &value, 0).is_err() {
+        bump_tls_profile_diagnostic(11);
+        return None;
+    }
+    Some(route)
+}
+
+#[inline(always)]
+fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u64) -> Option<u8> {
+    // Plain TCP already passed the route gate in HTTP_SOCKS.  TLS contexts require a write-side
+    // exact POST/path match before any response bytes are admitted.
+    if args.api_kind == TLS_PLAINTEXT_API_TCP {
+        return valid_plaintext_capture_route(args.route_kind).then_some(args.route_kind);
+    }
+    if args.api_kind == TLS_PLAINTEXT_API_RUSTLS && args.ssl_ptr == 0 {
+        // A zero Rustls pointer cannot identify a TLS session; sharing one map key across all
+        // sockets would authorize unrelated reads. Keep the raw ring/Kernel facts, but fail
+        // closed for plaintext association until the ABI supplies a stable context pointer.
+        bump_tls_profile_diagnostic(14);
+        return None;
+    }
+    let key = PlaintextTlsSessionKey {
+        cgroup_id,
+        pid,
+        _reserved: 0,
+        tls_context_id: args.ssl_ptr,
+        exec_id: unsafe { COMMITTED_EXEC_IDS.get(&pid).copied().unwrap_or(0) },
+    };
+    let now_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if args.direction == TLS_PLAINTEXT_DIRECTION_WRITE {
+        let detected = http_request_route_kind(args.buf, actual_len);
+        // A TLS allocator may reuse the same pointer for a new HTTP exchange. Clear the prior
+        // admission only for an unreadable buffer (revoke) or a real request-line shaped method.
+        // Body continuations—including INCOMPLETE alphanumeric runs that the method classifier
+        // cannot yet disambiguate—must keep the admission so SSL_read can still emit plaintext.
+        let fresh_method = http_method_prefix(args.buf, actual_len);
+        if fresh_method.is_none() || fresh_method == Some(true) {
+            let _ = PLAINTEXT_TLS_SESSIONS.remove(&key);
+        }
+        if fresh_method.is_none() {
+            return None;
+        }
+        if valid_plaintext_route(detected) {
+            return insert_tls_session(&key, detected, actual_len, now_boot_ns);
+        }
+        if fresh_method == Some(true) {
+            // Exact LLM/Tool path hashes are best-effort. Verified Agent TLS (Rustls, BoringSSL
+            // classic, OpenSSL-ex) must not depend on maintaining a global URL allowlist for every
+            // gateway prefix (e.g. /api/anthropic/v1/messages). Admit a bounded candidate session
+            // and let userspace Transport/LLM parsers accept or mark unparsed. WebSocket upgrades
+            // whose Upgrade/Connection headers sit past the 64-byte hint snapshot follow the same
+            // candidate path.
+            let admit_candidate = args.api_kind == TLS_PLAINTEXT_API_RUSTLS
+                || tls_api_is_ssl_family(args.api_kind)
+                || http_websocket_upgrade_hint(args.buf, actual_len);
+            return if admit_candidate {
+                if tls_api_is_ssl_family(args.api_kind) {
+                    bump_tls_profile_diagnostic(10);
+                }
+                insert_tls_session(
+                    &key,
+                    PLAINTEXT_HTTP_ROUTE_CANDIDATE,
+                    actual_len,
+                    now_boot_ns,
+                )
+            } else {
+                None
+            };
+        }
+        if let Some(route) = admitted_tls_session_route(&key, actual_len, now_boot_ns)
+            .filter(|route| valid_plaintext_capture_route(*route))
+        {
+            return Some(route);
+        }
+        // Rustls CommonState and split Classic/OpenSSL writes may observe body, HTTP/2
+        // frames, or a first record that is not a request-line. Verified-agent sessions
+        // must still open a bounded candidate; otherwise Claude's first hop (headers on
+        // one SSL_write, JSON/H2 on the next, or H2 frames with no POST prefix) is
+        // dropped before userspace can reassemble.
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS || tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(10);
+            return insert_tls_session(
+                &key,
+                PLAINTEXT_HTTP_ROUTE_CANDIDATE,
+                actual_len,
+                now_boot_ns,
+            );
+        }
+        return None;
+    }
+    admitted_tls_session_route(&key, actual_len, now_boot_ns).filter(|route| {
+        valid_plaintext_route(*route) || *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE
+    })
+}
+
+fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
+    if args.buf == 0 || actual_len == 0 {
         return 0;
     }
-    let Some(mut entry) = reserve_or_drop::<SslEvent>(&SSL_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !verified_agent_process(pid, cgroup_id) {
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
+            bump_tls_profile_diagnostic(8);
+        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
+            bump_tls_profile_diagnostic(13);
+        } else if tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(18);
+        }
+        return 0;
+    }
+    let Some(route_kind) = tls_session_route(&args, actual_len, pid, cgroup_id) else {
+        // Route miss used to be silent for Classic/OpenSSL-ex, which made "uprobes fire but
+        // ssl=0 / no interactions" undiagnosable for gateway paths outside the exact allowlist.
+        if args.api_kind == TLS_PLAINTEXT_API_RUSTLS {
+            bump_tls_profile_diagnostic(9);
+        } else if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
+            bump_tls_profile_diagnostic(14);
+        } else if tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(19);
+        }
         return 0;
     };
-    let ev = entry.as_mut_ptr();
-    unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*ev).is_read = is_read;
-        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
-        // n <= SSL_SNAP_LEN (data capacity) and n <= len (bytes actually written/read).
-        let n: u32 = if len > SSL_SNAP_LEN as u64 {
-            SSL_SNAP_LEN as u32
-        } else {
-            len as u32
-        };
-        (*ev).len = n;
-        (*ev).data = [0u8; SSL_SNAP_LEN];
-        let _ = bpf_probe_read_user(
-            (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
-            n,
-            buf as *const core::ffi::c_void,
-        );
+    let capture_decision = capture_raw_decision(
+        CAPTURE_PROBE_SSL,
+        cgroup_id,
+        pid,
+        actual_len,
+        (args.direction == TLS_PLAINTEXT_DIRECTION_READ) as u8,
+    );
+    if !capture_decision.selected() {
+        if args.api_kind == TLS_PLAINTEXT_API_SSL_EX {
+            bump_tls_profile_diagnostic(15);
+        } else if tls_api_is_ssl_family(args.api_kind) {
+            bump_tls_profile_diagnostic(20);
+        }
+        return 0;
     }
-    entry.submit(0);
+    capture_payload_candidate(CAPTURE_PROBE_SSL);
+    let bind = lookup_tls_ctx_bind(cgroup_id, pid, args.ssl_ptr);
+    let (bind_quality, mut socket_fd, socket_cookie, fd_generation) = match bind {
+        Some(value) => (
+            value.bind_quality,
+            value.fd as i32,
+            value.socket_cookie,
+            value.fd_generation,
+        ),
+        None => (TLS_BIND_QUALITY_UNBOUND, 0i32, 0u64, 0u32),
+    };
+    if args.api_kind == TLS_PLAINTEXT_API_TCP && args.syscall_fd > 0 {
+        socket_fd = args.syscall_fd as i32;
+    }
+    // Prefer a stable socket-derived identity when bound so rustls CommonState moves alias to one
+    // stream. Unbound TLS contexts keep the observed SSL*/CommonState pointer as connection_id.
+    let connection_id = if bind_quality >= TLS_BIND_QUALITY_COOKIE && socket_cookie != 0 {
+        socket_cookie
+    } else if bind_quality >= TLS_BIND_QUALITY_FD && socket_fd > 0 {
+        sock_key(cgroup_id, pid, socket_fd as u64)
+    } else if args.ssl_ptr != 0 {
+        args.ssl_ptr
+    } else {
+        pid_tgid
+    };
+    let call_seq = next_ssl_call_sequence(cgroup_id, pid, connection_id, args.direction);
+    let original_len = if actual_len > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        actual_len as u32
+    };
+
+    macro_rules! emit_tier {
+        ($event_type:ty, $capacity:expr) => {{
+            let Some(mut entry) = reserve_or_drop::<$event_type>(&SSL_EVENTS, PIPELINE_RING_SSL)
+            else {
+                return 0;
+            };
+            let captured_len = if actual_len > $capacity as u64 {
+                $capacity as u32
+            } else {
+                actual_len as u32
+            };
+            let mut flags = 0u16;
+            if actual_len > $capacity as u64 {
+                flags |= TLS_PLAINTEXT_FLAG_TRUNCATED;
+            }
+            if args.ssl_ptr == 0 && bind_quality == TLS_BIND_QUALITY_UNBOUND {
+                flags |= TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND;
+            }
+            if route_kind == PLAINTEXT_HTTP_ROUTE_TOOL {
+                flags |= TLS_PLAINTEXT_FLAG_TOOL_ROUTE;
+            }
+            if route_kind == PLAINTEXT_HTTP_ROUTE_CANDIDATE {
+                flags |= TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE;
+            }
+            let ev = entry.as_mut_ptr();
+            unsafe {
+                (*ev).header = TlsPlaintextEventHeader {
+                    abi_version: TLS_PLAINTEXT_ABI_V2,
+                    header_len: core::mem::size_of::<TlsPlaintextEventHeader>() as u16,
+                    flags,
+                    _pad0: 0,
+                    cgroup_id,
+                    pid,
+                    tid,
+                    connection_id,
+                    call_seq,
+                    original_len,
+                    captured_len,
+                    direction: args.direction,
+                    api_kind: args.api_kind,
+                    bind_quality,
+                    _pad1: 0,
+                    socket_fd,
+                    call_started_at_boot_ns: args.started_at_boot_ns,
+                    captured_at_boot_ns,
+                    socket_cookie,
+                    fd_generation,
+                    _pad2: 0,
+                    comm: bpf_get_current_comm().unwrap_or_default(),
+                    capture_decision,
+                };
+                if bpf_probe_read_user(
+                    (*ev).data.as_mut_ptr() as *mut c_void,
+                    captured_len,
+                    args.buf as *const c_void,
+                ) < 0
+                {
+                    capture_payload_error(CAPTURE_PROBE_SSL);
+                    entry.discard(0);
+                    return 0;
+                }
+            }
+            submit_accounted(entry, PIPELINE_RING_SSL);
+            return 0;
+        }};
+    }
+
+    if actual_len <= TLS_PLAINTEXT_TIER_SMALL as u64 {
+        emit_tier!(TlsPlaintextEventSmall, TLS_PLAINTEXT_TIER_SMALL);
+    }
+    if actual_len <= TLS_PLAINTEXT_TIER_MEDIUM as u64 {
+        emit_tier!(TlsPlaintextEventMedium, TLS_PLAINTEXT_TIER_MEDIUM);
+    }
+    emit_tier!(TlsPlaintextEventLarge, TLS_PLAINTEXT_TIER_LARGE);
+}
+
+fn try_plain_http_write(pid: u32, fd: u64, buf: *const u8, len: u64) {
+    if buf.is_null() || len == 0 {
+        return;
+    }
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if !verified_agent_process(pid, cgroup_id) {
+        return;
+    }
+    let key = sock_key(cgroup_id, pid, fd);
+    let mut route_kind = unsafe { HTTP_SOCKS.get(&key) }
+        .copied()
+        .unwrap_or(HTTP_PREFIX_UNKNOWN);
+    let detected = http_request_route_kind(buf as u64, len);
+    match detected {
+        PLAINTEXT_HTTP_ROUTE_LLM | PLAINTEXT_HTTP_ROUTE_TOOL | PLAINTEXT_HTTP_ROUTE_CANDIDATE => {
+            route_kind = detected;
+            let _ = HTTP_SOCKS.insert(&key, &route_kind, 0);
+        }
+        _ => {
+            // ClientHello and body continuations are not POST request-lines. Keep an already
+            // admitted socket; otherwise fail closed so stdout/files stay off this probe.
+            if !valid_plaintext_capture_route(route_kind) {
+                return;
+            }
+        }
+    }
+    if !valid_plaintext_capture_route(route_kind) {
+        return;
+    }
+
+    let args = SslCallArgs {
+        ssl_ptr: key,
+        buf: buf as u64,
+        requested_len: len,
+        result_len_ptr: 0,
+        started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+        direction: TLS_PLAINTEXT_DIRECTION_WRITE,
+        api_kind: TLS_PLAINTEXT_API_TCP,
+        route_kind,
+        _pad: [0; 5],
+        syscall_fd: fd as u32,
+    };
+    let _ = emit_tls_plaintext(args, len);
+}
+
+#[tracepoint]
+pub fn http_write(ctx: TracePointContext) -> u32 {
+    // sys_enter_write: fd @16, buf @24, count @32.
+    // Python urllib/httpx/http.client use write/sendto for plain HTTP, not writev (Node/libuv).
+    // Keep this as a sibling program so the always-on TLS ClientHello probe stays verifier-light.
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(buf) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(len) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    try_plain_http_write(pid, fd, buf as *const u8, len);
+    0
+}
+
+#[tracepoint]
+pub fn http_sendto(ctx: TracePointContext) -> u32 {
+    // sys_enter_sendto: fd @16, buf @24, size @32 (flags/addr unused for plain-HTTP body).
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(buf) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(len) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    try_plain_http_write(pid, fd, buf as *const u8, len);
+    0
+}
+
+#[tracepoint]
+pub fn http_writev(ctx: TracePointContext) -> u32 {
+    // sys_enter_writev: fd @16, iovec* @24, iovcnt @32. The first entries normally hold the HTTP
+    // header and JSON body separately (notably Node/libuv). Four fixed iterations keep verifier
+    // and copy cost bounded; the HTTP reassembler exposes missing bytes as partial/timeout.
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(iov_ptr) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    let Ok(iov_count) = (unsafe { ctx.read_at::<u64>(32) }) else {
+        return 0;
+    };
+    if iov_ptr == 0 || iov_count == 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    for index in 0..4u64 {
+        if index >= iov_count {
+            break;
+        }
+        let mut iov = UserIovec { base: 0, len: 0 };
+        let address = iov_ptr.saturating_add(index * core::mem::size_of::<UserIovec>() as u64);
+        if unsafe {
+            bpf_probe_read_user(
+                &mut iov as *mut UserIovec as *mut c_void,
+                core::mem::size_of::<UserIovec>() as u32,
+                address as *const c_void,
+            )
+        } < 0
+        {
+            break;
+        }
+        try_plain_http_write(pid, fd, iov.base as *const u8, iov.len);
+    }
+    0
+}
+
+/// Python asyncio/httpx and a number of native HTTP clients use `sendmsg` for a
+/// socket write.  Treat the first bounded iovec entries exactly like writev so
+/// plain HTTP discovery does not depend on one libc send implementation.
+#[tracepoint]
+pub fn http_sendmsg(ctx: TracePointContext) -> u32 {
+    let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
+        return 0;
+    };
+    let Ok(hdr) = (unsafe { ctx.read_at::<u64>(24) }) else {
+        return 0;
+    };
+    if hdr == 0 {
+        return 0;
+    }
+    let base = hdr as *const u8;
+    let Some(iov_ptr) = read_user_u64(unsafe { base.add(16) }) else {
+        return 0;
+    };
+    let Some(iov_count) = read_user_u64(unsafe { base.add(24) }) else {
+        return 0;
+    };
+    if iov_ptr == 0 || iov_count == 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    try_bind_tls_write_to_fd(fd);
+    for index in 0..4u64 {
+        if index >= iov_count {
+            break;
+        }
+        let mut iov = UserIovec { base: 0, len: 0 };
+        let address = iov_ptr.saturating_add(index * core::mem::size_of::<UserIovec>() as u64);
+        if unsafe {
+            bpf_probe_read_user(
+                &mut iov as *mut UserIovec as *mut c_void,
+                core::mem::size_of::<UserIovec>() as u32,
+                address as *const c_void,
+            )
+        } < 0
+        {
+            break;
+        }
+        try_plain_http_write(pid, fd, iov.base as *const u8, iov.len);
+    }
     0
 }
 
@@ -650,29 +3782,57 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
     if family != 2 && family != 10 {
         return Ok(0); // only AF_INET / AF_INET6
     }
-    let Some(mut entry) = reserve_or_drop::<ConnectEvent>(&CONNECT_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(
+        CAPTURE_PROBE_CONNECT,
+        cgroup_id,
+        pid,
+        0,
+        (family == 10) as u8,
+    );
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_CONNECT);
+    let Some(mut entry) = reserve_or_drop::<ConnectEvent>(&CONNECT_EVENTS, PIPELINE_RING_CONNECT)
+    else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).fd = fd as u32;
         (*ev).family = family;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let mut port = [0u8; 2];
-        let _ = bpf_probe_read_user_buf(addr_ptr.add(2), &mut port); // sin_port (network order)
+        if bpf_probe_read_user_buf(addr_ptr.add(2), &mut port).is_err() {
+            capture_payload_error(CAPTURE_PROBE_CONNECT);
+            entry.discard(0);
+            return Ok(0);
+        }
         (*ev).port = u16::from_be_bytes(port);
         // Read into a local first to avoid an autoref through the raw event pointer.
         let mut a = [0u8; 16];
         if family == 2 {
-            let _ = bpf_probe_read_user_buf(addr_ptr.add(4), &mut a[..4]); // sin_addr
-        } else {
-            let _ = bpf_probe_read_user_buf(addr_ptr.add(8), &mut a); // sin6_addr
+            if bpf_probe_read_user_buf(addr_ptr.add(4), &mut a[..4]).is_err() {
+                capture_payload_error(CAPTURE_PROBE_CONNECT);
+                entry.discard(0);
+                return Ok(0);
+            }
+        } else if bpf_probe_read_user_buf(addr_ptr.add(8), &mut a).is_err() {
+            capture_payload_error(CAPTURE_PROBE_CONNECT);
+            entry.discard(0);
+            return Ok(0);
         }
         (*ev).addr = a;
+        (*ev)._event_time_pad = [0; 4];
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_CONNECT);
     Ok(0)
 }
 
@@ -682,18 +3842,32 @@ fn try_connect(ctx: &TracePointContext) -> Result<u32, i64> {
 // when one fires it's worth a look — that's the whole point of a separate "rare and loud" tier.
 
 fn emit_sec(kind: u32, detail: u64) {
-    let Some(mut entry) = reserve_or_drop::<SecEvent>(&SEC_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // The Security event itself is hard-FULL, and atomically promotes this runtime to temporary
+    // investigation_full before subsequent file/network events can be evaluated.
+    promote_security_runtime(pid, cgroup_id);
+    let capture_decision =
+        capture_raw_decision(CAPTURE_PROBE_SECURITY, cgroup_id, pid, 0, kind as u8);
+    if !capture_decision.selected() {
+        return;
+    }
+    capture_payload_candidate(CAPTURE_PROBE_SECURITY);
+    let Some(mut entry) = reserve_or_drop::<SecEvent>(&SEC_EVENTS, PIPELINE_RING_SECURITY) else {
         return;
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).kind = kind;
         (*ev).detail = detail;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_SECURITY);
 }
 
 // Escalation TO root from a non-root caller — the loud case. Dropping privs (root → nobody, which
@@ -830,13 +4004,21 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
     if count < 13 {
         return Ok(0); // DNS header(12) + >=1 question byte
     }
-    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_DNS, cgroup_id, pid, count, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_DNS);
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS, PIPELINE_RING_DNS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if count > DNS_SNAP_LEN as u64 {
@@ -846,13 +4028,20 @@ fn try_dns(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; DNS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             buf as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_DNS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_DNS);
     Ok(0)
 }
 
@@ -907,13 +4096,21 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
     if iov_base == 0 || iov_len < 13 {
         return Ok(0);
     }
-    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS) else {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_DNS, cgroup_id, pid, iov_len, 0);
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    capture_payload_candidate(CAPTURE_PROBE_DNS);
+    let Some(mut entry) = reserve_or_drop::<DnsEvent>(&DNS_EVENTS, PIPELINE_RING_DNS) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev)._pad = 0;
         (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         let n: u32 = if iov_len > DNS_SNAP_LEN as u64 {
@@ -923,45 +4120,271 @@ fn try_dns_msghdr(ctx: &TracePointContext) -> Result<u32, i64> {
         };
         (*ev).len = n as u16;
         (*ev).data = [0u8; DNS_SNAP_LEN];
-        let _ = bpf_probe_read_user(
+        if bpf_probe_read_user(
             (*ev).data.as_mut_ptr() as *mut core::ffi::c_void,
             n,
             iov_base as *const core::ffi::c_void,
-        );
+        ) < 0
+        {
+            capture_payload_error(CAPTURE_PROBE_DNS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_DNS);
     Ok(0)
 }
 
-// ---- file opened for writing (sys_enter_openat) ----
-// Only write/rw opens are emitted (read opens are far too high-volume); userspace reads
-// the path. This is the "which files did the agent modify" signal.
+// ---- file opened (sys_enter_open/openat/openat2) ----
+// Write/rw opens retain their existing path. Read-only opens are a separate, default-off signal
+// selected only by an exact Agent Runtime/Root capture profile before path copy or Ring reserve.
 
 #[tracepoint]
 pub fn file_open(ctx: TracePointContext) -> u32 {
-    try_open(&ctx).unwrap_or(0)
+    try_openat(&ctx).unwrap_or(0)
 }
 
-fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
+#[tracepoint]
+pub fn file_openat2(ctx: TracePointContext) -> u32 {
+    try_openat2(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_open_legacy(ctx: TracePointContext) -> u32 {
+    try_open_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_openat(ctx: &TracePointContext) -> Result<u32, i64> {
     // sys_enter_openat: dfd @16, filename @24, flags @32, mode @40.
     let flags: u64 = unsafe { ctx.read_at(32)? };
-    if flags & 0x3 == 0 {
-        return Ok(0); // O_RDONLY — skip; keep only O_WRONLY / O_RDWR
-    }
     let filename: *const u8 = unsafe { ctx.read_at(24)? };
-    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
+    try_open_common(flags, filename)
+}
+
+fn try_openat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_openat2: dfd @16, filename @24, open_how* @32, usize @40.
+    // open_how.flags is the first u64. Reading only that fixed field keeps policy selection ahead
+    // of path copy and Ring reservation just like openat.
+    let filename: *const u8 = unsafe { ctx.read_at(24)? };
+    let how: *const u8 = unsafe { ctx.read_at(32)? };
+    if how.is_null() {
+        return Ok(0);
+    }
+    let Some(flags) = read_user_u64(how) else {
+        capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+        return Ok(0);
+    };
+    try_open_common(flags, filename)
+}
+
+fn try_open_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_open: filename @16, flags @24, mode @32. This tracepoint is absent on some
+    // architectures and is therefore attached as a non-fatal compatibility probe.
+    let filename: *const u8 = unsafe { ctx.read_at(16)? };
+    let flags: u64 = unsafe { ctx.read_at(24)? };
+    try_open_common(flags, filename)
+}
+
+fn try_open_common(flags: u64, filename: *const u8) -> Result<u32, i64> {
+    let access_mode = file_access_mode(flags as u32);
+    if access_mode == FILE_ACCESS_MODE_PATH_ONLY
+        || access_mode == FILE_ACCESS_MODE_SPECIAL
+        || access_mode == FILE_ACCESS_MODE_UNKNOWN
+    {
+        return Ok(0);
+    }
+    let read_only = access_mode == FILE_ACCESS_MODE_READ_ONLY;
+    // Legacy capture intentionally keeps the historical global read-off behavior. Selective reads
+    // require an atomically loaded S5 profile/Root map and never fail open on a map miss.
+    if read_only && (!capture_profile_enabled() || !file_read_capture_enabled()) {
+        return Ok(0);
+    }
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // Decide before reserving ring space or copying the userspace path. This is the load-shedding
+    // boundary: explicit non-Agent traffic and over-budget Unknown traffic never enter the ring.
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(
+            if read_only {
+                CAPTURE_PROBE_FILE_READ
+            } else {
+                CAPTURE_PROBE_FILE_ACCESS
+            },
+            cgroup_id,
+            pid,
+            0,
+            access_mode,
+        )
+    } else {
+        legacy_file_access_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(if read_only {
+            CAPTURE_PROBE_FILE_READ
+        } else {
+            CAPTURE_PROBE_FILE_ACCESS
+        });
+    }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if filename.is_null() {
+        capture_payload_error(if read_only {
+            CAPTURE_PROBE_FILE_READ
+        } else {
+            CAPTURE_PROBE_FILE_ACCESS
+        });
+        return Ok(0);
+    }
+    let Some(mut entry) = (if read_only {
+        reserve_or_drop::<FileEvent>(&FILE_READ_EVENTS, PIPELINE_RING_FILE_READ)
+    } else {
+        reserve_file_or_drop(&FILE_EVENTS, false)
+    }) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
         (*ev).flags = flags as u32;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).path = [0u8; PATH_SNAP_LEN];
-        let _ = bpf_probe_read_user_str_bytes(filename, &mut (*ev).path);
+        if bpf_probe_read_user_str_bytes(filename, &mut (*ev).path).is_err() {
+            capture_payload_error(if read_only {
+                CAPTURE_PROBE_FILE_READ
+            } else {
+                CAPTURE_PROBE_FILE_ACCESS
+            });
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(
+        entry,
+        if read_only {
+            PIPELINE_RING_FILE_READ
+        } else {
+            PIPELINE_RING_FILE_ACCESS
+        },
+    );
     Ok(0)
+}
+
+// ---- file renamed (sys_enter_rename/renameat/renameat2) ----
+// Same CAPTURE_PROBE_FILE_ACCESS decision path as write opens. Emit the *new* path so atomic
+// writers (tmp → final) produce a write_only FileAccess on the tool-declared destination.
+
+#[tracepoint]
+pub fn file_renameat(ctx: TracePointContext) -> u32 {
+    try_renameat(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_renameat2(ctx: TracePointContext) -> u32 {
+    try_renameat2(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_rename_legacy(ctx: TracePointContext) -> u32 {
+    try_rename_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_renameat(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_renameat: olddfd @16, oldname @24, newdfd @32, newname @40.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_renameat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_renameat2: olddfd @16, oldname @24, newdfd @32, newname @40, flags @48.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_rename_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_rename: oldname @16, newname @24.
+    let newname: *const u8 = unsafe { ctx.read_at(24)? };
+    try_rename_common(newname)
+}
+
+fn try_rename_common(newname: *const u8) -> Result<u32, i64> {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(
+            CAPTURE_PROBE_FILE_ACCESS,
+            cgroup_id,
+            pid,
+            0,
+            FILE_ACCESS_MODE_WRITE_ONLY,
+        )
+    } else {
+        legacy_file_access_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_ACCESS);
+    }
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    if newname.is_null() {
+        capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+        return Ok(0);
+    }
+    let Some(mut entry) = reserve_file_or_drop(&FILE_EVENTS, false) else {
+        return Ok(0);
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
+        (*ev).flags = FILE_RENAME_AS_WRITE_FLAGS;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+        (*ev).path = [0u8; PATH_SNAP_LEN];
+        if bpf_probe_read_user_str_bytes(newname, &mut (*ev).path).is_err() {
+            capture_payload_error(CAPTURE_PROBE_FILE_ACCESS);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
+    }
+    submit_accounted(entry, PIPELINE_RING_FILE_ACCESS);
+    Ok(0)
+}
+
+// ---- file linked (sys_enter_link/linkat) ----
+// Low-volume atomic publish (memfd/O_TMPFILE → final name via linkat). Same FILE_ACCESS filter.
+
+#[tracepoint]
+pub fn file_linkat(ctx: TracePointContext) -> u32 {
+    try_linkat(&ctx).unwrap_or(0)
+}
+
+#[tracepoint]
+pub fn file_link_legacy(ctx: TracePointContext) -> u32 {
+    try_link_legacy(&ctx).unwrap_or(0)
+}
+
+fn try_linkat(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_linkat: olddfd @16, oldname @24, newdfd @32, newname @40, flags @48.
+    let newname: *const u8 = unsafe { ctx.read_at(40)? };
+    try_rename_common(newname)
+}
+
+fn try_link_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_link: oldname @16, newname @24.
+    let newname: *const u8 = unsafe { ctx.read_at(24)? };
+    try_rename_common(newname)
 }
 
 // ---- file deleted (sys_enter_unlinkat) — the "which files did the agent destroy" signal ----
@@ -971,21 +4394,91 @@ pub fn file_unlink(ctx: TracePointContext) -> u32 {
     try_unlink(&ctx).unwrap_or(0)
 }
 
+#[tracepoint]
+pub fn file_unlink_legacy(ctx: TracePointContext) -> u32 {
+    try_unlink_legacy(&ctx).unwrap_or(0)
+}
+
 fn try_unlink(ctx: &TracePointContext) -> Result<u32, i64> {
     // sys_enter_unlinkat: dfd @16, pathname @24, flag @32.
-    let pathname: *const u8 = unsafe { ctx.read_at(24)? };
-    let Some(mut entry) = reserve_or_drop::<FileEvent>(&FILE_EVENTS) else {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(CAPTURE_PROBE_FILE_DELETE, cgroup_id, pid, 0, 0)
+    } else {
+        legacy_file_delete_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_DELETE);
+    }
+    let pathname: *const u8 = match unsafe { ctx.read_at(24) } {
+        Ok(pathname) => pathname,
+        Err(error) => {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            return Err(error);
+        }
+    };
+    submit_file_delete(cgroup_id, pid, pathname, capture_decision)
+}
+
+fn try_unlink_legacy(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_enter_unlink: pathname @16. glibc and language runtimes may use either unlink or
+    // unlinkat, so both tracepoints must feed the same independently sized delete ring.
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let capture_profile_active = capture_profile_enabled();
+    let capture_decision = if capture_profile_active {
+        capture_raw_decision(CAPTURE_PROBE_FILE_DELETE, cgroup_id, pid, 0, 0)
+    } else {
+        legacy_file_delete_decision(cgroup_id)
+    };
+    if !capture_decision.selected() {
+        return Ok(0);
+    }
+    if capture_profile_active {
+        capture_payload_candidate(CAPTURE_PROBE_FILE_DELETE);
+    }
+    let pathname: *const u8 = match unsafe { ctx.read_at(16) } {
+        Ok(pathname) => pathname,
+        Err(error) => {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            return Err(error);
+        }
+    };
+    submit_file_delete(cgroup_id, pid, pathname, capture_decision)
+}
+
+#[inline(always)]
+fn submit_file_delete(
+    cgroup_id: u64,
+    pid: u32,
+    pathname: *const u8,
+    capture_decision: CaptureDecisionContext,
+) -> Result<u32, i64> {
+    let captured_at_boot_ns = unsafe { bpf_ktime_get_ns() };
+    let Some(mut entry) = reserve_file_or_drop(&FILE_DELETE_EVENTS, true) else {
         return Ok(0);
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        (*ev).cgroup_id = bpf_get_current_cgroup_id();
-        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*ev).flags = FILE_DELETE_FLAG; // distinguish from an openat on the shared FILE_EVENTS ring
+        (*ev).cgroup_id = cgroup_id;
+        (*ev).pid = pid;
+        (*ev).flags = FILE_DELETE_FLAG;
+        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
         (*ev).path = [0u8; PATH_SNAP_LEN];
-        let _ = bpf_probe_read_user_str_bytes(pathname, &mut (*ev).path);
+        if bpf_probe_read_user_str_bytes(pathname, &mut (*ev).path).is_err() {
+            capture_payload_error(CAPTURE_PROBE_FILE_DELETE);
+            entry.discard(0);
+            return Ok(0);
+        }
+        (*ev).captured_at_boot_ns = captured_at_boot_ns;
+        (*ev).capture_decision = capture_decision;
     }
-    entry.submit(0);
+    submit_accounted(entry, PIPELINE_RING_FILE_DELETE);
     Ok(0)
 }
 
@@ -1014,41 +4507,99 @@ pub fn recv_exit(ctx: TracePointContext) -> u32 {
 }
 
 fn on_read_enter(ctx: &TracePointContext) -> u32 {
-    // sys_enter_read / sys_enter_recvfrom: fd @16.
+    // sys_enter_read / sys_enter_recvfrom: fd @16, destination buffer @24.
     let Ok(fd) = (unsafe { ctx.read_at::<u64>(16) }) else {
         return 0;
     };
     let tgid = bpf_get_current_pid_tgid();
-    let key = sock_key((tgid >> 32) as u32, fd);
+    let pid = (tgid >> 32) as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, pid, fd);
     // Stash only for tracked LLM sockets — keeps this node-wide hot path cheap.
     if unsafe { LLM_SOCKS.get(&key) }.is_some() {
         let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
+    }
+    // Agent TLS read bind: stash fd so SSL_read/rustls can pair even before ClientHello
+    // lands in LLM_SOCKS (Codex WS mid-session / short-lived attach).
+    if verified_agent_process(pid, cgroup_id) {
+        let _ = READ_FD.insert(&tgid, &(fd as u32), 0);
+    }
+    if unsafe { HTTP_SOCKS.get(&key) }.is_some() {
+        if let Ok(buf) = unsafe { ctx.read_at::<u64>(24) } {
+            if buf != 0 {
+                let args = HttpReadArgs {
+                    fd: fd as u32,
+                    _pad: 0,
+                    buf,
+                    started_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+                };
+                let _ = HTTP_READ_ARGS.insert(&tgid, &args, 0);
+            }
+        }
     }
     0
 }
 
 fn on_read_exit(ctx: &TracePointContext) -> u32 {
     let tgid = bpf_get_current_pid_tgid();
-    let Some(&fd) = (unsafe { READ_FD.get(&tgid) }) else {
-        return 0;
-    };
-    let _ = READ_FD.remove(&tgid);
     // sys_exit_*: long ret @16 (bytes read; <=0 means error/EOF).
     let Ok(ret) = (unsafe { ctx.read_at::<i64>(16) }) else {
         return 0;
     };
     if ret <= 0 {
+        let _ = READ_FD.remove(&tgid);
+        let _ = HTTP_READ_ARGS.remove(&tgid);
         return 0;
     }
-    let key = sock_key((tgid >> 32) as u32, fd as u64);
-    if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
-        unsafe {
-            (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
-            if (*stat).first_resp_ns == 0 {
-                (*stat).first_resp_ns = bpf_ktime_get_ns();
+    let pid = (tgid >> 32) as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if let Some(value) = unsafe { READ_FD.get(&tgid) } {
+        let fd = *value;
+        let key = sock_key(cgroup_id, pid, fd as u64);
+        if let Some(stat) = LLM_SOCKS.get_ptr_mut(&key) {
+            unsafe {
+                (*stat).resp_bytes = (*stat).resp_bytes.saturating_add(ret as u64);
+                if (*stat).first_resp_ns == 0 {
+                    (*stat).first_resp_ns = bpf_ktime_get_ns();
+                }
             }
         }
+        if verified_agent_process(pid, cgroup_id) {
+            let last = LastSocketIo {
+                fd,
+                _pad: 0,
+                observed_at_boot_ns: unsafe { bpf_ktime_get_ns() },
+            };
+            let _ = LAST_SOCKET_READ.insert(&tgid, &last, 0);
+            let _ = LAST_SOCKET_READ.insert(&(pid as u64), &last, 0);
+        }
     }
+    let _ = READ_FD.remove(&tgid);
+    if let Some(value) = unsafe { HTTP_READ_ARGS.get(&tgid) } {
+        let http_args = *value;
+        let key = sock_key(cgroup_id, pid, http_args.fd as u64);
+        let route_kind = unsafe { HTTP_SOCKS.get(&key) }
+            .copied()
+            .unwrap_or(HTTP_PREFIX_UNKNOWN);
+        if !valid_plaintext_capture_route(route_kind) {
+            let _ = HTTP_READ_ARGS.remove(&tgid);
+            return 0;
+        }
+        let args = SslCallArgs {
+            ssl_ptr: key,
+            buf: http_args.buf,
+            requested_len: ret as u64,
+            result_len_ptr: 0,
+            started_at_boot_ns: http_args.started_at_boot_ns,
+            direction: TLS_PLAINTEXT_DIRECTION_READ,
+            api_kind: TLS_PLAINTEXT_API_TCP,
+            route_kind,
+            _pad: [0; 5],
+            syscall_fd: http_args.fd,
+        };
+        let _ = emit_tls_plaintext(args, ret as u64);
+    }
+    let _ = HTTP_READ_ARGS.remove(&tgid);
     0
 }
 
@@ -1059,16 +4610,25 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
         return 0;
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let key = sock_key(pid, fd);
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let key = sock_key(cgroup_id, pid, fd);
+    bump_socket_fd_generation(cgroup_id, pid, fd);
+    let _ = HTTP_SOCKS.remove(&key);
     let Some(&stat) = (unsafe { LLM_SOCKS.get(&key) }) else {
         return 0; // not an LLM socket
     };
     let _ = LLM_SOCKS.remove(&key);
-    if let Some(mut entry) = reserve_or_drop::<LlmEvent>(&LLM_EVENTS) {
+    let bytes = stat.req_bytes.saturating_add(stat.resp_bytes);
+    let capture_decision = capture_raw_decision(CAPTURE_PROBE_LLM, cgroup_id, pid, bytes, 0);
+    if !capture_decision.selected() {
+        return 0;
+    }
+    capture_payload_candidate(CAPTURE_PROBE_LLM);
+    if let Some(mut entry) = reserve_or_drop::<LlmEvent>(&LLM_EVENTS, PIPELINE_RING_LLM) {
         let now = unsafe { bpf_ktime_get_ns() };
         let ev = entry.as_mut_ptr();
         unsafe {
-            (*ev).cgroup_id = bpf_get_current_cgroup_id();
+            (*ev).cgroup_id = cgroup_id;
             (*ev).pid = pid;
             (*ev).fd = fd as u32;
             (*ev).req_bytes = stat.req_bytes;
@@ -1080,8 +4640,10 @@ pub fn sock_close(ctx: TracePointContext) -> u32 {
                 0
             };
             (*ev).comm = bpf_get_current_comm().unwrap_or_default();
+            (*ev).captured_at_boot_ns = now;
+            (*ev).capture_decision = capture_decision;
         }
-        entry.submit(0);
+        submit_accounted(entry, PIPELINE_RING_LLM);
     }
     0
 }

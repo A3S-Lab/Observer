@@ -1,6 +1,6 @@
 use a3s_observer::{
     AgentEvent, EnrichedEvent, Freshness, Identity, IdentityResolver, ObservationMetadata,
-    WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
+    ProcessContext, WorkloadIdentity, WorkloadIdentityValue, MAX_WORKLOAD_IDENTITY_VALUE_LEN,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -141,9 +141,13 @@ impl IdentityResolver for LegacyResolver {
 fn resolver_workload_identity_and_observation_reach_ndjson() {
     let resolver = WorkloadResolver;
     let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
         identity: resolver.resolve(7, 11, 13),
         workload: resolver.resolve_workload(7, 11, 13),
         observation: Some(ObservationMetadata::fresh(1_720_000_015, 1_720_000_014, None).unwrap()),
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: None,
         provider: None,
         event: AgentEvent::ProcessExit {
@@ -165,14 +169,58 @@ fn resolver_workload_identity_and_observation_reach_ndjson() {
 }
 
 #[test]
+fn process_context_serializes_mount_namespace_with_stable_identity() {
+    let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
+        identity: Identity::default(),
+        workload: None,
+        observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
+        process: Some(ProcessContext {
+            host_id: Some("host-1".into()),
+            boot_id: Some("boot-1".into()),
+            pid: 42,
+            ppid: 1,
+            start_time_ticks: Some(987_654),
+            comm: "agent".into(),
+            mount_namespace: Some(4_026_531_840),
+            exe: None,
+            cwd: None,
+            cgroup: None,
+            cgroup_id: 73,
+            ..ProcessContext::default()
+        }),
+        provider: None,
+        event: AgentEvent::ProcessExit {
+            pid: 42,
+            exit_code: 0,
+            signal: 0,
+        },
+    };
+
+    let value = serde_json::to_value(event).unwrap();
+    assert_eq!(value["process"]["host_id"], "host-1");
+    assert_eq!(value["process"]["boot_id"], "boot-1");
+    assert_eq!(value["process"]["start_time_ticks"], 987_654u64);
+    assert_eq!(value["process"]["mount_namespace"], 4_026_531_840u64);
+    assert_eq!(value["process"]["cgroup_id"], 73u64);
+}
+
+#[test]
 fn existing_identity_resolvers_default_to_no_workload_identity() {
     let resolver = LegacyResolver;
     assert_eq!(resolver.resolve_workload(1, 2, 3), None);
 
     let event = EnrichedEvent {
+        timing: None,
+        capture_decision: None,
         identity: resolver.resolve(1, 2, 3),
         workload: resolver.resolve_workload(1, 2, 3),
         observation: None,
+        raw_observation: None,
+        coverage_gaps: Vec::new(),
         process: None,
         provider: None,
         event: AgentEvent::ProcessExit {

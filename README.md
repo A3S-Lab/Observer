@@ -53,9 +53,9 @@ latency / TTFT, or plaintext) / **where** (peer IP / hostname).
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |
 | llm metrics | per-socket `read`/`recv` + `close` | `LlmCall` — req/resp wire bytes, latency, TTFT |
 | `file`\* | `sys_enter_openat` (write opens) | `FileAccess` — files written (`A3S_OBSERVER_FILES=1`) |
-| `unlink`\* | `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
-| `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
-| `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
+| `unlink`\* | `sys_enter_unlink` + `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
+| `ssl-legacy`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` / `LlmApi` compatibility snapshots (`A3S_OBSERVER_SSL=1`) |
+| `agent-interaction`\* | PID-scoped TLS uprobes or plain-HTTP syscalls + user-space HTTP/SSE reassembly | `LlmInteraction` — final model request, visible response, tool calls/results, hashes, timing and completeness |
 | `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
 | collector heartbeat | userspace timer | `CollectorHeartbeat` — collector id, node/pod, attached probes, feature flags, per-window counts, ring drops, output drops |
 
@@ -221,11 +221,14 @@ let cage = ProviderPolicy::new([Provider::Anthropic]).deny_unclassified(true);
 
 - **Zero-instrumentation, language-agnostic** — observe or guard any agent (Python/Node/Go/Rust)
   without touching its code, including its tool subprocesses.
-- **Kernel hooks only in the always-on core, no uprobes** — so the core gives **no LLM
-  prompt/completion content**. That content is available via an **opt-in** OpenSSL uprobe
-  extension (`A3S_OBSERVER_SSL=1`) — OpenSSL only (Python/Node/curl …, not Go `crypto/tls`),
-  kept out of the universal core because a uprobe binds to a library symbol. (ECH will
-  eventually hide SNI → fall back to IP/DNS.)
+- **Kernel hooks only in the always-on core, opt-in plaintext extension** — the universal core
+  gives no prompt/completion body. `A3S_OBSERVER_SSL=1` enables PID/cgroup-gated TLS-library
+  uprobes plus plain-HTTP syscall capture. Dynamic libraries resolve exported TLS symbols; stripped
+  static executables use bounded TLS implementation-family anchors and read/write relations rather
+  than product versions or whole-file fingerprints. HTTP/1.1 JSON/SSE is reconstructed today;
+  unsupported HTTP/2/WebSocket streams emit metadata-only discovery evidence instead of fabricated
+  conversations. Additional Go `crypto/tls`, Rustls, HTTP/2, WebSocket, HTTP/3 and QUIC adapters use
+  the same discovery/transport interfaces as real target paths require them.
 - **a3s-box** — a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
   flows through the host net path) but not in-guest exec/file — those need an in-guest collector
   (phase 2).
@@ -245,8 +248,99 @@ A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON
 ```
 
 Linux only; needs root (CAP_BPF + CAP_PERFMON). Env knobs: `A3S_OBSERVER_JSON` (NDJSON),
-`A3S_OBSERVER_FILES` (file writes — high-volume), `A3S_OBSERVER_SSL` (OpenSSL content),
-`A3S_OBSERVER_HEARTBEAT` (liveness file path).
+`A3S_OBSERVER_FILES` (legacy combined FileAccess/FileDelete switch),
+`A3S_OBSERVER_FILE_ACCESS` / `A3S_OBSERVER_FILE_DELETE` (independent overrides),
+`A3S_OBSERVER_SSL` (opt-in Agent HTTP/TLS content),
+`A3S_OBSERVER_TLS_PROCESS_PATTERNS` (additional runtime-selection fragments),
+`A3S_OBSERVER_HEARTBEAT` (liveness file path), and
+`A3S_OBSERVER_JSON_QUEUE_CAPACITY` (bounded NDJSON burst queue, default 32768; 4096–262144).
+
+Kernel plaintext admission has only Agent Scope, successful TLS/HTTP boundary discovery, safe API
+return/buffer values and the configured capture budget. URL, Host, route, model, provider and CLI
+version are never kernel gates. Collector-side transport and wire-template matching decides whether
+sanitized content becomes a model/tool interaction, bounded unparsed evidence, or metadata-only
+non-LLM coverage. Large calls use 16 KiB, 128 KiB, or 512 KiB ring-record tiers; the reassembler is
+bounded to 8 MiB per direction. See the AnySentry
+[discovery-first design](../AnySentry/docs/anysentry-discovery-first-agent-tls-observability-v2-design.md)
+for the implementation-family matrix, timing semantics and security boundary.
+
+The embedded `a3s-observer-collector/src/tls-signature-families.json` registry is explicitly
+`versionPolicy=implementation-family`: its anchors and ABI pairs are reusable across releases of
+the same TLS implementation family, and it rejects product/version selectors. Runtime names in
+`tls-runtime-selection-hints.json` are bounded **discovery hints only**; they do not grant
+plaintext access or create an Agent identity. If an exceptional release changes an ABI, add a
+separately reviewed, signed capability extension that reuses the same attach/transport contracts;
+do not add a version branch to the generic scanner. Unknown ABI or malformed extension metadata
+fails closed and leaves the independent KernelFact/Coverage path intact.
+
+Each ring is drained by an event-driven reader into physically independent Critical, Semantic, and
+Bulk inboxes; raw probe evidence maps only to Critical or Semantic. The readers copy fixed PODs and
+never perform `/proc`, workload resolution, classification, or JSON work. A bounded event-time
+coordinator and single-writer processor perform those operations after ring admission. Configure
+the inboxes with `A3S_OBSERVER_CRITICAL_INBOX_CAPACITY` (default 16384),
+`A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY` (32768), and `A3S_OBSERVER_BULK_INBOX_CAPACITY` (4096).
+`A3S_OBSERVER_REORDER_CAPACITY` (65536) and `A3S_OBSERVER_REORDER_WINDOW_NS` (2000000) bound
+cross-ring reordering.
+
+NDJSON is written in batches of at most 256 lines or five milliseconds through a 1 MiB userspace
+buffer. Its three priority queues use `A3S_OBSERVER_JSON_CRITICAL_QUEUE_CAPACITY` (default 8192),
+`A3S_OBSERVER_JSON_SEMANTIC_QUEUE_CAPACITY` (defaults to the legacy queue setting), and
+`A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY` (8192). A terminal heartbeat is acknowledged only after
+all previously admitted priority-lane events have been flushed. FileAccess has an independent
+1 MiB ring; FileDelete uses a separate 4 MiB ring because package/container cleanup can unlink
+thousands of files in milliseconds. Kernel-ring, Collector-inbox, semantic-output, and writer-queue
+loss remain separate counters and are never presented as filtering.
+
+High-volume file capture can consume a hot-reloaded, node-local cgroup decision snapshot by setting
+`ANYSENTRY_FILTER_RULES_FILE`. Without this variable the historical full-capture behavior is
+preserved. With it configured, authoritative Infrastructure decisions can filter before the ring,
+while map misses, stale/conflicting rules, candidate drops, and `sample` decisions are kept by
+default. Only an authoritative `drop` can suppress FileDelete. Snapshot replacement is epoch-atomic:
+
+The unified S5 capture path is opt-in with `ANYSENTRY_CAPTURE_PROFILE_MODE=shadow|enforce` and uses
+the same `ANYSENTRY_FILTER_RULES_FILE`. `shadow` keeps all ten probes at FULL while reporting desired
+decisions. `enforce` applies bounded SAMPLE/AGGREGATE decisions before payload construction and ring
+reservation; DROP remains disabled until the current Collector instance has durably written the
+preview ACK and then validated a generation-fenced activation grant. The ACK defaults to
+`${ANYSENTRY_FILTER_RULES_FILE}.ack.json` and can be overridden with
+`ANYSENTRY_FILTER_RULES_ACK_FILE`. Missing, stale, conflicting, oversized, malformed, unacknowledged,
+or expired state remains discovery-safe. `legacy` is the default and preserves the original v1 File
+filter. S5 and v1 File decisions are mutually exclusive.
+
+An Agent candidate uses the same full probe matrix as a confirmed Agent once its bounded scope is
+selected; promotion changes identity quality, not visibility. The optional `file_read` signal still
+requires an explicit root/process-generation grant, and every profile remains subject to the
+shared ring, payload, TTL and queue budgets.
+
+Exact cumulative SAMPLE/AGGREGATE/DROP summaries are emitted as `CaptureAggregate` Bulk events.
+The kernel ledger is deliberately bounded to 4096 keys; saturation never restores an unbounded raw
+stream, but switches to the shared emergency sample budget and sets
+`captureProfile.aggregateLedgerDegraded` plus per-probe `aggregateError`. Decision counters use
+`decision_op`; ring delivery counters use `physical_record` and must not be added together for Exec.
+
+```json
+{
+  "schemaVersion": "anysentry.filter_rule_snapshot.v1",
+  "epoch": 42,
+  "entries": [
+    {
+      "cgroupId": "18412",
+      "action": "keep",
+      "authority": "authoritative",
+      "epoch": 42,
+      "expiresAt": "2026-08-17T09:00:15Z"
+    }
+  ]
+}
+```
+
+`A3S_OBSERVER_FILE_UNKNOWN_POLICY=keep` is the default and guarantees that unresolved FileAccess is
+not budget-suppressed. Set it explicitly to `sample` only for compatibility with the earlier bounded
+discovery mode. Its optional controls are `A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP` (default 20 per
+window), `A3S_OBSERVER_FILE_UNKNOWN_PER_NODE` (default 1000, divided across CPUs), and
+`A3S_OBSERVER_FILE_SAMPLE_WINDOW_MS` (default 1000). Candidate `drop` entries are safely downgraded
+to the configured Unknown policy; malformed, mixed-epoch, or non-monotonic snapshots leave the last
+valid epoch active.
 
 Opt-in enforcement — run against an agent's cgroup and/or a deny-list file:
 
