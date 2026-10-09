@@ -56,10 +56,10 @@ impl Default for HpackDecoder {
 }
 
 impl HpackDecoder {
+    #[cfg(test)]
     pub fn desynced(&self) -> bool {
         self.desync
     }
-
     pub fn mark_desync(&mut self) {
         self.desync = true;
         self.dynamic.clear();
@@ -420,6 +420,7 @@ const STATIC_TABLE: [(&str, &str); STATIC_TABLE_LEN] = [
     ("www-authenticate", ""),
 ];
 
+#[cfg(test)]
 fn encode_int(value: usize, prefix_bits: u8, prefix_mask: u8) -> Vec<u8> {
     let max = (1usize << prefix_bits) - 1;
     if value < max {
@@ -435,22 +436,26 @@ fn encode_int(value: usize, prefix_bits: u8, prefix_mask: u8) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn encode_string(value: &[u8]) -> Vec<u8> {
     let mut out = encode_int(value.len(), 7, 0x00);
     out.extend_from_slice(value);
     out
 }
 
+#[cfg(test)]
 fn hpack_encode_indexed(index: usize) -> Vec<u8> {
     encode_int(index, 7, 0x80)
 }
 
+#[cfg(test)]
 fn hpack_encode_literal_without_indexing(name_index: usize, value: &[u8]) -> Vec<u8> {
     let mut out = encode_int(name_index, 4, 0x00);
     out.extend(encode_string(value));
     out
 }
 
+#[cfg(test)]
 fn hpack_encode_literal_name_value(name: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = vec![0x00];
     out.extend(encode_string(name));
@@ -458,6 +463,7 @@ fn hpack_encode_literal_name_value(name: &[u8], value: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn static_name_index(name: &str) -> Option<usize> {
     STATIC_TABLE
         .iter()
@@ -466,6 +472,7 @@ fn static_name_index(name: &str) -> Option<usize> {
         .map(|(idx, _)| idx + 1)
 }
 
+#[cfg(test)]
 fn static_full_index(name: &str, value: &str) -> Option<usize> {
     STATIC_TABLE
         .iter()
@@ -474,6 +481,7 @@ fn static_full_index(name: &str, value: &str) -> Option<usize> {
         .map(|(idx, _)| idx + 1)
 }
 
+#[cfg(test)]
 /// Encode a literal header list for fixtures (not on the capture hot path).
 pub fn encode_headers(headers: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();

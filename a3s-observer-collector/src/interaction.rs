@@ -1422,25 +1422,13 @@ struct Http2StreamState {
     end_stream: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Http2ConnectionState {
     active: bool,
     leftover: Vec<u8>,
     request_hpack: HpackDecoder,
     response_hpack: HpackDecoder,
     streams: HashMap<u32, Http2StreamState>,
-}
-
-impl Default for Http2ConnectionState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            leftover: Vec::new(),
-            request_hpack: HpackDecoder::default(),
-            response_hpack: HpackDecoder::default(),
-            streams: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2351,13 +2339,13 @@ impl InteractionReassembler {
             .connections
             .get(&owner)
             .is_some_and(classic_http_request_poisoned);
-        if prefer_socket_home && !owner_poisoned {
-            if self.rebind_quiescent_connection(owner, observed)
-                || self.merge_classic_http_request_buffers(owner, observed)
-            {
-                self.remember_connection_alias(owner, observed);
-                return Some((observed, None));
-            }
+        if prefer_socket_home
+            && !owner_poisoned
+            && (self.rebind_quiescent_connection(owner, observed)
+                || self.merge_classic_http_request_buffers(owner, observed))
+        {
+            self.remember_connection_alias(owner, observed);
+            return Some((observed, None));
         }
         if self.rebind_quiescent_connection(observed, owner)
             || self.merge_classic_http_request_buffers(observed, owner)
@@ -4836,6 +4824,7 @@ fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_interaction(
     key: ConnectionKey,
     sequence: u64,
@@ -5590,7 +5579,7 @@ fn looks_like_http2_frame_prefix(data: &[u8]) -> bool {
         return false;
     }
     match frame_type {
-        0x4 => stream_id == 0 && length % 6 == 0 && (flags & !0x1) == 0,
+        0x4 => stream_id == 0 && length.is_multiple_of(6) && (flags & !0x1) == 0,
         0x8 => length == 4,
         0x6 => stream_id == 0 && length == 8,
         0x0 => stream_id != 0 && length > 0,
@@ -5863,7 +5852,7 @@ fn process_http2_chunk(
                     chunk.event_at_unix_ns,
                     &effective_reasons,
                 );
-                if response.headers.get("content-type").is_none() {
+                if !response.headers.contains_key("content-type") {
                     if looks_like_sse(&finished.body) {
                         response
                             .headers
@@ -8507,10 +8496,11 @@ mod tests {
     #[test]
     fn classic_sticky_request_parse_error_does_not_poison_response_gap() {
         let mut reassembler = InteractionReassembler::default();
-        // NUL inside the request-line token forces httparse Token error → sticky decode poison.
+        // NUL inside a header line passes the request-line prefix gate (the method token stays
+        // clean) but fails httparse with a Token error — which is what poisons the sticky decode.
         let garbage = classic_chunk_on(
             ChunkDirection::Request,
-            b"GET\x00 / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: x\x00\r\n\r\n".to_vec(),
             50,
             0x1111,
             0,

@@ -4051,6 +4051,7 @@ impl CollectorProcessor {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_retired_reassembly(
         &mut self,
         exporter: &dyn Exporter,
@@ -5215,6 +5216,7 @@ fn push_reorder_envelope(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pipeline(
     receiver: &mut PipelineReceiver,
     reorder: &mut ReorderCoordinator,
@@ -5832,10 +5834,7 @@ fn connection_from_event(
             ),
             AgentEvent::Egress { pid: _, fd, .. } => {
                 let fd = *fd;
-                let connection_id = match fd {
-                    Some(fd) => format!("egress:fd:{fd}"),
-                    None => return None,
-                };
+                let connection_id = format!("egress:fd:{}", fd?);
                 (
                     connection_id,
                     "tcp".to_string(),
