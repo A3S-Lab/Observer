@@ -330,7 +330,14 @@ fn plaintext_process_key(pid: i32) -> Option<PlaintextProcessKeyBytes> {
         let path = fields.next()?;
         (hierarchy == "0" && controllers.is_empty()).then_some(path)
     })?;
-    let mut cgroup_path = PathBuf::from("/sys/fs/cgroup");
+    // Hybrid hosts mount the v2 unified hierarchy below /sys/fs/cgroup/unified; only that
+    // hierarchy's kernfs inodes match bpf_get_current_cgroup_id, so the stat root must follow
+    // the real cgroup2 mount point (resolved once, mounts are static after boot).
+    static UNIFIED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+    let unified_root = UNIFIED_ROOT.get_or_init(|| {
+        tls_agent_scopes::cgroup2_root(Path::new("/proc"), Path::new("/sys/fs/cgroup"))
+    });
+    let mut cgroup_path = unified_root.clone();
     for component in Path::new(relative).components() {
         if let std::path::Component::Normal(value) = component {
             cgroup_path.push(value);

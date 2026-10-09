@@ -232,6 +232,52 @@ fn bounded_optional_text(entry: &Value, field: &str) -> anyhow::Result<Option<St
     Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
+/// Resolve the cgroup v2 (unified) hierarchy mount point. Hybrid layouts (UOS 20, older
+/// RHEL/CentOS) mount v1 controllers at /sys/fs/cgroup/<controller> and the unified hierarchy at
+/// /sys/fs/cgroup/unified; only the unified hierarchy's kernfs inodes match
+/// `bpf_get_current_cgroup_id`, so a `0::/...` membership path must be statted below the real
+/// cgroup2 mount instead of the configured root.
+pub(crate) fn cgroup2_root(proc_root: &Path, fallback: &Path) -> PathBuf {
+    if let Ok(mounts) = fs::read_to_string(proc_root.join("mounts")) {
+        for line in mounts.lines() {
+            let mut fields = line.split_whitespace();
+            let mount_point = fields.nth(1);
+            let fs_type = fields.next();
+            if fs_type != Some("cgroup2") {
+                continue;
+            }
+            if let Some(point) = mount_point.filter(|point| !point.is_empty()) {
+                return PathBuf::from(decode_mount_escapes(point));
+            }
+        }
+    }
+    fallback.to_path_buf()
+}
+
+/// /proc/mounts escapes space, tab, newline and backslash as octal (\040, \011, \012, \134).
+fn decode_mount_escapes(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        let octal: String = chars.by_ref().take(3).collect();
+        match u32::from_str_radix(&octal, 8).ok().and_then(char::from_u32) {
+            Some(decoded) => output.push(decoded),
+            None => {
+                output.push('\\');
+                output.push_str(&octal);
+            }
+        }
+    }
+    output
+}
+
 fn decimal_u64(value: Option<&Value>, field: &str) -> anyhow::Result<Option<u64>> {
     let Some(value) = value else {
         return Ok(None);
@@ -278,6 +324,9 @@ fn scan_pids_for_scopes(
     if scopes.cgroups.is_empty() {
         return Ok(HashSet::new());
     }
+    // Resolve once per scan: on hybrid hosts the unified hierarchy lives below its own mount
+    // point, and a per-pid mount-table read would dominate the scan.
+    let unified_root = cgroup2_root(proc_root, cgroup_root);
     let mut processes = HashMap::new();
     let entries =
         fs::read_dir(proc_root).with_context(|| format!("scan {}", proc_root.display()))?;
@@ -290,7 +339,7 @@ fn scan_pids_for_scopes(
         else {
             continue;
         };
-        let cgroup_id = process_cgroup_id(proc_root, cgroup_root, pid);
+        let cgroup_id = process_cgroup_id(proc_root, &unified_root, pid);
         let (ppid, start_time_ticks) = process_stat(proc_root, pid);
         processes.insert(
             pid,
@@ -663,8 +712,46 @@ mod tests {
     }
 
     #[test]
-    fn invalid_fence_does_not_replace_last_good_scope() {
-        let root = fixture_root("invalid");
+    fn hybrid_unified_mount_resolves_process_cgroup_ids() {
+        let root = fixture_root("hybrid");
+        let proc_root = root.join("proc");
+        let cgroup_root = root.join("cgroup");
+        // Hybrid layout: v1 controllers at <root>/<controller>, v2 unified at <root>/unified.
+        let unified = cgroup_root.join("unified");
+        let agent_cgroup = unified.join("docker/agent");
+        fs::create_dir_all(&agent_cgroup).unwrap();
+        fs::create_dir_all(cgroup_root.join("memory/docker/agent")).unwrap();
+        fs::create_dir_all(proc_root.join("101")).unwrap();
+        fs::write(proc_root.join("101/cgroup"), "5:memory:/docker/agent\n0::/docker/agent\n").unwrap();
+        fs::write(
+            proc_root.join("mounts"),
+            format!(
+                "cgroup {}/memory cgroup ro 0 0\ncgroup2 {}/unified cgroup2 rw 0 0\n",
+                cgroup_root.display(),
+                cgroup_root.display()
+            ),
+        )
+        .unwrap();
+        let agent_id = fs::metadata(&agent_cgroup).unwrap().ino();
+        let document = root.join("tls-agent-cgroups.json");
+        fs::write(
+            &document,
+            format!(
+                "{{\"schemaVersion\":\"{SCHEMA}\",\"entries\":[{{\"cgroupId\":\"{agent_id}\",\"agentScopeId\":\"office-agent\"}}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        // The scan must follow the cgroup2 mount point, not the v1-only root.
+        let mut reloader =
+            TlsAgentScopeReloader::with_roots(document, proc_root.clone(), cgroup_root);
+        let refresh = reloader.refresh().unwrap();
+        assert_eq!(refresh.pids, HashSet::from([101]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_fence_does_not_replace_last_good_scope() {        let root = fixture_root("invalid");
         fs::create_dir_all(&root).unwrap();
         let document = root.join("scopes.json");
         fs::write(
