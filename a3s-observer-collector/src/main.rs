@@ -44,9 +44,9 @@ use a3s_observer_common::{
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_LLM, PLAINTEXT_HTTP_ROUTE_TOOL,
-    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS,
-    TLS_PLAINTEXT_API_SSL_APP_DATA, TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX,
-    TLS_PLAINTEXT_API_TCP,
+    SEC_BIND, SEC_PTRACE, SEC_SETUID, TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD,
+    TLS_PLAINTEXT_ABI_V2, TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_APP_DATA,
+    TLS_PLAINTEXT_API_SSL_CLASSIC, TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP,
     TLS_PLAINTEXT_DIRECTION_READ, TLS_PLAINTEXT_DIRECTION_WRITE,
     TLS_PLAINTEXT_FLAG_ROUTE_CANDIDATE, TLS_PLAINTEXT_FLAG_TRUNCATED,
 };
@@ -3125,13 +3125,8 @@ fn attach_tls_plan(ebpf: &mut Ebpf, plan: &TlsAttachPlan) -> anyhow::Result<usiz
                 attached_programs += attach_offset_pair(ebpf, pair, &plan.path, plan.pid)?;
             }
             for write_offset in additional_write_offsets {
-                attached_programs += attach_write_offset(
-                    ebpf,
-                    write_abi,
-                    *write_offset,
-                    &plan.path,
-                    plan.pid,
-                )?;
+                attached_programs +=
+                    attach_write_offset(ebpf, write_abi, *write_offset, &plan.path, plan.pid)?;
             }
             for write_offset in app_data_write_offsets {
                 // The inode uprobe (pid=None) already fires for every process using this
@@ -5848,7 +5843,11 @@ fn connection_from_event(
                     None,
                     fd,
                     None,
-                    if fd.is_some() { "weak".to_string() } else { "unknown".to_string() },
+                    if fd.is_some() {
+                        "weak".to_string()
+                    } else {
+                        "unknown".to_string()
+                    },
                     false,
                 )
             }
@@ -6241,21 +6240,20 @@ fn json_num_after(s: &str, key: &str) -> Option<u32> {
 mod tests {
     use super::{
         collector_heartbeat, cstr, emit, env_value_disabled, exec_ppid, exec_process_context,
-        plaintext_process_key, scan_named_agent_runtime_pids,
         exit_lifecycle_context, file_feature_flags_from, hash_prefix, monotonic_delta,
         nonzero_unix_ns, observe_exec_commit_lifecycle, parse_dns_qname,
         parse_filter_rule_snapshot, parse_llm_meta, parse_process_start_time_ticks,
         parse_rfc3339_unix_nanos, parse_sni, parse_unknown_file_policy,
-        partial_window_interval_secs, pipeline_coverage_gaps, pod_bytes, pod_from_bytes,
-        process_context, process_generation_from_context, socket_key_with_generation,
-        supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
-        unix_ms_from_ns, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
-        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
-        PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
+        partial_window_interval_secs, pipeline_coverage_gaps, plaintext_process_key, pod_bytes,
+        pod_from_bytes, process_context, process_generation_from_context,
+        scan_named_agent_runtime_pids, socket_key_with_generation, supplement_exec_argv_at,
+        tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh, unix_ms_from_ns,
+        valid_plaintext_http_route, CollectorMeta, CollectorProcessor, CompletedExec,
+        ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState, PeerState,
+        PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
         ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
         Stats, UnknownFilePolicy, VerifiedProcessMap, EXEC_REASSEMBLY_TIMEOUT,
-        FILE_ACCESS_TRACEPOINTS,
-        SOCKET_STATE_TTL, UNKNOWN_PEER,
+        FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
     };
     use a3s_observer::{
         AgentEvent, AgentPlaintextEvidence, EnrichedEvent, EventTiming, ExportPriority, Exporter,

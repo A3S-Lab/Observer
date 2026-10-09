@@ -722,7 +722,11 @@ mod tests {
         fs::create_dir_all(&agent_cgroup).unwrap();
         fs::create_dir_all(cgroup_root.join("memory/docker/agent")).unwrap();
         fs::create_dir_all(proc_root.join("101")).unwrap();
-        fs::write(proc_root.join("101/cgroup"), "5:memory:/docker/agent\n0::/docker/agent\n").unwrap();
+        fs::write(
+            proc_root.join("101/cgroup"),
+            "5:memory:/docker/agent\n0::/docker/agent\n",
+        )
+        .unwrap();
         fs::write(
             proc_root.join("mounts"),
             format!(
@@ -751,7 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_fence_does_not_replace_last_good_scope() {        let root = fixture_root("invalid");
+    fn invalid_fence_does_not_replace_last_good_scope() {
+        let root = fixture_root("invalid");
         fs::create_dir_all(&root).unwrap();
         let document = root.join("scopes.json");
         fs::write(

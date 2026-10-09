@@ -5,7 +5,8 @@ use a3s_observer_common::{
     capture_cpu_sample_quota, capture_probe_is_protected, capture_probe_is_security,
     capture_profile_default_actions, capture_profile_is_agent_family,
     capture_profile_is_infrastructure_family, capture_sample_partitions,
-    classify_http_method_prefix_len, file_access_mode, CaptureAggregateKey, CaptureAggregateValue,
+    classic_tls_sock_connection_id, classify_http_method_prefix_len, file_access_mode,
+    http_request_line_shaped_len, CaptureAggregateKey, CaptureAggregateValue,
     CaptureDecisionContext, CaptureProbeStats, CaptureProcessKey, CaptureProfileConfig,
     CaptureProfileKey, CaptureProfileValue, CapturePromotionValue, CaptureSampleKey,
     CaptureSampleWindow, ConnectEvent, DnsEvent, ExecRecord, ExitEvent, FileEvent,
@@ -29,16 +30,15 @@ use a3s_observer_common::{
     EXEC_ARG_CHUNK_PAYLOAD, EXEC_FLAG_ARGV_INCOMPLETE, EXEC_FLAG_ARGV_TRUNCATED, EXEC_MAX_CHUNKS,
     EXEC_RECORD_ARG_CHUNK, EXEC_RECORD_COMMIT, EXEC_RECORD_END, EXEC_RECORD_HEADER,
     FILE_ACCESS_MODE_PATH_ONLY, FILE_ACCESS_MODE_READ_ONLY, FILE_ACCESS_MODE_SPECIAL,
-    FILE_ACCESS_MODE_UNKNOWN, FILE_ACCESS_MODE_WRITE_ONLY, FILE_DELETE_FLAG, FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP,
-    FILE_FILTER_AUTHORITY_AUTHORITATIVE, FILE_RENAME_AS_WRITE_FLAGS, HTTP_METHOD_PREFIX_COMPLETE,
-    HTTP_METHOD_PREFIX_INCOMPLETE, HTTP_METHOD_PREFIX_NONE,
-    PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
+    FILE_ACCESS_MODE_UNKNOWN, FILE_ACCESS_MODE_WRITE_ONLY, FILE_DELETE_FLAG,
+    FILE_FILTER_ACTION_DROP, FILE_FILTER_ACTION_KEEP, FILE_FILTER_AUTHORITY_AUTHORITATIVE,
+    FILE_RENAME_AS_WRITE_FLAGS, HTTP_METHOD_PREFIX_COMPLETE, HTTP_METHOD_PREFIX_INCOMPLETE,
+    HTTP_METHOD_PREFIX_NONE, PATH_SNAP_LEN, PIPELINE_RING_CONNECT, PIPELINE_RING_COUNT,
     PIPELINE_RING_DNS, PIPELINE_RING_EXEC, PIPELINE_RING_EXIT, PIPELINE_RING_FILE_ACCESS,
     PIPELINE_RING_FILE_DELETE, PIPELINE_RING_FILE_READ, PIPELINE_RING_LLM, PIPELINE_RING_SECURITY,
     PIPELINE_RING_SSL, PIPELINE_RING_TLS, PLAINTEXT_HTTP_ROUTE_CANDIDATE, PLAINTEXT_HTTP_ROUTE_LLM,
     PLAINTEXT_HTTP_ROUTE_MAX_LEN, PLAINTEXT_HTTP_ROUTE_TOOL, SEC_BIND, SEC_PTRACE, SEC_SETUID,
-    classic_tls_sock_connection_id, http_request_line_shaped_len, TLS_PLAINTEXT_ABI_V2,
-    TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND,
+    TLS_BIND_QUALITY_COOKIE, TLS_BIND_QUALITY_FD, TLS_BIND_QUALITY_UNBOUND, TLS_PLAINTEXT_ABI_V2,
     TLS_PLAINTEXT_API_RUSTLS, TLS_PLAINTEXT_API_SSL_APP_DATA, TLS_PLAINTEXT_API_SSL_CLASSIC,
     TLS_PLAINTEXT_API_SSL_EX, TLS_PLAINTEXT_API_TCP, TLS_PLAINTEXT_DIRECTION_READ,
     TLS_PLAINTEXT_DIRECTION_WRITE, TLS_PLAINTEXT_FLAG_CONNECTION_UNBOUND,
@@ -2820,7 +2820,7 @@ pub fn rustls_read_enter(ctx: ProbeContext) -> u32 {
             api_kind: TLS_PLAINTEXT_API_RUSTLS,
             route_kind: 0,
             _pad: [0; 5],
-        syscall_fd: 0,
+            syscall_fd: 0,
         },
         layout[2],
     )
@@ -3096,9 +3096,9 @@ fn http_method_prefix(buf: u64, len: u64) -> Option<bool> {
         // many SSL_write chunks; treating INCOMPLETE as revoke cleared the session before any
         // SSL_read, producing userspace request_buffer_bytes>0 / response_buffer_bytes=0.
         // Incomplete alone also must not admit a fresh route—callers only retain via admitted_*.
-        HTTP_METHOD_PREFIX_COMPLETE
-        | HTTP_METHOD_PREFIX_INCOMPLETE
-        | HTTP_METHOD_PREFIX_NONE => Some(false),
+        HTTP_METHOD_PREFIX_COMPLETE | HTTP_METHOD_PREFIX_INCOMPLETE | HTTP_METHOD_PREFIX_NONE => {
+            Some(false)
+        }
         _ => Some(false),
     }
 }
@@ -3430,9 +3430,8 @@ fn tls_session_route(args: &SslCallArgs, actual_len: u64, pid: u32, cgroup_id: u
         }
         return None;
     }
-    admitted_tls_session_route(&key, actual_len, now_boot_ns).filter(|route| {
-        valid_plaintext_route(*route) || *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE
-    })
+    admitted_tls_session_route(&key, actual_len, now_boot_ns)
+        .filter(|route| valid_plaintext_route(*route) || *route == PLAINTEXT_HTTP_ROUTE_CANDIDATE)
 }
 
 fn emit_tls_plaintext(args: SslCallArgs, actual_len: u64) -> u32 {
