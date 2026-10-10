@@ -1936,12 +1936,22 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && !env_value_disabled(value));
+    // HTTP plaintext admission (identity whitelist -> VERIFIED_AGENT_PROCESSES -> tcp_plaintext)
+    // is an independent switch from HTTPS capture (libssl uprobe attach). Admission machinery
+    // runs when either switch is on: existing SSL deployments keep their exact behavior, and a
+    // pure-HTTP confirmed Agent host opens plaintext without attaching probes to anything.
+    let plaintext_http_setting = std::env::var("A3S_OBSERVER_PLAINTEXT_HTTP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !env_value_disabled(value));
+    let plaintext_admission =
+        plaintext_admission_enabled(ssl_setting.as_deref(), plaintext_http_setting.as_deref());
     let verified_processes = BpfHashMap::try_from(
         ebpf.take_map("VERIFIED_AGENT_PROCESSES")
             .context("`VERIFIED_AGENT_PROCESSES` missing")?,
     )?;
     let verified_process_map = Arc::new(VerifiedProcessMap::new(verified_processes));
-    if ssl_setting.is_some() {
+    if plaintext_admission {
         let allowlist = Arc::clone(&verified_process_map);
         std::thread::Builder::new()
             .name("named-agent-allowlist".to_string())
@@ -1958,7 +1968,7 @@ async fn main() -> anyhow::Result<()> {
             .context("`PLAINTEXT_HTTP_ROUTES` missing")?,
     )?)?;
     let mut tls_attach_manager = ssl_setting.as_deref().map(TlsAttachManager::from_env);
-    let tls_agent_scope_path = ssl_setting.as_ref().and_then(|_| {
+    let tls_agent_scope_path = if plaintext_admission {
         env_any(&["ANYSENTRY_TLS_AGENT_CGROUPS_FILE"])
             .map(PathBuf::from)
             .or_else(|| {
@@ -1967,7 +1977,9 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|path| path.parent())
                     .map(|parent| parent.join("tls-agent-cgroups.json"))
             })
-    });
+    } else {
+        None
+    };
     let mut tls_agent_scope_reloader = tls_agent_scope_path.map(TlsAgentScopeReloader::new);
     if let Some(manager) = tls_attach_manager.as_mut() {
         attached = attached.saturating_add(refresh_tls_attachments(
@@ -2269,6 +2281,9 @@ async fn main() -> anyhow::Result<()> {
     let mut reader_failure: Option<String> = None;
     let mut last_tls_profile_diagnostics = [0u64; 21];
     let mut last_tls_agent_scope_error = String::new();
+    // Pure-HTTP mode (no TlsAttachManager): scope-verified PIDs from the whitelist reloader are
+    // held here and pushed into VERIFIED_AGENT_PROCESSES by the periodic sync.
+    let mut plaintext_scope_pids: HashSet<i32> = HashSet::new();
     'collect: loop {
         tokio::select! {
             biased;
@@ -2569,7 +2584,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            _ = named_agent_scan.tick(), if tls_attach_manager.is_some() => {
+            _ = named_agent_scan.tick(), if plaintext_admission => {
                 tokio::task::block_in_place(|| {
                     for pid in scan_named_agent_runtime_pids() {
                         processor.tls_verified_candidate_pids.insert(pid);
@@ -2579,43 +2594,50 @@ async fn main() -> anyhow::Result<()> {
                     processor.flush_immediate_allowlist(&verified_process_map);
                 });
             }
-            _ = tls_attach_scan.tick(), if tls_attach_manager.is_some() => {
-                if let Some(manager) = tls_attach_manager.as_mut() {
-                    if let Some(reloader) = tls_agent_scope_reloader.as_mut() {
-                        match tokio::task::block_in_place(|| reloader.refresh()) {
-                            Ok(refresh) => {
+            _ = tls_attach_scan.tick(), if plaintext_admission => {
+                // The identity whitelist reload runs in both plaintext modes; its verified PID
+                // set feeds the TlsAttachManager when HTTPS capture is on, or the HTTP-only
+                // scope slot otherwise.
+                if let Some(reloader) = tls_agent_scope_reloader.as_mut() {
+                    match tokio::task::block_in_place(|| reloader.refresh()) {
+                        Ok(refresh) => {
+                            if let Some(manager) = tls_attach_manager.as_mut() {
                                 manager.set_scope_verified_pids(refresh.pids.clone());
-                                last_tls_agent_scope_error.clear();
-                                if refresh.changed {
-                                    tracing::info!(
-                                        cgroups = refresh.cgroups,
-                                        pids = refresh.pids.len(),
-                                        fenced_roots = refresh.fenced_roots,
-                                        conflicts = refresh.conflicts,
-                                        "reconciled product-neutral TLS Agent cgroup scopes"
-                                    );
-                                }
-                                if refresh.conflicts > 0 {
-                                    tracing::warn!(
-                                        conflicts = refresh.conflicts,
-                                        fenced_roots = refresh.fenced_roots,
-                                        admitted_pids = refresh.pids.len(),
-                                        "TLS Agent cgroup scope conflict retained; blanket admission disabled"
-                                    );
-                                }
+                            } else {
+                                plaintext_scope_pids = refresh.pids.clone();
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                if last_tls_agent_scope_error != message {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "TLS Agent cgroup scope refresh failed; retaining the last valid scope"
-                                    );
-                                    last_tls_agent_scope_error = message;
-                                }
+                            last_tls_agent_scope_error.clear();
+                            if refresh.changed {
+                                tracing::info!(
+                                    cgroups = refresh.cgroups,
+                                    pids = refresh.pids.len(),
+                                    fenced_roots = refresh.fenced_roots,
+                                    conflicts = refresh.conflicts,
+                                    "reconciled product-neutral TLS Agent cgroup scopes"
+                                );
+                            }
+                            if refresh.conflicts > 0 {
+                                tracing::warn!(
+                                    conflicts = refresh.conflicts,
+                                    fenced_roots = refresh.fenced_roots,
+                                    admitted_pids = refresh.pids.len(),
+                                    "TLS Agent cgroup scope conflict retained; blanket admission disabled"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            if last_tls_agent_scope_error != message {
+                                tracing::warn!(
+                                    error = %error,
+                                    "TLS Agent cgroup scope refresh failed; retaining the last valid scope"
+                                );
+                                last_tls_agent_scope_error = message;
                             }
                         }
                     }
+                }
+                if let Some(manager) = tls_attach_manager.as_mut() {
                     let newly_attached = tokio::task::block_in_place(|| {
                         refresh_tls_attachments(manager, &verified_process_map, &mut ebpf)
                     });
@@ -2625,6 +2647,22 @@ async fn main() -> anyhow::Result<()> {
                             attached_targets = manager.attached_count(),
                             "refreshed Agent TLS plaintext attachments"
                         );
+                    }
+                } else {
+                    // HTTP-only plaintext mode: no TLS attach manager exists, so the manager
+                    // path (refresh_tls_attachments → sync) never runs. Push the scope-verified
+                    // set directly; sync() itself chains the named-agent runtime scan.
+                    match verified_process_map.sync(plaintext_scope_pids.iter().copied()) {
+                        Ok(newly_installed) if newly_installed > 0 => tracing::info!(
+                            newly_installed,
+                            installed = verified_process_map.installed_len(),
+                            "synchronized identity-verified Agent plaintext PID allowlist"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "failed to synchronize identity-verified Agent plaintext PID allowlist"
+                        ),
                     }
                 }
             }
@@ -5494,6 +5532,19 @@ fn env_value_disabled(value: &str) -> bool {
     )
 }
 
+/// HTTP plaintext admission (identity whitelist reload, named-agent scan, and the
+/// VERIFIED_AGENT_PROCESSES sync that gates tcp_plaintext) is controlled independently from
+/// HTTPS plaintext capture (libssl uprobe attach, `A3S_OBSERVER_SSL`). Admission runs when
+/// either switch is on: `A3S_OBSERVER_PLAINTEXT_HTTP` opens the pure-HTTP path, and the SSL
+/// switch implies admission because TLS events share the same verified-process map. An explicit
+/// `A3S_OBSERVER_PLAINTEXT_HTTP=off` therefore cannot disable admission while SSL capture is on.
+fn plaintext_admission_enabled(
+    ssl_setting: Option<&str>,
+    plaintext_http_setting: Option<&str>,
+) -> bool {
+    ssl_setting.is_some() || plaintext_http_setting.is_some()
+}
+
 fn env_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -6243,13 +6294,13 @@ mod tests {
         nonzero_unix_ns, observe_exec_commit_lifecycle, parse_dns_qname,
         parse_filter_rule_snapshot, parse_llm_meta, parse_process_start_time_ticks,
         parse_rfc3339_unix_nanos, parse_sni, parse_unknown_file_policy,
-        partial_window_interval_secs, pipeline_coverage_gaps, plaintext_process_key, pod_bytes,
-        pod_from_bytes, process_context, process_generation_from_context,
-        scan_named_agent_runtime_pids, socket_key_with_generation, supplement_exec_argv_at,
-        tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh, unix_ms_from_ns,
-        valid_plaintext_http_route, CollectorMeta, CollectorProcessor, CompletedExec,
-        ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState, PeerState,
-        PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
+        partial_window_interval_secs, pipeline_coverage_gaps, plaintext_admission_enabled,
+        plaintext_process_key, pod_bytes, pod_from_bytes, process_context,
+        process_generation_from_context, scan_named_agent_runtime_pids, socket_key_with_generation,
+        supplement_exec_argv_at, tls_capture_profile_needs_refresh, tls_exec_comm_needs_refresh,
+        unix_ms_from_ns, valid_plaintext_http_route, CollectorMeta, CollectorProcessor,
+        CompletedExec, ExecAssembler, FileFeatureFlags, FileFilterHeartbeatSnapshot, LlmMetaState,
+        PeerState, PipelineAccountingState, PipelineOrigin, PipelineRing, ProcessContextCache,
         ProcessLifecycleStore, RawEnvelope, RingOrigin, RingReaderLedgerSnapshot, RingWindowStats,
         Stats, UnknownFilePolicy, VerifiedProcessMap, EXEC_REASSEMBLY_TIMEOUT,
         FILE_ACCESS_TRACEPOINTS, SOCKET_STATE_TTL, UNKNOWN_PEER,
@@ -6302,6 +6353,22 @@ mod tests {
         for enabled in ["1", "true", "on", "/usr/lib/libssl.so"] {
             assert!(!env_value_disabled(enabled), "{enabled}");
         }
+    }
+
+    #[test]
+    fn plaintext_admission_switch_quadrants() {
+        // Both unset: admission machinery stays off (pre-split default behavior).
+        assert!(!plaintext_admission_enabled(None, None));
+        // HTTPS only: SSL implies admission (existing deployments unchanged).
+        assert!(plaintext_admission_enabled(Some("1"), None));
+        // HTTP only: pure-HTTP admission without any uprobe attach (the UOS fix).
+        assert!(plaintext_admission_enabled(None, Some("1")));
+        // Both on: identical to SSL-on behavior.
+        assert!(plaintext_admission_enabled(Some("1"), Some("1")));
+        // An explicit HTTP-off cannot disable admission while SSL capture is on: both gates
+        // share VERIFIED_AGENT_PROCESSES, and TLS events would silently lose admission.
+        assert!(plaintext_admission_enabled(Some("auto"), None));
+        assert!(plaintext_admission_enabled(Some("auto"), Some("1")));
     }
 
     #[test]
