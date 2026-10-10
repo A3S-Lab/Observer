@@ -1197,6 +1197,36 @@ pub const SEC_SETUID: u32 = 1; // setuid/setresuid → euid 0 from a non-root ca
 pub const SEC_PTRACE: u32 = 2; // ptrace(ATTACH|SEIZE) of another process (injection)
 pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a listener)
 
+/// Legacy (Linux 4.19) HTTP plaintext chunk: a fixed-size payload slice copied at the socket
+/// syscall boundary for identity-whitelisted PIDs only. Requests come from kprobe
+/// `write`/`sendto` (user buffer already populated); responses come from kretprobe
+/// `read`/`recvfrom` (kernel has filled the buffer by then, the return value is the length).
+/// Userspace feeds these chunks to the same `InteractionReassembler` as the modern
+/// plain-http-syscall path, so downstream conversation tracking sees one uniform shape.
+pub const LEGACY_PLAINTEXT_LEN: usize = 512;
+
+/// `LegacyPlaintextEvent.direction`: syscall write side (the Agent's HTTP request).
+pub const LEGACY_PLAINTEXT_DIRECTION_WRITE: u32 = 0;
+/// `LegacyPlaintextEvent.direction`: syscall read side (the LLM endpoint's HTTP response).
+pub const LEGACY_PLAINTEXT_DIRECTION_READ: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LegacyPlaintextEvent {
+    pub pid: u32,
+    pub fd: u32,
+    pub direction: u32,
+    pub len: u32,      // bytes captured into `data`
+    pub orig_len: u32, // syscall count (write) / return value (read) — truncation marker
+    pub _pad: u32,
+    pub comm: [u8; 16],
+    /// `CLOCK_MONOTONIC` nanoseconds at capture; doubles as the per-connection ordering key.
+    pub captured_at_boot_ns: u64,
+    pub data: [u8; LEGACY_PLAINTEXT_LEN],
+}
+
+const _: [(); 560] = [(); core::mem::size_of::<LegacyPlaintextEvent>()];
+
 #[cfg(test)]
 mod tests {
     use super::{

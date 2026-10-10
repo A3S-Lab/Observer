@@ -13,11 +13,16 @@ const validator = path.join(scripts, 'verify-legacy-bpf-object.mjs');
 const programs = [
   'legacy_exec', 'legacy_exit', 'legacy_connect', 'legacy_setuid',
   'legacy_ptrace', 'legacy_bind', 'legacy_openat', 'legacy_unlinkat',
+  'legacy_http_write', 'legacy_http_sendto',
+  'legacy_http_read_enter', 'legacy_http_recvfrom_enter',
+  'legacy_http_read_exit', 'legacy_http_recvfrom_exit',
 ];
 const maps = [
   'EVENTS', 'EXIT_EVENTS', 'CONNECT_EVENTS', 'FILE_EVENTS', 'SEC_EVENTS',
+  'PLAINTEXT_EVENTS',
   'EXEC_SCRATCH', 'EXIT_SCRATCH', 'CONNECT_SCRATCH', 'FILE_SCRATCH',
-  'SEC_SCRATCH', 'DROPS',
+  'SEC_SCRATCH', 'PLAINTEXT_SCRATCH', 'DROPS',
+  'PLAINTEXT_ALLOWED', 'PLAINTEXT_READ_ARGS',
 ];
 
 function align(value, alignment) {
@@ -55,7 +60,7 @@ function fixture({
   omitVersion = false,
   versionCode = 0x04135a,
 } = {}) {
-  const keptMaps = missingSymbol ? maps.slice(0, -1) : maps;
+  const keptMaps = missingSymbol ? maps.filter((name) => name !== 'DROPS') : maps;
   const symbolNames = [...programs, ...keptMaps];
   const strtab = strings(symbolNames);
   const code = Buffer.alloc(8);
