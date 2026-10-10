@@ -1209,8 +1209,8 @@ mod tests {
         CaptureSampleWindow, ConnectEvent, ConnectionIdentity, CoverageGap, DnsEvent, ExecRecord,
         ExitEvent, FileEvent, FileFilterConfig, LlmEvent, ProcessGenerationKey,
         RawObservationHeader, RingPipelineStats, SecEvent, SourceRef, SslEvent, TlsEvent,
-        TlsPlaintextEventHeader, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED, CAPTURE_ACTION_SAMPLE,
-        CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE, CAPTURE_CONFIG_ENABLED,
+        TlsPlaintextEventHeader, CAPTURE_ACTION_FULL, CAPTURE_ACTION_NOT_ENABLED,
+        CAPTURE_ACTION_SAMPLE, CAPTURE_CONFIG_BOUNDED_UNKNOWN_LIFECYCLE, CAPTURE_CONFIG_ENABLED,
         CAPTURE_DECISION_FLAG_SELECTED, CAPTURE_PROBE_CONNECT, CAPTURE_PROBE_COUNT,
         CAPTURE_PROBE_DNS, CAPTURE_PROBE_EXEC, CAPTURE_PROBE_EXIT, CAPTURE_PROBE_FILE_ACCESS,
         CAPTURE_PROBE_FILE_DELETE, CAPTURE_PROBE_FILE_READ, CAPTURE_PROBE_LLM,
@@ -1306,11 +1306,26 @@ mod tests {
         // ABI v2 header stays 8-byte aligned and carries ConnectionIdentity bind fields.
         // Layout through socket_fd reuses the former `_pad1[6]` so call_started stays at offset 56.
         assert_eq!(core::mem::align_of::<TlsPlaintextEventHeader>(), 8);
-        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, bind_quality), 50);
-        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, socket_fd), 52);
-        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, call_started_at_boot_ns), 56);
-        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, socket_cookie), 72);
-        assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, fd_generation), 80);
+        assert_eq!(
+            core::mem::offset_of!(TlsPlaintextEventHeader, bind_quality),
+            50
+        );
+        assert_eq!(
+            core::mem::offset_of!(TlsPlaintextEventHeader, socket_fd),
+            52
+        );
+        assert_eq!(
+            core::mem::offset_of!(TlsPlaintextEventHeader, call_started_at_boot_ns),
+            56
+        );
+        assert_eq!(
+            core::mem::offset_of!(TlsPlaintextEventHeader, socket_cookie),
+            72
+        );
+        assert_eq!(
+            core::mem::offset_of!(TlsPlaintextEventHeader, fd_generation),
+            80
+        );
         assert_eq!(core::mem::offset_of!(TlsPlaintextEventHeader, comm), 88);
         assert_eq!(TLS_PLAINTEXT_ABI_V2, 2);
 

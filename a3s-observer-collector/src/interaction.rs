@@ -1422,25 +1422,13 @@ struct Http2StreamState {
     end_stream: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Http2ConnectionState {
     active: bool,
     leftover: Vec<u8>,
     request_hpack: HpackDecoder,
     response_hpack: HpackDecoder,
     streams: HashMap<u32, Http2StreamState>,
-}
-
-impl Default for Http2ConnectionState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            leftover: Vec::new(),
-            request_hpack: HpackDecoder::default(),
-            response_hpack: HpackDecoder::default(),
-            streams: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1875,41 +1863,42 @@ impl InteractionReassembler {
                                 ["classic_non_http_prefix".to_string()],
                             );
                         } else {
-                        for mut request in state.requests.push(
-                            &chunk.data,
-                            chunk.event_at_unix_ns,
-                            &effective_reasons,
-                        ) {
-                            if let Some((endpoint, path)) = websocket_upgrade_metadata(&request) {
-                                state.websocket.upgrade_requested = true;
-                                state.websocket.endpoint = endpoint.clone();
-                                state.websocket.path = path.clone();
-                                state.identity.observe_route(&endpoint, &path);
-                                // Rustls CommonState pointers often change between the upgrade
-                                // GET and later WS frames. Activate from the client offer now so
-                                // sibling pointers remount onto this connection before 101, using
-                                // the offered Sec-WebSocket-Extensions (refined when 101 arrives).
-                                if !state.websocket.active {
-                                    let extension = request
-                                        .header("sec-websocket-extensions")
-                                        .map(str::to_owned);
-                                    state.websocket.activate(extension.as_deref());
-                                }
-                            } else {
-                                state
-                                    .identity
-                                    .observe_http(&request, ChunkDirection::Request);
-                                add_binding_reasons(state, &mut request.partial_reasons);
-                                if !state.push_pending_request(request) {
-                                    self.metrics.body_limit_drops =
-                                        self.metrics.body_limit_drops.saturating_add(1);
-                                    extend_unique(
-                                        &mut deferred_body_gap_reasons,
-                                        ["pending_request_limit".to_string()],
-                                    );
+                            for mut request in state.requests.push(
+                                &chunk.data,
+                                chunk.event_at_unix_ns,
+                                &effective_reasons,
+                            ) {
+                                if let Some((endpoint, path)) = websocket_upgrade_metadata(&request)
+                                {
+                                    state.websocket.upgrade_requested = true;
+                                    state.websocket.endpoint = endpoint.clone();
+                                    state.websocket.path = path.clone();
+                                    state.identity.observe_route(&endpoint, &path);
+                                    // Rustls CommonState pointers often change between the upgrade
+                                    // GET and later WS frames. Activate from the client offer now so
+                                    // sibling pointers remount onto this connection before 101, using
+                                    // the offered Sec-WebSocket-Extensions (refined when 101 arrives).
+                                    if !state.websocket.active {
+                                        let extension = request
+                                            .header("sec-websocket-extensions")
+                                            .map(str::to_owned);
+                                        state.websocket.activate(extension.as_deref());
+                                    }
+                                } else {
+                                    state
+                                        .identity
+                                        .observe_http(&request, ChunkDirection::Request);
+                                    add_binding_reasons(state, &mut request.partial_reasons);
+                                    if !state.push_pending_request(request) {
+                                        self.metrics.body_limit_drops =
+                                            self.metrics.body_limit_drops.saturating_add(1);
+                                        extend_unique(
+                                            &mut deferred_body_gap_reasons,
+                                            ["pending_request_limit".to_string()],
+                                        );
+                                    }
                                 }
                             }
-                        }
                         }
                     } else {
                         // A candidate prefix which is not an LLM body is retained as bounded
@@ -2350,13 +2339,13 @@ impl InteractionReassembler {
             .connections
             .get(&owner)
             .is_some_and(classic_http_request_poisoned);
-        if prefer_socket_home && !owner_poisoned {
-            if self.rebind_quiescent_connection(owner, observed)
-                || self.merge_classic_http_request_buffers(owner, observed)
-            {
-                self.remember_connection_alias(owner, observed);
-                return Some((observed, None));
-            }
+        if prefer_socket_home
+            && !owner_poisoned
+            && (self.rebind_quiescent_connection(owner, observed)
+                || self.merge_classic_http_request_buffers(owner, observed))
+        {
+            self.remember_connection_alias(owner, observed);
+            return Some((observed, None));
         }
         if self.rebind_quiescent_connection(observed, owner)
             || self.merge_classic_http_request_buffers(observed, owner)
@@ -3104,11 +3093,7 @@ impl InteractionReassembler {
             let Some(state) = self.connections.remove(&key) else {
                 continue;
             };
-            self.retire_incomplete_connection(
-                key,
-                state,
-                "reassembly_idle_expire_incomplete",
-            );
+            self.retire_incomplete_connection(key, state, "reassembly_idle_expire_incomplete");
         }
         self.retain_live_connection_aliases();
     }
@@ -3153,8 +3138,7 @@ impl InteractionReassembler {
         {
             if let Some(oldest) = self.gap_evidence_fingerprints.iter().next().cloned() {
                 self.gap_evidence_fingerprints.remove(&oldest);
-                self.metrics.evidence_evictions =
-                    self.metrics.evidence_evictions.saturating_add(1);
+                self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
             }
         }
         if self.gap_evidence_fingerprints.insert(fingerprint.clone()) {
@@ -3198,13 +3182,11 @@ impl InteractionReassembler {
             };
             if self.pending_evidence.len() >= self.max_connections {
                 self.pending_evidence.pop_front();
-                self.metrics.evidence_evictions =
-                    self.metrics.evidence_evictions.saturating_add(1);
+                self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
             }
             self.pending_evidence.push_back(evidence);
         }
-        self.metrics.connection_expirations =
-            self.metrics.connection_expirations.saturating_add(1);
+        self.metrics.connection_expirations = self.metrics.connection_expirations.saturating_add(1);
     }
 
     /// Drop every protocol/alias state owned by a process generation as soon as its kernel Exit
@@ -3221,11 +3203,7 @@ impl InteractionReassembler {
             .collect::<Vec<_>>();
         for key in keys {
             if let Some(state) = self.connections.remove(&key) {
-                self.retire_incomplete_connection(
-                    key,
-                    state,
-                    "reassembly_process_exit_incomplete",
-                );
+                self.retire_incomplete_connection(key, state, "reassembly_process_exit_incomplete");
             }
         }
         self.connection_aliases.retain(|observed, canonical| {
@@ -3285,8 +3263,7 @@ impl InteractionReassembler {
             };
             if self.pending_completed.len() >= self.max_connections {
                 self.pending_completed.pop_front();
-                self.metrics.evidence_evictions =
-                    self.metrics.evidence_evictions.saturating_add(1);
+                self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
             }
             self.pending_completed.push_back(interaction);
         }
@@ -3817,10 +3794,12 @@ fn looks_like_split_http_method(data: &[u8]) -> bool {
         return false;
     }
     const METHODS: [&[u8]; 10] = [
-        b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE",
-        b"CONNECT", b"PRI",
+        b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE", b"CONNECT",
+        b"PRI",
     ];
-    METHODS.iter().any(|method| method.starts_with(data) || data.starts_with(method))
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(data) || data.starts_with(method))
 }
 
 fn classic_http_request_poisoned(state: &ConnectionState) -> bool {
@@ -3849,7 +3828,11 @@ fn prefer_classic_pending_post_owner(
     let mut posts = owners
         .iter()
         .copied()
-        .filter(|key| connections.get(key).is_some_and(classic_http_has_pending_post))
+        .filter(|key| {
+            connections
+                .get(key)
+                .is_some_and(classic_http_has_pending_post)
+        })
         .collect::<Vec<_>>();
     match posts.len() {
         1 => posts.pop(),
@@ -4841,6 +4824,7 @@ fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_interaction(
     key: ConnectionKey,
     sequence: u64,
@@ -5595,7 +5579,7 @@ fn looks_like_http2_frame_prefix(data: &[u8]) -> bool {
         return false;
     }
     match frame_type {
-        0x4 => stream_id == 0 && length % 6 == 0 && (flags & !0x1) == 0,
+        0x4 => stream_id == 0 && length.is_multiple_of(6) && (flags & !0x1) == 0,
         0x8 => length == 4,
         0x6 => stream_id == 0 && length == 8,
         0x0 => stream_id != 0 && length > 0,
@@ -5868,7 +5852,7 @@ fn process_http2_chunk(
                     chunk.event_at_unix_ns,
                     &effective_reasons,
                 );
-                if response.headers.get("content-type").is_none() {
+                if !response.headers.contains_key("content-type") {
                     if looks_like_sse(&finished.body) {
                         response
                             .headers
@@ -8512,10 +8496,11 @@ mod tests {
     #[test]
     fn classic_sticky_request_parse_error_does_not_poison_response_gap() {
         let mut reassembler = InteractionReassembler::default();
-        // NUL inside the request-line token forces httparse Token error → sticky decode poison.
+        // NUL inside a header line passes the request-line prefix gate (the method token stays
+        // clean) but fails httparse with a Token error — which is what poisons the sticky decode.
         let garbage = classic_chunk_on(
             ChunkDirection::Request,
-            b"GET\x00 / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: x\x00\r\n\r\n".to_vec(),
             50,
             0x1111,
             0,
@@ -9639,10 +9624,24 @@ mod tests {
         };
 
         assert!(reassembler
-            .push(tcp(ChunkDirection::Request, invoke_req, 10, invoke_key, invoke_fd, true))
+            .push(tcp(
+                ChunkDirection::Request,
+                invoke_req,
+                10,
+                invoke_key,
+                invoke_fd,
+                true
+            ))
             .is_empty());
         assert!(reassembler
-            .push(tcp(ChunkDirection::Request, chat_req, 11, chat_key, chat_fd, false))
+            .push(tcp(
+                ChunkDirection::Request,
+                chat_req,
+                11,
+                chat_key,
+                chat_fd,
+                false
+            ))
             .is_empty());
         let chat_done = reassembler.push(tcp(
             ChunkDirection::Response,
@@ -10544,7 +10543,8 @@ mod tests {
         // on the same ssl_ptr. Both hops must become interactions once the body is admitted.
         let ssl_ptr = 0x7ffc_d53e_64b8_u64;
         let mut reassembler = InteractionReassembler::default();
-        let first_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
+        let first_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
         let first_headers = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             first_body.len()
@@ -10579,7 +10579,8 @@ mod tests {
         assert_eq!(first.len(), 1, "{first:?}");
         assert_eq!(first[0].path, "/v1/messages");
 
-        let second_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"done"}]}"#;
+        let second_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"done"}]}"#;
         let second_request = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{second_body}",
             second_body.len()
@@ -10609,7 +10610,8 @@ mod tests {
     fn duplicate_app_data_probe_does_not_double_pending_request() {
         let ssl_ptr = 0x5898_e8f0_e40_u64;
         let mut reassembler = InteractionReassembler::default();
-        let body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
+        let body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"run bash"}]}"#;
         let request = format!(
             "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -10653,13 +10655,7 @@ mod tests {
         let ssl_ptr = 0x7ffe_ecd0_47b8_u64;
         let fd_key = classic_tls_sock_connection_id(7, 42, 17);
         let mut reassembler = InteractionReassembler::default();
-        let mut split = classic_chunk_on(
-            ChunkDirection::Request,
-            b"PO".to_vec(),
-            9,
-            ssl_ptr,
-            0,
-        );
+        let mut split = classic_chunk_on(ChunkDirection::Request, b"PO".to_vec(), 9, ssl_ptr, 0);
         split.sequence = 1;
         assert!(reassembler.push(split).is_empty());
         let mut junk = classic_chunk_on(
@@ -10682,7 +10678,8 @@ mod tests {
         junk_fd.sequence = 3;
         assert!(reassembler.push(junk_fd).is_empty());
 
-        let body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
         let request = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -10715,8 +10712,10 @@ mod tests {
         let fd_key = classic_tls_sock_connection_id(7, 42, 17);
         let cookie = 0x525d_9b5f_e910_d211_u64;
         let mut reassembler = InteractionReassembler::default();
-        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
-        let final_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
+        let tool_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let final_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
         let tool_req = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
             tool_body.len()
@@ -10760,7 +10759,11 @@ mod tests {
         hop1_resp.socket_fd = 17;
         let first = reassembler.push(hop1_resp);
         assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+        assert!(
+            first[0].request.body.contains("tool"),
+            "{}",
+            first[0].request.body
+        );
 
         let mut hop2_resp = classic_chunk_on(
             ChunkDirection::Response,
@@ -10786,8 +10789,10 @@ mod tests {
         let fd_key = classic_tls_sock_connection_id(7, 42, 17);
         let cookie = 0x3c5d_2348_e910_d211_u64;
         let mut reassembler = InteractionReassembler::default();
-        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
-        let final_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
+        let tool_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let final_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"final"}]}"#;
         let tool_req = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
             tool_body.len()
@@ -10832,7 +10837,11 @@ mod tests {
         hop1_resp.socket_cookie = cookie;
         let first = reassembler.push(hop1_resp);
         assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+        assert!(
+            first[0].request.body.contains("tool"),
+            "{}",
+            first[0].request.body
+        );
 
         let mut hop2_resp = classic_chunk_on(
             ChunkDirection::Response,
@@ -10857,7 +10866,8 @@ mod tests {
     fn expire_process_emits_partial_interaction_for_pending_http_request() {
         let fd_key = classic_tls_sock_connection_id(7, 42, 17);
         let mut reassembler = InteractionReassembler::default();
-        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let tool_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
         let tool_req = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
             tool_body.len()
@@ -10885,7 +10895,11 @@ mod tests {
             "{:?}",
             completed[0].partial_reasons
         );
-        assert!(completed[0].request.body.contains("tool"), "{}", completed[0].request.body);
+        assert!(
+            completed[0].request.body.contains("tool"),
+            "{}",
+            completed[0].request.body
+        );
         assert_eq!(reassembler.active_connections(), 0);
     }
 
@@ -10896,7 +10910,8 @@ mod tests {
         let cookie = 0x8532_91f9_6910_d211_u64;
         let mut reassembler = InteractionReassembler::default();
         let head = b"HEAD /api/hello HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".to_vec();
-        let tool_body = r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
+        let tool_body =
+            r#"{"model":"fixture-claude-model","messages":[{"role":"user","content":"tool"}]}"#;
         let tool_req = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{tool_body}",
             tool_body.len()
@@ -10937,7 +10952,11 @@ mod tests {
         hop1_resp.bind_quality = a3s_observer_common::TLS_BIND_QUALITY_COOKIE;
         let first = reassembler.push(hop1_resp);
         assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].request.body.contains("tool"), "{}", first[0].request.body);
+        assert!(
+            first[0].request.body.contains("tool"),
+            "{}",
+            first[0].request.body
+        );
         assert_eq!(first[0].path, "/v1/messages");
     }
 

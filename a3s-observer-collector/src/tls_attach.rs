@@ -1707,9 +1707,9 @@ fn va_is_code(segments: &[ElfLoadSegment], va: u64) -> bool {
 }
 
 fn classic_write_calls_protocol_method_slot(bytes: &[u8]) -> bool {
-    bytes.windows(3).any(|window| {
-        window[0] == 0xff && (0x50..=0x57).contains(&window[1]) && window[2] == 0x48
-    })
+    bytes
+        .windows(3)
+        .any(|window| window[0] == 0xff && (0x50..=0x57).contains(&window[1]) && window[2] == 0x48)
 }
 
 fn read_file_exact(file: &mut File, offset: u64, buf: &mut [u8]) -> anyhow::Result<bool> {
@@ -1748,7 +1748,8 @@ fn discover_protocol_method_write_offsets(
         let mut cursor = segment.file_start;
         let mut carry = Vec::<u8>::new();
         while cursor < segment.file_end && found.len() < MAX_PROTOCOL_METHOD_WRITES {
-            let requested = (segment.file_end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
+            let requested =
+                (segment.file_end - cursor).min(STATIC_SCAN_CHUNK_BYTES as u64) as usize;
             let mut window = vec![0u8; carry.len() + requested];
             window[..carry.len()].copy_from_slice(&carry);
             if !read_file_exact(&mut file, cursor, &mut window[carry.len()..])? {
@@ -1816,7 +1817,9 @@ fn discover_protocol_method_write_in_table(
         return Ok(false);
     }
     if !head.starts_with(&WRITE_APP_DATA_PROLOGUE)
-        || !head.windows(3).any(|window| window == OUT_NEEDS_HANDSHAKE_FALSE)
+        || !head
+            .windows(3)
+            .any(|window| window == OUT_NEEDS_HANDSHAKE_FALSE)
     {
         return Ok(false);
     }
@@ -2018,11 +2021,7 @@ mod tests {
     #[test]
     fn drain_runnable_deferred_pids_keeps_stopped_and_drops_exited() {
         let mut deferred = HashSet::from([11, 22, 33]);
-        let ready = drain_runnable_deferred_pids(
-            &mut deferred,
-            |pid| pid == 11,
-            |pid| pid != 33,
-        );
+        let ready = drain_runnable_deferred_pids(&mut deferred, |pid| pid == 11, |pid| pid != 33);
         assert_eq!(ready, vec![22]);
         assert_eq!(deferred, HashSet::from([11]));
     }
@@ -2137,9 +2136,8 @@ mod tests {
         assert_eq!(pairs[0].write_offset, 0x2364220);
         assert_eq!(extras, vec![0x241a530, 0x39d2d50]);
         let all_writes = HashSet::from([
-            0x2364220, 0x241a530, 0x39d2d50, 0x39d5430, 0x3db6700, 0x3f0be20,
-            0x40769d0, 0x4076c90, 0x4076dd0, 0x4077090, 0x4077fb0, 0x40782e0,
-            0x40a7ee0, 0x40a81a0,
+            0x2364220, 0x241a530, 0x39d2d50, 0x39d5430, 0x3db6700, 0x3f0be20, 0x40769d0, 0x4076c90,
+            0x4076dd0, 0x4077090, 0x4077fb0, 0x40782e0, 0x40a7ee0, 0x40a81a0,
         ]);
         let (_, extras) = pair_static_family_offsets(
             &reads,
