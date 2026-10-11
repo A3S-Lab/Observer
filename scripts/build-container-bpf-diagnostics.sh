@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-OUTPUT_DIR=${1:-/home/chensicheng/a3s/security/release/anysentry-bpf-container-diagnostics-uos20-arm64}
+OUTPUT_DIR=${1:-$ROOT_DIR/target/bpf-container-diagnostics}
 TOOL_CACHE=${A3S_HOTFIX_TOOL_CACHE:-/home/chensicheng/.config/superpowers/worktrees/AnySentry/uos20-arm64-package/.build/uos20-arm64/tools}
 ZIG=$TOOL_CACHE/zig-0.14.1/zig
 

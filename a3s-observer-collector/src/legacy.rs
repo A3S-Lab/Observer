@@ -1,27 +1,35 @@
-use super::{cstr, emit, identity_for, peer_ip, process_context, CollectorMeta, Stats};
+use super::interaction::{ChunkDirection, InteractionReassembler, PlaintextChunk};
+use super::tls_agent_scopes::TlsAgentScopeReloader;
+use super::{
+    cstr, emit, fallback_raw_observation, hash_prefix, identity_for, peer_ip, process_context,
+    safe_unix_now_ns, CollectorMeta, Stats,
+};
 use a3s_observer::{
-    read_ppid, AgentEvent, EnrichedEvent, Exporter, IdentityResolver, JsonExporter, KubeResolver,
-    LogExporter,
+    read_ppid, AgentEvent, EnrichedEvent, EventCaptureDecision, EventTiming, Exporter,
+    IdentityResolver, JsonExporter, KubeResolver, LogExporter, RawObservation, SniClassifier,
 };
 use a3s_observer_common::{
-    ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG,
-    LEGACY_ARG_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    classic_tls_sock_connection_id, ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent,
+    LegacyPlaintextEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG, LEGACY_ARG_LEN,
+    LEGACY_PLAINTEXT_DIRECTION_READ, LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
-    maps::{perf::AsyncPerfEventArray, PerCpuArray},
+    maps::{perf::AsyncPerfEventArray, HashMap as BpfHashMap, MapData, PerCpuArray},
     programs::KProbe,
     util::online_cpus,
     Ebpf,
 };
 use bytes::BytesMut;
 use std::{
+    collections::HashSet,
     mem::size_of,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -31,6 +39,7 @@ enum RawEvent {
     Connect(ConnectEvent),
     File(Box<FileEvent>),
     Security(SecEvent),
+    Plaintext(Box<LegacyPlaintextEvent>),
 }
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -101,6 +110,41 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         );
     }
 
+    // HTTP plaintext admission is an independent switch from TLS uprobe capture: the legacy
+    // backend implements only the syscall-boundary path (kprobe write/sendto + kprobe/kretprobe
+    // read/recvfrom) for identity-whitelisted PIDs. A3S_OBSERVER_SSL has no effect here — TLS
+    // library probing is not implemented on Linux 4.19; warn instead of silently ignoring it.
+    let plaintext_http = plaintext_http_enabled();
+    if std::env::var_os("A3S_OBSERVER_SSL").is_some() {
+        tracing::warn!(
+            "A3S_OBSERVER_SSL is set but the perf-kprobe-legacy backend does not implement TLS uprobe capture; the setting is ignored"
+        );
+    }
+    let mut plaintext_allowed: Option<BpfHashMap<MapData, u32, u8>> = None;
+    if plaintext_http {
+        for (program, symbols) in [
+            ("legacy_http_write", ["__arm64_sys_write"].as_slice()),
+            ("legacy_http_sendto", ["__arm64_sys_sendto"].as_slice()),
+            ("legacy_http_read_enter", ["__arm64_sys_read"].as_slice()),
+            (
+                "legacy_http_recvfrom_enter",
+                ["__arm64_sys_recvfrom"].as_slice(),
+            ),
+            ("legacy_http_read_exit", ["__arm64_sys_read"].as_slice()),
+            (
+                "legacy_http_recvfrom_exit",
+                ["__arm64_sys_recvfrom"].as_slice(),
+            ),
+        ] {
+            attach_first(&mut ebpf, program, symbols, &mut attached);
+        }
+        let map = BpfHashMap::try_from(
+            ebpf.take_map("PLAINTEXT_ALLOWED")
+                .context("`PLAINTEXT_ALLOWED` missing")?,
+        )?;
+        plaintext_allowed = Some(map);
+    }
+
     let effective_probes = attached
         .iter()
         .filter(|name| {
@@ -151,6 +195,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         perf_lost.clone(),
         wrap_file,
     )?;
+    if plaintext_http {
+        spawn_perf(
+            &mut ebpf,
+            "PLAINTEXT_EVENTS",
+            tx.clone(),
+            perf_lost.clone(),
+            wrap_plaintext,
+        )?;
+    }
     spawn_perf(
         &mut ebpf,
         "SEC_EVENTS",
@@ -186,6 +239,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if files {
         collector.enabled_features.push("files".to_string());
     }
+    if plaintext_http {
+        collector
+            .enabled_features
+            .push("plaintext-http".to_string());
+    }
+    let classifier = SniClassifier;
+    let mut plaintext_scope =
+        plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
+    let mut interactions = plaintext_http.then(InteractionReassembler::default);
+    let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
+    plaintext_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    plaintext_tick.tick().await;
     let heartbeat_path = std::env::var("A3S_OBSERVER_HEARTBEAT")
         .unwrap_or_else(|_| "/run/a3s-observer.alive".to_string());
     let _ = std::fs::write(&heartbeat_path, b"ok");
@@ -208,13 +273,190 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 emit_legacy_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped);
                 stats = Stats::default();
             }
+            _ = plaintext_tick.tick(), if plaintext_http => {
+                if let (Some(reloader), Some(map)) =
+                    (plaintext_scope.as_mut(), plaintext_allowed.as_mut())
+                {
+                    match reloader.refresh() {
+                        Ok(refresh) => {
+                            sync_plaintext_allowed(map, &refresh.pids);
+                            if refresh.changed {
+                                tracing::info!(
+                                    cgroups = refresh.cgroups,
+                                    pids = refresh.pids.len(),
+                                    fenced_roots = refresh.fenced_roots,
+                                    conflicts = refresh.conflicts,
+                                    "legacy plaintext Agent cgroup scopes reconciled"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "legacy plaintext scope refresh failed; retaining the last valid scope"
+                        ),
+                    }
+                }
+                if let Some(reassembler) = interactions.as_mut() {
+                    reassembler.expire_idle(Instant::now());
+                    let retired = reassembler.take_completed();
+                    emit_plaintext_interactions(
+                        exporter.as_ref(),
+                        &mut stats,
+                        &resolver,
+                        &classifier,
+                        [0u8; 16],
+                        retired,
+                    );
+                }
+            }
             raw = rx.recv() => {
                 let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
-                handle_raw(exporter.as_ref(), &resolver, &mut stats, raw);
+                match raw {
+                    RawEvent::Plaintext(ev) => {
+                        if let Some(reassembler) = interactions.as_mut() {
+                            let chunk = plaintext_chunk_from_event(&ev, safe_unix_now_ns());
+                            let completed = reassembler.push(chunk);
+                            emit_plaintext_interactions(
+                                exporter.as_ref(),
+                                &mut stats,
+                                &resolver,
+                                &classifier,
+                                ev.comm,
+                                completed,
+                            );
+                        }
+                    }
+                    other => handle_raw(exporter.as_ref(), &resolver, &mut stats, other),
+                }
             }
         }
     }
     Ok(())
+}
+
+fn plaintext_http_enabled() -> bool {
+    std::env::var("A3S_OBSERVER_PLAINTEXT_HTTP")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+        })
+        .unwrap_or(false)
+}
+
+fn plaintext_scope_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ANYSENTRY_TLS_AGENT_CGROUPS_FILE") {
+        return PathBuf::from(path);
+    }
+    if let Some(rules) = std::env::var_os("ANYSENTRY_FILTER_RULES_FILE") {
+        if let Some(parent) = PathBuf::from(rules).parent().map(|path| path.to_path_buf()) {
+            return parent.join("tls-agent-cgroups.json");
+        }
+    }
+    PathBuf::from("/run/anysentry-filter/tls-agent-cgroups.json")
+}
+
+fn sync_plaintext_allowed(map: &mut BpfHashMap<MapData, u32, u8>, pids: &HashSet<i32>) {
+    let desired: HashSet<u32> = pids
+        .iter()
+        .filter_map(|pid| u32::try_from(*pid).ok())
+        .collect();
+    let existing: Vec<u32> = map.keys().filter_map(|key| key.ok()).collect();
+    for key in existing {
+        if !desired.contains(&key) {
+            let _ = map.remove(&key);
+        }
+    }
+    for pid in desired {
+        if let Err(error) = map.insert(pid, 1u8, 0) {
+            tracing::warn!(pid, error = %error, "legacy plaintext admission insert failed");
+        }
+    }
+}
+
+fn plaintext_chunk_from_event(ev: &LegacyPlaintextEvent, now_unix_ns: u128) -> PlaintextChunk {
+    let len = (ev.len as usize).min(LEGACY_PLAINTEXT_LEN);
+    PlaintextChunk {
+        cgroup_id: 0,
+        pid: ev.pid,
+        // The legacy ABI carries no kernel cgroup id; (pid, fd) is the connection key. The
+        // reassembler pairs requests and responses on it exactly like the modern TCP path.
+        connection_id: classic_tls_sock_connection_id(0, ev.pid, u64::from(ev.fd)),
+        sequence: ev.captured_at_boot_ns,
+        direction: if ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ {
+            ChunkDirection::Response
+        } else {
+            ChunkDirection::Request
+        },
+        data: ev.data[..len].to_vec(),
+        event_at_unix_ns: now_unix_ns,
+        source: "tcp_plaintext".to_string(),
+        adapter_id: "plain-http-syscall".to_string(),
+        route_candidate: false,
+        partial_reasons: if ev.len < ev.orig_len {
+            vec!["probe_call_limit".to_string()]
+        } else {
+            Vec::new()
+        },
+        bind_quality: 0,
+        socket_fd: ev.fd as i32,
+        socket_cookie: 0,
+        fd_generation: 0,
+    }
+}
+
+fn emit_plaintext_interactions(
+    exporter: &dyn Exporter,
+    stats: &mut Stats,
+    resolver: &KubeResolver,
+    classifier: &SniClassifier,
+    comm: [u8; 16],
+    completed: Vec<super::interaction::CompletedInteraction>,
+) {
+    for interaction in completed {
+        let now = safe_unix_now_ns();
+        let timing = EventTiming::from_unix_ns(now, now);
+        let capture_decision = EventCaptureDecision::new(0, 0, 0, 0, 0, false, 0);
+        let raw_observation = plaintext_raw_observation(&interaction.interaction_id, &timing);
+        super::emit_completed_interaction(
+            exporter,
+            stats,
+            resolver,
+            classifier,
+            comm,
+            timing,
+            capture_decision,
+            raw_observation,
+            Vec::new(),
+            interaction,
+        );
+    }
+}
+
+/// Provenance record for a legacy syscall-boundary plaintext interaction. The dummy event fed
+/// to `fallback_raw_observation` only seeds the hash token shape; identity is pinned to the
+/// interaction id and the source fields honestly describe the syscall probe.
+fn plaintext_raw_observation(interaction_id: &str, timing: &EventTiming) -> RawObservation {
+    let mut raw = fallback_raw_observation(
+        &AgentEvent::ProcessExit {
+            pid: 0,
+            exit_code: 0,
+            signal: 0,
+        },
+        Some(timing),
+    );
+    let token = hash_prefix(format!("legacy-tcp|{interaction_id}").as_bytes());
+    raw.observation_id = format!("ro_{token}");
+    raw.idempotency_key = format!("idem_{token}");
+    raw.source.source_type = "socket_payload".to_string();
+    raw.source.probe_id = Some("plain-http-syscall".to_string());
+    raw.payload.kind = "tls_plaintext_chunk".to_string();
+    raw.payload.encoding = Some("binary".to_string());
+    raw.payload.redaction_state = "hash_only".to_string();
+    raw
 }
 
 fn attach_first(ebpf: &mut Ebpf, program: &str, symbols: &[&str], attached: &mut Vec<String>) {
@@ -299,6 +541,10 @@ fn wrap_exec(event: LegacyExecEvent) -> RawEvent {
 
 fn wrap_file(event: FileEvent) -> RawEvent {
     RawEvent::File(Box::new(event))
+}
+
+fn wrap_plaintext(event: LegacyPlaintextEvent) -> RawEvent {
+    RawEvent::Plaintext(Box::new(event))
 }
 
 fn legacy_argv(event: &LegacyExecEvent) -> Vec<String> {
@@ -408,6 +654,9 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
                 detail: ev.detail,
             },
         ),
+        // Plaintext chunks are intercepted in the main loop before handle_raw; this arm only
+        // exists so the match stays exhaustive.
+        RawEvent::Plaintext(_) => return,
     };
     let ring = match &enriched.event {
         AgentEvent::ToolExec { .. } => super::PipelineRing::Exec,
@@ -461,5 +710,82 @@ fn legacy_enriched(
         process,
         provider: None,
         event,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plaintext_event(direction: u32, len: u32, orig_len: u32) -> LegacyPlaintextEvent {
+        let mut event = LegacyPlaintextEvent {
+            pid: 4242,
+            fd: 7,
+            direction,
+            len,
+            orig_len,
+            _pad: 0,
+            comm: [0u8; 16],
+            captured_at_boot_ns: 123_456_789,
+            data: [0u8; LEGACY_PLAINTEXT_LEN],
+        };
+        event.data[..5].copy_from_slice(b"GET /");
+        event
+    }
+
+    #[test]
+    fn plaintext_chunk_maps_request_direction_and_bounds_payload() {
+        let chunk = plaintext_chunk_from_event(&plaintext_event(0, 5, 5), 999);
+        assert!(matches!(chunk.direction, ChunkDirection::Request));
+        assert_eq!(chunk.data, b"GET /");
+        assert_eq!(chunk.pid, 4242);
+        assert_eq!(chunk.sequence, 123_456_789);
+        assert_eq!(chunk.source, "tcp_plaintext");
+        assert_eq!(chunk.adapter_id, "plain-http-syscall");
+        assert!(chunk.partial_reasons.is_empty());
+        assert_eq!(
+            chunk.connection_id,
+            classic_tls_sock_connection_id(0, 4242, 7),
+            "connection identity must be the (pid, fd) join"
+        );
+    }
+
+    #[test]
+    fn plaintext_chunk_maps_response_and_marks_truncation() {
+        let chunk = plaintext_chunk_from_event(
+            &plaintext_event(LEGACY_PLAINTEXT_DIRECTION_READ, 512, 4096),
+            999,
+        );
+        assert!(matches!(chunk.direction, ChunkDirection::Response));
+        assert_eq!(chunk.partial_reasons, vec!["probe_call_limit".to_string()]);
+    }
+
+    #[test]
+    fn plaintext_chunk_never_overruns_the_fixed_payload() {
+        // A corrupted length field must not read past the fixed record.
+        let chunk = plaintext_chunk_from_event(&plaintext_event(0, u32::MAX, u32::MAX), 999);
+        assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN);
+    }
+
+    #[test]
+    fn plaintext_http_switch_parsing_matches_operator_convention() {
+        // The switch shares the SSL switch's truthy/disabled vocabulary (see
+        // plaintext_admission_enabled in the modern backend).
+        for (value, expected) in [
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("disabled"), false),
+            (None, false),
+        ] {
+            match value {
+                Some(v) => std::env::set_var("A3S_OBSERVER_PLAINTEXT_HTTP", v),
+                None => std::env::remove_var("A3S_OBSERVER_PLAINTEXT_HTTP"),
+            }
+            assert_eq!(plaintext_http_enabled(), expected, "value={value:?}");
+        }
+        std::env::remove_var("A3S_OBSERVER_PLAINTEXT_HTTP");
     }
 }
