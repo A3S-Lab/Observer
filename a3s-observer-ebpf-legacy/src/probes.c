@@ -425,10 +425,13 @@ INLINE int plaintext_admitted(u32 pid) {
     return bpf_map_lookup_elem(&PLAINTEXT_ALLOWED, &pid) != 0;
 }
 
-/* Copy one bounded payload slice and emit it as a fixed-size record. The variable-length
- * probe_read is clamped before use so the 4.19 verifier can prove the bound; the record itself
- * stays fixed-size so the perf ABI never varies. HTTP syntax is deliberately judged in
- * userspace (the interaction reassembler), keeping the kernel side product-neutral. */
+/* Copy one bounded payload slice and emit it as a fixed-size record. The payload read uses
+ * only constant sizes: the 4.19 verifier does not propagate range narrowing across register
+ * copies, so a variable-length probe_read is rejected as "unbounded memory access" even when
+ * the source value was clamped (observed on UOS 4.19.90, compat19 field). event->len stays the
+ * authoritative valid-byte count for userspace; bytes past len in the fixed read are never
+ * parsed. If the full window crosses an unmapped page, retry with a small fixed window before
+ * dropping the payload. */
 INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
                            u32 direction) {
     struct plaintext_event *event;
@@ -452,8 +455,12 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
     event->captured_at_boot_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     event->data[0] = 0;
-    if (len)
-        bpf_probe_read(event->data, len, (const void *)buf);
+    if (bpf_probe_read(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf) < 0) {
+        if (bpf_probe_read(event->data, 64, (const void *)buf) < 0)
+            event->len = 0;
+        else if (event->len > 64)
+            event->len = 64;
+    }
     output(ctx, &PLAINTEXT_EVENTS, event, sizeof(*event));
 }
 
