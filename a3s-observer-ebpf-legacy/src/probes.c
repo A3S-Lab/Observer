@@ -189,7 +189,13 @@ static u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
 static long (*bpf_get_current_comm)(void *buf, u32 size) = (void *)16;
 static long (*bpf_perf_event_output)(void *ctx, void *map, u64 flags,
                                      const void *data, u64 size) = (void *)25;
-static long (*bpf_probe_read_str)(void *dst, u32 size, const void *src) = (void *)45;
+/* UOS 4.19.90（Kunpeng 920，CONFIG_ARM64_PAN=y）实测：helper 4/45 读用户态内存必返
+ * -EFAULT（现场 chunk 日志 read_rc=14，argv/path 全空）。该机 BPF 回移植（0x4135a）
+ * 带 5.5+ 的 probe_read_user[_str]（bpf-inspect helpers 试加载 112/114 通过验证器），
+ * 走 uaccess/LDTR 路径天然绕过 PAN。所有"读用户态"的调用点必须换成它们；
+ * 读内核态（如 syscall_arg 解引用的 pt_regs）保持 helper 4。 */
+static long (*bpf_probe_read_user)(void *dst, u32 size, const void *src) = (void *)112;
+static long (*bpf_probe_read_user_str)(void *dst, u32 size, const void *src) = (void *)114;
 
 INLINE void count_drop(void) {
     u32 key = 0;
@@ -228,10 +234,10 @@ INLINE void event_common_init(u64 *cgroup_id, u64 *captured_at_boot_ns,
 
 #define READ_EXEC_ARG(index) \
     arg = 0; \
-    if (bpf_probe_read(&arg, sizeof(arg), (const void *)(argv + ((index) * 8))) < 0 || arg == 0) \
+    if (bpf_probe_read_user(&arg, sizeof(arg), (const void *)(argv + ((index) * 8))) < 0 || arg == 0) \
         goto submit_exec; \
     event->args[(index)][0] = 0; \
-    bpf_probe_read_str(event->args[(index)], ARG_LEN, (const void *)arg); \
+    bpf_probe_read_user_str(event->args[(index)], ARG_LEN, (const void *)arg); \
     event->argc = (index) + 1
 
 SEC("kprobe")
@@ -254,7 +260,7 @@ int legacy_exec(struct pt_regs *ctx) {
     event->argc = 0;
     event->filename[0] = 0;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
-    bpf_probe_read_str(event->filename, sizeof(event->filename), (const void *)filename);
+    bpf_probe_read_user_str(event->filename, sizeof(event->filename), (const void *)filename);
     if (!argv)
         goto submit_exec;
     READ_EXEC_ARG(0);
@@ -316,7 +322,7 @@ int legacy_connect(struct pt_regs *ctx) {
     u16 network_port = 0;
     if (!sockaddr || addrlen < 8)
         return 0;
-    if (bpf_probe_read(&family, sizeof(family), (const void *)sockaddr) < 0)
+    if (bpf_probe_read_user(&family, sizeof(family), (const void *)sockaddr) < 0)
         return 0;
     if (family != 2 && family != 10)
         return 0;
@@ -329,16 +335,16 @@ int legacy_connect(struct pt_regs *ctx) {
     event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
     event->fd = (u32)fd;
     event->family = family;
-    bpf_probe_read(&network_port, sizeof(network_port), (const void *)(sockaddr + 2));
+    bpf_probe_read_user(&network_port, sizeof(network_port), (const void *)(sockaddr + 2));
     event->port = __builtin_bswap16(network_port);
     event->addr[0] = 0; event->addr[1] = 0; event->addr[2] = 0; event->addr[3] = 0;
     event->addr[4] = 0; event->addr[5] = 0; event->addr[6] = 0; event->addr[7] = 0;
     event->addr[8] = 0; event->addr[9] = 0; event->addr[10] = 0; event->addr[11] = 0;
     event->addr[12] = 0; event->addr[13] = 0; event->addr[14] = 0; event->addr[15] = 0;
     if (family == 2)
-        bpf_probe_read(event->addr, 4, (const void *)(sockaddr + 4));
+        bpf_probe_read_user(event->addr, 4, (const void *)(sockaddr + 4));
     else
-        bpf_probe_read(event->addr, 16, (const void *)(sockaddr + 8));
+        bpf_probe_read_user(event->addr, 16, (const void *)(sockaddr + 8));
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     output(ctx, &CONNECT_EVENTS, event, sizeof(*event));
     return 0;
@@ -358,7 +364,7 @@ INLINE void emit_file(struct pt_regs *ctx, u64 path, u32 flags) {
     event->flags = flags;
     event->path[0] = 0;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
-    bpf_probe_read_str(event->path, sizeof(event->path), (const void *)path);
+    bpf_probe_read_user_str(event->path, sizeof(event->path), (const void *)path);
     output(ctx, &FILE_EVENTS, event, sizeof(*event));
 }
 
@@ -413,7 +419,7 @@ int legacy_bind(struct pt_regs *ctx) {
     u16 port;
     if (!sockaddr)
         return 0;
-    if (bpf_probe_read(&network_port, sizeof(network_port), (const void *)(sockaddr + 2)) < 0)
+    if (bpf_probe_read_user(&network_port, sizeof(network_port), (const void *)(sockaddr + 2)) < 0)
         return 0;
     port = __builtin_bswap16(network_port);
     if (port)
@@ -459,9 +465,9 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
      * 把两次 probe_read 的返回值（-errno）打包进 _pad 带回用户态定根因（低 16 位=主读，
      * 高 16 位=64B 回退读；0 表示未走到该步）。 */
     {
-        const long rc1 = bpf_probe_read(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf);
+        const long rc1 = bpf_probe_read_user(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf);
         if (rc1 < 0) {
-            const long rc2 = bpf_probe_read(event->data, 64, (const void *)buf);
+            const long rc2 = bpf_probe_read_user(event->data, 64, (const void *)buf);
             event->_pad = ((u32)(-rc1) & 0xffffu) | (((u32)(-rc2) & 0xffffu) << 16);
             if (rc2 < 0)
                 event->len = 0;
