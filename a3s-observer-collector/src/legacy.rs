@@ -42,6 +42,12 @@ enum RawEvent {
     Plaintext(Box<LegacyPlaintextEvent>),
 }
 
+// Diagnostic counters (UOS 4.19 field investigation): the legacy plaintext path produced zero
+// events on the customer kernel while every static check passed. Count and preview what (if
+// anything) arrives from the PLAINTEXT_EVENTS ring, and log every completed interaction.
+static PLAINTEXT_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_INTERACTION_SEEN: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) async fn run() -> anyhow::Result<()> {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
         println!(
@@ -313,6 +319,30 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
                 match raw {
                     RawEvent::Plaintext(ev) => {
+                        let seen = PLAINTEXT_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                        if seen <= 50 || seen % 500 == 0 {
+                            let take = (ev.len as usize).min(32).min(ev.data.len());
+                            let preview: String = ev.data[..take]
+                                .iter()
+                                .map(|b| {
+                                    if b.is_ascii_graphic() || *b == b' ' {
+                                        *b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
+                            tracing::info!(
+                                seen,
+                                pid = ev.pid,
+                                fd = ev.fd,
+                                direction = ev.direction,
+                                len = ev.len,
+                                orig_len = ev.orig_len,
+                                preview = %preview,
+                                "legacy plaintext chunk received"
+                            );
+                        }
                         if let Some(reassembler) = interactions.as_mut() {
                             let chunk = plaintext_chunk_from_event(&ev, safe_unix_now_ns());
                             let completed = reassembler.push(chunk);
@@ -417,6 +447,12 @@ fn emit_plaintext_interactions(
     completed: Vec<super::interaction::CompletedInteraction>,
 ) {
     for interaction in completed {
+        let n = PLAINTEXT_INTERACTION_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            n,
+            interaction_id = %interaction.interaction_id,
+            "legacy plaintext interaction completed; exporting"
+        );
         let now = safe_unix_now_ns();
         let timing = EventTiming::from_unix_ns(now, now);
         let capture_decision = EventCaptureDecision::new(0, 0, 0, 0, 0, false, 0);
