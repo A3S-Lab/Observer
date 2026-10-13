@@ -339,6 +339,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 direction = ev.direction,
                                 len = ev.len,
                                 orig_len = ev.orig_len,
+                                read_rc1 = ev._pad & 0xffff,
+                                read_rc2 = (ev._pad >> 16) & 0xffff,
                                 preview = %preview,
                                 "legacy plaintext chunk received"
                             );

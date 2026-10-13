@@ -455,11 +455,21 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
     event->captured_at_boot_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     event->data[0] = 0;
-    if (bpf_probe_read(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf) < 0) {
-        if (bpf_probe_read(event->data, 64, (const void *)buf) < 0)
-            event->len = 0;
-        else if (event->len > 64)
-            event->len = 64;
+    /* UOS 4.19.90 现场：chunk 全通但 len 恒 0（双向、全 pid）——载荷读取 100% 失败。
+     * 把两次 probe_read 的返回值（-errno）打包进 _pad 带回用户态定根因（低 16 位=主读，
+     * 高 16 位=64B 回退读；0 表示未走到该步）。 */
+    {
+        const long rc1 = bpf_probe_read(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf);
+        if (rc1 < 0) {
+            const long rc2 = bpf_probe_read(event->data, 64, (const void *)buf);
+            event->_pad = ((u32)(-rc1) & 0xffffu) | (((u32)(-rc2) & 0xffffu) << 16);
+            if (rc2 < 0)
+                event->len = 0;
+            else if (event->len > 64)
+                event->len = 64;
+        } else {
+            event->_pad = 0;
+        }
     }
     output(ctx, &PLAINTEXT_EVENTS, event, sizeof(*event));
 }
