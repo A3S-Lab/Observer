@@ -268,8 +268,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let classifier = SniClassifier;
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
-    let mut interactions = plaintext_http
-        .then(|| InteractionReassembler::with_idle_timeout(reassembly_idle_timeout()));
+    let mut interactions = plaintext_http.then(|| {
+        InteractionReassembler::with_idle_lanes(reassembly_idle_timeout(), inflight_idle_timeout())
+    });
     let mut sequencer = PlaintextSequencer::default();
     let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
@@ -425,11 +426,9 @@ fn perf_ring_pages() -> usize {
         .unwrap_or(8)
 }
 
-/// Reassembler idle timeout (A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS). The 90s default
-/// is fine for request/response APIs, but LLM gateways hold the connection silently while the
-/// model thinks (field-observed minutes of silence before a single large chunked JSON answer):
-/// a 90s timeout retires the interaction before the response starts, the answer bytes then
-/// arrive orphaned and are never stored. 600s+ keeps request and response in one record.
+/// Reassembler fast-lane idle timeout (A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS,
+/// default 90s): connections without an in-flight request (noise streams, health checks)
+/// retire here so they never linger.
 fn reassembly_idle_timeout() -> Duration {
     std::env::var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS")
         .ok()
@@ -437,6 +436,20 @@ fn reassembly_idle_timeout() -> Duration {
         .filter(|seconds| (5..=86_400).contains(seconds))
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(90))
+}
+
+/// In-flight slow lane (A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS, default = fast lane):
+/// connections holding a complete request that still awaits its response. LLM gateways hold
+/// the wire silently while the model thinks (field-observed minutes before a single large
+/// chunked JSON answer); a short timeout retires the interaction request-only and the late
+/// answer bytes are orphaned and never stored. 900s covers the observed think latency.
+fn inflight_idle_timeout() -> Duration {
+    std::env::var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (5..=86_400).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or_else(reassembly_idle_timeout)
 }
 
 fn plaintext_scope_path() -> PathBuf {
@@ -980,6 +993,35 @@ mod tests {
             );
         }
         std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS");
+    }
+
+    #[test]
+    fn inflight_idle_timeout_defaults_to_fast_lane_and_is_bounded() {
+        for (fast, slow, expected_secs) in [
+            (None, None, 90),
+            (None, Some("900"), 900),
+            (Some("120"), None, 120), // 慢车道缺省跟随快车道
+            (Some("120"), Some("900"), 900),
+            (None, Some("0"), 90), // 越界回退快车道
+            (None, Some("99999999"), 90),
+            (None, Some("not-a-number"), 90),
+        ] {
+            match fast {
+                Some(v) => std::env::set_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS"),
+            }
+            match slow {
+                Some(v) => std::env::set_var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS"),
+            }
+            assert_eq!(
+                inflight_idle_timeout(),
+                Duration::from_secs(expected_secs),
+                "fast={fast:?} slow={slow:?}"
+            );
+        }
+        std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS");
+        std::env::remove_var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS");
     }
 
     #[test]

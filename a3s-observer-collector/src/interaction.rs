@@ -1588,6 +1588,10 @@ pub struct InteractionReassembler {
     max_connections: usize,
     max_body_bytes: usize,
     idle_timeout: Duration,
+    /// Slow lane for connections with a complete request still awaiting its response
+    /// (LLM gateways hold the wire silent for minutes while the model thinks). Connections
+    /// without an in-flight request retire on the fast lane (`idle_timeout`).
+    inflight_idle_timeout: Duration,
     websocket_idle_timeout: Duration,
     metrics: ReassemblyMetrics,
     gap_evidence_fingerprints: HashSet<String>,
@@ -1612,6 +1616,18 @@ impl InteractionReassembler {
         max_body_bytes: usize,
         idle_timeout: Duration,
     ) -> Self {
+        Self::with_limits_and_inflight(max_connections, max_body_bytes, idle_timeout, idle_timeout)
+    }
+
+    /// Full form: separate fast-lane (idle_timeout) and in-flight (inflight_idle_timeout)
+    /// retirement. The in-flight lane only applies while a complete request awaits its
+    /// response; everything else retires on the fast lane so noise connections never linger.
+    pub fn with_limits_and_inflight(
+        max_connections: usize,
+        max_body_bytes: usize,
+        idle_timeout: Duration,
+        inflight_idle_timeout: Duration,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             connection_aliases: HashMap::new(),
@@ -1620,22 +1636,27 @@ impl InteractionReassembler {
             max_connections: max_connections.max(1),
             max_body_bytes: max_body_bytes.max(4 * 1024),
             idle_timeout,
-            websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT.max(idle_timeout),
+            inflight_idle_timeout: inflight_idle_timeout.max(idle_timeout),
+            websocket_idle_timeout: DEFAULT_WEBSOCKET_IDLE_TIMEOUT
+                .max(idle_timeout)
+                .max(inflight_idle_timeout),
             metrics: ReassemblyMetrics::default(),
             gap_evidence_fingerprints: HashSet::new(),
             observed_fragment_sequences: HashMap::new(),
         }
     }
 
-    /// Default limits with a caller-chosen idle timeout. The legacy syscall backend needs a
-    /// longer window than the 90s default: LLM gateways on the field hold the connection
-    /// silently while the model thinks (observed minutes), so a 90s timeout retires the
-    /// interaction before the response starts and the late response bytes are orphaned.
-    pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
-        Self::with_limits(
+    /// Default limits with separate fast/in-flight idle lanes. The legacy syscall backend needs
+    /// the long in-flight lane: LLM gateways on the field hold the connection silently while
+    /// the model thinks (observed minutes), so a 90s timeout retires the interaction before the
+    /// response starts and the late response bytes are orphaned. Connections without an
+    /// in-flight request still retire on the fast lane, so noise never lingers.
+    pub fn with_idle_lanes(idle_timeout: Duration, inflight_idle_timeout: Duration) -> Self {
+        Self::with_limits_and_inflight(
             DEFAULT_MAX_CONNECTIONS,
             DEFAULT_MAX_STREAM_BYTES,
             idle_timeout,
+            inflight_idle_timeout,
         )
     }
 
@@ -3135,6 +3156,7 @@ impl InteractionReassembler {
     /// coverage can distinguish silent idle loss from filter drops.
     pub fn expire_idle(&mut self, now: Instant) {
         let idle_timeout = self.idle_timeout;
+        let inflight_idle_timeout = self.inflight_idle_timeout;
         let websocket_idle_timeout = self.websocket_idle_timeout;
         let expired_keys = self
             .connections
@@ -3142,6 +3164,8 @@ impl InteractionReassembler {
             .filter(|(_, state)| {
                 let timeout = if state.quiescent_websocket() {
                     websocket_idle_timeout
+                } else if !state.pending_requests.is_empty() {
+                    inflight_idle_timeout
                 } else {
                     idle_timeout
                 };
@@ -9931,7 +9955,7 @@ Content-Type: application/json
     #[test]
     fn long_idle_timeout_keeps_slow_llm_response_in_one_record() {
         // 现场形状：完整 POST 请求 → 模型思考 >90s（连接静默）→ 大 JSON 响应一次性到达。
-        // 默认 90s idle 会把请求单独退休（响应空壳）；with_idle_timeout(900) 应让响应归队。
+        // 默认 90s idle 会把请求单独退休（响应空壳）；双车道的慢车道(900s)应让响应归队。
         let pid = 4242_u32;
         let fd = 12_u64;
         let key = classic_tls_sock_connection_id(0, pid, fd);
@@ -9946,7 +9970,13 @@ Content-Type: application/json
             item.socket_fd = fd as i32;
             item
         };
-        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"model\":\"glm\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let req_body = br#"{"model":"glm","messages":[{"role":"user","content":"hi"}]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            req_body.len(),
+            String::from_utf8_lossy(req_body)
+        )
+        .into_bytes();
         let json = format!(
             "{{\"code\":0,\"message\":\"success\",\"data\":{{\"answer\":\"{}\"}}}}",
             "A".repeat(3000)
@@ -9956,7 +9986,7 @@ Content-Type: application/json
         // 对照组：默认 90s——请求在响应到达前被退休，响应空壳（现场 bug 复现）
         let mut r90 = InteractionReassembler::default();
         assert!(r90
-            .push(mk(ChunkDirection::Request, request.to_vec(), 1))
+            .push(mk(ChunkDirection::Request, request.clone(), 1))
             .is_empty());
         r90.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
         let retired90 = r90.take_completed();
@@ -9971,20 +10001,28 @@ Content-Type: application/json
             .iter()
             .any(|r| r == "reassembly_idle_expire_incomplete"));
 
-        // 修复组：900s——同一连接响应迟到但归队，请求/响应同在一条记录
-        let mut r900 = InteractionReassembler::with_idle_timeout(Duration::from_secs(900));
+        // 修复组：快车道 90s / 慢车道 900s——在等响应的连接走慢车道，迟到响应归队
+        let mut r900 = InteractionReassembler::with_idle_lanes(
+            Duration::from_secs(90),
+            Duration::from_secs(900),
+        );
         assert!(r900
             .push(mk(ChunkDirection::Request, request.to_vec(), 1))
             .is_empty());
         r900.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
-        assert!(r900.take_completed().is_empty(), "900s 窗口内不得提前退休");
+        assert!(
+            r900.take_completed().is_empty(),
+            "在等响应的连接 91s 不得退休"
+        );
         let mut seq = 2u64;
+        let mut completed900 = Vec::new();
         for slice in wire.chunks(1024) {
-            r900.push(mk(ChunkDirection::Response, slice.to_vec(), seq));
+            completed900.extend(r900.push(mk(ChunkDirection::Response, slice.to_vec(), seq)));
             seq += 1;
         }
         r900.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(3600));
-        let retired900 = r900.take_completed();
+        completed900.extend(r900.take_completed());
+        let retired900 = &completed900;
         assert_eq!(retired900.len(), 1, "{retired900:?}");
         assert!(
             retired900[0].response.body.len() > 1024,
@@ -9996,6 +10034,32 @@ Content-Type: application/json
             .iter()
             .any(|r| r == "reassembly_idle_expire_incomplete"
                 && retired900[0].response.body.is_empty()));
+
+        // 快车道断言：非 HTTP 噪音流（Redis/日志管道）永不完成请求头 → 无在途请求 →
+        // 仍在 90s 快车道退休，不占慢车道内存
+        let mut noise = InteractionReassembler::with_idle_lanes(
+            Duration::from_secs(90),
+            Duration::from_secs(900),
+        );
+        let noise_key = classic_tls_sock_connection_id(0, pid, 13);
+        let mut c = chunk(
+            ChunkDirection::Request,
+            b"*2\r\n$3\r\nGET\r\n$16\r\ncache:run_stat:x\r\n".to_vec(),
+            2000,
+        );
+        c.cgroup_id = 0;
+        c.pid = pid;
+        c.source = "tcp_plaintext".to_string();
+        c.adapter_id = "plain-http-syscall".to_string();
+        c.connection_id = noise_key;
+        c.sequence = 1;
+        c.socket_fd = 13;
+        noise.push(c);
+        noise.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
+        assert!(
+            !noise.take_completed().is_empty() || !noise.take_evidence().is_empty(),
+            "非 HTTP 噪音连接必须在快车道退休（90s），不得占用慢车道"
+        );
     }
 
     #[test]
