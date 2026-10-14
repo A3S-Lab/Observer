@@ -1,3 +1,11 @@
+//! Linux 4.19 legacy (perf-kprobe) collector backend.
+//!
+//! Plaintext latency contract: interactions that do not complete on the wire are flushed at the
+//! reassembler idle boundary, not immediately. A quiet connection (one-off probe GET, health
+//! check, short POST) therefore takes the reassembler idle timeout (90s by default) plus the
+//! 2s plaintext tick to appear in storage, instead of the sub-second latency of a completed
+//! request/response pair. Acceptance scripts must wait beyond that boundary before declaring
+//! plaintext capture missing; it is normal for a first event to arrive roughly 60-90s late.
 use super::interaction::{ChunkDirection, InteractionReassembler, PlaintextChunk};
 use super::tls_agent_scopes::TlsAgentScopeReloader;
 use super::{
@@ -171,6 +179,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         "legacy Observer probes attached"
     );
 
+    let ring_pages = perf_ring_pages();
     let (tx, mut rx) = mpsc::channel(4096);
     let perf_lost = Arc::new(AtomicU64::new(0));
     spawn_perf(
@@ -179,6 +188,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tx.clone(),
         perf_lost.clone(),
         wrap_exec,
+        ring_pages,
     )?;
     spawn_perf(
         &mut ebpf,
@@ -186,6 +196,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tx.clone(),
         perf_lost.clone(),
         RawEvent::Exit,
+        ring_pages,
     )?;
     spawn_perf(
         &mut ebpf,
@@ -193,6 +204,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tx.clone(),
         perf_lost.clone(),
         RawEvent::Connect,
+        ring_pages,
     )?;
     spawn_perf(
         &mut ebpf,
@@ -200,6 +212,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tx.clone(),
         perf_lost.clone(),
         wrap_file,
+        ring_pages,
     )?;
     if plaintext_http {
         spawn_perf(
@@ -208,6 +221,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             tx.clone(),
             perf_lost.clone(),
             wrap_plaintext,
+            ring_pages,
         )?;
     }
     spawn_perf(
@@ -216,6 +230,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tx,
         perf_lost.clone(),
         RawEvent::Security,
+        ring_pages,
     )?;
     let drops: PerCpuArray<_, u64> =
         PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
@@ -254,6 +269,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
     let mut interactions = plaintext_http.then(InteractionReassembler::default);
+    let mut sequencer = PlaintextSequencer::default();
+    let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
     plaintext_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     plaintext_tick.tick().await;
@@ -277,6 +294,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
                 let dropped = map_drops + perf_lost.load(Ordering::Relaxed);
                 emit_legacy_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped);
+                if suppressed_shells > 0 {
+                    // Unparsed interactions with zero request/response payload are noise (idle
+                    // expiries, non-HTTP streams). They are counted here instead of occupying
+                    // interaction rows the conversation view cannot render anyway.
+                    tracing::info!(
+                        suppressed = suppressed_shells,
+                        "legacy plaintext empty-shell interactions demoted to metrics"
+                    );
+                    suppressed_shells = 0;
+                }
                 stats = Stats::default();
             }
             _ = plaintext_tick.tick(), if plaintext_http => {
@@ -312,6 +339,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         &classifier,
                         [0u8; 16],
                         retired,
+                        &mut suppressed_shells,
                     );
                 }
             }
@@ -320,7 +348,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 match raw {
                     RawEvent::Plaintext(ev) => {
                         let seen = PLAINTEXT_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-                        if seen <= 50 || seen % 500 == 0 {
+                        if seen <= 50 || seen.is_multiple_of(500) {
                             let take = (ev.len as usize).min(32).min(ev.data.len());
                             let preview: String = ev.data[..take]
                                 .iter()
@@ -346,7 +374,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             );
                         }
                         if let Some(reassembler) = interactions.as_mut() {
-                            let chunk = plaintext_chunk_from_event(&ev, safe_unix_now_ns());
+                            let chunk = plaintext_chunk_from_event(
+                                &ev,
+                                safe_unix_now_ns(),
+                                &mut sequencer,
+                            );
                             let completed = reassembler.push(chunk);
                             emit_plaintext_interactions(
                                 exporter.as_ref(),
@@ -355,6 +387,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 &classifier,
                                 ev.comm,
                                 completed,
+                                &mut suppressed_shells,
                             );
                         }
                     }
@@ -377,6 +410,18 @@ fn plaintext_http_enabled() -> bool {
                 )
         })
         .unwrap_or(false)
+}
+
+/// Perf ring buffer pages per CPU per map (A3S_OBSERVER_PERF_RING_PAGES). On a 64 KiB-page
+/// host the default 8 pages = 512 KiB per CPU per map; larger values absorb SSE bursts at the
+/// cost of pages * page_size * cpu_count bytes of locked memory per perf map. Bounds keep an
+/// accidental huge value from exhausting memory: 1..=1024 pages (64 MiB per map at 64 KiB pages).
+fn perf_ring_pages() -> usize {
+    std::env::var("A3S_OBSERVER_PERF_RING_PAGES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|pages| (1..=1_024).contains(pages))
+        .unwrap_or(8)
 }
 
 fn plaintext_scope_path() -> PathBuf {
@@ -409,15 +454,45 @@ fn sync_plaintext_allowed(map: &mut BpfHashMap<MapData, u32, u8>, pids: &HashSet
     }
 }
 
-fn plaintext_chunk_from_event(ev: &LegacyPlaintextEvent, now_unix_ns: u128) -> PlaintextChunk {
+/// Per-connection, per-direction consecutive sequence numbers. The reassembler flags
+/// `fragment_sequence_gap` whenever a chunk's sequence is not exactly previous+1, so the raw
+/// monotonic capture timestamp must NOT be used as the sequence (that was the compat25 bug that
+/// stamped every multi-chunk interaction with a spurious gap). Counters are userspace state:
+/// zero kernel cost and the same semantics as the modern `call_seq`.
+#[derive(Default)]
+struct PlaintextSequencer {
+    counters: std::collections::HashMap<(u32, u32, bool), u64>,
+}
+
+impl PlaintextSequencer {
+    fn next(&mut self, pid: u32, fd: u32, is_read: bool) -> u64 {
+        if self.counters.len() >= 4_096 && !self.counters.contains_key(&(pid, fd, is_read)) {
+            // Bounded state: evict one arbitrary baseline. A fresh key restarts at 1, which the
+            // reassembler treats as a new baseline (no gap), never as a fabricated continuity.
+            if let Some(oldest) = self.counters.keys().next().copied() {
+                self.counters.remove(&oldest);
+            }
+        }
+        let slot = self.counters.entry((pid, fd, is_read)).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        *slot
+    }
+}
+
+fn plaintext_chunk_from_event(
+    ev: &LegacyPlaintextEvent,
+    now_unix_ns: u128,
+    sequencer: &mut PlaintextSequencer,
+) -> PlaintextChunk {
     let len = (ev.len as usize).min(LEGACY_PLAINTEXT_LEN);
+    let is_read = ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ;
     PlaintextChunk {
         cgroup_id: 0,
         pid: ev.pid,
         // The legacy ABI carries no kernel cgroup id; (pid, fd) is the connection key. The
         // reassembler pairs requests and responses on it exactly like the modern TCP path.
         connection_id: classic_tls_sock_connection_id(0, ev.pid, u64::from(ev.fd)),
-        sequence: ev.captured_at_boot_ns,
+        sequence: sequencer.next(ev.pid, ev.fd, is_read),
         direction: if ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ {
             ChunkDirection::Response
         } else {
@@ -447,8 +522,16 @@ fn emit_plaintext_interactions(
     classifier: &SniClassifier,
     comm: [u8; 16],
     completed: Vec<super::interaction::CompletedInteraction>,
+    suppressed_shells: &mut u64,
 ) {
     for interaction in completed {
+        // Unparsed interactions with zero payload on both sides are pure noise (idle expiries
+        // and non-HTTP streams sharing an admitted pid). Demote them to a metric instead of
+        // storing empty interaction rows the conversation view cannot render.
+        if interaction.is_empty_unparsed_shell() {
+            *suppressed_shells = suppressed_shells.saturating_add(1);
+            continue;
+        }
         let n = PLAINTEXT_INTERACTION_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::info!(
             n,
@@ -533,13 +616,14 @@ fn spawn_perf<T: Copy + Send + 'static>(
     tx: mpsc::Sender<RawEvent>,
     lost: Arc<AtomicU64>,
     wrap: fn(T) -> RawEvent,
+    ring_pages: usize,
 ) -> anyhow::Result<()> {
     let mut array = AsyncPerfEventArray::try_from(
         ebpf.take_map(map_name)
             .with_context(|| format!("`{map_name}` missing"))?,
     )?;
     for cpu in online_cpus().map_err(|(_, error)| error)? {
-        let mut buffer = array.open(cpu, Some(8))?;
+        let mut buffer = array.open(cpu, Some(ring_pages))?;
         let tx = tx.clone();
         let lost = lost.clone();
         tokio::spawn(async move {
@@ -773,11 +857,18 @@ mod tests {
 
     #[test]
     fn plaintext_chunk_maps_request_direction_and_bounds_payload() {
-        let chunk = plaintext_chunk_from_event(&plaintext_event(0, 5, 5), 999);
+        let chunk = plaintext_chunk_from_event(
+            &plaintext_event(0, 5, 5),
+            999,
+            &mut PlaintextSequencer::default(),
+        );
         assert!(matches!(chunk.direction, ChunkDirection::Request));
         assert_eq!(chunk.data, b"GET /");
         assert_eq!(chunk.pid, 4242);
-        assert_eq!(chunk.sequence, 123_456_789);
+        assert_eq!(
+            chunk.sequence, 1,
+            "userspace sequencer starts at 1, not ktime"
+        );
         assert_eq!(chunk.source, "tcp_plaintext");
         assert_eq!(chunk.adapter_id, "plain-http-syscall");
         assert!(chunk.partial_reasons.is_empty());
@@ -793,6 +884,7 @@ mod tests {
         let chunk = plaintext_chunk_from_event(
             &plaintext_event(LEGACY_PLAINTEXT_DIRECTION_READ, 512, 4096),
             999,
+            &mut PlaintextSequencer::default(),
         );
         assert!(matches!(chunk.direction, ChunkDirection::Response));
         assert_eq!(chunk.partial_reasons, vec!["probe_call_limit".to_string()]);
@@ -801,8 +893,56 @@ mod tests {
     #[test]
     fn plaintext_chunk_never_overruns_the_fixed_payload() {
         // A corrupted length field must not read past the fixed record.
-        let chunk = plaintext_chunk_from_event(&plaintext_event(0, u32::MAX, u32::MAX), 999);
+        let chunk = plaintext_chunk_from_event(
+            &plaintext_event(0, u32::MAX, u32::MAX),
+            999,
+            &mut PlaintextSequencer::default(),
+        );
         assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN);
+    }
+
+    #[test]
+    fn plaintext_sequencer_is_consecutive_per_connection_and_direction() {
+        let mut sequencer = PlaintextSequencer::default();
+        let ev = plaintext_event(0, 5, 5);
+        let first = plaintext_chunk_from_event(&ev, 1, &mut sequencer);
+        let second = plaintext_chunk_from_event(&ev, 2, &mut sequencer);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(
+            second.sequence, 2,
+            "sequence must be previous+1 or the reassembler flags a gap"
+        );
+        let response = plaintext_chunk_from_event(
+            &plaintext_event(LEGACY_PLAINTEXT_DIRECTION_READ, 5, 5),
+            3,
+            &mut sequencer,
+        );
+        assert_eq!(
+            response.sequence, 1,
+            "response direction has its own baseline"
+        );
+        let mut other_fd = plaintext_event(0, 5, 5);
+        other_fd.fd = 99;
+        let other = plaintext_chunk_from_event(&other_fd, 4, &mut sequencer);
+        assert_eq!(other.sequence, 1, "a different fd is a different stream");
+    }
+
+    #[test]
+    fn perf_ring_pages_env_is_bounded() {
+        for (value, expected) in [
+            (None, 8),
+            (Some("64"), 64),
+            (Some("0"), 8),
+            (Some("99999"), 8),
+            (Some("not-a-number"), 8),
+        ] {
+            match value {
+                Some(v) => std::env::set_var("A3S_OBSERVER_PERF_RING_PAGES", v),
+                None => std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES"),
+            }
+            assert_eq!(perf_ring_pages(), expected, "value={value:?}");
+        }
+        std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
     }
 
     #[test]

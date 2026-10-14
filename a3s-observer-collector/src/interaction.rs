@@ -7,6 +7,7 @@
 //! (`:method`/`:path`/`:status`/`content-type`/`host`/`authority`) plus DATA bodies; HPACK desync
 //! surfaces as `h2_hpack_desync` while the DATA body-only lane continues.
 
+use crate::event_time::system_now_unix_ns;
 use crate::h2_hpack::{HpackDecoder, Http2HeaderBlock};
 use a3s_observer::{
     DefaultLlmFormatAdapter, LlmConversationAnchor, LlmFormatAdapter, LlmInteractionContent,
@@ -44,6 +45,18 @@ const WEBSOCKET_DEFLATE_TAIL: &[u8; 4] = b"\x00\x00\xff\xff";
 pub enum ChunkDirection {
     Request,
     Response,
+}
+
+impl CompletedInteraction {
+    /// Pure-noise outcome: no wire parse and zero payload on both sides (idle expiries and
+    /// non-HTTP streams sharing an admitted pid). Collectors may demote these to metrics
+    /// instead of storing rows the conversation view cannot render.
+    #[allow(dead_code)] // consumed by the legacy (Linux 4.19) collector backend only
+    pub fn is_empty_unparsed_shell(&self) -> bool {
+        self.parse_state == "unparsed"
+            && self.request.captured_bytes == 0
+            && self.response.captured_bytes == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -646,6 +659,41 @@ impl HttpStreamDecoder {
     fn observed_at_unix_ns(&self) -> u128 {
         self.last_at_unix_ns
             .max(self.buffer_started_at_unix_ns.unwrap_or(0))
+    }
+
+    /// Flush the buffered bytes as a partial HTTP message at a retire boundary. Only a valid
+    /// head (start line + headers) is required; the body is whatever arrived. Returns None for
+    /// empty or non-HTTP buffers so pure noise stays out of the interaction stream.
+    fn take_partial_message(&mut self, at_unix_ns: u128) -> Option<HttpMessage> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let (header_len, start_line, headers, _) =
+            parse_http_head(self.kind, &self.buffer).ok()??;
+        let body = self.buffer[header_len..].to_vec();
+        let mut partial_reasons = std::mem::take(&mut self.partial_reasons);
+        extend_unique(
+            &mut partial_reasons,
+            ["reassembly_retire_partial".to_string()],
+        );
+        let started_at = self.buffer_started_at_unix_ns.unwrap_or(at_unix_ns);
+        self.buffer.clear();
+        self.buffer_started_at_unix_ns = None;
+        self.last_decode_error = None;
+        self.sse_scan = SseTerminalScanState::default();
+        self.chunked_scan = SseTerminalScanState::default();
+        Some(HttpMessage {
+            start_line,
+            headers,
+            captured_body_bytes: body.len(),
+            body,
+            started_at_unix_ns: started_at,
+            completed_at_unix_ns: at_unix_ns,
+            partial_reasons,
+            metadata_inferred: true,
+            transport_protocol: None,
+            derived_body: None,
+        })
     }
 
     fn push(
@@ -3105,9 +3153,12 @@ impl InteractionReassembler {
         reason: &'static str,
     ) {
         let pending_requests = state.pending_requests.len();
-        self.flush_pending_requests_as_partial(key, &mut state, reason);
+        // Capture the buffer sizes before flushing: the retire path may drain them into a
+        // partial interaction, and the coverage-gap evidence must still describe the truncated
+        // bytes that were observed (both channels are intentional, not duplicates in intent).
         let request_buffer_bytes = state.requests.buffered_bytes();
         let response_buffer_bytes = state.responses.buffered_bytes();
+        self.flush_pending_requests_as_partial(key, &mut state, reason);
         if pending_requests > 0 || request_buffer_bytes > 0 || response_buffer_bytes > 0 {
             tracing::warn!(
                 pid = key.pid,
@@ -3231,21 +3282,18 @@ impl InteractionReassembler {
         state: &mut ConnectionState,
         reason: &'static str,
     ) {
+        let at = system_now_unix_ns().unwrap_or(0);
+        let mut flushed_something = false;
+        // Prefer any real response bytes over the synthetic empty response. A response that
+        // arrived but never framed completely still carries model output worth showing.
         while let Some(mut request) = state.pop_pending_request() {
+            flushed_something = true;
             extend_unique(&mut request.partial_reasons, [reason.to_string()]);
             add_binding_reasons(state, &mut request.partial_reasons);
-            let response = HttpMessage {
-                start_line: "HTTP/1.1 0 Unobserved".to_string(),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-                captured_body_bytes: 0,
-                started_at_unix_ns: request.completed_at_unix_ns,
-                completed_at_unix_ns: request.completed_at_unix_ns,
-                partial_reasons: vec![reason.to_string()],
-                metadata_inferred: true,
-                transport_protocol: request.transport_protocol.clone(),
-                derived_body: None,
-            };
+            let response = state
+                .responses
+                .take_partial_message(at)
+                .unwrap_or_else(|| Self::unobserved_response(&request, reason));
             state.sequence = state.sequence.wrapping_add(1);
             let Some(interaction) = build_interaction(
                 key,
@@ -3266,6 +3314,54 @@ impl InteractionReassembler {
                 self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
             }
             self.pending_completed.push_back(interaction);
+        }
+        if !flushed_something {
+            // A request whose body never completed still carries the user's question. Flush it
+            // as a partial interaction instead of dropping it to gap-only evidence. Buffers that
+            // do not start with a valid HTTP head return None and stay evidence-only.
+            if let Some(mut request) = state.requests.take_partial_message(at) {
+                extend_unique(&mut request.partial_reasons, [reason.to_string()]);
+                add_binding_reasons(state, &mut request.partial_reasons);
+                let response = state
+                    .responses
+                    .take_partial_message(at)
+                    .unwrap_or_else(|| Self::unobserved_response(&request, reason));
+                state.sequence = state.sequence.wrapping_add(1);
+                if let Some(interaction) = build_interaction(
+                    key,
+                    state.sequence,
+                    &state.source,
+                    &state.adapter_id,
+                    request,
+                    response,
+                    state.bind_quality,
+                    state.socket_fd,
+                    state.socket_cookie,
+                    state.fd_generation,
+                ) {
+                    if self.pending_completed.len() >= self.max_connections {
+                        self.pending_completed.pop_front();
+                        self.metrics.evidence_evictions =
+                            self.metrics.evidence_evictions.saturating_add(1);
+                    }
+                    self.pending_completed.push_back(interaction);
+                }
+            }
+        }
+    }
+
+    fn unobserved_response(request: &HttpMessage, reason: &str) -> HttpMessage {
+        HttpMessage {
+            start_line: "HTTP/1.1 0 Unobserved".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            captured_body_bytes: 0,
+            started_at_unix_ns: request.completed_at_unix_ns,
+            completed_at_unix_ns: request.completed_at_unix_ns,
+            partial_reasons: vec![reason.to_string()],
+            metadata_inferred: true,
+            transport_protocol: request.transport_protocol.clone(),
+            derived_body: None,
         }
     }
 
@@ -4901,6 +4997,18 @@ fn build_interaction(
             .unwrap_or_default();
         (structured, text, calls)
     };
+    // A truncated non-SSE response still yields the model's completed earlier choices: salvage
+    // them so the answer side of the timeline is not lost with the whole-document JSON error.
+    let response_text_salvaged = response_text.is_none()
+        && !response_is_sse
+        && salvage_closed_json_objects(&response_parse_body, "choices")
+            .as_ref()
+            .and_then(extract_response_text)
+            .map(|text| {
+                response_text = Some(text);
+                true
+            })
+            .unwrap_or(false);
     dedup_tool_calls(&mut tool_calls);
     if status_code < 400
         && !response_matches_wire_template(
@@ -4932,6 +5040,15 @@ fn build_interaction(
         .as_ref()
         .map(extract_request_messages)
         .unwrap_or_default();
+    // Whole-document JSON failure must not erase complete earlier user messages: a probe cap or
+    // a lost fragment can truncate the tail while every closed message object is still valid.
+    let mut request_messages_salvaged = false;
+    if messages.is_empty() && request_json.is_none() {
+        if let Some(salvaged) = salvage_closed_json_objects(&request_body, "messages") {
+            messages = extract_request_messages(&salvaged);
+            request_messages_salvaged = !messages.is_empty();
+        }
+    }
     if structured_output_final.is_some() && request.header("x-anysentry-run-id").is_some() {
         for message in &mut messages {
             if framework_orchestration_prompt(&message.content) {
@@ -5010,6 +5127,18 @@ fn build_interaction(
         extend_unique(
             &mut partial_reasons,
             [format!("wire_template_{}", wire_match.parse_state)],
+        );
+    }
+    if request_messages_salvaged {
+        extend_unique(
+            &mut partial_reasons,
+            ["truncated_request_messages_salvaged".to_string()],
+        );
+    }
+    if response_text_salvaged {
+        extend_unique(
+            &mut partial_reasons,
+            ["truncated_response_text_salvaged".to_string()],
         );
     }
     let transport_completeness = if request.partial_reasons.is_empty()
@@ -5900,6 +6029,51 @@ fn process_http2_chunk(
     (completed, gap_reasons)
 }
 
+/// Shared start-line/header parser. Ok(None) means "need more bytes"; Err means malformed.
+/// The response variant also returns the status code used by framing decisions.
+type HttpHead = (usize, String, BTreeMap<String, String>, Option<u16>);
+
+fn parse_http_head(kind: StreamKind, bytes: &[u8]) -> Result<Option<HttpHead>, String> {
+    let mut headers_storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    match kind {
+        StreamKind::Request => {
+            let mut request = httparse::Request::new(&mut headers_storage);
+            let status = request
+                .parse(bytes)
+                .map_err(|_| "http_request_parse_error".to_string())?;
+            let httparse::Status::Complete(header_len) = status else {
+                return Ok(None);
+            };
+            let method = request.method.unwrap_or_default();
+            let path = request.path.unwrap_or_default();
+            let version = request.version.unwrap_or(1);
+            Ok(Some((
+                header_len,
+                format!("{method} {path} HTTP/1.{version}"),
+                owned_headers(request.headers),
+                None,
+            )))
+        }
+        StreamKind::Response => {
+            let mut response = httparse::Response::new(&mut headers_storage);
+            let status = response
+                .parse(bytes)
+                .map_err(|_| "http_response_parse_error".to_string())?;
+            let httparse::Status::Complete(header_len) = status else {
+                return Ok(None);
+            };
+            let code = response.code.unwrap_or_default();
+            let version = response.version.unwrap_or(1);
+            Ok(Some((
+                header_len,
+                format!("HTTP/1.{version} {code}"),
+                owned_headers(response.headers),
+                Some(code),
+            )))
+        }
+    }
+}
+
 fn decode_http_message(
     kind: StreamKind,
     bytes: &[u8],
@@ -5914,43 +6088,8 @@ fn decode_http_message(
         return Err("unsupported_http2".to_string());
     }
 
-    let mut headers_storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let (header_len, start_line, headers, status_code) = match kind {
-        StreamKind::Request => {
-            let mut request = httparse::Request::new(&mut headers_storage);
-            let status = request
-                .parse(bytes)
-                .map_err(|_| "http_request_parse_error".to_string())?;
-            let httparse::Status::Complete(header_len) = status else {
-                return Ok(None);
-            };
-            let method = request.method.unwrap_or_default();
-            let path = request.path.unwrap_or_default();
-            let version = request.version.unwrap_or(1);
-            (
-                header_len,
-                format!("{method} {path} HTTP/1.{version}"),
-                owned_headers(request.headers),
-                None,
-            )
-        }
-        StreamKind::Response => {
-            let mut response = httparse::Response::new(&mut headers_storage);
-            let status = response
-                .parse(bytes)
-                .map_err(|_| "http_response_parse_error".to_string())?;
-            let httparse::Status::Complete(header_len) = status else {
-                return Ok(None);
-            };
-            let code = response.code.unwrap_or_default();
-            let version = response.version.unwrap_or(1);
-            (
-                header_len,
-                format!("HTTP/1.{version} {code}"),
-                owned_headers(response.headers),
-                Some(code),
-            )
-        }
+    let Some((header_len, start_line, headers, status_code)) = parse_http_head(kind, bytes)? else {
+        return Ok(None);
     };
 
     let body_bytes = &bytes[header_len..];
@@ -6604,6 +6743,69 @@ fn append_schema_descriptor(value: &Value, depth: usize, output: &mut String) {
 
 fn parse_json_body(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(body).ok()
+}
+
+/// Best-effort message salvage for a truncated LLM JSON document. A probe payload cap or a
+/// dropped fragment can invalidate the *whole* JSON value even though earlier array elements
+/// are complete and independently valid. Extract the fully-closed objects of one named array
+/// ("messages" in requests, "choices" in responses) into a synthetic document so the
+/// conversation timeline still shows the turns that did arrive. The truncation itself stays
+/// visible through transport partial reasons; nothing is rewritten as complete.
+fn salvage_closed_json_objects(body: &[u8], array_key: &str) -> Option<Value> {
+    let needle = format!("\"{array_key}\"");
+    let key_at = find_bytes(body, needle.as_bytes())?;
+    let array_at = key_at + find_bytes(&body[key_at..], b"[")?;
+    let mut elements = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0u32;
+    let mut element_start: Option<usize> = None;
+    let mut cursor = array_at + 1;
+    while cursor < body.len() {
+        let byte = body[cursor];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    element_start = Some(cursor);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = element_start.take() {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&body[start..=cursor]) {
+                            elements.push(value);
+                        }
+                    }
+                }
+            }
+            b']' if depth == 0 => break,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if elements.is_empty() {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert(array_key.to_string(), Value::Array(elements));
+    Some(Value::Object(object))
 }
 
 fn bounded_provider_id(value: Option<&Value>) -> Option<String> {
@@ -9588,6 +9790,166 @@ mod tests {
     }
 
     #[test]
+    fn plain_tcp_consecutive_sequences_have_no_fragment_gap() {
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        let req = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"model":"glm","messages":[{"role":"user","content":"hello-sequence"}]}"#,
+        );
+        let resp = http_response(r#"{"choices":[{"message":{"content":"ok-seq"}}]}"#);
+        let tcp = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        let mut reassembler = InteractionReassembler::default();
+        let mut completed = Vec::new();
+        let mut req_seq = 0_u64;
+        for part in req.chunks(512) {
+            req_seq += 1;
+            completed.extend(reassembler.push(tcp(
+                ChunkDirection::Request,
+                part.to_vec(),
+                req_seq,
+            )));
+        }
+        let mut resp_seq = 0_u64;
+        for part in resp.chunks(512) {
+            resp_seq += 1;
+            completed.extend(reassembler.push(tcp(
+                ChunkDirection::Response,
+                part.to_vec(),
+                resp_seq,
+            )));
+        }
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert!(
+            !completed[0]
+                .partial_reasons
+                .iter()
+                .any(|r| r == "fragment_sequence_gap"),
+            "consecutive per-direction sequences must not flag gaps: {:?}",
+            completed[0].partial_reasons
+        );
+        assert_eq!(completed[0].parse_state, "parsed");
+        assert_eq!(completed[0].completeness, "complete");
+    }
+
+    #[test]
+    fn truncated_openai_exchange_salvages_user_messages_and_response_text() {
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        // The request JSON is truncated after the first complete message object; the second
+        // message object is cut mid-string. The response is truncated after one closed choice.
+        let request = br#"POST /v1/chat/completions HTTP/1.1
+Host: llm:3888
+Content-Type: application/json
+Content-Length: 111
+
+{"model":"glm","messages":[{"role":"user","content":"what is 100*2"},{"role":"user","content":"truncated-tail"#;
+        let response = br#"HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"choices":[{"message":{"content":"200"}},{"message":{"content":"cut"#;
+        let tcp = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        let mut reassembler = InteractionReassembler::default();
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Request, request.to_vec(), 1))
+            .is_empty());
+        // A truncated response has no self-delimiting frame, so the interaction flushes at the
+        // idle boundary — exactly the field's reassembly_idle_expire_incomplete path.
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Response, response.to_vec(), 2))
+            .is_empty());
+        reassembler.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let completed = reassembler.take_completed();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let item = &completed[0];
+        assert_eq!(
+            item.request.messages.len(),
+            1,
+            "{:?}",
+            item.request.messages
+        );
+        assert!(
+            item.partial_reasons
+                .iter()
+                .any(|r| r == "truncated_request_messages_salvaged"),
+            "{:?}",
+            item.partial_reasons
+        );
+        assert!(
+            item.partial_reasons
+                .iter()
+                .any(|r| r == "truncated_response_text_salvaged"),
+            "{:?}",
+            item.partial_reasons
+        );
+        assert_eq!(item.response.text.as_deref(), Some("200"));
+        assert!(
+            item.semantic_items
+                .iter()
+                .any(|entry| entry.kind == "user_message"),
+            "salvaged user turns must reach the semantic timeline: {:?}",
+            item.semantic_items
+        );
+    }
+
+    #[test]
+    fn empty_unparsed_shell_detection_matches_only_noise() {
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        let tcp = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        // A real exchange must NOT be demoted.
+        let mut reassembler = InteractionReassembler::default();
+        let req = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[]}"#,
+        );
+        let resp = http_response(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Request, req, 1))
+            .is_empty());
+        let completed = reassembler.push(tcp(ChunkDirection::Response, resp, 2));
+        assert_eq!(completed.len(), 1);
+        assert!(!completed[0].is_empty_unparsed_shell());
+    }
+
+    #[test]
     fn plain_tcp_parallel_posts_do_not_swap_responses() {
         let cgroup = 9_u64;
         let pid = 4242_u32;
@@ -10141,8 +10503,8 @@ mod tests {
     #[test]
     fn idle_orphan_request_cannot_poison_a_later_response() {
         // Leave an incomplete request body in the stream buffer (Content-Length not satisfied)
-        // so idle expire must drop state without fabricating an LlmInteraction, while still
-        // emitting AgentPlaintextEvidence for the coverage gap.
+        // so idle expire retires it as a partial interaction carrying whatever bytes arrived,
+        // and the coverage-gap evidence record must also be preserved.
         let incomplete = b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: 120\r\n\r\n{\"model\":\"gpt-test\",\"messages\":[{\"role\":\"user\",\"content\":\"orphan\"}";
         let mut reassembler =
             InteractionReassembler::with_limits(8, 64 * 1024, Duration::from_millis(1));

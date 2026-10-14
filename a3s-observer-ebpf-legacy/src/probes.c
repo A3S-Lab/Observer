@@ -106,7 +106,7 @@ struct sec_event {
     struct capture_decision decision;
 };
 
-#define LEGACY_PLAINTEXT_LEN 512
+#define LEGACY_PLAINTEXT_LEN 1024
 #define LEGACY_PLAINTEXT_DIRECTION_WRITE 0
 #define LEGACY_PLAINTEXT_DIRECTION_READ 1
 
@@ -138,7 +138,7 @@ _Static_assert(sizeof(struct exit_event) == 72, "exit_event ABI mismatch");
 _Static_assert(sizeof(struct connect_event) == 80, "connect_event ABI mismatch");
 _Static_assert(sizeof(struct file_event) == 312, "file_event ABI mismatch");
 _Static_assert(sizeof(struct sec_event) == 64, "sec_event ABI mismatch");
-_Static_assert(sizeof(struct plaintext_event) == 560, "plaintext_event ABI mismatch");
+_Static_assert(sizeof(struct plaintext_event) == 1072, "plaintext_event ABI mismatch");
 _Static_assert(sizeof(struct read_args) == 16, "read_args ABI mismatch");
 
 #define PERF_MAP(name) \
