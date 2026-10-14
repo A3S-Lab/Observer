@@ -1627,6 +1627,18 @@ impl InteractionReassembler {
         }
     }
 
+    /// Default limits with a caller-chosen idle timeout. The legacy syscall backend needs a
+    /// longer window than the 90s default: LLM gateways on the field hold the connection
+    /// silently while the model thinks (observed minutes), so a 90s timeout retires the
+    /// interaction before the response starts and the late response bytes are orphaned.
+    pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_CONNECTIONS,
+            DEFAULT_MAX_STREAM_BYTES,
+            idle_timeout,
+        )
+    }
+
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
         self.evict_if_needed();
         let observed_key = ConnectionKey::from(&chunk);
@@ -9914,6 +9926,76 @@ Content-Type: application/json
             "salvaged user turns must reach the semantic timeline: {:?}",
             item.semantic_items
         );
+    }
+
+    #[test]
+    fn long_idle_timeout_keeps_slow_llm_response_in_one_record() {
+        // 现场形状：完整 POST 请求 → 模型思考 >90s（连接静默）→ 大 JSON 响应一次性到达。
+        // 默认 90s idle 会把请求单独退休（响应空壳）；with_idle_timeout(900) 应让响应归队。
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        let mk = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"model\":\"glm\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let json = format!(
+            "{{\"code\":0,\"message\":\"success\",\"data\":{{\"answer\":\"{}\"}}}}",
+            "A".repeat(3000)
+        );
+        let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", json.len(), json).into_bytes();
+
+        // 对照组：默认 90s——请求在响应到达前被退休，响应空壳（现场 bug 复现）
+        let mut r90 = InteractionReassembler::default();
+        assert!(r90
+            .push(mk(ChunkDirection::Request, request.to_vec(), 1))
+            .is_empty());
+        r90.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
+        let retired90 = r90.take_completed();
+        assert_eq!(retired90.len(), 1, "{retired90:?}");
+        assert_eq!(
+            retired90[0].response.body.len(),
+            0,
+            "90s idle 应复现响应空壳"
+        );
+        assert!(retired90[0]
+            .partial_reasons
+            .iter()
+            .any(|r| r == "reassembly_idle_expire_incomplete"));
+
+        // 修复组：900s——同一连接响应迟到但归队，请求/响应同在一条记录
+        let mut r900 = InteractionReassembler::with_idle_timeout(Duration::from_secs(900));
+        assert!(r900
+            .push(mk(ChunkDirection::Request, request.to_vec(), 1))
+            .is_empty());
+        r900.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
+        assert!(r900.take_completed().is_empty(), "900s 窗口内不得提前退休");
+        let mut seq = 2u64;
+        for slice in wire.chunks(1024) {
+            r900.push(mk(ChunkDirection::Response, slice.to_vec(), seq));
+            seq += 1;
+        }
+        r900.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let retired900 = r900.take_completed();
+        assert_eq!(retired900.len(), 1, "{retired900:?}");
+        assert!(
+            retired900[0].response.body.len() > 1024,
+            "迟到响应应进入同一记录: {:?}",
+            retired900[0].partial_reasons
+        );
+        assert!(!retired900[0]
+            .partial_reasons
+            .iter()
+            .any(|r| r == "reassembly_idle_expire_incomplete"
+                && retired900[0].response.body.is_empty()));
     }
 
     #[test]

@@ -268,7 +268,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let classifier = SniClassifier;
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
-    let mut interactions = plaintext_http.then(InteractionReassembler::default);
+    let mut interactions = plaintext_http
+        .then(|| InteractionReassembler::with_idle_timeout(reassembly_idle_timeout()));
     let mut sequencer = PlaintextSequencer::default();
     let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
@@ -422,6 +423,20 @@ fn perf_ring_pages() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|pages| (1..=1_024).contains(pages))
         .unwrap_or(8)
+}
+
+/// Reassembler idle timeout (A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS). The 90s default
+/// is fine for request/response APIs, but LLM gateways hold the connection silently while the
+/// model thinks (field-observed minutes of silence before a single large chunked JSON answer):
+/// a 90s timeout retires the interaction before the response starts, the answer bytes then
+/// arrive orphaned and are never stored. 600s+ keeps request and response in one record.
+fn reassembly_idle_timeout() -> Duration {
+    std::env::var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (5..=86_400).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(90))
 }
 
 fn plaintext_scope_path() -> PathBuf {
@@ -943,6 +958,28 @@ mod tests {
             assert_eq!(perf_ring_pages(), expected, "value={value:?}");
         }
         std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
+    }
+
+    #[test]
+    fn reassembly_idle_timeout_env_is_bounded() {
+        for (value, expected_secs) in [
+            (None, 90),
+            (Some("600"), 600),
+            (Some("0"), 90),
+            (Some("99999999"), 90),
+            (Some("not-a-number"), 90),
+        ] {
+            match value {
+                Some(v) => std::env::set_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS"),
+            }
+            assert_eq!(
+                reassembly_idle_timeout(),
+                Duration::from_secs(expected_secs),
+                "value={value:?}"
+            );
+        }
+        std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS");
     }
 
     #[test]
