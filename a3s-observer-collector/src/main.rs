@@ -4032,7 +4032,12 @@ impl CollectorProcessor {
         Self {
             peers: HashMap::new(),
             llm_meta: HashMap::new(),
-            interactions: InteractionReassembler::default(),
+            // Same two idle lanes as the legacy backend: fast lane for noise, long in-flight
+            // lane for LLM think phases. Defaults preserve the previous 90s behavior.
+            interactions: InteractionReassembler::with_idle_lanes(
+                InteractionReassembler::reassembly_idle_timeout(),
+                InteractionReassembler::inflight_idle_timeout(),
+            ),
             exec_assembler: ExecAssembler::new(exec_commit_probe_attached),
             process_lifecycles: ProcessLifecycleStore::default(),
             tls_attach_candidate_pids: HashSet::new(),

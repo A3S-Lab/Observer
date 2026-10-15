@@ -670,7 +670,20 @@ impl HttpStreamDecoder {
         }
         let (header_len, start_line, headers, _) =
             parse_http_head(self.kind, &self.buffer).ok()??;
-        let body = self.buffer[header_len..].to_vec();
+        let raw_body = &self.buffer[header_len..];
+        // Partial bodies still need HTTP framing removed: a chunked+gzip response must be
+        // de-chunked (complete chunks only) before the content-encoding stage can decompress.
+        let transfer_chunked = headers
+            .get("transfer-encoding")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case("chunked"));
+        let body = if transfer_chunked {
+            decode_chunked_partial(raw_body)
+        } else {
+            raw_body.to_vec()
+        };
         let mut partial_reasons = std::mem::take(&mut self.partial_reasons);
         extend_unique(
             &mut partial_reasons,
@@ -1651,6 +1664,32 @@ impl InteractionReassembler {
     /// the model thinks (observed minutes), so a 90s timeout retires the interaction before the
     /// response starts and the late response bytes are orphaned. Connections without an
     /// in-flight request still retire on the fast lane, so noise never lingers.
+    /// Reassembler fast-lane idle timeout (A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS,
+    /// default 90s): connections without an in-flight request (noise streams, health checks)
+    /// retire here so they never linger.
+    pub fn reassembly_idle_timeout() -> Duration {
+        std::env::var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| (1..=86_400).contains(seconds))
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(90))
+    }
+
+    /// In-flight slow lane (A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS, default = fast lane):
+    /// connections holding a complete request that still awaits its response. LLM gateways hold
+    /// the wire silently while the model thinks; a short timeout retires the interaction
+    /// request-only and the late answer bytes are orphaned. 900s covers the observed think
+    /// latency on slow gateways.
+    pub fn inflight_idle_timeout() -> Duration {
+        std::env::var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| (5..=86_400).contains(seconds))
+            .map(Duration::from_secs)
+            .unwrap_or_else(Self::reassembly_idle_timeout)
+    }
+
     pub fn with_idle_lanes(idle_timeout: Duration, inflight_idle_timeout: Duration) -> Self {
         Self::with_limits_and_inflight(
             DEFAULT_MAX_CONNECTIONS,
@@ -5085,6 +5124,17 @@ fn build_interaction(
             request_messages_salvaged = !messages.is_empty();
         }
     }
+    // The conversation projection drops interactionType=unparsed wholesale. A truncated but
+    // LLM-shaped exchange is not an unknown wire: the salvage is sufficient evidence to admit
+    // it as a partial model interaction so its salvaged turns reach the semantic timeline.
+    if wire_match.parse_state != "parsed" && (request_messages_salvaged || response_text_salvaged) {
+        wire_match = WireMatch {
+            template_id: "generic-llm-json",
+            likelihood: "likely",
+            parse_state: "partial",
+            interaction_kind: WireInteractionKind::Model,
+        };
+    }
     if structured_output_final.is_some() && request.header("x-anysentry-run-id").is_some() {
         for message in &mut messages {
             if framework_orchestration_prompt(&message.content) {
@@ -6249,6 +6299,44 @@ fn is_secret_header(name: &str) -> bool {
     )
 }
 
+/// Tolerant de-chunking for retire-time partial bodies: emit every complete chunk, drop the
+/// incomplete tail. Never errors on truncation; malformed framing yields whatever was decoded
+/// so far (possibly empty), which downstream treats as truncated rather than fabricated.
+fn decode_chunked_partial(bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(line_end) = find_bytes(&bytes[cursor..], b"\r\n") {
+        let line_end = cursor + line_end;
+        let Ok(size_line) = std::str::from_utf8(&bytes[cursor..line_end]) else {
+            break;
+        };
+        let size_text = size_line.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        cursor = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        let Some(chunk_end) = cursor.checked_add(size) else {
+            break;
+        };
+        if bytes.len() < chunk_end + 2 {
+            // The declared chunk is incomplete (the field's common "one big chunk" shape):
+            // its arrived prefix is still real payload — keep it instead of dropping all.
+            let available_end = chunk_end.min(bytes.len());
+            body.extend_from_slice(&bytes[cursor..available_end]);
+            break;
+        }
+        if bytes.get(chunk_end..chunk_end + 2) != Some(b"\r\n") {
+            break;
+        }
+        body.extend_from_slice(&bytes[cursor..chunk_end]);
+        cursor = chunk_end + 2;
+    }
+    body
+}
+
 fn detached_chunk_terminator_prefix(bytes: &[u8]) -> usize {
     let mut consumed = 0usize;
     while bytes
@@ -6345,6 +6433,17 @@ fn decode_content_encoding<'a>(
             (
                 std::borrow::Cow::Owned(output),
                 Some("decompressed_body_limit".to_string()),
+            )
+        }
+        Err(_) if !output.is_empty() => {
+            // DEFLATE is a streaming algorithm: a truncated input still yields a valid
+            // decompressed prefix. Return it with an explicit truncation reason instead of
+            // discarding everything as content_decode_error — downstream JSON salvage can then
+            // use the turns that did decompress.
+            output.truncate(max_output_bytes);
+            (
+                std::borrow::Cow::Owned(output),
+                Some("truncated_compressed_stream".to_string()),
             )
         }
         Err(_) => (
@@ -9923,6 +10022,14 @@ Content-Type: application/json
         assert_eq!(completed.len(), 1, "{completed:?}");
         let item = &completed[0];
         assert_eq!(
+            item.interaction_type, "model",
+            "salvaged LLM exchange must not stay unparsed"
+        );
+        assert_eq!(
+            item.parse_state, "partial",
+            "truncated means partial, never fake-parsed"
+        );
+        assert_eq!(
             item.request.messages.len(),
             1,
             "{:?}",
@@ -10093,6 +10200,107 @@ Content-Type: application/json
         let completed = reassembler.push(tcp(ChunkDirection::Response, resp, 2));
         assert_eq!(completed.len(), 1);
         assert!(!completed[0].is_empty_unparsed_shell());
+    }
+
+    fn gzip_chunked_body(json: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn gzip_chunked_response(json: &str, chunk_len: Option<usize>) -> Vec<u8> {
+        let gz = gzip_chunked_body(json);
+        let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let len = chunk_len.unwrap_or(gz.len());
+        out.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+        out.extend_from_slice(&gz);
+        out.extend_from_slice(b"\r\n0\r\n\r\n");
+        out
+    }
+
+    #[test]
+    fn gzip_chunked_response_decodes_full_and_truncated() {
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        let tcp = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        let req = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[{"role":"user","content":"gz"}]}"#,
+        );
+        let json = format!(
+            r#"{{"choices":[{{"message":{{"content":"gz-answer-{}"}}}}]}}"#,
+            "y".repeat(4096)
+        );
+        let full = gzip_chunked_response(&json, None);
+        let mut reassembler = InteractionReassembler::default();
+        assert!(reassembler
+            .push(tcp(ChunkDirection::Request, req.clone(), 1))
+            .is_empty());
+        let mut completed = Vec::new();
+        let mut seq = 1_u64;
+        for part in full.chunks(1024) {
+            seq += 1;
+            completed.extend(reassembler.push(tcp(ChunkDirection::Response, part.to_vec(), seq)));
+        }
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let text = completed[0].response.text.clone().unwrap_or_default();
+        assert!(text.starts_with("gz-answer-"), "{text}");
+
+        // Same stream truncated mid-gzip: the decompressed prefix must survive, not a wholesale
+        // content_decode_error.
+        // The first choice closes early; the second is cut mid-string. The closed first choice
+        // must survive both decompression and JSON salvage.
+        let truncated_json = format!(
+            r#"{{"choices":[{{"message":{{"content":"gz-answer-first"}}}},{{"message":{{"content":"{}"}}}}]}}"#,
+            (0..400)
+                .map(|i| format!("segment-{i:03}-varied-model-output;"))
+                .collect::<String>()
+        );
+        let truncated_full = gzip_chunked_response(&truncated_json, None);
+        let truncated = &truncated_full[..(truncated_full.len() * 3 / 5)];
+        let mut reassembler2 = InteractionReassembler::default();
+        assert!(reassembler2
+            .push(tcp(ChunkDirection::Request, req, 1))
+            .is_empty());
+        let mut seq2 = 1_u64;
+        for part in truncated.chunks(1024) {
+            seq2 += 1;
+            assert!(reassembler2
+                .push(tcp(ChunkDirection::Response, part.to_vec(), seq2))
+                .is_empty());
+        }
+        reassembler2.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let completed2 = reassembler2.take_completed();
+        assert_eq!(completed2.len(), 1, "{completed2:?}");
+        let item = &completed2[0];
+        let text2 = item.response.text.clone().unwrap_or_default();
+        assert_eq!(
+            text2, "gz-answer-first",
+            "truncated gzip must still yield the model answer prefix: {text2:?}"
+        );
+        assert!(
+            item.partial_reasons
+                .iter()
+                .any(|r| r == "truncated_compressed_stream"),
+            "{:?}",
+            item.partial_reasons
+        );
     }
 
     #[test]

@@ -269,7 +269,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
     let mut interactions = plaintext_http.then(|| {
-        InteractionReassembler::with_idle_lanes(reassembly_idle_timeout(), inflight_idle_timeout())
+        InteractionReassembler::with_idle_lanes(
+            InteractionReassembler::reassembly_idle_timeout(),
+            InteractionReassembler::inflight_idle_timeout(),
+        )
     });
     let mut sequencer = PlaintextSequencer::default();
     let mut suppressed_shells = 0u64;
@@ -424,32 +427,6 @@ fn perf_ring_pages() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|pages| (1..=1_024).contains(pages))
         .unwrap_or(8)
-}
-
-/// Reassembler fast-lane idle timeout (A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS,
-/// default 90s): connections without an in-flight request (noise streams, health checks)
-/// retire here so they never linger.
-fn reassembly_idle_timeout() -> Duration {
-    std::env::var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| (5..=86_400).contains(seconds))
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(90))
-}
-
-/// In-flight slow lane (A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS, default = fast lane):
-/// connections holding a complete request that still awaits its response. LLM gateways hold
-/// the wire silently while the model thinks (field-observed minutes before a single large
-/// chunked JSON answer); a short timeout retires the interaction request-only and the late
-/// answer bytes are orphaned and never stored. 900s covers the observed think latency.
-fn inflight_idle_timeout() -> Duration {
-    std::env::var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| (5..=86_400).contains(seconds))
-        .map(Duration::from_secs)
-        .unwrap_or_else(reassembly_idle_timeout)
 }
 
 fn plaintext_scope_path() -> PathBuf {
@@ -987,7 +964,7 @@ mod tests {
                 None => std::env::remove_var("A3S_OBSERVER_REASSEMBLY_IDLE_TIMEOUT_SECONDS"),
             }
             assert_eq!(
-                reassembly_idle_timeout(),
+                InteractionReassembler::reassembly_idle_timeout(),
                 Duration::from_secs(expected_secs),
                 "value={value:?}"
             );
@@ -1015,7 +992,7 @@ mod tests {
                 None => std::env::remove_var("A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS"),
             }
             assert_eq!(
-                inflight_idle_timeout(),
+                InteractionReassembler::inflight_idle_timeout(),
                 Duration::from_secs(expected_secs),
                 "fast={fast:?} slow={slow:?}"
             );
