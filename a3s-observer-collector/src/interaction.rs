@@ -668,9 +668,34 @@ impl HttpStreamDecoder {
         if self.buffer.is_empty() {
             return None;
         }
-        let (header_len, start_line, headers, _) =
-            parse_http_head(self.kind, &self.buffer).ok()??;
-        let raw_body = &self.buffer[header_len..];
+        let mut base_offset = 0usize;
+        let mut head = parse_http_head(self.kind, &self.buffer).ok().flatten();
+        if head.is_none() {
+            // F8 mid-stream capture: the head may not sit at offset 0. Resync at the first
+            // line-start that parses as a valid HTTP head, bounded to 4 KiB / 64 line starts.
+            let scan_limit = self.buffer.len().min(4_096);
+            let mut cursor = 0usize;
+            let mut tried = 0usize;
+            while cursor < scan_limit && tried < 64 {
+                let Some(nl) = find_bytes(&self.buffer[cursor..scan_limit], b"\n") else {
+                    break;
+                };
+                let start = cursor + nl + 1;
+                if start >= scan_limit {
+                    break;
+                }
+                tried += 1;
+                if let Ok(Some(parsed)) = parse_http_head(self.kind, &self.buffer[start..]) {
+                    base_offset = start;
+                    head = Some(parsed);
+                    break;
+                }
+                cursor = start;
+            }
+        }
+        let (header_len, start_line, headers, _) = head?;
+        let head_absolute = base_offset + header_len;
+        let raw_body = &self.buffer[head_absolute..];
         // Partial bodies still need HTTP framing removed: a chunked+gzip response must be
         // de-chunked (complete chunks only) before the content-encoding stage can decompress.
         let transfer_chunked = headers
@@ -689,6 +714,9 @@ impl HttpStreamDecoder {
             &mut partial_reasons,
             ["reassembly_retire_partial".to_string()],
         );
+        if base_offset > 0 {
+            extend_unique(&mut partial_reasons, ["midstream_head_resync".to_string()]);
+        }
         let started_at = self.buffer_started_at_unix_ns.unwrap_or(at_unix_ns);
         self.buffer.clear();
         self.buffer_started_at_unix_ns = None;
@@ -801,6 +829,18 @@ impl HttpStreamDecoder {
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
         }
         messages
+    }
+
+    /// Append bytes without decoding (F8 mid-stream start). The retire-time partial flush
+    /// resyncs to the first valid head; noise stays undecoded and evidence-only.
+    fn buffer_raw(&mut self, data: &[u8], event_at_unix_ns: u128) {
+        if self.buffer.is_empty() {
+            self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
+        }
+        self.last_at_unix_ns = event_at_unix_ns;
+        let remaining = self.max_bytes.saturating_sub(self.buffer.len());
+        let admitted = data.len().min(remaining);
+        self.buffer.extend_from_slice(&data[..admitted]);
     }
 
     fn take_unparsed_tail(&mut self) -> Vec<u8> {
@@ -1521,6 +1561,10 @@ struct ConnectionState {
     last_activity: Instant,
     /// Global + per-pid uprobes can emit the same SSL_write twice (~100µs apart).
     last_probe_write: Option<(ChunkDirection, u64, [u8; 32], u128)>,
+    /// Decoded responses that arrived without a pending request (F8 mid-stream capture: the
+    /// request head predates collector attach). Bounded; paired with a synthetic placeholder
+    /// request at retire so the observed answer is never dropped to gap-only evidence.
+    orphan_responses: VecDeque<HttpMessage>,
 }
 
 impl ConnectionState {
@@ -1550,6 +1594,7 @@ impl ConnectionState {
             fd_generation: 0,
             last_activity: now,
             last_probe_write: None,
+            orphan_responses: VecDeque::new(),
         }
     }
 
@@ -1982,6 +2027,13 @@ impl InteractionReassembler {
                                 &mut deferred_body_gap_reasons,
                                 ["classic_non_http_prefix".to_string()],
                             );
+                            // F8 mid-stream request starts: the first observed request-lane
+                            // bytes may begin mid-body. Buffer them raw (no decode, so no sticky
+                            // parse poison) — the retire-time partial flush resyncs to the first
+                            // valid head if one exists, or leaves noise evidence-only.
+                            state
+                                .requests
+                                .buffer_raw(&chunk.data, chunk.event_at_unix_ns);
                         } else {
                             for mut request in state.requests.push(
                                 &chunk.data,
@@ -2083,6 +2135,10 @@ impl InteractionReassembler {
                             let Some(mut request) = state.pop_pending_request() else {
                                 self.metrics.orphan_chunks =
                                     self.metrics.orphan_chunks.saturating_add(1);
+                                if state.orphan_responses.len() >= 4 {
+                                    state.orphan_responses.pop_front();
+                                }
+                                state.orphan_responses.push_back(response);
                                 continue;
                             };
                             add_binding_reasons(state, &mut request.partial_reasons);
@@ -2151,6 +2207,10 @@ impl InteractionReassembler {
                             let Some(mut request) = state.pop_pending_request() else {
                                 self.metrics.orphan_chunks =
                                     self.metrics.orphan_chunks.saturating_add(1);
+                                if state.orphan_responses.len() >= 4 {
+                                    state.orphan_responses.pop_front();
+                                }
+                                state.orphan_responses.push_back(response);
                                 continue;
                             };
                             add_binding_reasons(state, &mut request.partial_reasons);
@@ -2184,6 +2244,35 @@ impl InteractionReassembler {
                                 &mut deferred_body_gap_reasons,
                                 ["rustls_body_only_not_candidate".to_string()],
                             );
+                        }
+                    }
+                    // Keep-alive concatenation (F7): after a complete response, the read lane
+                    // may already carry the *next* request's head on this connection. Re-home
+                    // those bytes to the request decoder instead of letting a POST line poison
+                    // the next response parse.
+                    if !state.responses.buffer.is_empty()
+                        && looks_like_http_request_prefix(&state.responses.buffer)
+                    {
+                        let rehomed = state.responses.take_unparsed_tail();
+                        extend_unique(
+                            &mut deferred_body_gap_reasons,
+                            ["keepalive_request_splice".to_string()],
+                        );
+                        for mut rehomed_request in
+                            state.requests.push(&rehomed, chunk.event_at_unix_ns, &[])
+                        {
+                            state
+                                .identity
+                                .observe_http(&rehomed_request, ChunkDirection::Request);
+                            extend_unique(
+                                &mut rehomed_request.partial_reasons,
+                                ["keepalive_request_splice".to_string()],
+                            );
+                            add_binding_reasons(state, &mut rehomed_request.partial_reasons);
+                            if !state.push_pending_request(rehomed_request) {
+                                self.metrics.body_limit_drops =
+                                    self.metrics.body_limit_drops.saturating_add(1);
+                            }
                         }
                     }
                     completed
@@ -3358,17 +3447,56 @@ impl InteractionReassembler {
         reason: &'static str,
     ) {
         let at = system_now_unix_ns().unwrap_or(0);
-        let mut flushed_something = false;
+        let mut pairs: Vec<(HttpMessage, HttpMessage)> = Vec::new();
         // Prefer any real response bytes over the synthetic empty response. A response that
         // arrived but never framed completely still carries model output worth showing.
         while let Some(mut request) = state.pop_pending_request() {
-            flushed_something = true;
             extend_unique(&mut request.partial_reasons, [reason.to_string()]);
             add_binding_reasons(state, &mut request.partial_reasons);
             let response = state
                 .responses
                 .take_partial_message(at)
                 .unwrap_or_else(|| Self::unobserved_response(&request, reason));
+            pairs.push((request, response));
+        }
+        if pairs.is_empty() {
+            // A request whose body never completed still carries the user's question. Flush it
+            // as a partial interaction instead of dropping it to gap-only evidence. Buffers that
+            // do not start with a valid HTTP head return None and stay evidence-only.
+            if let Some(mut request) = state.requests.take_partial_message(at) {
+                extend_unique(&mut request.partial_reasons, [reason.to_string()]);
+                add_binding_reasons(state, &mut request.partial_reasons);
+                let response = state
+                    .responses
+                    .take_partial_message(at)
+                    .unwrap_or_else(|| Self::unobserved_response(&request, reason));
+                pairs.push((request, response));
+            } else {
+                // F8 mid-stream capture: only the response lane was ever observed (the request
+                // head predates collector attach). Decoded orphan responses are drained first;
+                // a still-buffered partial response is the fallback. Each is paired with a
+                // synthetic placeholder request so the model answer is never gap-only evidence.
+                while let Some(mut response) = state.orphan_responses.pop_front() {
+                    extend_unique(
+                        &mut response.partial_reasons,
+                        [reason.to_string(), "midstream_response_only".to_string()],
+                    );
+                    let request = Self::midstream_placeholder_request(&response, reason);
+                    pairs.push((request, response));
+                }
+                if pairs.is_empty() {
+                    if let Some(mut response) = state.responses.take_partial_message(at) {
+                        extend_unique(
+                            &mut response.partial_reasons,
+                            [reason.to_string(), "midstream_response_only".to_string()],
+                        );
+                        let request = Self::midstream_placeholder_request(&response, reason);
+                        pairs.push((request, response));
+                    }
+                }
+            }
+        }
+        for (request, response) in pairs {
             state.sequence = state.sequence.wrapping_add(1);
             let Some(interaction) = build_interaction(
                 key,
@@ -3390,38 +3518,20 @@ impl InteractionReassembler {
             }
             self.pending_completed.push_back(interaction);
         }
-        if !flushed_something {
-            // A request whose body never completed still carries the user's question. Flush it
-            // as a partial interaction instead of dropping it to gap-only evidence. Buffers that
-            // do not start with a valid HTTP head return None and stay evidence-only.
-            if let Some(mut request) = state.requests.take_partial_message(at) {
-                extend_unique(&mut request.partial_reasons, [reason.to_string()]);
-                add_binding_reasons(state, &mut request.partial_reasons);
-                let response = state
-                    .responses
-                    .take_partial_message(at)
-                    .unwrap_or_else(|| Self::unobserved_response(&request, reason));
-                state.sequence = state.sequence.wrapping_add(1);
-                if let Some(interaction) = build_interaction(
-                    key,
-                    state.sequence,
-                    &state.source,
-                    &state.adapter_id,
-                    request,
-                    response,
-                    state.bind_quality,
-                    state.socket_fd,
-                    state.socket_cookie,
-                    state.fd_generation,
-                ) {
-                    if self.pending_completed.len() >= self.max_connections {
-                        self.pending_completed.pop_front();
-                        self.metrics.evidence_evictions =
-                            self.metrics.evidence_evictions.saturating_add(1);
-                    }
-                    self.pending_completed.push_back(interaction);
-                }
-            }
+    }
+
+    fn midstream_placeholder_request(response: &HttpMessage, reason: &str) -> HttpMessage {
+        HttpMessage {
+            start_line: "GET /unobserved-midstream HTTP/1.1".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            captured_body_bytes: 0,
+            started_at_unix_ns: response.started_at_unix_ns,
+            completed_at_unix_ns: response.started_at_unix_ns,
+            partial_reasons: vec![reason.to_string(), "midstream_response_only".to_string()],
+            metadata_inferred: true,
+            transport_protocol: response.transport_protocol.clone(),
+            derived_body: None,
         }
     }
 
@@ -5127,7 +5237,15 @@ fn build_interaction(
     // The conversation projection drops interactionType=unparsed wholesale. A truncated but
     // LLM-shaped exchange is not an unknown wire: the salvage is sufficient evidence to admit
     // it as a partial model interaction so its salvaged turns reach the semantic timeline.
-    if wire_match.parse_state != "parsed" && (request_messages_salvaged || response_text_salvaged) {
+    // A valid LLM-shaped response (choices/output/candidates) is itself sufficient evidence of
+    // a model exchange even when the request side was never observed (F8 mid-stream capture).
+    if wire_match.parse_state != "parsed"
+        && (request_messages_salvaged
+            || response_text_salvaged
+            || response_structured
+                .as_ref()
+                .is_some_and(llm_shaped_response))
+    {
         wire_match = WireMatch {
             template_id: "generic-llm-json",
             likelihood: "likely",
@@ -6886,6 +7004,33 @@ fn parse_json_body(body: &[u8]) -> Option<Value> {
 /// ("messages" in requests, "choices" in responses) into a synthetic document so the
 /// conversation timeline still shows the turns that did arrive. The truncation itself stays
 /// visible through transport partial reasons; nothing is rewritten as complete.
+/// The response JSON carries an unmistakable model-answer shape (OpenAI choices/message or
+/// delta content, Responses output, Gemini candidates, Anthropic content blocks).
+fn llm_shaped_response(value: &Value) -> bool {
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        if choices.iter().any(|choice| {
+            choice
+                .get("message")
+                .or_else(|| choice.get("delta"))
+                .and_then(|message| message.get("content"))
+                .is_some()
+        }) {
+            return true;
+        }
+    }
+    if value.get("output").is_some() || value.get("candidates").is_some() {
+        return true;
+    }
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("text").is_some() || block.get("type").is_some())
+        })
+}
+
 fn salvage_closed_json_objects(body: &[u8], array_key: &str) -> Option<Value> {
     let needle = format!("\"{array_key}\"");
     let key_at = find_bytes(body, needle.as_bytes())?;
@@ -10301,6 +10446,126 @@ Content-Type: application/json
             "{:?}",
             item.partial_reasons
         );
+    }
+
+    #[test]
+    fn keepalive_response_tail_is_spliced_into_next_request() {
+        // F7: on a keep-alive connection the read lane already carries the *next* POST head.
+        let req1 = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[{"role":"user","content":"q1"}]}"#,
+        );
+        let resp1 = http_response(r#"{"choices":[{"message":{"content":"a1"}}]}"#);
+        let req2 = custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[{"role":"user","content":"q2"}]}"#,
+        );
+        let resp2 = http_response(r#"{"choices":[{"message":{"content":"a2"}}]}"#);
+        // resp1 chunk carries the next request head concatenated after the response.
+        let mut resp1_plus = resp1.clone();
+        resp1_plus.extend_from_slice(&req2);
+        let mut reassembler = InteractionReassembler::default();
+        assert!(reassembler
+            .push({
+                let mut c = chunk(ChunkDirection::Request, req1, 1);
+                c.source = "tcp_plaintext".to_string();
+                c
+            })
+            .is_empty());
+        let first = reassembler.push({
+            let mut c = chunk(ChunkDirection::Response, resp1_plus, 2);
+            c.source = "tcp_plaintext".to_string();
+            c
+        });
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].response.text.as_deref(), Some("a1"));
+        let second = reassembler.push({
+            let mut c = chunk(ChunkDirection::Response, resp2, 3);
+            c.source = "tcp_plaintext".to_string();
+            c
+        });
+        assert_eq!(
+            second.len(),
+            1,
+            "spliced request must pair with its response: {second:?}"
+        );
+        assert_eq!(second[0].response.text.as_deref(), Some("a2"));
+        assert!(
+            second[0].request.body.contains("q2"),
+            "{}",
+            second[0].request.body
+        );
+    }
+
+    #[test]
+    fn midstream_response_only_retires_into_a_partial_interaction() {
+        // F8: capture attaches mid-connection; only the response lane is ever observed.
+        let resp = http_response(r#"{"choices":[{"message":{"content":"late-answer"}}]}"#);
+        let mut reassembler =
+            InteractionReassembler::with_limits(8, 64 * 1024, std::time::Duration::from_millis(1));
+        reassembler.push({
+            let mut c = chunk(ChunkDirection::Response, resp, 1);
+            c.source = "tcp_plaintext".to_string();
+            c
+        });
+        reassembler.expire_idle(std::time::Instant::now() + std::time::Duration::from_millis(5));
+        let completed = reassembler.take_completed();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let item = &completed[0];
+        assert_eq!(item.response.text.as_deref(), Some("late-answer"));
+        assert_eq!(
+            item.request.captured_bytes, 0,
+            "midstream capture has no request bytes"
+        );
+        assert_eq!(item.path, "/unobserved-midstream");
+        assert!(item
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "midstream_response_only"));
+        assert_eq!(
+            item.interaction_type, "model",
+            "LLM-shaped response must admit the record"
+        );
+    }
+
+    #[test]
+    fn midstream_request_head_resync_recovers_the_exchange() {
+        // F8 request side: garbage prefix before the first real request head.
+        let mut reassembler =
+            InteractionReassembler::with_limits(8, 64 * 1024, std::time::Duration::from_millis(1));
+        let mut polluted = b"garbage-tail-of-prior-payload\n".to_vec();
+        polluted.extend_from_slice(&custom_http_request(
+            "POST",
+            "/v1/chat/completions",
+            "llm:3888",
+            r#"{"messages":[{"role":"user","content":"resync-question"}]}"#,
+        ));
+        reassembler.push({
+            let mut c = chunk(ChunkDirection::Request, polluted, 1);
+            c.source = "tcp_plaintext".to_string();
+            c
+        });
+        reassembler.expire_idle(std::time::Instant::now() + std::time::Duration::from_millis(5));
+        let completed = reassembler.take_completed();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let item = &completed[0];
+        assert!(
+            item.request.body.contains("resync-question"),
+            "{}",
+            item.request.body
+        );
+        assert!(
+            item.partial_reasons
+                .iter()
+                .any(|reason| reason == "midstream_head_resync"),
+            "{:?}",
+            item.partial_reasons
+        );
+        assert_eq!(item.request.messages.len(), 1);
     }
 
     #[test]
