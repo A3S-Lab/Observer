@@ -953,6 +953,11 @@ pub enum AgentEvent {
         exec_reassembly_timeout: u64,
         dropped: u64,
         output_dropped: u64,
+        /// Temporality of the legacy compatibility counters above. Collector counters are
+        /// process-lifetime cumulative; consumers must compute window deltas against the
+        /// previous heartbeat instead of treating a historical total as a live failure.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        legacy_counter_temporality: Option<String>,
         #[serde(
             rename = "interactionReassembly",
             skip_serializing_if = "Option::is_none"
@@ -1028,6 +1033,7 @@ mod tests {
             exec_reassembly_timeout: 0,
             dropped: 0,
             output_dropped: 0,
+            legacy_counter_temporality: Some("cumulative".to_string()),
             interaction_reassembly: None,
             pipeline_accounting: None,
             capture_profile: None,

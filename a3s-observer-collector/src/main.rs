@@ -5765,6 +5765,7 @@ fn collector_heartbeat(
             exec_reassembly_timeout: stats.exec_reassembly_timeout,
             dropped,
             output_dropped,
+            legacy_counter_temporality: Some("cumulative".to_string()),
             interaction_reassembly: interaction_reassembly.map(Box::new),
             pipeline_accounting: pipeline_accounting.map(Box::new),
             capture_profile: capture_profile.map(Box::new),
