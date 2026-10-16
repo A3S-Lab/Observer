@@ -5244,13 +5244,21 @@ fn build_interaction(
     // requests with empty response bodies retiring as unknown-json-exchange despite
     // req_msgs>0 — the salvage markers only fire on truncation, so these exchanges had no
     // path into the projection (check: repro_field_request_only_openai_exchange_admits).
+    // Compat33-and-older legacy field dumps cap one syscall at 1 KiB and can then splice the
+    // next keep-alive request into the same buffer. Whole-document JSON and closed-object
+    // salvage can both be empty there, so the bounded structural prefix remains the final
+    // conservative admission test for those records (and for any future bounded capture).
+    // compat34 raised the legacy payload cap to 16 KiB, but did not remove this fallback.
+    let request_llm_shaped_prefix =
+        llm_shaped_request_prefix(&method, &path, &request.headers, &request_body);
     if wire_match.parse_state != "parsed"
         && (request_messages_salvaged
             || response_text_salvaged
             || response_structured
                 .as_ref()
                 .is_some_and(llm_shaped_response)
-            || !messages.is_empty())
+            || !messages.is_empty()
+            || request_llm_shaped_prefix)
     {
         wire_match = WireMatch {
             template_id: "generic-llm-json",
@@ -7002,6 +7010,48 @@ fn append_schema_descriptor(value: &Value, depth: usize, output: &mut String) {
 
 fn parse_json_body(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(body).ok()
+}
+
+/// Conservative request-side LLM admission when the whole JSON document is invalid because a
+/// bounded probe slice ended inside it (and may even be followed by the next keep-alive HTTP
+/// request). The route, content type, and key order are all required so generic REST traffic
+/// that merely contains words like "messages" is not promoted into a model conversation.
+fn llm_shaped_request_prefix(
+    method: &str,
+    path: &str,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+) -> bool {
+    if !method.eq_ignore_ascii_case("post") {
+        return false;
+    }
+    let path = path.to_ascii_lowercase();
+    let llm_route = [
+        "/chat/completions",
+        "/completions",
+        "/responses",
+        "/messages",
+        "generatecontent",
+    ]
+    .iter()
+    .any(|route| path.contains(route));
+    let json_content = headers
+        .get("content-type")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
+    if !llm_route || !json_content {
+        return false;
+    }
+    let bounded = &body[..body.len().min(16 * 1024)];
+    let Some(messages_at) = find_bytes(bounded, b"\"messages\"") else {
+        return false;
+    };
+    let Some(role_at) = find_bytes(bounded, b"\"role\"") else {
+        return false;
+    };
+    let Some(content_at) = find_bytes(bounded, b"\"content\"") else {
+        return false;
+    };
+    messages_at < role_at && messages_at < content_at
 }
 
 /// Best-effort message salvage for a truncated LLM JSON document. A probe payload cap or a
@@ -10128,6 +10178,137 @@ mod tests {
         assert_eq!(rb.len(), 1, "{rb:?}");
         assert_eq!(rb[0].parse_state, "parsed", "{:?}", rb[0].partial_reasons);
         assert_eq!(rb[0].request.messages.len(), 2);
+    }
+
+    #[test]
+    fn field_probe_capped_llm_prefix_with_pipelined_requests_admits_partial_model() {
+        // UOS 现场样本（已脱敏）的真实形态：legacy 探针在 1024B 处截断 JSON 字符串，
+        // 随后同一个重组缓冲里拼接了 keep-alive 连接上的后续 HTTP 请求。此时全文 JSON
+        // 无法解析，messages salvage 也没有闭合对象可用，但 LLM 路径 + OpenAI messages
+        // 前缀仍是充分证据；不得继续退回 unknown-json-exchange。
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = ConnectionKey {
+            cgroup_id: 0,
+            pid,
+            connection_id: classic_tls_sock_connection_id(0, pid, fd),
+        };
+        let request_body = r##"{"messages":[{"role":"system","content":"# 角色
+你是现场智能体的系统指令。任务：根据用户输入完成分析。
+
+# 输入
+用户问题在后续消息中。"}POST /ctct-guard/v1/chat/completions HTTP/1.1
+Host: llm-gateway
+Content-Type: application/json
+Content-Length: 1820
+
+{"messages":[{"role":"user","content":"下一个请求也被同一个缓冲截断""##;
+        let request_body = request_body.as_bytes().to_vec();
+        let request = HttpMessage {
+            start_line: "POST /ctct-guard/v1/chat/completions HTTP/1.1".to_string(),
+            headers: BTreeMap::from([
+                ("host".to_string(), "llm-gateway".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "content-length".to_string(),
+                    (request_body.len() + 4096).to_string(),
+                ),
+            ]),
+            body: request_body.clone(),
+            captured_body_bytes: request_body.len(),
+            started_at_unix_ns: 100,
+            completed_at_unix_ns: 200,
+            partial_reasons: vec!["probe_call_limit".to_string()],
+            metadata_inferred: false,
+            transport_protocol: Some("http/1.1".to_string()),
+            derived_body: None,
+        };
+        let response = HttpMessage {
+            start_line: "HTTP/1.1 0 Unobserved".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            captured_body_bytes: 0,
+            started_at_unix_ns: 200,
+            completed_at_unix_ns: 200,
+            partial_reasons: Vec::new(),
+            metadata_inferred: false,
+            transport_protocol: Some("http/1.1".to_string()),
+            derived_body: None,
+        };
+        let interaction = build_interaction(
+            key,
+            1,
+            "tcp_plaintext",
+            "plain-http-syscall",
+            request,
+            response,
+            0,
+            fd as i32,
+            0,
+            0,
+        )
+        .expect("LLM-shaped probe-capped request must remain visible");
+        assert_eq!(
+            interaction.parse_state, "partial",
+            "{:?}",
+            interaction.partial_reasons
+        );
+        assert_eq!(interaction.interaction_type, "model");
+        assert!(
+            interaction
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "probe_call_limit"),
+            "probe truncation must stay explicit: {:?}",
+            interaction.partial_reasons
+        );
+        assert!(
+            interaction.request.body.starts_with("{\"messages\""),
+            "observed prefix must remain in the evidence body"
+        );
+
+        let ordinary_body =
+            br#"{"messages":"not-an-llm-array","role":"owner","content":"metadata"}"#.to_vec();
+        let ordinary_request = HttpMessage {
+            start_line: "POST /api/application/get HTTP/1.1".to_string(),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            captured_body_bytes: ordinary_body.len(),
+            body: ordinary_body,
+            started_at_unix_ns: 300,
+            completed_at_unix_ns: 400,
+            partial_reasons: vec!["probe_call_limit".to_string()],
+            metadata_inferred: false,
+            transport_protocol: Some("http/1.1".to_string()),
+            derived_body: None,
+        };
+        let ordinary_response_body = br#"{"code":0}"#.to_vec();
+        let ordinary_response = HttpMessage {
+            start_line: "HTTP/1.1 200 OK".to_string(),
+            headers: BTreeMap::new(),
+            captured_body_bytes: ordinary_response_body.len(),
+            body: ordinary_response_body,
+            started_at_unix_ns: 400,
+            completed_at_unix_ns: 500,
+            partial_reasons: Vec::new(),
+            metadata_inferred: false,
+            transport_protocol: Some("http/1.1".to_string()),
+            derived_body: None,
+        };
+        let ordinary = build_interaction(
+            key,
+            2,
+            "tcp_plaintext",
+            "plain-http-syscall",
+            ordinary_request,
+            ordinary_response,
+            0,
+            fd as i32,
+            0,
+            0,
+        )
+        .expect("ordinary REST exchange must remain inspectable");
+        assert_eq!(ordinary.parse_state, "unparsed");
+        assert_eq!(ordinary.interaction_type, "unparsed");
     }
 
     #[test]

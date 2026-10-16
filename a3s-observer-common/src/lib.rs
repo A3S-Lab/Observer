@@ -1203,7 +1203,10 @@ pub const SEC_BIND: u32 = 3; // bind() to a fixed (non-ephemeral) port (opened a
 /// `read`/`recvfrom` (kernel has filled the buffer by then, the return value is the length).
 /// Userspace feeds these chunks to the same `InteractionReassembler` as the modern
 /// plain-http-syscall path, so downstream conversation tracking sees one uniform shape.
-pub const LEGACY_PLAINTEXT_LEN: usize = 1024;
+/// Keep this aligned with the modern small TLS plaintext tier: 1 KiB truncates ordinary
+/// OpenAI requests before the user turn, while 16 KiB covers normal chat payloads without
+/// turning every perf record into the 512 KiB large-response tier.
+pub const LEGACY_PLAINTEXT_LEN: usize = 16 * 1024;
 
 /// `LegacyPlaintextEvent.direction`: syscall write side (the Agent's HTTP request).
 pub const LEGACY_PLAINTEXT_DIRECTION_WRITE: u32 = 0;
@@ -1225,7 +1228,7 @@ pub struct LegacyPlaintextEvent {
     pub data: [u8; LEGACY_PLAINTEXT_LEN],
 }
 
-const _: [(); 1072] = [(); core::mem::size_of::<LegacyPlaintextEvent>()];
+const _: [(); 16_432] = [(); core::mem::size_of::<LegacyPlaintextEvent>()];
 
 #[cfg(test)]
 mod tests {

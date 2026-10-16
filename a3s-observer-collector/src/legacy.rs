@@ -215,12 +215,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         ring_pages,
     )?;
     if plaintext_http {
-        spawn_perf(
+        spawn_plaintext_perf(
             &mut ebpf,
             "PLAINTEXT_EVENTS",
             tx.clone(),
             perf_lost.clone(),
-            wrap_plaintext,
             ring_pages,
         )?;
     }
@@ -657,6 +656,77 @@ fn spawn_perf<T: Copy + Send + 'static>(
     Ok(())
 }
 
+fn spawn_plaintext_perf(
+    ebpf: &mut Ebpf,
+    map_name: &str,
+    tx: mpsc::Sender<RawEvent>,
+    lost: Arc<AtomicU64>,
+    ring_pages: usize,
+) -> anyhow::Result<()> {
+    let mut array = AsyncPerfEventArray::try_from(
+        ebpf.take_map(map_name)
+            .with_context(|| format!("`{map_name}` missing"))?,
+    )?;
+    for cpu in online_cpus().map_err(|(_, error)| error)? {
+        let mut buffer = array.open(cpu, Some(ring_pages))?;
+        let tx = tx.clone();
+        let lost = lost.clone();
+        tokio::spawn(async move {
+            let mut slots = (0..32)
+                .map(|_| BytesMut::with_capacity(size_of::<LegacyPlaintextEvent>()))
+                .collect::<Vec<_>>();
+            loop {
+                let events = match buffer.read_events(&mut slots).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        tracing::error!(cpu, error = %error, "legacy plaintext perf reader failed");
+                        break;
+                    }
+                };
+                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                for slot in slots.iter().take(events.read) {
+                    if let Some(event) = plaintext_event_from_record(slot) {
+                        if tx.send(RawEvent::Plaintext(Box::new(event))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+fn plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyPlaintextEvent> {
+    const HEADER_LEN: usize = size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
+    if bytes.len() < HEADER_LEN {
+        return None;
+    }
+    let read_u32 = |offset: usize| {
+        bytes
+            .get(offset..offset + 4)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_ne_bytes)
+    };
+    let len = read_u32(12)? as usize;
+    if len > LEGACY_PLAINTEXT_LEN || bytes.len() < HEADER_LEN + len {
+        return None;
+    }
+    let mut event = LegacyPlaintextEvent {
+        pid: read_u32(0)?,
+        fd: read_u32(4)?,
+        direction: read_u32(8)?,
+        len: len as u32,
+        orig_len: read_u32(16)?,
+        _pad: read_u32(20)?,
+        comm: bytes.get(24..40)?.try_into().ok()?,
+        captured_at_boot_ns: u64::from_ne_bytes(bytes.get(40..48)?.try_into().ok()?),
+        data: [0; LEGACY_PLAINTEXT_LEN],
+    };
+    event.data[..len].copy_from_slice(&bytes[HEADER_LEN..HEADER_LEN + len]);
+    Some(event)
+}
+
 fn read_value<T: Copy>(bytes: &[u8]) -> Option<T> {
     (bytes.len() >= size_of::<T>())
         .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
@@ -668,10 +738,6 @@ fn wrap_exec(event: LegacyExecEvent) -> RawEvent {
 
 fn wrap_file(event: FileEvent) -> RawEvent {
     RawEvent::File(Box::new(event))
-}
-
-fn wrap_plaintext(event: LegacyPlaintextEvent) -> RawEvent {
-    RawEvent::Plaintext(Box::new(event))
 }
 
 fn legacy_argv(event: &LegacyExecEvent) -> Vec<String> {
@@ -904,6 +970,41 @@ mod tests {
             &mut PlaintextSequencer::default(),
         );
         assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN);
+    }
+
+    #[test]
+    fn plaintext_variable_perf_record_round_trips_without_ring_padding() {
+        const HEADER_LEN: usize = size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
+        let mut event = plaintext_event(LEGACY_PLAINTEXT_DIRECTION_READ, 2048, 4096);
+        for (index, byte) in event.data[..2048].iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut record = Vec::with_capacity(HEADER_LEN + 2048);
+        record.extend_from_slice(&event.pid.to_ne_bytes());
+        record.extend_from_slice(&event.fd.to_ne_bytes());
+        record.extend_from_slice(&event.direction.to_ne_bytes());
+        record.extend_from_slice(&event.len.to_ne_bytes());
+        record.extend_from_slice(&event.orig_len.to_ne_bytes());
+        record.extend_from_slice(&event._pad.to_ne_bytes());
+        record.extend_from_slice(&event.comm);
+        record.extend_from_slice(&event.captured_at_boot_ns.to_ne_bytes());
+        record.extend_from_slice(&event.data[..2048]);
+
+        let decoded = plaintext_event_from_record(&record).expect("valid variable record");
+        assert_eq!(decoded.len, 2048);
+        assert_eq!(decoded.orig_len, 4096);
+        assert_eq!(decoded.direction, LEGACY_PLAINTEXT_DIRECTION_READ);
+        assert_eq!(decoded.data[..2048], event.data[..2048]);
+        assert!(decoded.data[2048..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn plaintext_variable_perf_record_rejects_overstated_lengths() {
+        const HEADER_LEN: usize = size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
+        let event = plaintext_event(0, (LEGACY_PLAINTEXT_LEN + 1) as u32, 0);
+        let mut record = vec![0u8; HEADER_LEN];
+        record[12..16].copy_from_slice(&event.len.to_ne_bytes());
+        assert!(plaintext_event_from_record(&record).is_none());
     }
 
     #[test]

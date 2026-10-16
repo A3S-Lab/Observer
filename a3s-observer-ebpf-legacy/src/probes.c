@@ -106,7 +106,7 @@ struct sec_event {
     struct capture_decision decision;
 };
 
-#define LEGACY_PLAINTEXT_LEN 1024
+#define LEGACY_PLAINTEXT_LEN (16 * 1024)
 #define LEGACY_PLAINTEXT_DIRECTION_WRITE 0
 #define LEGACY_PLAINTEXT_DIRECTION_READ 1
 
@@ -138,7 +138,7 @@ _Static_assert(sizeof(struct exit_event) == 72, "exit_event ABI mismatch");
 _Static_assert(sizeof(struct connect_event) == 80, "connect_event ABI mismatch");
 _Static_assert(sizeof(struct file_event) == 312, "file_event ABI mismatch");
 _Static_assert(sizeof(struct sec_event) == 64, "sec_event ABI mismatch");
-_Static_assert(sizeof(struct plaintext_event) == 1072, "plaintext_event ABI mismatch");
+_Static_assert(sizeof(struct plaintext_event) == 16432, "plaintext_event ABI mismatch");
 _Static_assert(sizeof(struct read_args) == 16, "read_args ABI mismatch");
 
 #define PERF_MAP(name) \
@@ -431,13 +431,12 @@ INLINE int plaintext_admitted(u32 pid) {
     return bpf_map_lookup_elem(&PLAINTEXT_ALLOWED, &pid) != 0;
 }
 
-/* Copy one bounded payload slice and emit it as a fixed-size record. The payload read uses
- * only constant sizes: the 4.19 verifier does not propagate range narrowing across register
- * copies, so a variable-length probe_read is rejected as "unbounded memory access" even when
- * the source value was clamped (observed on UOS 4.19.90, compat19 field). event->len stays the
- * authoritative valid-byte count for userspace; bytes past len in the fixed read are never
- * parsed. If the full window crosses an unmapped page, retry with a small fixed window before
- * dropping the payload. */
+/* Copy one bounded payload slice and emit only its valid header+payload prefix. The payload
+ * read uses a constant size because the 4.19 verifier does not propagate range narrowing across
+ * register copies (observed on UOS 4.19.90, compat19 field). event->len stays the authoritative
+ * valid-byte count for userspace; the perf record is trimmed to len so short socket calls do not
+ * consume a 16 KiB ring slot. If the full window crosses an unmapped page, retry with a small
+ * fixed window before dropping the payload. */
 INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
                            u32 direction) {
     struct plaintext_event *event;
@@ -461,11 +460,11 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
     event->captured_at_boot_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     event->data[0] = 0;
-    /* UOS 4.19.90 现场：chunk 全通但 len 恒 0（双向、全 pid）——载荷读取 100% 失败。
-     * 把两次 probe_read 的返回值（-errno）打包进 _pad 带回用户态定根因（低 16 位=主读，
-     * 高 16 位=64B 回退读；0 表示未走到该步）。 */
+    /* UOS 4.19.90 现场：helper 112 的变量长度读会被 verifier 判为 unbounded，
+     * 因此按固定窗口顺序复制 1 KiB + 1/3 KiB + 三个 4 KiB 块，覆盖 16 KiB 上限。
+     * 每个窗口失败时保留已验证前缀，不再为读不到的未来字节伪造完整载荷。 */
     {
-        const long rc1 = bpf_probe_read_user(event->data, LEGACY_PLAINTEXT_LEN, (const void *)buf);
+        const long rc1 = bpf_probe_read_user(event->data, 1024, (const void *)buf);
         if (rc1 < 0) {
             const long rc2 = bpf_probe_read_user(event->data, 64, (const void *)buf);
             event->_pad = ((u32)(-rc1) & 0xffffu) | (((u32)(-rc2) & 0xffffu) << 16);
@@ -475,9 +474,44 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
                 event->len = 64;
         } else {
             event->_pad = 0;
+            if (len > 1024) {
+                long rc2;
+                if (len <= 2048)
+                    rc2 = bpf_probe_read_user(event->data + 1024, 1024,
+                                              (const void *)(buf + 1024));
+                else
+                    rc2 = bpf_probe_read_user(event->data + 1024, 3072,
+                                              (const void *)(buf + 1024));
+                if (rc2 < 0) {
+                    event->_pad = (((u32)(-rc1) & 0xffffu) << 16) | ((u32)(-rc2) & 0xffffu);
+                    event->len = 1024;
+                } else if (len > 4096) {
+                    const long rc3 = bpf_probe_read_user(event->data + 4096, 4096,
+                                                         (const void *)(buf + 4096));
+                    if (rc3 < 0) {
+                        event->_pad = (((u32)(-rc1) & 0xffffu) << 16) | ((u32)(-rc3) & 0xffffu);
+                        event->len = 4096;
+                    } else if (len > 8192) {
+                        const long rc4 = bpf_probe_read_user(event->data + 8192, 4096,
+                                                             (const void *)(buf + 8192));
+                        if (rc4 < 0) {
+                            event->_pad = (((u32)(-rc1) & 0xffffu) << 16) | ((u32)(-rc4) & 0xffffu);
+                            event->len = 8192;
+                        } else if (len > 12288) {
+                            const long rc5 = bpf_probe_read_user(event->data + 12288, 4096,
+                                                                 (const void *)(buf + 12288));
+                            if (rc5 < 0) {
+                                event->_pad = (((u32)(-rc1) & 0xffffu) << 16) | ((u32)(-rc5) & 0xffffu);
+                                event->len = 12288;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-    output(ctx, &PLAINTEXT_EVENTS, event, sizeof(*event));
+    output(ctx, &PLAINTEXT_EVENTS, event,
+           sizeof(*event) - LEGACY_PLAINTEXT_LEN + event->len);
 }
 
 INLINE void plaintext_write(struct pt_regs *ctx) {
