@@ -5239,12 +5239,18 @@ fn build_interaction(
     // it as a partial model interaction so its salvaged turns reach the semantic timeline.
     // A valid LLM-shaped response (choices/output/candidates) is itself sufficient evidence of
     // a model exchange even when the request side was never observed (F8 mid-stream capture).
+    // Symmetrically, a request whose JSON already yielded OpenAI-shaped messages is sufficient
+    // evidence even when the response was never observed: UOS field dumps showed complete
+    // requests with empty response bodies retiring as unknown-json-exchange despite
+    // req_msgs>0 — the salvage markers only fire on truncation, so these exchanges had no
+    // path into the projection (check: repro_field_request_only_openai_exchange_admits).
     if wire_match.parse_state != "parsed"
         && (request_messages_salvaged
             || response_text_salvaged
             || response_structured
                 .as_ref()
-                .is_some_and(llm_shaped_response))
+                .is_some_and(llm_shaped_response)
+            || !messages.is_empty())
     {
         wire_match = WireMatch {
             template_id: "generic-llm-json",
@@ -10067,6 +10073,61 @@ mod tests {
             Some("completed")
         );
         assert!(interaction.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn repro_field_request_only_openai_exchange_admits() {
+        // UOS 现场解剖（2026-10-16 dump）：wire_template_unparsed 的 LLM 记录共性 = 请求是
+        // 完整 OpenAI JSON + 响应体为空（0B）。消息提取成功（req_msgs>0）但因无截断标记、
+        // 响应侧缺失，被 unknown-json-exchange 挡在投影外。修复：请求侧 OpenAI 消息本身即
+        // 充分证据，对称升级为 generic-llm-json/partial/Model。
+        let pid = 4242_u32;
+        let fd = 12_u64;
+        let key = classic_tls_sock_connection_id(0, pid, fd);
+        let mk = |direction, data: Vec<u8>, seq| {
+            let mut item = chunk(direction, data, 1000);
+            item.cgroup_id = 0;
+            item.pid = pid;
+            item.source = "tcp_plaintext".to_string();
+            item.adapter_id = "plain-http-syscall".to_string();
+            item.connection_id = key;
+            item.sequence = seq;
+            item.socket_fd = fd as i32;
+            item
+        };
+        let req_body = r#"{"model":"glm","messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"user question"}]}"#.as_bytes().to_vec();
+        let request = format!(
+            "POST /ctct-guard/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            req_body.len(),
+            String::from_utf8_lossy(&req_body)
+        ).into_bytes();
+
+        // 情形A：完整请求 + 响应为空（现场失败形态）→ 必须 admission 为 partial/Model
+        let mut a = InteractionReassembler::default();
+        a.push(mk(ChunkDirection::Request, request.clone(), 1));
+        a.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let ra = a.take_completed();
+        assert_eq!(ra.len(), 1, "{ra:?}");
+        assert_eq!(ra[0].parse_state, "partial", "{:?}", ra[0].partial_reasons);
+        assert_eq!(ra[0].interaction_type, "model");
+        assert_eq!(ra[0].request.messages.len(), 2, "messages must survive");
+        assert!(
+            ra[0]
+                .partial_reasons
+                .iter()
+                .any(|r| r == "reassembly_idle_expire_incomplete"),
+            "响应缺失的诚实标记必须保留: {:?}",
+            ra[0].partial_reasons
+        );
+
+        // 情形B：完整请求 + SSE 响应（基线，仍应 parsed，不回退）
+        let mut b = InteractionReassembler::default();
+        let mut rb = b.push(mk(ChunkDirection::Request, request, 1));
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"回答\"}}]}\n\ndata: [DONE]\n\n".as_bytes().to_vec();
+        rb.extend(b.push(mk(ChunkDirection::Response, resp, 1)));
+        assert_eq!(rb.len(), 1, "{rb:?}");
+        assert_eq!(rb[0].parse_state, "parsed", "{:?}", rb[0].partial_reasons);
+        assert_eq!(rb[0].request.messages.len(), 2);
     }
 
     #[test]
