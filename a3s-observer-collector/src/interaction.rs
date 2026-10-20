@@ -4936,8 +4936,12 @@ fn is_rustls_source(chunk: &PlaintextChunk) -> bool {
 }
 
 fn is_plain_tcp_http(chunk: &PlaintextChunk) -> bool {
+    // Sources with exact connection identity skip the TLS remount heuristics: the syscall path
+    // keys by (pid,fd,generation) and the openssl uprobe keys by SSL* pointer; neither needs
+    // (or tolerates) cross-lane rehoming.
     chunk.source.eq_ignore_ascii_case("tcp_plaintext")
         || chunk.adapter_id.eq_ignore_ascii_case("plain-http-syscall")
+        || chunk.adapter_id.eq_ignore_ascii_case("openssl-uprobe")
 }
 
 fn rustls_like_chunk(chunk: &PlaintextChunk) -> bool {

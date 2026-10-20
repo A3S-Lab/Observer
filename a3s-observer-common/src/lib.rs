@@ -1222,13 +1222,36 @@ pub struct LegacyPlaintextEvent {
     pub len: u32,      // bytes captured into `data`
     pub orig_len: u32, // syscall count (write) / return value (read) — truncation marker
     pub _pad: u32,
+    /// Per-(pid,fd) connection generation, bumped in-kernel on connect/accept/close.
+    /// fd-number reuse after a close must never merge into the previous connection's
+    /// reassembly lane; userspace mixes this into the connection key. 0 = pre-attach.
+    pub fd_generation: u32,
     pub comm: [u8; 16],
     /// `CLOCK_MONOTONIC` nanoseconds at capture; doubles as the per-connection ordering key.
     pub captured_at_boot_ns: u64,
     pub data: [u8; LEGACY_PLAINTEXT_LEN],
 }
 
-const _: [(); 16_432] = [(); core::mem::size_of::<LegacyPlaintextEvent>()];
+const _: [(); 16_440] = [(); core::mem::size_of::<LegacyPlaintextEvent>()];
+
+/// Legacy uprobe (OpenSSL libssl `SSL_read`/`SSL_write`) TLS plaintext chunk. The connection
+/// identity is the `SSL*` pointer (`tls_ctx`) — immune to fd-number reuse by construction.
+/// Kept separate from `LegacyPlaintextEvent` so the syscall-channel ABI stays frozen.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LegacyTlsPlaintextEvent {
+    pub pid: u32,
+    pub direction: u32,
+    pub len: u32,      // bytes captured into `data`
+    pub orig_len: u32, // SSL call length (write) / return value (read) — truncation marker
+    pub tls_ctx: u64,
+    pub comm: [u8; 16],
+    /// `CLOCK_MONOTONIC` nanoseconds at capture; doubles as the per-connection ordering key.
+    pub captured_at_boot_ns: u64,
+    pub data: [u8; LEGACY_PLAINTEXT_LEN],
+}
+
+const _: [(); 16_432] = [(); core::mem::size_of::<LegacyTlsPlaintextEvent>()];
 
 #[cfg(test)]
 mod tests {

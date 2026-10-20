@@ -18,13 +18,14 @@ use a3s_observer::{
 };
 use a3s_observer_common::{
     classic_tls_sock_connection_id, ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent,
-    LegacyPlaintextEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG, LEGACY_ARG_LEN,
-    LEGACY_PLAINTEXT_DIRECTION_READ, LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
+    LegacyPlaintextEvent, LegacyTlsPlaintextEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG,
+    LEGACY_ARG_LEN, LEGACY_PLAINTEXT_DIRECTION_READ, LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE,
+    SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
     maps::{perf::AsyncPerfEventArray, HashMap as BpfHashMap, MapData, PerCpuArray},
-    programs::KProbe,
+    programs::{KProbe, ProgramError, UProbe},
     util::online_cpus,
     Ebpf,
 };
@@ -32,7 +33,7 @@ use bytes::BytesMut;
 use std::{
     collections::HashSet,
     mem::size_of,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -59,12 +60,14 @@ enum RawEvent {
     File(Box<FileEvent>),
     Security(SecEvent),
     Plaintext(Box<LegacyPlaintextEvent>),
+    PlaintextTls(Box<LegacyTlsPlaintextEvent>),
 }
 
 // Diagnostic counters (UOS 4.19 field investigation): the legacy plaintext path produced zero
 // events on the customer kernel while every static check passed. Count and preview what (if
 // anything) arrives from the PLAINTEXT_EVENTS ring, and log every completed interaction.
 static PLAINTEXT_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_TLS_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_INTERACTION_SEEN: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -135,16 +138,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         );
     }
 
-    // HTTP plaintext admission is an independent switch from TLS uprobe capture: the legacy
-    // backend implements only the syscall-boundary path (kprobe write/sendto + kprobe/kretprobe
-    // read/recvfrom) for identity-whitelisted PIDs. A3S_OBSERVER_SSL has no effect here — TLS
-    // library probing is not implemented on Linux 4.19; warn instead of silently ignoring it.
+    // HTTP plaintext admission is an independent switch from TLS uprobe capture. The legacy
+    // backend implements both: the syscall-boundary path (kprobe write/sendto + kprobe/kretprobe
+    // read/recvfrom) and, when A3S_OBSERVER_SSL is set, OpenSSL uprobe capture
+    // (SSL_write entry / SSL_read entry+return) on whitelisted processes' libssl — the
+    // AgentSight-style user-space path; connection identity is the SSL* pointer.
     let plaintext_http = plaintext_http_enabled();
-    if std::env::var_os("A3S_OBSERVER_SSL").is_some() {
-        tracing::warn!(
-            "A3S_OBSERVER_SSL is set but the perf-kprobe-legacy backend does not implement TLS uprobe capture; the setting is ignored"
-        );
-    }
+    let ssl_uprobes = plaintext_http && ssl_uprobes_enabled();
+    let mut ssl_manager = ssl_uprobes.then(SslUprobeManager::default);
     let mut plaintext_allowed: Option<BpfHashMap<MapData, u32, u8>> = None;
     if plaintext_http {
         for (program, symbols) in [
@@ -160,6 +161,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 "legacy_http_recvfrom_exit",
                 [sys_sym!("recvfrom")].as_slice(),
             ),
+            ("legacy_http_accept_ret", [sys_sym!("accept")].as_slice()),
+            ("legacy_http_accept4_ret", [sys_sym!("accept4")].as_slice()),
+            ("legacy_http_close", [sys_sym!("close")].as_slice()),
         ] {
             attach_first(&mut ebpf, program, symbols, &mut attached);
         }
@@ -168,6 +172,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .context("`PLAINTEXT_ALLOWED` missing")?,
         )?;
         plaintext_allowed = Some(map);
+    }
+
+    // Dev-machine x86_64 diagnosis (A3S_BPF_DIAG build only): unconditional connect-boundary
+    // trace_printk probe. Absent from the frozen arm64 object; attach is a no-op then.
+    if std::env::var_os("A3S_OBSERVER_DIAG").is_some() {
+        attach_first(&mut ebpf, "legacy_diag_connect", &[sys_sym!("connect")], &mut attached);
+        attach_first(&mut ebpf, "legacy_diag_sysconnect", &["__sys_connect"], &mut attached);
+        attach_first(&mut ebpf, "legacy_diag_ksysread", &["ksys_read"], &mut attached);
+        attach_first(&mut ebpf, "legacy_diag_ksysread_ret", &["ksys_read"], &mut attached);
     }
 
     let effective_probes = attached
@@ -234,6 +247,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ring_pages,
         )?;
     }
+    if ssl_uprobes {
+        spawn_tls_plaintext_perf(&mut ebpf, tx.clone(), perf_lost.clone(), ring_pages)?;
+    }
     spawn_perf(
         &mut ebpf,
         "SEC_EVENTS",
@@ -274,6 +290,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         collector
             .enabled_features
             .push("plaintext-http".to_string());
+    }
+    if ssl_uprobes {
+        collector
+            .enabled_features
+            .push("openssl-uprobe".to_string());
     }
     let classifier = SniClassifier;
     let mut plaintext_scope =
@@ -325,9 +346,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 if let (Some(reloader), Some(map)) =
                     (plaintext_scope.as_mut(), plaintext_allowed.as_mut())
                 {
+                    let mut attach_pids: Option<HashSet<i32>> = None;
                     match reloader.refresh() {
                         Ok(refresh) => {
                             sync_plaintext_allowed(map, &refresh.pids);
+                            if ssl_manager.is_some() {
+                                attach_pids = Some(refresh.pids.clone());
+                            }
                             if refresh.changed {
                                 tracing::info!(
                                     cgroups = refresh.cgroups,
@@ -342,6 +367,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             error = %error,
                             "legacy plaintext scope refresh failed; retaining the last valid scope"
                         ),
+                    }
+                    if let (Some(manager), Some(pids)) = (ssl_manager.as_mut(), attach_pids) {
+                        manager.ensure_attached(&mut ebpf, &pids);
                     }
                 }
                 if let Some(reassembler) = interactions.as_mut() {
@@ -406,12 +434,63 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             );
                         }
                     }
+                    RawEvent::PlaintextTls(ev) => {
+                        let seen = PLAINTEXT_TLS_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                        if seen <= 50 || seen.is_multiple_of(500) {
+                            let take = (ev.len as usize).min(32).min(ev.data.len());
+                            let preview: String = ev.data[..take]
+                                .iter()
+                                .map(|b| {
+                                    if b.is_ascii_graphic() || *b == b' ' {
+                                        *b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
+                            tracing::info!(
+                                seen,
+                                pid = ev.pid,
+                                tls_ctx = ev.tls_ctx,
+                                direction = ev.direction,
+                                len = ev.len,
+                                orig_len = ev.orig_len,
+                                preview = %preview,
+                                "legacy tls plaintext chunk received"
+                            );
+                        }
+                        if let Some(reassembler) = interactions.as_mut() {
+                            let chunk = tls_plaintext_chunk_from_event(
+                                &ev,
+                                safe_unix_now_ns(),
+                                &mut sequencer,
+                            );
+                            let completed = reassembler.push(chunk);
+                            emit_plaintext_interactions(
+                                exporter.as_ref(),
+                                &mut stats,
+                                &resolver,
+                                &classifier,
+                                ev.comm,
+                                completed,
+                                &mut suppressed_shells,
+                            );
+                        }
+                    }
                     other => handle_raw(exporter.as_ref(), &resolver, &mut stats, other),
                 }
             }
         }
     }
     Ok(())
+}
+
+fn ssl_uprobes_enabled() -> bool {
+    // Opt-in user-space OpenSSL capture on the legacy backend (AgentSight-style):
+    // attaches uprobe/uretprobe to libssl SSL_write/SSL_read of whitelisted processes.
+    // User-space reads go through probe_read_user (helper 112/114) — PAN-safe on the
+    // UOS 4.19 backport and verified on the dev host's 5.14.
+    std::env::var_os("A3S_OBSERVER_SSL").is_some()
 }
 
 fn plaintext_http_enabled() -> bool {
@@ -476,21 +555,58 @@ fn sync_plaintext_allowed(map: &mut BpfHashMap<MapData, u32, u8>, pids: &HashSet
 /// zero kernel cost and the same semantics as the modern `call_seq`.
 #[derive(Default)]
 struct PlaintextSequencer {
-    counters: std::collections::HashMap<(u32, u32, bool), u64>,
+    counters: std::collections::HashMap<(u32, u32, u32, bool), u64>,
 }
 
 impl PlaintextSequencer {
-    fn next(&mut self, pid: u32, fd: u32, is_read: bool) -> u64 {
-        if self.counters.len() >= 4_096 && !self.counters.contains_key(&(pid, fd, is_read)) {
+    fn next(&mut self, pid: u32, fd: u32, generation: u32, is_read: bool) -> u64 {
+        if self.counters.len() >= 4_096 && !self.counters.contains_key(&(pid, fd, generation, is_read)) {
             // Bounded state: evict one arbitrary baseline. A fresh key restarts at 1, which the
             // reassembler treats as a new baseline (no gap), never as a fabricated continuity.
             if let Some(oldest) = self.counters.keys().next().copied() {
                 self.counters.remove(&oldest);
             }
         }
-        let slot = self.counters.entry((pid, fd, is_read)).or_insert(0);
+        let slot = self.counters.entry((pid, fd, generation, is_read)).or_insert(0);
         *slot = slot.wrapping_add(1);
         *slot
+    }
+}
+
+fn tls_plaintext_chunk_from_event(
+    ev: &LegacyTlsPlaintextEvent,
+    now_unix_ns: u128,
+    sequencer: &mut PlaintextSequencer,
+) -> PlaintextChunk {
+    let len = (ev.len as usize).min(LEGACY_PLAINTEXT_LEN);
+    let is_read = ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ;
+    let lo = ev.tls_ctx as u32;
+    let hi = (ev.tls_ctx >> 32) as u32;
+    PlaintextChunk {
+        cgroup_id: 0,
+        pid: ev.pid,
+        // SSL* 指针即连接身份（uprobe 天然免疫 fd 复用）。tag 位避免与 fd 哈希空间相碰。
+        connection_id: ev.tls_ctx ^ 0x5353_6c73_0000_0000,
+        sequence: sequencer.next(ev.pid, lo, hi, is_read),
+        direction: if is_read {
+            ChunkDirection::Response
+        } else {
+            ChunkDirection::Request
+        },
+        data: ev.data[..len].to_vec(),
+        event_at_unix_ns: now_unix_ns,
+        source: "openssl_uprobe".to_string(),
+        adapter_id: "openssl-uprobe".to_string(),
+        route_candidate: false,
+        partial_reasons: if ev.len < ev.orig_len {
+            vec!["probe_call_limit".to_string()]
+        } else {
+            Vec::new()
+        },
+        bind_quality: 0,
+        socket_fd: 0,
+        socket_cookie: 0,
+        fd_generation: 0,
     }
 }
 
@@ -501,13 +617,21 @@ fn plaintext_chunk_from_event(
 ) -> PlaintextChunk {
     let len = (ev.len as usize).min(LEGACY_PLAINTEXT_LEN);
     let is_read = ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ;
+    // The legacy ABI carries no kernel cgroup id; (pid, fd) keyed lanes alone spliced
+    // unrelated connections after fd-number reuse (observed on the dev host: an auth
+    // response landed on an LLM request). The kernel-side fd generation makes every
+    // connect/accept/close a fresh lane; gen 0 keeps the pre-attach baseline.
+    let base_connection_id = classic_tls_sock_connection_id(0, ev.pid, u64::from(ev.fd));
+    let connection_id = if ev.fd_generation == 0 {
+        base_connection_id
+    } else {
+        base_connection_id ^ u64::from(ev.fd_generation).rotate_left(32)
+    };
     PlaintextChunk {
         cgroup_id: 0,
         pid: ev.pid,
-        // The legacy ABI carries no kernel cgroup id; (pid, fd) is the connection key. The
-        // reassembler pairs requests and responses on it exactly like the modern TCP path.
-        connection_id: classic_tls_sock_connection_id(0, ev.pid, u64::from(ev.fd)),
-        sequence: sequencer.next(ev.pid, ev.fd, is_read),
+        connection_id,
+        sequence: sequencer.next(ev.pid, ev.fd, ev.fd_generation, is_read),
         direction: if ev.direction == LEGACY_PLAINTEXT_DIRECTION_READ {
             ChunkDirection::Response
         } else {
@@ -526,7 +650,7 @@ fn plaintext_chunk_from_event(
         bind_quality: 0,
         socket_fd: ev.fd as i32,
         socket_cookie: 0,
-        fd_generation: 0,
+        fd_generation: ev.fd_generation,
     }
 }
 
@@ -625,6 +749,107 @@ fn attach_first(ebpf: &mut Ebpf, program: &str, symbols: &[&str], attached: &mut
     }
 }
 
+/// OpenSSL uprobe lifecycle on the legacy backend: scan whitelisted processes' maps for
+/// libssl, attach SSL_write/SSL_read(+ret) once per shared inode (identical base layers share
+/// one). The BPF side gates by the identity whitelist, so inode-wide attach is safe.
+#[derive(Default)]
+struct SslUprobeManager {
+    attached: HashSet<(u64, u64)>,
+    failed: HashSet<(u64, u64)>,
+    logged_scan: bool,
+    read_failed: HashSet<i32>,
+    logged_ssl_pids: HashSet<i32>,
+}
+
+impl SslUprobeManager {
+    fn ensure_attached(&mut self, ebpf: &mut Ebpf, pids: &HashSet<i32>) {
+        use std::os::unix::fs::MetadataExt;
+        if !self.logged_scan {
+            self.logged_scan = true;
+            tracing::info!(pids = pids.len(), "legacy openssl uprobe scan started");
+        }
+        let mut seen = HashSet::new();
+        for pid in pids {
+            let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+                Ok(maps) => maps,
+                Err(error) => {
+                    if self.read_failed.insert(*pid) {
+                        tracing::warn!(pid = *pid, error = %error, "legacy openssl uprobe: maps read failed");
+                    }
+                    continue;
+                }
+            };
+            let mut ssl_lines = 0usize;
+            for line in maps.lines() {
+                let Some(path) = line.split_whitespace().nth(5) else {
+                    continue;
+                };
+                if !path.contains("libssl.so") {
+                    continue;
+                }
+                ssl_lines += 1;
+                if !seen.insert(path.to_string()) {
+                    continue;
+                }
+                if ssl_lines == 1 && self.logged_ssl_pids.insert(*pid) {
+                    tracing::info!(pid = *pid, path, "legacy openssl uprobe scan: libssl mapped");
+                }
+                let host_path = PathBuf::from(format!("/proc/{pid}/root{path}"));
+                let Ok(metadata) = std::fs::metadata(&host_path) else {
+                    continue;
+                };
+                let key = (metadata.dev(), metadata.ino());
+                if self.attached.contains(&key) || self.failed.contains(&key) {
+                    continue;
+                }
+                match attach_ssl_uprobes(ebpf, &host_path) {
+                    Ok(()) => {
+                        self.attached.insert(key);
+                        tracing::info!(
+                            path = %host_path.display(),
+                            "legacy openssl uprobes attached (SSL_write/SSL_read)"
+                        );
+                    }
+                    Err(error) => {
+                        self.failed.insert(key);
+                        tracing::warn!(
+                            path = %host_path.display(),
+                            error = %error,
+                            "legacy openssl uprobe attach failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<()> {
+    for (program, symbol) in [
+        ("legacy_ssl_write", "SSL_write"),
+        ("legacy_ssl_write_ex", "SSL_write_ex"),
+        ("legacy_ssl_read_enter", "SSL_read"),
+        ("legacy_ssl_read_enter_ex", "SSL_read_ex"),
+        ("legacy_ssl_read_exit", "SSL_read"),
+        ("legacy_ssl_read_exit", "SSL_read_ex"),
+    ] {
+        let raw = ebpf
+            .program_mut(program)
+            .with_context(|| format!("program `{program}` missing"))?;
+        let probe: &mut UProbe = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("program `{program}` type mismatch"))?;
+        match probe.load() {
+            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+            Err(error) => return Err(error).context("uprobe load failed"),
+        }
+        probe
+            .attach(Some(symbol), 0, path, None)
+            .with_context(|| format!("uprobe attach `{symbol}` failed"))?;
+    }
+    Ok(())
+}
+
 fn spawn_perf<T: Copy + Send + 'static>(
     ebpf: &mut Ebpf,
     map_name: &str,
@@ -708,6 +933,78 @@ fn spawn_plaintext_perf(
     Ok(())
 }
 
+fn tls_plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyTlsPlaintextEvent> {
+    // Same trimmed-record convention as `plaintext_event_from_record`: the kernel emits
+    // header + len only. Header layout: pid@0 direction@4 len@8 orig_len@12 tls_ctx@16
+    // comm@24 captured_at_boot_ns@40, data@48.
+    const HEADER_LEN: usize = size_of::<LegacyTlsPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
+    if bytes.len() < HEADER_LEN {
+        return None;
+    }
+    let read_u32 = |offset: usize| {
+        bytes
+            .get(offset..offset + 4)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_ne_bytes)
+    };
+    let len = read_u32(8)? as usize;
+    if len > LEGACY_PLAINTEXT_LEN || bytes.len() < HEADER_LEN + len {
+        return None;
+    }
+    let mut event = LegacyTlsPlaintextEvent {
+        pid: read_u32(0)?,
+        direction: read_u32(4)?,
+        len: len as u32,
+        orig_len: read_u32(12)?,
+        tls_ctx: u64::from_ne_bytes(bytes.get(16..24)?.try_into().ok()?),
+        comm: bytes.get(24..40)?.try_into().ok()?,
+        captured_at_boot_ns: u64::from_ne_bytes(bytes.get(40..48)?.try_into().ok()?),
+        data: [0; LEGACY_PLAINTEXT_LEN],
+    };
+    event.data[..len].copy_from_slice(&bytes[HEADER_LEN..HEADER_LEN + len]);
+    Some(event)
+}
+
+fn spawn_tls_plaintext_perf(
+    ebpf: &mut Ebpf,
+    tx: mpsc::Sender<RawEvent>,
+    lost: Arc<AtomicU64>,
+    ring_pages: usize,
+) -> anyhow::Result<()> {
+    let mut array = AsyncPerfEventArray::try_from(
+        ebpf.take_map("PLAINTEXT_TLS_EVENTS")
+            .context("`PLAINTEXT_TLS_EVENTS` missing")?,
+    )?;
+    for cpu in online_cpus().map_err(|(_, error)| error)? {
+        let mut buffer = array.open(cpu, Some(ring_pages))?;
+        let tx = tx.clone();
+        let lost = lost.clone();
+        tokio::spawn(async move {
+            let mut slots = (0..32)
+                .map(|_| BytesMut::with_capacity(size_of::<LegacyTlsPlaintextEvent>()))
+                .collect::<Vec<_>>();
+            loop {
+                let events = match buffer.read_events(&mut slots).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        tracing::error!(cpu, error = %error, "legacy tls plaintext perf reader failed");
+                        break;
+                    }
+                };
+                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                for slot in slots.iter().take(events.read) {
+                    if let Some(event) = tls_plaintext_event_from_record(slot) {
+                        if tx.send(RawEvent::PlaintextTls(Box::new(event))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
 fn plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyPlaintextEvent> {
     const HEADER_LEN: usize = size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
     if bytes.len() < HEADER_LEN {
@@ -730,8 +1027,9 @@ fn plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyPlaintextEvent> {
         len: len as u32,
         orig_len: read_u32(16)?,
         _pad: read_u32(20)?,
-        comm: bytes.get(24..40)?.try_into().ok()?,
-        captured_at_boot_ns: u64::from_ne_bytes(bytes.get(40..48)?.try_into().ok()?),
+        fd_generation: read_u32(24)?,
+        comm: bytes.get(28..44)?.try_into().ok()?,
+        captured_at_boot_ns: u64::from_ne_bytes(bytes.get(48..56)?.try_into().ok()?),
         data: [0; LEGACY_PLAINTEXT_LEN],
     };
     event.data[..len].copy_from_slice(&bytes[HEADER_LEN..HEADER_LEN + len]);
@@ -861,6 +1159,7 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
         // Plaintext chunks are intercepted in the main loop before handle_raw; this arm only
         // exists so the match stays exhaustive.
         RawEvent::Plaintext(_) => return,
+        RawEvent::PlaintextTls(_) => return,
     };
     let ring = match &enriched.event {
         AgentEvent::ToolExec { .. } => super::PipelineRing::Exec,
