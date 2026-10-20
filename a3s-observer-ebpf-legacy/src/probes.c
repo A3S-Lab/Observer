@@ -519,8 +519,17 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
             }
         }
     }
-    output(ctx, &PLAINTEXT_EVENTS, event,
-           sizeof(*event) - LEGACY_PLAINTEXT_LEN + event->len);
+    {
+        /* Values reloaded from a map are unbounded to the verifier (modern kernels
+         * reject an unbounded bpf_perf_event_output size). Re-clamp into a local so
+         * the emitted record size is provably within the event allocation; on 4.19
+         * this is idempotent with the clamp already applied to len above. */
+        u32 emit_len = event->len;
+        if (emit_len > LEGACY_PLAINTEXT_LEN)
+            emit_len = LEGACY_PLAINTEXT_LEN;
+        output(ctx, &PLAINTEXT_EVENTS, event,
+               sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
+    }
 }
 
 INLINE void plaintext_write(struct pt_regs *ctx) {
