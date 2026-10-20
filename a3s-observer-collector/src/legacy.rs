@@ -41,6 +41,17 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// Syscall kprobe symbol prefix for the target architecture.
+/// UOS 20 ARM64 exposes `__arm64_sys_*` aliases; x86_64 kernels expose `__x64_sys_*`.
+macro_rules! sys_sym {
+    ($name:literal) => {{
+        #[cfg(target_arch = "aarch64")]
+        { concat!("__arm64_sys_", $name) }
+        #[cfg(not(target_arch = "aarch64"))]
+        { concat!("__x64_sys_", $name) }
+    }};
+}
+
 enum RawEvent {
     Exec(Box<LegacyExecEvent>),
     Exit(ExitEvent),
@@ -81,45 +92,45 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     attach_first(
         &mut ebpf,
         "legacy_exec",
-        &["__arm64_sys_execve"],
+        &[sys_sym!("execve")],
         &mut attached,
     );
     attach_first(&mut ebpf, "legacy_exit", &["do_exit"], &mut attached);
     attach_first(
         &mut ebpf,
         "legacy_connect",
-        &["__arm64_sys_connect"],
+        &[sys_sym!("connect")],
         &mut attached,
     );
     attach_first(
         &mut ebpf,
         "legacy_setuid",
-        &["__arm64_sys_setuid"],
+        &[sys_sym!("setuid")],
         &mut attached,
     );
     attach_first(
         &mut ebpf,
         "legacy_ptrace",
-        &["__arm64_sys_ptrace"],
+        &[sys_sym!("ptrace")],
         &mut attached,
     );
     attach_first(
         &mut ebpf,
         "legacy_bind",
-        &["__arm64_sys_bind"],
+        &[sys_sym!("bind")],
         &mut attached,
     );
     if files {
         attach_first(
             &mut ebpf,
             "legacy_openat",
-            &["__arm64_sys_openat"],
+            &[sys_sym!("openat")],
             &mut attached,
         );
         attach_first(
             &mut ebpf,
             "legacy_unlinkat",
-            &["__arm64_sys_unlinkat"],
+            &[sys_sym!("unlinkat")],
             &mut attached,
         );
     }
@@ -137,17 +148,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut plaintext_allowed: Option<BpfHashMap<MapData, u32, u8>> = None;
     if plaintext_http {
         for (program, symbols) in [
-            ("legacy_http_write", ["__arm64_sys_write"].as_slice()),
-            ("legacy_http_sendto", ["__arm64_sys_sendto"].as_slice()),
-            ("legacy_http_read_enter", ["__arm64_sys_read"].as_slice()),
+            ("legacy_http_write", [sys_sym!("write")].as_slice()),
+            ("legacy_http_sendto", [sys_sym!("sendto")].as_slice()),
+            ("legacy_http_read_enter", [sys_sym!("read")].as_slice()),
             (
                 "legacy_http_recvfrom_enter",
-                ["__arm64_sys_recvfrom"].as_slice(),
+                [sys_sym!("recvfrom")].as_slice(),
             ),
-            ("legacy_http_read_exit", ["__arm64_sys_read"].as_slice()),
+            ("legacy_http_read_exit", [sys_sym!("read")].as_slice()),
             (
                 "legacy_http_recvfrom_exit",
-                ["__arm64_sys_recvfrom"].as_slice(),
+                [sys_sym!("recvfrom")].as_slice(),
             ),
         ] {
             attach_first(&mut ebpf, program, symbols, &mut attached);

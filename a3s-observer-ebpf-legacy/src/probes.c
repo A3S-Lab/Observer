@@ -176,7 +176,10 @@ struct bpf_map_def SEC("maps") PLAINTEXT_READ_ARGS = {
 };
 
 /* UOS reports 4.19.0 in uname but its BPF KProbe gate requires 4.19.90. */
-u32 A3S_KERNEL_VERSION SEC("version") = UOS_KERNEL_VERSION_4_19_90;
+#ifndef A3S_BPF_KERN_VERSION
+#define A3S_BPF_KERN_VERSION UOS_KERNEL_VERSION_4_19_90
+#endif
+u32 A3S_KERNEL_VERSION SEC("version") = A3S_BPF_KERN_VERSION;
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value,
