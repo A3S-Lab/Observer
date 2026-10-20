@@ -185,7 +185,13 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value,
                                    u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
-static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)4;
+#ifndef A3S_BPF_KERNEL_READ_HELPER
+/* ARM64 4.19 legacy kernels have helper 4 and it reads kernel memory fine.
+ * x86 kernels >= 5.12 reject helper 4 (non-overlapping address space); builds
+ * for such targets pass -DA3S_BPF_KERNEL_READ_HELPER=117 (probe_read_kernel). */
+#define A3S_BPF_KERNEL_READ_HELPER 4
+#endif
+static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)A3S_BPF_KERNEL_READ_HELPER;
 static u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
