@@ -825,14 +825,24 @@ impl SslUprobeManager {
 }
 
 fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<()> {
-    for (program, symbol) in [
-        ("legacy_ssl_write", "SSL_write"),
+    // OpenSSL 3.x 的 SSL_write/SSL_read 包装内部会调用导出的 SSL_write_ex/SSL_read_ex
+    // （开发机实测双挂产生重复分块：同一写请求 headers 采到两次）。默认只挂 _ex 变体 +
+    // 共享出口；个别包装不转发导出符号的 libssl 可用 A3S_OBSERVER_SSL_LEGACY_SYMBOLS=1
+    // 恢复旧符号挂接（仿真环境打包前需在目标 libssl 上验证一次）。
+    let legacy_symbols = std::env::var("A3S_OBSERVER_SSL_LEGACY_SYMBOLS")
+        .map(|value| matches!(value.trim(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let mut programs = vec![
         ("legacy_ssl_write_ex", "SSL_write_ex"),
-        ("legacy_ssl_read_enter", "SSL_read"),
         ("legacy_ssl_read_enter_ex", "SSL_read_ex"),
-        ("legacy_ssl_read_exit", "SSL_read"),
         ("legacy_ssl_read_exit", "SSL_read_ex"),
-    ] {
+    ];
+    if legacy_symbols {
+        programs.push(("legacy_ssl_write", "SSL_write"));
+        programs.push(("legacy_ssl_read_enter", "SSL_read"));
+        programs.push(("legacy_ssl_read_exit", "SSL_read"));
+    }
+    for (program, symbol) in programs {
         let raw = ebpf
             .program_mut(program)
             .with_context(|| format!("program `{program}` missing"))?;

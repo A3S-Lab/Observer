@@ -342,11 +342,17 @@ INLINE void fd_gen_bump(u32 pid, u32 fd) {
  * 二进制协议（PK/ thrift 等）一律不匹配——用于存量连接的收养判定。 */
 #if defined(A3S_BPF_DST_NARROW)
 /* 开发机定向收窄（铁律：仅 x86 开发通道构建启用，仿真环境 arm64 打包绝不含）：
- * 只跟踪到 LLM 网关 122.144.165.65:18890 的明文连接。 */
+ * 只跟踪到 LLM 网关/模型服务的明文连接：
+ * - 122.144.165.65:18890（外网 nginx 网关：Qwen3-32B/bge 等）
+ * - 10.1.3.119:18890（本机 ai-web 网关容器：业务 API + 部分模型路由）
+ * - 10.1.3.128:20002（远端模型服务：Qwen3.5-122B-YD，ai-ai-java 直连） */
 #define FD_GEN_ALLOW 0x80000000U
 #define FD_GEN_MASK 0x7fffffffU
 INLINE int dst_narrow_allow(u32 ip_be, u16 port) {
-    return port == 18890 && ip_be == 0x7a90a541U;
+    if (port == 18890 && (ip_be == 0x7a90a541U || ip_be == 0x0a010377U))
+        return 1;
+    /* 10.1.3.128:20002 = 远端模型服务（Qwen3.5-122B-YD，ai-ai-java 直连）。 */
+    return port == 20002 && ip_be == 0x0a010380U;
 }
 /* accept/close：换代际并清除允许位——入站 fd 与关闭后的复用 fd 都不采。 */
 INLINE void fd_gen_rotate_blocked(u32 pid, u32 fd) {
@@ -357,7 +363,9 @@ INLINE void fd_gen_rotate_blocked(u32 pid, u32 fd) {
 }
 #endif
 
-#if !defined(A3S_BPF_DST_NARROW)
+/* 前 4 字节按小端比较 HTTP/1.x 请求方法或响应行。文件日志、Redis RESP、TLS 握手、
+ * 二进制协议（PK/ thrift 等）一律不匹配——用于存量连接的收养判定。
+ * 注意：收窄构建也需要它（见 emit_plaintext 的存量收养分支），不可再按窄构建裁剪。 */
 INLINE int is_http1_prefix32(u32 w) {
     return w == 0x20544547U /* "GET " */ || w == 0x54534f50U /* "POST" */ ||
            w == 0x20545550U /* "PUT " */ || w == 0x44414548U /* "HEAD" */ ||
@@ -365,7 +373,6 @@ INLINE int is_http1_prefix32(u32 w) {
            w == 0x43544150U /* "PATC" */ || w == 0x454c4544U /* "DELE" */ ||
            w == 0x43415254U /* "TRAC" */ || w == 0x4e4e4f43U /* "CONN" */;
 }
-#endif
 
 SEC("kprobe")
 int legacy_exec(struct pt_regs *ctx) {
@@ -608,13 +615,24 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
     /* 采集器启动前已存在的连接（gen==0）：只在嗅到 HTTP 前缀时收养进跟踪，
      * 否则丢弃——白名单进程的文件/管道/Redis 字节不再占用 perf 通道。 */
 #if defined(A3S_BPF_DST_NARROW)
-    /* 收窄构建：只有目的地命中的连接（bit31）才采，代际另行可取。 */
+    /* 收窄构建：connect 时目的地命中的连接（bit31）必采。对采集器启动前已存在的
+     * keep-alive 连接（重启后不再有 connect 事件，永远打不上标），按非收窄构建同款
+     * HTTP 前缀收养——否则重启前的连接池长连成为永久盲区（2026-10-22 122b 漏采
+     * 根因之二：ai-agent 到本地网关的复用连接在重启后新建连接前不可见）。 */
     {
         const u64 key = ((u64)pid << 32) | fd;
         const u32 *val = bpf_map_lookup_elem(&PLAINTEXT_FD_GEN, &key);
-        if (!val || !(*val & FD_GEN_ALLOW))
-            return;
-        event->fd_generation = *val & FD_GEN_MASK;
+        if (!val || !(*val & FD_GEN_ALLOW)) {
+            u32 prefix = 0;
+            if (bpf_probe_read_user(&prefix, sizeof(prefix), (const void *)buf) < 0 ||
+                !is_http1_prefix32(prefix))
+                return;
+            const u32 adopted = (((val ? *val : 0) & FD_GEN_MASK) + 1) | FD_GEN_ALLOW;
+            bpf_map_update_elem(&PLAINTEXT_FD_GEN, &key, &adopted, 0);
+            event->fd_generation = adopted & FD_GEN_MASK;
+        } else {
+            event->fd_generation = *val & FD_GEN_MASK;
+        }
     }
 #else
     u32 gen = fd_gen_current(pid, fd);
@@ -821,8 +839,9 @@ char LICENSE[] SEC("license") = "GPL";
 
 /* 与 emit_plaintext 同款的定长窗口复制（4.19 验证器只认常量长度）；差别只在事件类型
  * 与 tls_ctx 身份字段，没有 fd/代际——SSL* 指针即连接身份。 */
-INLINE void emit_tls_plaintext(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
-                               u64 count, u32 direction) {
+/* 单次 SSL 调用只产出一个分块。大缓冲由 emit_tls_plaintext 的定界循环拆分多次调用。 */
+INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
+                           u64 count, u32 direction) {
     struct plaintext_tls_event *event;
     u32 len;
     if (!buf || !count || !tls_ctx)
@@ -889,6 +908,31 @@ INLINE void emit_tls_plaintext(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 bu
             emit_len = LEGACY_PLAINTEXT_LEN;
         output(ctx, &PLAINTEXT_TLS_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
+    }
+}
+
+/* 大缓冲拆分：之前每次 SSL 调用只复制首个 16KB 窗口，150KB 的单次 SSL_write 只采到
+ * 16KB（开发机实测 deepseek/大 POST 截断根因）。定界循环按 16KB 步长顺序产出多个事件；
+ * 同一调用的分块在同一 CPU 的 ring 上顺序相邻，重组器按到达序追加即可。 */
+/* x86_64 开发机（5.14，验证器 1M 指令上限）实测单次 SSL_write 可达 384KB+，12 块（192KB）
+ * 仍会截断并诱发同 CPU ring 溢出丢块；放宽到 40 块（640KB）覆盖真实大请求。
+ * arm64/4.19 仿真侧保持 12 冻结不变（该值已在目标内核验证，且 128K 指令预算更紧）。 */
+#if defined(A3S_BPF_ARCH_X86_64)
+#define TLS_SPLIT_MAX 40
+#else
+#define TLS_SPLIT_MAX 12
+#endif
+INLINE void emit_tls_plaintext(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
+                               u64 count, u32 direction) {
+    if (!buf || !count || !tls_ctx)
+        return;
+    /* 全展开：老内核验证器不接受回跳；展开后的 break 只产生前向跳。窗口大小见 TLS_SPLIT_MAX。 */
+#pragma unroll
+    for (u32 i = 0; i < TLS_SPLIT_MAX; i++) {
+        const u64 offset = (u64)i * LEGACY_PLAINTEXT_LEN;
+        if (offset >= count)
+            break;
+        emit_tls_chunk(ctx, pid, tls_ctx, buf + offset, count - offset, direction);
     }
 }
 
