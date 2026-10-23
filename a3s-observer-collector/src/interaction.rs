@@ -3310,6 +3310,22 @@ impl InteractionReassembler {
         self.retain_live_connection_aliases();
     }
 
+    /// Redacted printable preview of buffered wire bytes for gap evidence: enough to
+    /// recognize a protocol shape (HTTP/1.1 start line, h2 preface, binary framing)
+    /// without carrying credentials or payloads into storage.
+    fn redacted_wire_sample(bytes: &[u8], max: usize) -> Option<String> {
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(
+            bytes
+                .iter()
+                .take(max)
+                .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '·' })
+                .collect(),
+        )
+    }
+
     fn retire_incomplete_connection(
         &mut self,
         key: ConnectionKey,
@@ -3317,11 +3333,14 @@ impl InteractionReassembler {
         reason: &'static str,
     ) {
         let pending_requests = state.pending_requests.len();
-        // Capture the buffer sizes before flushing: the retire path may drain them into a
-        // partial interaction, and the coverage-gap evidence must still describe the truncated
-        // bytes that were observed (both channels are intentional, not duplicates in intent).
+        // Capture the buffer sizes and a redacted wire preview before flushing: the retire
+        // path may drain them into a partial interaction, and the coverage-gap evidence must
+        // still describe the truncated bytes that were observed (both channels are
+        // intentional, not duplicates in intent).
         let request_buffer_bytes = state.requests.buffered_bytes();
         let response_buffer_bytes = state.responses.buffered_bytes();
+        let wire_sample = Self::redacted_wire_sample(&state.requests.buffer, 64)
+            .or_else(|| Self::redacted_wire_sample(&state.responses.buffer, 64));
         self.flush_pending_requests_as_partial(key, &mut state, reason);
         if pending_requests > 0 || request_buffer_bytes > 0 || response_buffer_bytes > 0 {
             tracing::warn!(
@@ -3385,7 +3404,7 @@ impl InteractionReassembler {
                     + response_buffer_bytes
                     + state.pending_request_bytes) as u64,
                 encoding: "metadata_only".to_string(),
-                redacted_sample: None,
+                redacted_sample: wire_sample,
                 sample_sha256: sha256_hex(fingerprint.as_bytes()),
                 reasons: vec![
                     reason.to_string(),
