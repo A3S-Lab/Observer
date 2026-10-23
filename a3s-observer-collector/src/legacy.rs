@@ -17,14 +17,15 @@ use a3s_observer::{
     IdentityResolver, JsonExporter, KubeResolver, LogExporter, RawObservation, SniClassifier,
 };
 use a3s_observer_common::{
-    classic_tls_sock_connection_id, ConnectEvent, ExitEvent, FileEvent, LegacyExecEvent,
-    LegacyPlaintextEvent, LegacyTlsPlaintextEvent, SecEvent, ARGV_SLOTS, FILE_DELETE_FLAG,
-    LEGACY_ARG_LEN, LEGACY_PLAINTEXT_DIRECTION_READ, LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE,
-    SEC_SETUID,
+    classic_tls_sock_connection_id, fnv1a64, ConnectEvent, ExitEvent, FileEvent,
+    LegacyCursorExt, LegacyExecEvent, LegacyPlaintextEvent, LegacyTlsPlaintextEvent, SecEvent,
+    A3S_CONFIG_FLAG_CURSOR_REREAD, ARGV_SLOTS, FILE_DELETE_FLAG, LEGACY_ARG_LEN,
+    LEGACY_CURSOR_EXT_MAGIC, LEGACY_CURSOR_TAIL_LEN, LEGACY_PLAINTEXT_DIRECTION_READ,
+    LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
-    maps::{perf::AsyncPerfEventArray, HashMap as BpfHashMap, MapData, PerCpuArray},
+    maps::{perf::AsyncPerfEventArray, Array as BpfArray, HashMap as BpfHashMap, MapData, PerCpuArray},
     programs::{KProbe, ProgramError, UProbe},
     util::online_cpus,
     Ebpf,
@@ -59,8 +60,8 @@ enum RawEvent {
     Connect(ConnectEvent),
     File(Box<FileEvent>),
     Security(SecEvent),
-    Plaintext(Box<LegacyPlaintextEvent>),
-    PlaintextTls(Box<LegacyTlsPlaintextEvent>),
+    Plaintext(Box<LegacyPlaintextEvent>, Option<LegacyCursorExt>),
+    PlaintextTls(Box<LegacyTlsPlaintextEvent>, Option<LegacyCursorExt>),
 }
 
 // Diagnostic counters (UOS 4.19 field investigation): the legacy plaintext path produced zero
@@ -69,6 +70,14 @@ enum RawEvent {
 static PLAINTEXT_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_TLS_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_INTERACTION_SEEN: AtomicU64 = AtomicU64::new(0);
+
+// R3 截断补读计数器：拼接成功/字节数与四类拒绝，60s 心跳周期随 report tick 输出。
+static CURSOR_PATCHED: AtomicU64 = AtomicU64::new(0);
+static CURSOR_PATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+static CURSOR_REJECT_TTL: AtomicU64 = AtomicU64::new(0);
+static CURSOR_REJECT_SELF_FNV: AtomicU64 = AtomicU64::new(0);
+static CURSOR_REJECT_OVERLAP_FNV: AtomicU64 = AtomicU64::new(0);
+static CURSOR_REJECT_READ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) async fn run() -> anyhow::Result<()> {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
@@ -173,6 +182,30 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         )?;
         plaintext_allowed = Some(map);
     }
+
+    // R3 截断补读：默认关。开启时置位 BPF 运行时开关（A3S_RUNTIME_CONFIG[0] bit0），
+    // 窗口用尽末片才开始携带续读游标扩展；map 缺失（arm64 冻结对象）时特性整体关闭。
+    let cursor_rereader = if plaintext_http {
+        CursorRereader::from_env().and_then(|rereader| match enable_cursor_reread(&mut ebpf) {
+            Ok(()) => {
+                tracing::info!(
+                    max_bytes = rereader.max_bytes,
+                    ttl_ns = rereader.ttl_ns,
+                    "legacy cursor reread enabled"
+                );
+                Some(rereader)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "legacy cursor reread unavailable; leaving BPF cursor generation off"
+                );
+                None
+            }
+        })
+    } else {
+        None
+    };
 
     // Dev-machine x86_64 diagnosis (A3S_BPF_DIAG build only): unconditional connect-boundary
     // trace_printk probe. Absent from the frozen arm64 object; attach is a no-op then.
@@ -302,6 +335,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .enabled_features
             .push("openssl-uprobe".to_string());
     }
+    if cursor_rereader.is_some() {
+        collector
+            .enabled_features
+            .push("cursor-reread".to_string());
+    }
     let classifier = SniClassifier;
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
@@ -360,6 +398,31 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     );
                     suppressed_shells = 0;
                 }
+                {
+                    // R3 截断补读 60s 窗口统计：拼接成功/字节与四类拒绝（默认关时恒零不输出）。
+                    let patched = CURSOR_PATCHED.swap(0, Ordering::Relaxed);
+                    let patched_bytes = CURSOR_PATCH_BYTES.swap(0, Ordering::Relaxed);
+                    let reject_ttl = CURSOR_REJECT_TTL.swap(0, Ordering::Relaxed);
+                    let reject_self = CURSOR_REJECT_SELF_FNV.swap(0, Ordering::Relaxed);
+                    let reject_overlap = CURSOR_REJECT_OVERLAP_FNV.swap(0, Ordering::Relaxed);
+                    let reject_read = CURSOR_REJECT_READ.swap(0, Ordering::Relaxed);
+                    if patched > 0
+                        || reject_ttl > 0
+                        || reject_self > 0
+                        || reject_overlap > 0
+                        || reject_read > 0
+                    {
+                        tracing::info!(
+                            patched,
+                            patched_bytes,
+                            reject_ttl,
+                            reject_self_fingerprint = reject_self,
+                            reject_overlap_fingerprint = reject_overlap,
+                            reject_read,
+                            "legacy cursor reread stats (60s window)"
+                        );
+                    }
+                }
                 stats = Stats::default();
             }
             _ = plaintext_tick.tick(), if plaintext_http => {
@@ -409,7 +472,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             raw = rx.recv() => {
                 let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
                 match raw {
-                    RawEvent::Plaintext(ev) => {
+                    RawEvent::Plaintext(ev, cursor) => {
                         let seen = PLAINTEXT_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
                         if seen <= 50 || seen.is_multiple_of(500) {
                             let take = (ev.len as usize).min(32).min(ev.data.len());
@@ -437,10 +500,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             );
                         }
                         if let Some(reassembler) = interactions.as_mut() {
-                            let chunk = plaintext_chunk_from_event(
+                            let mut chunk = plaintext_chunk_from_event(
                                 &ev,
                                 safe_unix_now_ns(),
                                 &mut sequencer,
+                            );
+                            cursor_patch_and_log(
+                                cursor_rereader.as_ref(),
+                                cursor,
+                                &mut chunk,
+                                ev.captured_at_boot_ns,
                             );
                             let completed = reassembler.push(chunk);
                             emit_plaintext_interactions(
@@ -454,7 +523,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             );
                         }
                     }
-                    RawEvent::PlaintextTls(ev) => {
+                    RawEvent::PlaintextTls(ev, cursor) => {
                         let seen = PLAINTEXT_TLS_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
                         if seen <= 50 || seen.is_multiple_of(500) {
                             let take = (ev.len as usize).min(32).min(ev.data.len());
@@ -480,10 +549,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             );
                         }
                         if let Some(reassembler) = interactions.as_mut() {
-                            let chunk = tls_plaintext_chunk_from_event(
+                            let mut chunk = tls_plaintext_chunk_from_event(
                                 &ev,
                                 safe_unix_now_ns(),
                                 &mut sequencer,
+                            );
+                            cursor_patch_and_log(
+                                cursor_rereader.as_ref(),
+                                cursor,
+                                &mut chunk,
+                                ev.captured_at_boot_ns,
                             );
                             let completed = reassembler.push(chunk);
                             emit_plaintext_interactions(
@@ -524,6 +599,152 @@ fn plaintext_http_enabled() -> bool {
                 )
         })
         .unwrap_or(false)
+}
+
+/// CLOCK_MONOTONIC nanoseconds — the same clock as the BPF-side `captured_at_boot_ns`,
+/// so cursor TTL compares like with like.
+fn boot_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer; clock_gettime with CLOCK_MONOTONIC cannot fail.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// R3 截断补读（见 probes.c 游标扩展注释）：窗口用尽末片携带续读游标时，用
+/// process_vm_readv 从目标进程内存补读剩余部分。默认关（A3S_OBSERVER_CURSOR_REREAD）；
+/// 开启后 collector 在加载后置位 A3S_RUNTIME_CONFIG[0]，BPF 才开始产生游标。
+struct CursorRereader {
+    max_bytes: usize,
+    ttl_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchReject {
+    /// 游标超过 TTL：buffer 大概率已被复用，拼接风险不可接受。
+    TtlExpired,
+    /// chunk 自带尾部与游标指纹不一致（解析串道/数据被改写）。
+    SelfFingerprint,
+    /// 补读到的衔接处 64B 与已采尾部指纹不一致：目标内存已变，错拼风险。
+    OverlapFingerprint,
+    /// process_vm_readv 失败或连衔接 64B 都读不全。
+    ReadFailed,
+}
+
+impl CursorRereader {
+    fn from_env() -> Option<Self> {
+        let enabled = std::env::var("A3S_OBSERVER_CURSOR_REREAD")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty()
+                    && !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no" | "disabled"
+                    )
+            })
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let max_kb = std::env::var("A3S_OBSERVER_CURSOR_REREAD_MAX_KB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1_024)
+            .clamp(64, 8_192);
+        let ttl_ms = std::env::var("A3S_OBSERVER_CURSOR_REREAD_TTL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(500)
+            .clamp(1, 10_000);
+        Some(Self {
+            max_bytes: max_kb * 1_024,
+            ttl_ns: ttl_ms * 1_000_000,
+        })
+    }
+
+    /// 校验并拼接。任何一步存疑都原样保留 partial chunk（宁可不拼，不可错拼）。
+    /// `reader(pid, addr, len)` 注入目标内存读取，测试用假实现，生产用 process_vm_readv。
+    fn patch(
+        &self,
+        chunk: &mut PlaintextChunk,
+        cursor: &LegacyCursorExt,
+        captured_at_boot_ns: u64,
+        now_boot_ns: u64,
+        reader: &dyn Fn(u32, u64, usize) -> Option<Vec<u8>>,
+    ) -> Result<usize, PatchReject> {
+        if now_boot_ns.saturating_sub(captured_at_boot_ns) > self.ttl_ns {
+            return Err(PatchReject::TtlExpired);
+        }
+        let tail_len = cursor.tail_len as usize;
+        if tail_len != LEGACY_CURSOR_TAIL_LEN
+            || cursor.remaining == 0
+            || cursor.resume_buf < tail_len as u64
+            || chunk.data.len() < tail_len
+        {
+            return Err(PatchReject::SelfFingerprint);
+        }
+        // 自证：带上游标的 chunk 尾部必须与 BPF 指纹一致（防解析串道）。
+        if fnv1a64(&chunk.data[chunk.data.len() - tail_len..]) != cursor.tail_fnv64 {
+            return Err(PatchReject::SelfFingerprint);
+        }
+        let want = (cursor.remaining as usize).min(self.max_bytes);
+        let base = cursor.resume_buf - tail_len as u64;
+        let read = reader(chunk.pid, base, tail_len + want).ok_or(PatchReject::ReadFailed)?;
+        if read.len() < tail_len {
+            return Err(PatchReject::ReadFailed);
+        }
+        // 衔接校验：目标进程内存里 resume_buf 前的 64B 必须仍是已采尾部。
+        if fnv1a64(&read[..tail_len]) != cursor.tail_fnv64 {
+            return Err(PatchReject::OverlapFingerprint);
+        }
+        let payload = &read[tail_len..];
+        chunk.data.extend_from_slice(payload);
+        chunk.partial_reasons.push("cursor_reread_patched".to_string());
+        if payload.len() < cursor.remaining as usize {
+            chunk
+                .partial_reasons
+                .push("cursor_reread_capped".to_string());
+        }
+        Ok(payload.len())
+    }
+}
+
+/// 生产侧 reader：process_vm_readv 直读目标进程内存。部分读取保留可用前缀
+/// （不足衔接 64B 由调用方判 ReadFailed）。
+fn process_vm_read(pid: u32, addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as usize as *mut libc::c_void,
+        iov_len: len,
+    };
+    // SAFETY: both iovecs reference valid ranges for the duration of the call; the remote
+    // range is validated by the kernel (ptrace access mode), never dereferenced locally.
+    let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+/// 开启 BPF 侧游标产生：写 A3S_RUNTIME_CONFIG[0] bit0。arm64 冻结对象不含此 map，
+/// 返回错误后特性整体关闭（行为与旧版一致）。
+fn enable_cursor_reread(ebpf: &mut Ebpf) -> anyhow::Result<()> {
+    let map = ebpf
+        .map_mut("A3S_RUNTIME_CONFIG")
+        .context("`A3S_RUNTIME_CONFIG` missing (legacy object without cursor support)")?;
+    let mut config: BpfArray<_, u64> =
+        BpfArray::try_from(map).context("`A3S_RUNTIME_CONFIG` type mismatch")?;
+    config
+        .set(0, A3S_CONFIG_FLAG_CURSOR_REREAD, 0)
+        .context("`A3S_RUNTIME_CONFIG` write failed")?;
+    Ok(())
 }
 
 /// Legacy perf maps and their short heartbeat keys, in registration order. The short key is
@@ -748,6 +969,52 @@ fn plaintext_chunk_from_event(
         socket_fd: ev.fd as i32,
         socket_cookie: 0,
         fd_generation: ev.fd_generation,
+    }
+}
+
+/// R3 截断补读入口：游标存在且特性开启时尝试补读拼接；结果只影响本 chunk，
+/// 失败原样保留 partial。计数进 60s 心跳窗口。
+fn cursor_patch_and_log(
+    rereader: Option<&CursorRereader>,
+    cursor: Option<LegacyCursorExt>,
+    chunk: &mut PlaintextChunk,
+    captured_at_boot_ns: u64,
+) {
+    let (Some(rereader), Some(cursor)) = (rereader, cursor) else {
+        return;
+    };
+    match rereader.patch(
+        chunk,
+        &cursor,
+        captured_at_boot_ns,
+        boot_now_ns(),
+        &process_vm_read,
+    ) {
+        Ok(appended) => {
+            CURSOR_PATCHED.fetch_add(1, Ordering::Relaxed);
+            CURSOR_PATCH_BYTES.fetch_add(appended as u64, Ordering::Relaxed);
+            tracing::info!(
+                pid = chunk.pid,
+                appended,
+                remaining = cursor.remaining,
+                "legacy cursor reread patched truncated call"
+            );
+        }
+        Err(reason) => {
+            let counter = match reason {
+                PatchReject::TtlExpired => &CURSOR_REJECT_TTL,
+                PatchReject::SelfFingerprint => &CURSOR_REJECT_SELF_FNV,
+                PatchReject::OverlapFingerprint => &CURSOR_REJECT_OVERLAP_FNV,
+                PatchReject::ReadFailed => &CURSOR_REJECT_READ,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                pid = chunk.pid,
+                ?reason,
+                remaining = cursor.remaining,
+                "legacy cursor reread rejected; keeping partial"
+            );
+        }
     }
 }
 
@@ -1031,7 +1298,16 @@ fn spawn_plaintext_perf(
                 lost.record(ring_index, events.lost as u64);
                 for slot in slots.iter().take(events.read) {
                     if let Some(event) = plaintext_event_from_record(slot) {
-                        if tx.send(RawEvent::Plaintext(Box::new(event))).await.is_err() {
+                        let cursor = cursor_ext_from_record(
+                            slot,
+                            size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN,
+                            event.len as usize,
+                        );
+                        if tx
+                            .send(RawEvent::Plaintext(Box::new(event), cursor))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1105,7 +1381,16 @@ fn spawn_tls_plaintext_perf(
                 lost.record(ring_index, events.lost as u64);
                 for slot in slots.iter().take(events.read) {
                     if let Some(event) = tls_plaintext_event_from_record(slot) {
-                        if tx.send(RawEvent::PlaintextTls(Box::new(event))).await.is_err() {
+                        let cursor = cursor_ext_from_record(
+                            slot,
+                            size_of::<LegacyTlsPlaintextEvent>() - LEGACY_PLAINTEXT_LEN,
+                            event.len as usize,
+                        );
+                        if tx
+                            .send(RawEvent::PlaintextTls(Box::new(event), cursor))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1150,6 +1435,26 @@ fn plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyPlaintextEvent> {
 fn read_value<T: Copy>(bytes: &[u8]) -> Option<T> {
     (bytes.len() >= size_of::<T>())
         .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
+
+/// R3 游标扩展尾部：record 布局为 header + len + [ext]。旧解析只读到 header+len，
+/// 多余尾部天然忽略（宽容性已由 trimmed-record 约定保证）；新解析仅在 record 足够长
+/// 且 magic 匹配时采纳，其余字段的合法性由 CursorRereader::patch 复核。
+fn cursor_ext_from_record(
+    bytes: &[u8],
+    header_len: usize,
+    len: usize,
+) -> Option<LegacyCursorExt> {
+    let start = header_len.checked_add(len)?;
+    let ext = bytes.get(start..start + size_of::<LegacyCursorExt>())?;
+    let cursor = LegacyCursorExt {
+        magic: u64::from_ne_bytes(ext.get(0..8)?.try_into().ok()?),
+        resume_buf: u64::from_ne_bytes(ext.get(8..16)?.try_into().ok()?),
+        tail_fnv64: u64::from_ne_bytes(ext.get(16..24)?.try_into().ok()?),
+        remaining: u32::from_ne_bytes(ext.get(24..28)?.try_into().ok()?),
+        tail_len: u32::from_ne_bytes(ext.get(28..32)?.try_into().ok()?),
+    };
+    (cursor.magic == LEGACY_CURSOR_EXT_MAGIC).then_some(cursor)
 }
 
 fn wrap_exec(event: LegacyExecEvent) -> RawEvent {
@@ -1269,8 +1574,8 @@ fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stat
         ),
         // Plaintext chunks are intercepted in the main loop before handle_raw; this arm only
         // exists so the match stays exhaustive.
-        RawEvent::Plaintext(_) => return,
-        RawEvent::PlaintextTls(_) => return,
+        RawEvent::Plaintext(..) => return,
+        RawEvent::PlaintextTls(..) => return,
     };
     let ring = match &enriched.event {
         AgentEvent::ToolExec { .. } => super::PipelineRing::Exec,
@@ -1432,6 +1737,234 @@ mod tests {
         let mut record = vec![0u8; HEADER_LEN];
         record[12..16].copy_from_slice(&event.len.to_ne_bytes());
         assert!(plaintext_event_from_record(&record).is_none());
+    }
+
+    fn cursor_test_rereader() -> CursorRereader {
+        CursorRereader {
+            max_bytes: 1_024 * 1_024,
+            ttl_ns: 500_000_000,
+        }
+    }
+
+    fn patterned_chunk(len: usize) -> PlaintextChunk {
+        let mut event = plaintext_event(0, len as u32, (len * 2) as u32);
+        for (index, byte) in event.data[..len].iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        plaintext_chunk_from_event(&event, 999, &mut PlaintextSequencer::default())
+    }
+
+    fn cursor_for(chunk: &PlaintextChunk, remaining: u32, resume_buf: u64) -> LegacyCursorExt {
+        LegacyCursorExt {
+            magic: LEGACY_CURSOR_EXT_MAGIC,
+            resume_buf,
+            tail_fnv64: fnv1a64(&chunk.data[chunk.data.len() - LEGACY_CURSOR_TAIL_LEN..]),
+            remaining,
+            tail_len: LEGACY_CURSOR_TAIL_LEN as u32,
+        }
+    }
+
+    #[test]
+    fn fnv1a64_matches_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 14_695_981_039_346_656_037);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn cursor_ext_record_tail_round_trips_and_stays_optional() {
+        const HEADER_LEN: usize = size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN;
+        // 无扩展尾部的普通 record：游标为 None（旧对象/常规分片，旧解析行为不变）。
+        let record = vec![0u8; HEADER_LEN + 1_024];
+        assert!(cursor_ext_from_record(&record, HEADER_LEN, 1_024).is_none());
+        // 尾部字节存在但 magic 不匹配（随机尾部）同样判 None。
+        let record = vec![0u8; HEADER_LEN + 1_024 + size_of::<LegacyCursorExt>()];
+        assert!(cursor_ext_from_record(&record, HEADER_LEN, 1_024).is_none());
+        // 合法扩展尾部完整往返。
+        let cursor = LegacyCursorExt {
+            magic: LEGACY_CURSOR_EXT_MAGIC,
+            resume_buf: 0x7f00_1000,
+            tail_fnv64: 0x1122_3344_5566_7788,
+            remaining: 300_000,
+            tail_len: LEGACY_CURSOR_TAIL_LEN as u32,
+        };
+        let mut record = vec![0u8; HEADER_LEN + 1_024];
+        record.extend_from_slice(&cursor.magic.to_ne_bytes());
+        record.extend_from_slice(&cursor.resume_buf.to_ne_bytes());
+        record.extend_from_slice(&cursor.tail_fnv64.to_ne_bytes());
+        record.extend_from_slice(&cursor.remaining.to_ne_bytes());
+        record.extend_from_slice(&cursor.tail_len.to_ne_bytes());
+        assert_eq!(
+            cursor_ext_from_record(&record, HEADER_LEN, 1_024),
+            Some(cursor)
+        );
+    }
+
+    #[test]
+    fn cursor_patch_appends_payload_on_fingerprint_match() {
+        let rereader = cursor_test_rereader();
+        let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let payload_len = 100_000usize;
+        let cursor = cursor_for(&chunk, payload_len as u32, 0x7f00_0000);
+        let overlap: Vec<u8> = chunk.data[chunk.data.len() - LEGACY_CURSOR_TAIL_LEN..].to_vec();
+        let reader = move |_pid: u32, addr: u64, len: usize| {
+            assert_eq!(addr, 0x7f00_0000 - LEGACY_CURSOR_TAIL_LEN as u64);
+            assert_eq!(len, LEGACY_CURSOR_TAIL_LEN + payload_len);
+            let mut buf = overlap.clone();
+            buf.extend(std::iter::repeat(9u8).take(payload_len));
+            Some(buf)
+        };
+        let appended = rereader
+            .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
+            .expect("fingerprint match must patch");
+        assert_eq!(appended, payload_len);
+        assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN + payload_len);
+        assert!(chunk
+            .partial_reasons
+            .contains(&"cursor_reread_patched".to_string()));
+        assert!(!chunk
+            .partial_reasons
+            .contains(&"cursor_reread_capped".to_string()));
+        // 原始 partial 元数据保留可追溯。
+        assert!(chunk
+            .partial_reasons
+            .contains(&"probe_call_limit".to_string()));
+    }
+
+    #[test]
+    fn cursor_patch_rejects_overlap_fingerprint_mismatch() {
+        let rereader = cursor_test_rereader();
+        let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let cursor = cursor_for(&chunk, 50_000, 0x7f00_0000);
+        let before = chunk.data.clone();
+        // 目标内存已被复用：衔接处 64B 全零，指纹必不匹配。
+        let reader = |_pid: u32, _addr: u64, len: usize| Some(vec![0u8; len]);
+        let reject = rereader
+            .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
+            .expect_err("stale target memory must reject");
+        assert_eq!(reject, PatchReject::OverlapFingerprint);
+        assert_eq!(
+            chunk.data, before,
+            "rejected patch must keep the partial untouched"
+        );
+        assert!(!chunk
+            .partial_reasons
+            .contains(&"cursor_reread_patched".to_string()));
+    }
+
+    #[test]
+    fn cursor_patch_rejects_self_fingerprint_mismatch() {
+        let rereader = cursor_test_rereader();
+        let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let mut cursor = cursor_for(&chunk, 50_000, 0x7f00_0000);
+        cursor.tail_fnv64 ^= 0xffff; // 解析串道：游标不是为本 chunk 算的
+        let before = chunk.data.len();
+        let reader = |_pid: u32, _addr: u64, _len: usize| -> Option<Vec<u8>> {
+            panic!("self fingerprint mismatch must not touch target memory")
+        };
+        let reject = rereader
+            .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
+            .expect_err("self fingerprint mismatch must reject");
+        assert_eq!(reject, PatchReject::SelfFingerprint);
+        assert_eq!(chunk.data.len(), before);
+    }
+
+    #[test]
+    fn cursor_patch_rejects_expired_cursor_without_reading() {
+        let rereader = cursor_test_rereader();
+        let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let cursor = cursor_for(&chunk, 50_000, 0x7f00_0000);
+        let reader = |_pid: u32, _addr: u64, _len: usize| -> Option<Vec<u8>> {
+            panic!("expired cursor must not touch target memory")
+        };
+        let reject = rereader
+            .patch(&mut chunk, &cursor, 1_000, 1_000 + 600_000_000, &reader)
+            .expect_err("expired cursor must reject");
+        assert_eq!(reject, PatchReject::TtlExpired);
+    }
+
+    #[test]
+    fn cursor_patch_caps_payload_at_max_bytes() {
+        let rereader = CursorRereader {
+            max_bytes: 256 * 1_024,
+            ttl_ns: 500_000_000,
+        };
+        let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let cursor = cursor_for(&chunk, 700_000, 0x7f00_0000);
+        let overlap: Vec<u8> = chunk.data[chunk.data.len() - LEGACY_CURSOR_TAIL_LEN..].to_vec();
+        let reader = move |_pid: u32, _addr: u64, len: usize| {
+            assert_eq!(len, LEGACY_CURSOR_TAIL_LEN + 256 * 1_024);
+            let mut buf = overlap.clone();
+            buf.extend(std::iter::repeat(7u8).take(len - overlap.len()));
+            Some(buf)
+        };
+        let appended = rereader
+            .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
+            .expect("capped patch must still append");
+        assert_eq!(appended, 256 * 1_024);
+        assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN + 256 * 1_024);
+        assert!(chunk
+            .partial_reasons
+            .contains(&"cursor_reread_patched".to_string()));
+        assert!(chunk
+            .partial_reasons
+            .contains(&"cursor_reread_capped".to_string()));
+    }
+
+    #[test]
+    fn oversized_single_write_retires_as_partial_after_idle() {
+        // 开发机 R3 验收实测形状：单次 sendto(32858) 被采成一个 len=16384、orig_len=32858
+        // 的截断 chunk（partial_reasons=["probe_call_limit"]），网关收下完整 body 后回小包。
+        // 该测试钉住存量行为：交互不在响应到达时完成（请求不完整），而是在 idle 边界以
+        // partial 退休导出——验收脚本必须等过 idle 边界再判"零事件"。
+        let body_len = 32_768usize;
+        let head = format!("POST /r3test HTTP/1.1\r\nHost: x\r\nContent-Length: {body_len}\r\n\r\n");
+        let mut full = head.into_bytes();
+        full.extend(std::iter::repeat(b'x').take(body_len));
+        let total = full.len();
+
+        let mut request_event =
+            plaintext_event(0, LEGACY_PLAINTEXT_LEN as u32, total as u32);
+        request_event.data[..LEGACY_PLAINTEXT_LEN].copy_from_slice(&full[..LEGACY_PLAINTEXT_LEN]);
+        let response_wire = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut response_event = plaintext_event(
+            LEGACY_PLAINTEXT_DIRECTION_READ,
+            response_wire.len() as u32,
+            response_wire.len() as u32,
+        );
+        response_event.data[..response_wire.len()].copy_from_slice(response_wire);
+
+        let mut sequencer = PlaintextSequencer::default();
+        let mut reassembler = InteractionReassembler::with_idle_lanes(
+            Duration::from_secs(90),
+            Duration::from_secs(90),
+        );
+        let request_chunk = plaintext_chunk_from_event(&request_event, 1, &mut sequencer);
+        assert_eq!(
+            request_chunk.partial_reasons,
+            vec!["probe_call_limit".to_string()]
+        );
+        assert_eq!(request_chunk.data.len(), LEGACY_PLAINTEXT_LEN);
+        assert!(
+            reassembler.push(request_chunk).is_empty(),
+            "truncated request must stay buffered, not complete"
+        );
+        let response_chunk = plaintext_chunk_from_event(&response_event, 2, &mut sequencer);
+        assert!(
+            reassembler.push(response_chunk).is_empty(),
+            "response completing while the request is partial must not flush early"
+        );
+        reassembler.expire_idle(Instant::now() + Duration::from_secs(91));
+        let completed = reassembler.take_completed();
+        assert_eq!(completed.len(), 1, "idle boundary must retire the partial: {completed:?}");
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|r| r.contains("reassembly_idle_expire")));
+        assert!(
+            completed[0].request.captured_bytes > 0,
+            "the truncated request prefix must be retained as partial evidence"
+        );
     }
 
     #[test]

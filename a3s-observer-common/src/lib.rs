@@ -1253,6 +1253,42 @@ pub struct LegacyTlsPlaintextEvent {
 
 const _: [(); 16_432] = [(); core::mem::size_of::<LegacyTlsPlaintextEvent>()];
 
+/// 截断补读游标扩展（R3 实验特性，x86 开发通道）：附加在窗口用尽末片 perf record 的
+/// header+len 之后。解析按 record 长度读取——旧解析只要求 record >= header+len，多余
+/// 尾部天然被忽略；新解析仅在 record 足够长且 magic 匹配时采纳。不新增独立事件类型。
+pub const LEGACY_CURSOR_EXT_MAGIC: u64 = 0x3153_5255_4353_3341; // "A3SCURS1" little-endian
+/// 衔接校验指纹覆盖的已采尾部字节数（BPF 侧定长展开上限）。
+pub const LEGACY_CURSOR_TAIL_LEN: usize = 64;
+/// `A3S_RUNTIME_CONFIG[0]` 位标志：collector 开启 `A3S_OBSERVER_CURSOR_REREAD` 时置位，
+/// BPF 侧才开始在窗口用尽末片挂游标扩展；默认 0 = 完全不产生游标。
+pub const A3S_CONFIG_FLAG_CURSOR_REREAD: u64 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyCursorExt {
+    pub magic: u64,
+    /// 用户态续读地址 = buf + 已覆盖字节数。
+    pub resume_buf: u64,
+    /// 已采尾部 `tail_len` 字节的 FNV-1a（衔接校验）。
+    pub tail_fnv64: u64,
+    /// 未覆盖字节数（原调用口径，u32::MAX 封顶）。
+    pub remaining: u32,
+    /// 指纹覆盖字节数，恒为 [`LEGACY_CURSOR_TAIL_LEN`]。
+    pub tail_len: u32,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<LegacyCursorExt>()];
+
+/// FNV-1a 64：与 probes.c `cursor_tail_fnv64` 同参数，衔接指纹两侧必须逐位一致。
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 14_695_981_039_346_656_037;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

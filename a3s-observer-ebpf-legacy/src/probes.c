@@ -8,6 +8,7 @@ typedef unsigned long long u64;
 
 enum {
     BPF_MAP_TYPE_HASH = 1,
+    BPF_MAP_TYPE_ARRAY = 2,
     BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4,
     BPF_MAP_TYPE_PERCPU_ARRAY = 6,
     BPF_MAP_TYPE_LRU_HASH = 9,
@@ -168,6 +169,43 @@ struct plaintext_tls_event {
 };
 _Static_assert(sizeof(struct plaintext_tls_event) == 16432, "plaintext_tls_event ABI mismatch");
 
+/* ---- 截断补读游标（R3 实验特性，仅 x86 开发通道，A3S_BPF_ARCH_X86_64 门控）----
+ * 单次 SSL_write/SSL_read（uprobe）或 HTTP write/read（kprobe）数据量超过发射窗口
+ * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道单分片 16KB）时被截断：末片 chunk 事件在
+ * header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度和已采尾部 64B 的
+ * FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，先比对衔接处指纹
+ * 再拼接——宁可不拼，不可错拼。
+ * 不进 arm64/4.19 对象：该面已在 TLS_SPLIT_MAX=12 上验证冻结，验证器预算无冗余，
+ * 全部游标代码、扩展 scratch 与 A3S_RUNTIME_CONFIG map 均由 A3S_BPF_ARCH_X86_64
+ * 条件编译剔除，arm64 对象保持字节不变（构建校验：对比改动前后 sha256）。
+ * 游标信息自包含在事件扩展尾部（任务书 ABI 条款的优先方式），因此无需 BPF 侧
+ * cursor LRU map：游标随事件生灭，TTL 由用户态按 captured_at_boot_ns 判定。 */
+#define PLAINTEXT_CURSOR_MAGIC 0x3153525543533341ULL /* "A3SCURS1" 小端 */
+#define PLAINTEXT_CURSOR_TAIL_LEN 64
+#define A3S_CONFIG_FLAG_CURSOR_REREAD 1ULL
+
+struct plaintext_cursor_ext {
+    u64 magic;       /* PLAINTEXT_CURSOR_MAGIC：尾部存在性/版本判别 */
+    u64 resume_buf;  /* 用户态续读地址 = buf + 已覆盖字节数 */
+    u64 tail_fnv64;  /* 已采尾部 tail_len 字节的 FNV-1a（衔接校验） */
+    u32 remaining;   /* 未覆盖字节数（原调用口径，封顶 0xffffffff） */
+    u32 tail_len;    /* 指纹覆盖字节数，恒为 PLAINTEXT_CURSOR_TAIL_LEN */
+};
+_Static_assert(sizeof(struct plaintext_cursor_ext) == 32, "cursor ext ABI mismatch");
+
+#if defined(A3S_BPF_ARCH_X86_64)
+/* 扩展 scratch：事件后预留游标槽位。常规分片仍按 header+len 修剪发射；只有窗口
+ * 用尽的末片把记录扩到 sizeof(event)+sizeof(ext)。 */
+struct plaintext_event_with_cursor {
+    struct plaintext_event event;
+    struct plaintext_cursor_ext ext;
+};
+struct plaintext_tls_event_with_cursor {
+    struct plaintext_tls_event event;
+    struct plaintext_cursor_ext ext;
+};
+#endif
+
 /* SSL_read 进入/返回关联：进入时只有 buf 指针，返回时才知道读到的长度。按 pid_tgid 键。 */
 struct ssl_read_args {
     u64 ssl;
@@ -198,8 +236,13 @@ SCRATCH_MAP(EXIT_SCRATCH, struct exit_event);
 SCRATCH_MAP(CONNECT_SCRATCH, struct connect_event);
 SCRATCH_MAP(FILE_SCRATCH, struct file_event);
 SCRATCH_MAP(SEC_SCRATCH, struct sec_event);
+#if defined(A3S_BPF_ARCH_X86_64)
+SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event_with_cursor);
+SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event_with_cursor);
+#else
 SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event);
 SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
+#endif
 SCRATCH_MAP(DROPS, u64);
 
 /* Identity-whitelisted TGIDs admitted to plaintext payload capture. Written by the userspace
@@ -221,6 +264,14 @@ struct bpf_map_def SEC("maps") SSL_READ_ARGS = {
     .type = BPF_MAP_TYPE_HASH, .key_size = 8, .value_size = sizeof(struct ssl_read_args),
     .max_entries = 16384
 };
+#if defined(A3S_BPF_ARCH_X86_64)
+/* 运行时开关（R3）：bit0 = 截断补读。collector 仅在 A3S_OBSERVER_CURSOR_REREAD 开启时
+ * 于加载后写 1；默认 0 = BPF 侧完全不产生游标扩展，行为与旧版逐字节一致。
+ * arm64 对象不含此 map（游标代码整体按架构剔除）。 */
+struct bpf_map_def SEC("maps") A3S_RUNTIME_CONFIG = {
+    .type = BPF_MAP_TYPE_ARRAY, .key_size = 4, .value_size = 8, .max_entries = 1
+};
+#endif
 
 /* UOS reports 4.19.0 in uname but its BPF KProbe gate requires 4.19.90. */
 #ifndef A3S_BPF_KERN_VERSION
@@ -322,6 +373,36 @@ INLINE void event_common_init(u64 *cgroup_id, u64 *captured_at_boot_ns,
 INLINE int plaintext_admitted(u32 pid) {
     return bpf_map_lookup_elem(&PLAINTEXT_ALLOWED, &pid) != 0;
 }
+
+#if defined(A3S_BPF_ARCH_X86_64)
+/* R3 截断补读：以下三个 helper 只在窗口用尽的冷路径被调用。 */
+INLINE int cursor_reread_enabled(void) {
+    u32 key = 0;
+    const u64 *flags = bpf_map_lookup_elem(&A3S_RUNTIME_CONFIG, &key);
+    return flags && (*flags & A3S_CONFIG_FLAG_CURSOR_REREAD) != 0;
+}
+
+/* 已采尾部 64B 的 FNV-1a，定长全展开（验证器只认常量偏移）。tail 指向 scratch map
+ * 内事件数据尾（map value 常量偏移读，无需 probe_read）。与用户态 fnv1a64 同参数。 */
+INLINE u64 cursor_tail_fnv64(const u8 *tail) {
+    u64 h = 14695981039346656037ULL;
+#pragma unroll
+    for (u32 i = 0; i < PLAINTEXT_CURSOR_TAIL_LEN; i++) {
+        h ^= tail[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+INLINE void cursor_ext_fill(struct plaintext_cursor_ext *ext, u64 resume_buf,
+                            u64 remaining, const u8 *tail) {
+    ext->magic = PLAINTEXT_CURSOR_MAGIC;
+    ext->resume_buf = resume_buf;
+    ext->remaining = remaining > 0xffffffffULL ? 0xffffffffU : (u32)remaining;
+    ext->tail_len = PLAINTEXT_CURSOR_TAIL_LEN;
+    ext->tail_fnv64 = cursor_tail_fnv64(tail);
+}
+#endif
 
 #if !defined(A3S_BPF_DST_NARROW)
 INLINE u32 fd_gen_current(u32 pid, u32 fd) {
@@ -707,6 +788,20 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
         u32 emit_len = event->len;
         if (emit_len > LEGACY_PLAINTEXT_LEN)
             emit_len = LEGACY_PLAINTEXT_LEN;
+#if defined(A3S_BPF_ARCH_X86_64)
+        /* 截断补读游标（冷路径）：本 syscall 超过 16KB 窗口且完整采满时挂续读扩展。
+         * len 被读失败降窗（<16KB）说明衔接处不可信，不挂游标——宁可不拼。 */
+        if (count > LEGACY_PLAINTEXT_LEN && emit_len == LEGACY_PLAINTEXT_LEN &&
+            cursor_reread_enabled()) {
+            struct plaintext_event_with_cursor *full = (void *)event;
+            cursor_ext_fill(&full->ext, buf + LEGACY_PLAINTEXT_LEN,
+                            count - LEGACY_PLAINTEXT_LEN,
+                            event->data + LEGACY_PLAINTEXT_LEN - PLAINTEXT_CURSOR_TAIL_LEN);
+            output(ctx, &PLAINTEXT_EVENTS, event,
+                   sizeof(*event) + sizeof(struct plaintext_cursor_ext));
+            return;
+        }
+#endif
         output(ctx, &PLAINTEXT_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
     }
@@ -839,9 +934,11 @@ char LICENSE[] SEC("license") = "GPL";
 
 /* 与 emit_plaintext 同款的定长窗口复制（4.19 验证器只认常量长度）；差别只在事件类型
  * 与 tls_ctx 身份字段，没有 fd/代际——SSL* 指针即连接身份。 */
-/* 单次 SSL 调用只产出一个分块。大缓冲由 emit_tls_plaintext 的定界循环拆分多次调用。 */
+/* 单次 SSL 调用只产出一个分块。大缓冲由 emit_tls_plaintext 的定界循环拆分多次调用。
+ * emit_cursor（R3，仅 x86 生效）：调用方仅在窗口用尽的末片置位，本函数在该片的事件
+ * 尾部追加续读游标扩展；arm64 构建恒传 0，内联后无任何游标代码。 */
 INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
-                           u64 count, u32 direction) {
+                           u64 count, u32 direction, u32 emit_cursor) {
     struct plaintext_tls_event *event;
     u32 len;
     if (!buf || !count || !tls_ctx)
@@ -906,6 +1003,20 @@ INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
         u32 emit_len = event->len;
         if (emit_len > LEGACY_PLAINTEXT_LEN)
             emit_len = LEGACY_PLAINTEXT_LEN;
+#if defined(A3S_BPF_ARCH_X86_64)
+        /* 窗口用尽末片且完整采满时挂续读扩展；count 是本分片起点的剩余量，
+         * count - 16KB 即窗口外未覆盖字节数。 */
+        if (emit_cursor && emit_len == LEGACY_PLAINTEXT_LEN &&
+            cursor_reread_enabled()) {
+            struct plaintext_tls_event_with_cursor *full = (void *)event;
+            cursor_ext_fill(&full->ext, buf + LEGACY_PLAINTEXT_LEN,
+                            count - LEGACY_PLAINTEXT_LEN,
+                            event->data + LEGACY_PLAINTEXT_LEN - PLAINTEXT_CURSOR_TAIL_LEN);
+            output(ctx, &PLAINTEXT_TLS_EVENTS, event,
+                   sizeof(*event) + sizeof(struct plaintext_cursor_ext));
+            return;
+        }
+#endif
         output(ctx, &PLAINTEXT_TLS_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
     }
@@ -932,7 +1043,16 @@ INLINE void emit_tls_plaintext(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 bu
         const u64 offset = (u64)i * LEGACY_PLAINTEXT_LEN;
         if (offset >= count)
             break;
-        emit_tls_chunk(ctx, pid, tls_ctx, buf + offset, count - offset, direction);
+#if defined(A3S_BPF_ARCH_X86_64)
+        /* i == TLS_SPLIT_MAX-1 是编译期常量：非末片迭代的游标分支被死代码消除，
+         * 游标代码在对象里只出现一次。末片之外（count - offset <= 16KB）不挂游标。 */
+        const u32 cursor =
+            (i == TLS_SPLIT_MAX - 1 && count - offset > LEGACY_PLAINTEXT_LEN) ? 1 : 0;
+#else
+        const u32 cursor = 0;
+#endif
+        emit_tls_chunk(ctx, pid, tls_ctx, buf + offset, count - offset, direction,
+                       cursor);
     }
 }
 
