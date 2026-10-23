@@ -2244,6 +2244,7 @@ async fn main() -> anyhow::Result<()> {
             &processor.stats,
             0,
             exporter.output_drops(),
+            None,
             FileFilterHeartbeatSnapshot {
                 stats: aggregate_file_filter_stats(&file_filter_stats),
                 enabled: file_filter.enabled,
@@ -2409,6 +2410,7 @@ async fn main() -> anyhow::Result<()> {
                         &processor.stats,
                         dropped,
                         output_dropped,
+                        None,
                         FileFilterHeartbeatSnapshot {
                             stats: filter_stats,
                             enabled: file_filter.enabled,
@@ -2839,6 +2841,7 @@ async fn main() -> anyhow::Result<()> {
         &processor.stats,
         dropped,
         exporter.output_drops(),
+        None,
         FileFilterHeartbeatSnapshot {
             stats: aggregate_file_filter_stats(&file_filter_stats),
             enabled: file_filter.enabled,
@@ -5702,6 +5705,7 @@ fn collector_heartbeat(
     stats: &Stats,
     dropped: u64,
     output_dropped: u64,
+    perf_lost_by_map: Option<BTreeMap<String, u64>>,
     file_filter: FileFilterHeartbeatSnapshot,
     pipeline_accounting: Option<CollectorPipelineAccounting>,
     capture_profile: Option<CollectorCaptureProfileStats>,
@@ -5765,6 +5769,7 @@ fn collector_heartbeat(
             exec_reassembly_timeout: stats.exec_reassembly_timeout,
             dropped,
             output_dropped,
+            perf_lost_by_map,
             legacy_counter_temporality: Some("cumulative".to_string()),
             interaction_reassembly: interaction_reassembly.map(Box::new),
             pipeline_accounting: pipeline_accounting.map(Box::new),
@@ -6659,6 +6664,7 @@ mod tests {
             &stats,
             11,
             13,
+            None,
             FileFilterHeartbeatSnapshot {
                 stats: filter_stats,
                 enabled: true,

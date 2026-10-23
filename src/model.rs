@@ -4,6 +4,7 @@
 use crate::traits::{Identity, Provider};
 use crate::workload::{ObservationMetadata, WorkloadIdentity};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -967,6 +968,13 @@ pub enum AgentEvent {
         pipeline_accounting: Option<Box<CollectorPipelineAccounting>>,
         #[serde(rename = "captureProfile", skip_serializing_if = "Option::is_none")]
         capture_profile: Option<Box<CollectorCaptureProfileStats>>,
+        /// Per-map perf ring lost-event breakdown keyed by short ring name. The aggregate
+        /// stays in `dropped`; this additive detail pinpoints which perf map sheds records.
+        /// Absent on backends without per-map perf buffer accounting. (The legacy perf
+        /// backend deliberately does not populate `pipelineAccounting.rings`, which is
+        /// reserved for the ring-buffer pipeline's submitted/received/enqueued envelope.)
+        #[serde(rename = "perfLostByMap", skip_serializing_if = "Option::is_none")]
+        perf_lost_by_map: Option<BTreeMap<String, u64>>,
     },
 }
 
@@ -1037,6 +1045,7 @@ mod tests {
             interaction_reassembly: None,
             pipeline_accounting: None,
             capture_profile: None,
+            perf_lost_by_map: None,
         }
     }
 
@@ -1078,6 +1087,22 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn collector_heartbeat_perf_lost_by_map_is_additive_and_camel_case() {
+        let mut event = collector_heartbeat(false);
+        let value = serde_json::to_value(&event).unwrap();
+        assert!(value["CollectorHeartbeat"].get("perfLostByMap").is_none());
+        let AgentEvent::CollectorHeartbeat {
+            perf_lost_by_map, ..
+        } = &mut event
+        else {
+            panic!("expected CollectorHeartbeat");
+        };
+        *perf_lost_by_map = Some(BTreeMap::from([("plaintext".to_string(), 7u64)]));
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["CollectorHeartbeat"]["perfLostByMap"]["plaintext"], 7);
     }
 
     #[test]

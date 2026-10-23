@@ -31,7 +31,7 @@ use aya::{
 };
 use bytes::BytesMut;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
@@ -205,7 +205,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let ring_pages = perf_ring_pages();
     let (tx, mut rx) = mpsc::channel(4096);
-    let perf_lost = Arc::new(AtomicU64::new(0));
+    let perf_lost = Arc::new(PerfLostCounters::default());
     spawn_perf(
         &mut ebpf,
         "EVENTS",
@@ -248,7 +248,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         )?;
     }
     if ssl_uprobes {
-        spawn_tls_plaintext_perf(&mut ebpf, tx.clone(), perf_lost.clone(), ring_pages)?;
+        spawn_tls_plaintext_perf(
+            &mut ebpf,
+            "PLAINTEXT_TLS_EVENTS",
+            tx.clone(),
+            perf_lost.clone(),
+            ring_pages,
+        )?;
     }
     spawn_perf(
         &mut ebpf,
@@ -319,7 +325,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut report = tokio::time::interval(Duration::from_secs(60));
     report.tick().await;
     let mut stats = Stats::default();
-    emit_legacy_heartbeat(exporter.as_ref(), &collector, 0, &stats, 0);
+    emit_legacy_heartbeat(
+        exporter.as_ref(),
+        &collector,
+        0,
+        &stats,
+        0,
+        Some(perf_lost.snapshot()),
+    );
 
     loop {
         tokio::select! {
@@ -328,8 +341,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             _ = report.tick() => {
                 let _ = std::fs::write(&heartbeat_path, b"ok");
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
-                let dropped = map_drops + perf_lost.load(Ordering::Relaxed);
-                emit_legacy_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped);
+                let dropped = map_drops + perf_lost.total();
+                emit_legacy_heartbeat(
+                    exporter.as_ref(),
+                    &collector,
+                    60,
+                    &stats,
+                    dropped,
+                    Some(perf_lost.snapshot()),
+                );
                 if suppressed_shells > 0 {
                     // Unparsed interactions with zero request/response payload are noise (idle
                     // expiries, non-HTTP streams). They are counted here instead of occupying
@@ -506,16 +526,93 @@ fn plaintext_http_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Perf ring buffer pages per CPU per map (A3S_OBSERVER_PERF_RING_PAGES). On a 64 KiB-page
-/// host the default 8 pages = 512 KiB per CPU per map; larger values absorb SSE bursts at the
-/// cost of pages * page_size * cpu_count bytes of locked memory per perf map. Bounds keep an
-/// accidental huge value from exhausting memory: 1..=1024 pages (64 MiB per map at 64 KiB pages).
+/// Legacy perf maps and their short heartbeat keys, in registration order. The short key is
+/// the stable `perfLostByMap` dimension; the map name is the BPF object name.
+const PERF_RINGS: [(&str, &str); 7] = [
+    ("EVENTS", "events"),
+    ("EXIT_EVENTS", "exit"),
+    ("CONNECT_EVENTS", "connect"),
+    ("FILE_EVENTS", "file"),
+    ("SEC_EVENTS", "security"),
+    ("PLAINTEXT_EVENTS", "plaintext"),
+    ("PLAINTEXT_TLS_EVENTS", "plaintext_tls"),
+];
+
+fn perf_ring_index(map_name: &str) -> usize {
+    PERF_RINGS
+        .iter()
+        .position(|(name, _)| *name == map_name)
+        .unwrap_or_else(|| panic!("unknown legacy perf map `{map_name}`"))
+}
+
+/// Per-map perf buffer lost-event counters. `total` keeps the heartbeat `dropped` accounting
+/// on its historical aggregate while the per-map slots identify which of the seven
+/// PERF_EVENT_ARRAY maps is shedding records under burst load. The breakdown rides the
+/// additive `perfLostByMap` heartbeat field rather than `pipelineAccounting.rings`: the rings
+/// envelope is reserved for the ring-buffer pipeline's submitted/received/enqueued delta
+/// windows, which the perf backend cannot produce without inventing zero-valued counters that
+/// consumers would misread as "no traffic".
+#[derive(Default)]
+struct PerfLostCounters {
+    total: AtomicU64,
+    by_map: [AtomicU64; PERF_RINGS.len()],
+}
+
+impl PerfLostCounters {
+    fn record(&self, ring: usize, lost: u64) {
+        self.by_map[ring].fetch_add(lost, Ordering::Relaxed);
+        self.total.fetch_add(lost, Ordering::Relaxed);
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        PERF_RINGS
+            .iter()
+            .enumerate()
+            .map(|(index, (_, key))| {
+                ((*key).to_string(), self.by_map[index].load(Ordering::Relaxed))
+            })
+            .collect()
+    }
+}
+
+/// Host page size in bytes: the exchange rate between the byte-oriented ring budget and the
+/// page count the perf mmap API takes. Falls back to 4 KiB if sysconf fails.
+fn host_page_size() -> usize {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size > 0 {
+        page_size as usize
+    } else {
+        4096
+    }
+}
+
+/// Perf ring buffer sizing per CPU per map. The page size is an exchange rate, not the intent:
+/// operators budget burst absorption in bytes, so the primary knob is the byte target
+/// (A3S_OBSERVER_PERF_RING_KB, KiB per CPU per map) converted to pages through the host page
+/// size, which generalizes across 4 KiB- and 64 KiB-page hosts. A3S_OBSERVER_PERF_RING_PAGES
+/// remains as an explicit page-count override and beats the adaptive default, but not an
+/// explicit byte target. The default targets 512 KiB per CPU per map clamped to 8..=1024
+/// pages: 128 pages on 4 KiB-page hosts (x86 5.14) and 8 pages on 64 KiB-page hosts (arm64
+/// 4.19), matching both release channels. Larger values absorb SSE bursts at the cost of
+/// pages * page_size * cpu_count bytes of locked memory per perf map.
 fn perf_ring_pages() -> usize {
+    let page_size = host_page_size();
+    let target_kb = std::env::var("A3S_OBSERVER_PERF_RING_KB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|kb| *kb > 0);
+    if let Some(kb) = target_kb {
+        return kb.saturating_mul(1024).div_ceil(page_size).clamp(8, 1_024);
+    }
     std::env::var("A3S_OBSERVER_PERF_RING_PAGES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|pages| (1..=1_024).contains(pages))
-        .unwrap_or(8)
+        .unwrap_or_else(|| (512 * 1024_usize).div_ceil(page_size).clamp(8, 1_024))
 }
 
 fn plaintext_scope_path() -> PathBuf {
@@ -864,7 +961,7 @@ fn spawn_perf<T: Copy + Send + 'static>(
     ebpf: &mut Ebpf,
     map_name: &str,
     tx: mpsc::Sender<RawEvent>,
-    lost: Arc<AtomicU64>,
+    lost: Arc<PerfLostCounters>,
     wrap: fn(T) -> RawEvent,
     ring_pages: usize,
 ) -> anyhow::Result<()> {
@@ -872,6 +969,7 @@ fn spawn_perf<T: Copy + Send + 'static>(
         ebpf.take_map(map_name)
             .with_context(|| format!("`{map_name}` missing"))?,
     )?;
+    let ring_index = perf_ring_index(map_name);
     for cpu in online_cpus().map_err(|(_, error)| error)? {
         let mut buffer = array.open(cpu, Some(ring_pages))?;
         let tx = tx.clone();
@@ -888,7 +986,7 @@ fn spawn_perf<T: Copy + Send + 'static>(
                         break;
                     }
                 };
-                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                lost.record(ring_index, events.lost as u64);
                 for slot in slots.iter().take(events.read) {
                     if let Some(value) = read_value::<T>(slot) {
                         if tx.send(wrap(value)).await.is_err() {
@@ -906,13 +1004,14 @@ fn spawn_plaintext_perf(
     ebpf: &mut Ebpf,
     map_name: &str,
     tx: mpsc::Sender<RawEvent>,
-    lost: Arc<AtomicU64>,
+    lost: Arc<PerfLostCounters>,
     ring_pages: usize,
 ) -> anyhow::Result<()> {
     let mut array = AsyncPerfEventArray::try_from(
         ebpf.take_map(map_name)
             .with_context(|| format!("`{map_name}` missing"))?,
     )?;
+    let ring_index = perf_ring_index(map_name);
     for cpu in online_cpus().map_err(|(_, error)| error)? {
         let mut buffer = array.open(cpu, Some(ring_pages))?;
         let tx = tx.clone();
@@ -929,7 +1028,7 @@ fn spawn_plaintext_perf(
                         break;
                     }
                 };
-                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                lost.record(ring_index, events.lost as u64);
                 for slot in slots.iter().take(events.read) {
                     if let Some(event) = plaintext_event_from_record(slot) {
                         if tx.send(RawEvent::Plaintext(Box::new(event))).await.is_err() {
@@ -977,14 +1076,16 @@ fn tls_plaintext_event_from_record(bytes: &[u8]) -> Option<LegacyTlsPlaintextEve
 
 fn spawn_tls_plaintext_perf(
     ebpf: &mut Ebpf,
+    map_name: &str,
     tx: mpsc::Sender<RawEvent>,
-    lost: Arc<AtomicU64>,
+    lost: Arc<PerfLostCounters>,
     ring_pages: usize,
 ) -> anyhow::Result<()> {
     let mut array = AsyncPerfEventArray::try_from(
-        ebpf.take_map("PLAINTEXT_TLS_EVENTS")
-            .context("`PLAINTEXT_TLS_EVENTS` missing")?,
+        ebpf.take_map(map_name)
+            .with_context(|| format!("`{map_name}` missing"))?,
     )?;
+    let ring_index = perf_ring_index(map_name);
     for cpu in online_cpus().map_err(|(_, error)| error)? {
         let mut buffer = array.open(cpu, Some(ring_pages))?;
         let tx = tx.clone();
@@ -1001,7 +1102,7 @@ fn spawn_tls_plaintext_perf(
                         break;
                     }
                 };
-                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                lost.record(ring_index, events.lost as u64);
                 for slot in slots.iter().take(events.read) {
                     if let Some(event) = tls_plaintext_event_from_record(slot) {
                         if tx.send(RawEvent::PlaintextTls(Box::new(event))).await.is_err() {
@@ -1189,6 +1290,7 @@ fn emit_legacy_heartbeat(
     interval_secs: u64,
     stats: &Stats,
     dropped: u64,
+    perf_lost_by_map: Option<BTreeMap<String, u64>>,
 ) {
     let event = super::collector_heartbeat(
         collector,
@@ -1196,6 +1298,7 @@ fn emit_legacy_heartbeat(
         stats,
         dropped,
         exporter.output_drops(),
+        perf_lost_by_map,
         super::FileFilterHeartbeatSnapshot::default(),
         None,
         None,
@@ -1238,6 +1341,7 @@ mod tests {
             len,
             orig_len,
             _pad: 0,
+            fd_generation: 0,
             comm: [0u8; 16],
             captured_at_boot_ns: 123_456_789,
             data: [0u8; LEGACY_PLAINTEXT_LEN],
@@ -1306,7 +1410,10 @@ mod tests {
         record.extend_from_slice(&event.len.to_ne_bytes());
         record.extend_from_slice(&event.orig_len.to_ne_bytes());
         record.extend_from_slice(&event._pad.to_ne_bytes());
+        record.extend_from_slice(&event.fd_generation.to_ne_bytes());
         record.extend_from_slice(&event.comm);
+        // repr(C) pads the header so captured_at_boot_ns lands on an 8-byte boundary.
+        record.extend_from_slice(&[0u8; 4]);
         record.extend_from_slice(&event.captured_at_boot_ns.to_ne_bytes());
         record.extend_from_slice(&event.data[..2048]);
 
@@ -1354,21 +1461,62 @@ mod tests {
     }
 
     #[test]
-    fn perf_ring_pages_env_is_bounded() {
+    fn perf_ring_pages_env_priority_and_bounds() {
+        // Both knobs live in one test body: env mutation is process-global, so splitting the
+        // cases across parallel tests would race.
+        let default_pages = (512 * 1024_usize)
+            .div_ceil(host_page_size())
+            .clamp(8, 1_024);
+        std::env::remove_var("A3S_OBSERVER_PERF_RING_KB");
         for (value, expected) in [
-            (None, 8),
+            (None, default_pages),
             (Some("64"), 64),
-            (Some("0"), 8),
-            (Some("99999"), 8),
-            (Some("not-a-number"), 8),
+            (Some("0"), default_pages),
+            (Some("99999"), default_pages),
+            (Some("not-a-number"), default_pages),
         ] {
             match value {
                 Some(v) => std::env::set_var("A3S_OBSERVER_PERF_RING_PAGES", v),
                 None => std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES"),
             }
-            assert_eq!(perf_ring_pages(), expected, "value={value:?}");
+            assert_eq!(perf_ring_pages(), expected, "pages value={value:?}");
         }
         std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
+        for (value, expected) in [
+            (Some("256"), (256 * 1024_usize).div_ceil(host_page_size()).clamp(8, 1_024)),
+            // Sub-page byte targets clamp up to the minimum page budget.
+            (Some("1"), 8),
+            // Huge byte targets clamp down to the maximum page budget.
+            (Some("1048576"), 1_024),
+            (Some("0"), default_pages),
+            (Some("not-a-number"), default_pages),
+        ] {
+            std::env::set_var("A3S_OBSERVER_PERF_RING_KB", value.unwrap());
+            assert_eq!(perf_ring_pages(), expected, "kb value={value:?}");
+        }
+        // An explicit byte target wins over an explicit page count.
+        std::env::set_var("A3S_OBSERVER_PERF_RING_PAGES", "64");
+        std::env::set_var("A3S_OBSERVER_PERF_RING_KB", "256");
+        assert_eq!(
+            perf_ring_pages(),
+            (256 * 1024_usize).div_ceil(host_page_size()).clamp(8, 1_024)
+        );
+        std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
+        std::env::remove_var("A3S_OBSERVER_PERF_RING_KB");
+    }
+
+    #[test]
+    fn perf_lost_counters_split_totals_by_map() {
+        let counters = PerfLostCounters::default();
+        counters.record(perf_ring_index("PLAINTEXT_EVENTS"), 3);
+        counters.record(perf_ring_index("EVENTS"), 2);
+        counters.record(perf_ring_index("PLAINTEXT_EVENTS"), 4);
+        assert_eq!(counters.total(), 9);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.get("plaintext"), Some(&7));
+        assert_eq!(snapshot.get("events"), Some(&2));
+        assert_eq!(snapshot.get("plaintext_tls"), Some(&0));
+        assert_eq!(snapshot.len(), PERF_RINGS.len());
     }
 
     #[test]
