@@ -26,13 +26,15 @@ use a3s_observer_common::{
 use anyhow::Context as _;
 use aya::{
     maps::{perf::AsyncPerfEventArray, Array as BpfArray, HashMap as BpfHashMap, MapData, PerCpuArray},
-    programs::{KProbe, ProgramError, UProbe},
+    programs::{KProbe, ProgramError, UProbe, UProbeError},
     util::online_cpus,
     Ebpf,
 };
 use bytes::BytesMut;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, HashSet, VecDeque},
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
@@ -78,6 +80,7 @@ static CURSOR_REJECT_TTL: AtomicU64 = AtomicU64::new(0);
 static CURSOR_REJECT_SELF_FNV: AtomicU64 = AtomicU64::new(0);
 static CURSOR_REJECT_OVERLAP_FNV: AtomicU64 = AtomicU64::new(0);
 static CURSOR_REJECT_READ: AtomicU64 = AtomicU64::new(0);
+static DUPLICATE_FRAGMENT_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) async fn run() -> anyhow::Result<()> {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
@@ -350,6 +353,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         )
     });
     let mut sequencer = PlaintextSequencer::default();
+    let mut fragment_dedup = FragmentDedup::default();
     let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
     plaintext_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -362,6 +366,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut report = tokio::time::interval(Duration::from_secs(60));
     report.tick().await;
+    let mut ssl_attach_diag = tokio::time::interval(Duration::from_secs(30));
+    ssl_attach_diag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ssl_attach_diag.tick().await;
     let mut stats = Stats::default();
     emit_legacy_heartbeat(
         exporter.as_ref(),
@@ -376,6 +383,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tokio::select! {
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
+            _ = ssl_attach_diag.tick(), if ssl_uprobes => {
+                if let Some(manager) = ssl_manager.as_ref() {
+                    manager.log_attach_summary();
+                }
+            }
             _ = report.tick() => {
                 let _ = std::fs::write(&heartbeat_path, b"ok");
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
@@ -423,6 +435,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         );
                     }
                 }
+                let duplicate_fragment_suppressed =
+                    DUPLICATE_FRAGMENT_SUPPRESSED.swap(0, Ordering::Relaxed);
+                if duplicate_fragment_suppressed > 0 {
+                    tracing::info!(
+                        duplicate_fragment_suppressed,
+                        "legacy plaintext duplicate fragment suppression stats (60s window)"
+                    );
+                }
                 stats = Stats::default();
             }
             _ = plaintext_tick.tick(), if plaintext_http => {
@@ -456,6 +476,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     }
                 }
                 if let Some(reassembler) = interactions.as_mut() {
+                    fragment_dedup.expire_idle(
+                        boot_now_ns(),
+                        InteractionReassembler::reassembly_idle_timeout(),
+                    );
                     reassembler.expire_idle(Instant::now());
                     let retired = reassembler.take_completed();
                     emit_plaintext_interactions(
@@ -505,13 +529,27 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 safe_unix_now_ns(),
                                 &mut sequencer,
                             );
-                            cursor_patch_and_log(
+                            let duplicate = suppress_duplicate_fragment(
+                                &mut fragment_dedup,
+                                &mut sequencer,
+                                &chunk,
+                                ev.orig_len,
+                                ev.captured_at_boot_ns,
+                                ev.fd,
+                                ev.fd_generation,
+                            );
+                            let completed = if duplicate {
+                                Vec::new()
+                            } else if cursor_patch_and_log(
                                 cursor_rereader.as_ref(),
                                 cursor,
                                 &mut chunk,
                                 ev.captured_at_boot_ns,
-                            );
-                            let completed = reassembler.push(chunk);
+                            ) {
+                                reassembler.push(chunk)
+                            } else {
+                                Vec::new()
+                            };
                             emit_plaintext_interactions(
                                 exporter.as_ref(),
                                 &mut stats,
@@ -541,6 +579,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 seen,
                                 pid = ev.pid,
                                 tls_ctx = ev.tls_ctx,
+                                connection_id = ev.tls_ctx ^ 0x5353_6c73_0000_0000,
+                                captured_at_boot_ns = ev.captured_at_boot_ns,
                                 direction = ev.direction,
                                 len = ev.len,
                                 orig_len = ev.orig_len,
@@ -554,13 +594,27 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 safe_unix_now_ns(),
                                 &mut sequencer,
                             );
-                            cursor_patch_and_log(
+                            let duplicate = suppress_duplicate_fragment(
+                                &mut fragment_dedup,
+                                &mut sequencer,
+                                &chunk,
+                                ev.orig_len,
+                                ev.captured_at_boot_ns,
+                                ev.tls_ctx as u32,
+                                (ev.tls_ctx >> 32) as u32,
+                            );
+                            let completed = if duplicate {
+                                Vec::new()
+                            } else if cursor_patch_and_log(
                                 cursor_rereader.as_ref(),
                                 cursor,
                                 &mut chunk,
                                 ev.captured_at_boot_ns,
-                            );
-                            let completed = reassembler.push(chunk);
+                            ) {
+                                reassembler.push(chunk)
+                            } else {
+                                Vec::new()
+                            };
                             emit_plaintext_interactions(
                                 exporter.as_ref(),
                                 &mut stats,
@@ -619,7 +673,19 @@ fn boot_now_ns() -> u64 {
 struct CursorRereader {
     max_bytes: usize,
     ttl_ns: u64,
+    claims: RefCell<VecDeque<CursorClaim>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorClaim {
+    pid: u32,
+    connection_id: u64,
+    resume_buf: u64,
+    remaining: u32,
+    tail_fnv64: u64,
+}
+
+const CURSOR_CLAIM_LIMIT: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchReject {
@@ -661,11 +727,34 @@ impl CursorRereader {
         Some(Self {
             max_bytes: max_kb * 1_024,
             ttl_ns: ttl_ms * 1_000_000,
+            claims: RefCell::new(VecDeque::new()),
         })
+    }
+
+    fn claim(&self, chunk: &PlaintextChunk, cursor: &LegacyCursorExt) -> bool {
+        // captured_at_boot_ns 标识一次发射，不属于游标身份；同一游标经不同时间/路径
+        // 重发时仍必须命中同一台账项。
+        let claim = CursorClaim {
+            pid: chunk.pid,
+            connection_id: chunk.connection_id,
+            resume_buf: cursor.resume_buf,
+            remaining: cursor.remaining,
+            tail_fnv64: cursor.tail_fnv64,
+        };
+        let mut claims = self.claims.borrow_mut();
+        if claims.contains(&claim) {
+            return false;
+        }
+        if claims.len() >= CURSOR_CLAIM_LIMIT {
+            claims.pop_front();
+        }
+        claims.push_back(claim);
+        true
     }
 
     /// 校验并拼接。任何一步存疑都原样保留 partial chunk（宁可不拼，不可错拼）。
     /// `reader(pid, addr, len)` 注入目标内存读取，测试用假实现，生产用 process_vm_readv。
+    /// 同连接相同游标再次消费返回 Ok(None)，不会二次读取或追加；调用方必须跳过该分片。
     fn patch(
         &self,
         chunk: &mut PlaintextChunk,
@@ -673,7 +762,10 @@ impl CursorRereader {
         captured_at_boot_ns: u64,
         now_boot_ns: u64,
         reader: &dyn Fn(u32, u64, usize) -> Option<Vec<u8>>,
-    ) -> Result<usize, PatchReject> {
+    ) -> Result<Option<usize>, PatchReject> {
+        if !self.claim(chunk, cursor) {
+            return Ok(None);
+        }
         if now_boot_ns.saturating_sub(captured_at_boot_ns) > self.ttl_ns {
             return Err(PatchReject::TtlExpired);
         }
@@ -707,7 +799,7 @@ impl CursorRereader {
                 .partial_reasons
                 .push("cursor_reread_capped".to_string());
         }
-        Ok(payload.len())
+        Ok(Some(payload.len()))
     }
 }
 
@@ -889,6 +981,140 @@ impl PlaintextSequencer {
         *slot = slot.wrapping_add(1);
         *slot
     }
+
+    fn rollback(&mut self, pid: u32, fd: u32, generation: u32, is_read: bool) {
+        if let Some(slot) = self.counters.get_mut(&(pid, fd, generation, is_read)) {
+            *slot = slot.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FragmentKey {
+    is_read: bool,
+    orig_len: u32,
+    hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FragmentEntry {
+    key: FragmentKey,
+    first_seen_boot_ns: u64,
+}
+
+#[derive(Default)]
+struct ConnectionDedup {
+    entries: VecDeque<FragmentEntry>,
+    last_seen_boot_ns: u64,
+}
+
+// 25ms 覆盖实测约 5ms 的重复发射；窗口只抑制完全相同的分片，超过窗口的合法重复
+// 请求和不同 orig_len/内容的 delta 一律放行。captured_at 只用于窗口，不参与键。
+const DUPLICATE_FRAGMENT_WINDOW_NS: u64 = 25_000_000;
+const DUPLICATE_FRAGMENT_KEYS_PER_CONNECTION: usize = 64;
+const DUPLICATE_FRAGMENT_MAX_CONNECTIONS: usize = 1_024;
+
+#[derive(Default)]
+struct FragmentDedup {
+    connections: std::collections::HashMap<(u64, u32), ConnectionDedup>,
+}
+
+impl FragmentDedup {
+    fn should_suppress(
+        &mut self,
+        chunk: &PlaintextChunk,
+        orig_len: u32,
+        captured_at_boot_ns: u64,
+    ) -> bool {
+        let key = FragmentKey {
+            is_read: matches!(chunk.direction, ChunkDirection::Response),
+            orig_len,
+            hash: Sha256::digest(&chunk.data).into(),
+        };
+        let connection_key = (chunk.connection_id, chunk.pid);
+        if self.connections.len() >= DUPLICATE_FRAGMENT_MAX_CONNECTIONS
+            && !self.connections.contains_key(&connection_key)
+        {
+            if let Some(oldest) = self
+                .connections
+                .iter()
+                .min_by_key(|(_, connection)| connection.last_seen_boot_ns)
+                .map(|(key, _)| *key)
+            {
+                self.connections.remove(&oldest);
+            }
+        }
+        let connection = self.connections.entry(connection_key).or_default();
+        connection.last_seen_boot_ns = connection.last_seen_boot_ns.max(captured_at_boot_ns);
+        if let Some(index) = connection
+            .entries
+            .iter()
+            .position(|entry| entry.key == key)
+        {
+            let first_seen_boot_ns = connection.entries[index].first_seen_boot_ns;
+            let duplicate =
+                captured_at_boot_ns.saturating_sub(first_seen_boot_ns) <= DUPLICATE_FRAGMENT_WINDOW_NS;
+            connection.entries.remove(index);
+            connection.entries.push_back(FragmentEntry {
+                key,
+                first_seen_boot_ns: if duplicate {
+                    first_seen_boot_ns
+                } else {
+                    captured_at_boot_ns
+                },
+            });
+            return duplicate;
+        }
+        connection.entries.push_back(FragmentEntry {
+            key,
+            first_seen_boot_ns: captured_at_boot_ns,
+        });
+        if connection.entries.len() > DUPLICATE_FRAGMENT_KEYS_PER_CONNECTION {
+            connection.entries.pop_front();
+        }
+        false
+    }
+
+    fn expire_idle(&mut self, now_boot_ns: u64, timeout: Duration) {
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        self.connections.retain(|_, connection| {
+            now_boot_ns.saturating_sub(connection.last_seen_boot_ns) <= timeout_ns
+        });
+    }
+}
+
+/// 在 cursor patch 前判定，保证补读扩展后的分片不再进入去重；被抑制的分片同时回滚
+/// userspace sequence，避免把主动去重视为真实 fragment_sequence_gap。
+fn suppress_duplicate_fragment(
+    dedup: &mut FragmentDedup,
+    sequencer: &mut PlaintextSequencer,
+    chunk: &PlaintextChunk,
+    orig_len: u32,
+    captured_at_boot_ns: u64,
+    fd: u32,
+    generation: u32,
+) -> bool {
+    if !dedup.should_suppress(chunk, orig_len, captured_at_boot_ns) {
+        return false;
+    }
+    sequencer.rollback(
+        chunk.pid,
+        fd,
+        generation,
+        matches!(chunk.direction, ChunkDirection::Response),
+    );
+    let count = DUPLICATE_FRAGMENT_SUPPRESSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_multiple_of(64) {
+        tracing::info!(
+            pid = chunk.pid,
+            connection_id = chunk.connection_id,
+            direction = ?chunk.direction,
+            orig_len,
+            duplicate_fragment_suppressed = count,
+            "duplicate plaintext fragment suppressed"
+        );
+    }
+    true
 }
 
 fn tls_plaintext_chunk_from_event(
@@ -973,15 +1199,16 @@ fn plaintext_chunk_from_event(
 }
 
 /// R3 截断补读入口：游标存在且特性开启时尝试补读拼接；结果只影响本 chunk，
-/// 失败原样保留 partial。计数进 60s 心跳窗口。
+/// 失败原样保留 partial。计数进 60s 心跳窗口。返回 false 表示同连接游标重复，
+/// 该分片已在首次消费时进入重组器，不能再次 push。
 fn cursor_patch_and_log(
     rereader: Option<&CursorRereader>,
     cursor: Option<LegacyCursorExt>,
     chunk: &mut PlaintextChunk,
     captured_at_boot_ns: u64,
-) {
+) -> bool {
     let (Some(rereader), Some(cursor)) = (rereader, cursor) else {
-        return;
+        return true;
     };
     match rereader.patch(
         chunk,
@@ -990,16 +1217,22 @@ fn cursor_patch_and_log(
         boot_now_ns(),
         &process_vm_read,
     ) {
-        Ok(appended) => {
+        Ok(Some(appended)) => {
             CURSOR_PATCHED.fetch_add(1, Ordering::Relaxed);
             CURSOR_PATCH_BYTES.fetch_add(appended as u64, Ordering::Relaxed);
             tracing::info!(
                 pid = chunk.pid,
+                connection_id = chunk.connection_id,
+                captured_at_boot_ns,
+                resume_buf = cursor.resume_buf,
+                tail_fnv64 = cursor.tail_fnv64,
                 appended,
                 remaining = cursor.remaining,
                 "legacy cursor reread patched truncated call"
             );
+            true
         }
+        Ok(None) => false,
         Err(reason) => {
             let counter = match reason {
                 PatchReject::TtlExpired => &CURSOR_REJECT_TTL,
@@ -1014,6 +1247,7 @@ fn cursor_patch_and_log(
                 remaining = cursor.remaining,
                 "legacy cursor reread rejected; keeping partial"
             );
+            true
         }
     }
 }
@@ -1113,21 +1347,117 @@ fn attach_first(ebpf: &mut Ebpf, program: &str, symbols: &[&str], attached: &mut
     }
 }
 
-/// OpenSSL uprobe lifecycle on the legacy backend: scan whitelisted processes' maps for
-/// libssl, attach SSL_write/SSL_read(+ret) once per shared inode (identical base layers share
-/// one). The BPF side gates by the identity whitelist, so inode-wide attach is safe.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct SslAttachKey {
+    pid: i32,
+    start_time_ticks: u64,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SslProcessState {
+    Present(u64),
+    Exited,
+    Unavailable,
+}
+
+impl SslAttachKey {
+    fn matches(self, state: SslProcessState) -> bool {
+        match state {
+            SslProcessState::Present(start_time_ticks) => {
+                start_time_ticks == self.start_time_ticks
+            }
+            SslProcessState::Exited => false,
+            // 瞬时 proc 读取/解析失败不是退出证据；保留现有链接和台账，避免重复挂接。
+            SslProcessState::Unavailable => true,
+        }
+    }
+
+    fn is_current(self) -> bool {
+        self.matches(ssl_process_state(self.pid))
+    }
+}
+
+fn ssl_process_state(pid: i32) -> SslProcessState {
+    match super::read_process_stat(pid as u32) {
+        Some((_, start_time_ticks)) => SslProcessState::Present(start_time_ticks),
+        None if !Path::new("/proc").join(pid.to_string()).exists() => SslProcessState::Exited,
+        None => SslProcessState::Unavailable,
+    }
+}
+
+fn ssl_process_start_ticks(pid: i32) -> Option<u64> {
+    super::read_process_stat(pid as u32).map(|(_, start_time_ticks)| start_time_ticks)
+}
+
+struct SslDiagEntry {
+    path: PathBuf,
+    attach_entries: u64,
+}
+
+const SSL_ATTACH_DIAG_LIMIT: usize = 4_096;
+
+/// OpenSSL uprobe lifecycle on the legacy backend: attach once per process/start and mapped
+/// inode. PID-scoped links prevent global registrations for other containers from replaying one
+/// SSL call into this collector. Process start ticks allow safe PID reuse without reattaching to
+/// every process on every refresh.
 #[derive(Default)]
 struct SslUprobeManager {
-    attached: HashSet<(u64, u64)>,
-    failed: HashSet<(u64, u64)>,
+    attached: HashSet<SslAttachKey>,
+    failed: HashSet<SslAttachKey>,
+    diag_entries: BTreeMap<SslAttachKey, SslDiagEntry>,
     logged_scan: bool,
     read_failed: HashSet<i32>,
     logged_ssl_pids: HashSet<i32>,
 }
 
 impl SslUprobeManager {
+    fn record_attach_success(&mut self, key: SslAttachKey, path: &Path) {
+        self.attached.insert(key);
+        if self.diag_entries.len() >= SSL_ATTACH_DIAG_LIMIT
+            && !self.diag_entries.contains_key(&key)
+        {
+            if let Some(oldest) = self.diag_entries.keys().next().copied() {
+                self.diag_entries.remove(&oldest);
+            }
+        }
+        let entry = self.diag_entries.entry(key).or_insert_with(|| SslDiagEntry {
+            path: path.to_path_buf(),
+            attach_entries: 0,
+        });
+        entry.path = path.to_path_buf();
+        entry.attach_entries += 1;
+    }
+
+    fn log_attach_summary(&self) {
+        tracing::info!(
+            entries = self.diag_entries.len(),
+            "legacy SSL attach table summary (30s)"
+        );
+        for (key, entry) in &self.diag_entries {
+            tracing::info!(
+                pid = key.pid,
+                invalid_pid = key.pid <= 0,
+                start_time_ticks = key.start_time_ticks,
+                dev = key.dev,
+                inode = key.ino,
+                path = %entry.path.display(),
+                attach_entries = entry.attach_entries,
+                duplicate_suspect = entry.attach_entries > 1,
+                "legacy SSL attach entry"
+            );
+        }
+    }
+
+    fn prune_stale(&mut self) {
+        self.attached.retain(|key| key.is_current());
+        self.failed.retain(|key| key.is_current());
+    }
+
     fn ensure_attached(&mut self, ebpf: &mut Ebpf, pids: &HashSet<i32>) {
         use std::os::unix::fs::MetadataExt;
+        self.prune_stale();
         if !self.logged_scan {
             self.logged_scan = true;
             tracing::info!(pids = pids.len(), "legacy openssl uprobe scan started");
@@ -1152,7 +1482,7 @@ impl SslUprobeManager {
                     continue;
                 }
                 ssl_lines += 1;
-                if !seen.insert(path.to_string()) {
+                if !seen.insert((*pid, path.to_string())) {
                     continue;
                 }
                 if ssl_lines == 1 && self.logged_ssl_pids.insert(*pid) {
@@ -1162,14 +1492,24 @@ impl SslUprobeManager {
                 let Ok(metadata) = std::fs::metadata(&host_path) else {
                     continue;
                 };
-                let key = (metadata.dev(), metadata.ino());
+                let Some(start_time_ticks) = ssl_process_start_ticks(*pid) else {
+                    continue;
+                };
+                let key = SslAttachKey {
+                    pid: *pid,
+                    start_time_ticks,
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                };
                 if self.attached.contains(&key) || self.failed.contains(&key) {
                     continue;
                 }
-                match attach_ssl_uprobes(ebpf, &host_path) {
+                match attach_ssl_uprobes(ebpf, &host_path, *pid) {
                     Ok(()) => {
-                        self.attached.insert(key);
+                        self.record_attach_success(key, &host_path);
                         tracing::info!(
+                            pid = *pid,
+                            start_time_ticks,
                             path = %host_path.display(),
                             "legacy openssl uprobes attached (SSL_write/SSL_read)"
                         );
@@ -1177,6 +1517,7 @@ impl SslUprobeManager {
                     Err(error) => {
                         self.failed.insert(key);
                         tracing::warn!(
+                            pid = *pid,
                             path = %host_path.display(),
                             error = %error,
                             "legacy openssl uprobe attach failed"
@@ -1188,38 +1529,71 @@ impl SslUprobeManager {
     }
 }
 
-fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<()> {
-    // OpenSSL 3.x 的 SSL_write/SSL_read 包装内部会调用导出的 SSL_write_ex/SSL_read_ex
-    // （开发机实测双挂产生重复分块：同一写请求 headers 采到两次）。默认只挂 _ex 变体 +
-    // 共享出口；个别包装不转发导出符号的 libssl 可用 A3S_OBSERVER_SSL_LEGACY_SYMBOLS=1
-    // 恢复旧符号挂接（仿真环境打包前需在目标 libssl 上验证一次）。
-    let legacy_symbols = std::env::var("A3S_OBSERVER_SSL_LEGACY_SYMBOLS")
-        .map(|value| matches!(value.trim(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false);
-    let mut programs = vec![
-        ("legacy_ssl_write_ex", "SSL_write_ex"),
-        ("legacy_ssl_read_enter_ex", "SSL_read_ex"),
-        ("legacy_ssl_read_exit", "SSL_read_ex"),
-    ];
-    if legacy_symbols {
-        programs.push(("legacy_ssl_write", "SSL_write"));
-        programs.push(("legacy_ssl_read_enter", "SSL_read"));
-        programs.push(("legacy_ssl_read_exit", "SSL_read"));
+fn attach_ssl_symbol(
+    ebpf: &mut Ebpf,
+    program: &str,
+    symbol: &str,
+    path: &Path,
+    pid: i32,
+) -> Result<(), ProgramError> {
+    let raw = ebpf
+        .program_mut(program)
+        .ok_or_else(|| ProgramError::InvalidName {
+            name: program.to_string(),
+        })?;
+    let probe: &mut UProbe = raw
+        .try_into()
+        .map_err(|_| ProgramError::UnexpectedProgramType)?;
+    match probe.load() {
+        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+        Err(error) => return Err(error),
     }
-    for (program, symbol) in programs {
-        let raw = ebpf
-            .program_mut(program)
-            .with_context(|| format!("program `{program}` missing"))?;
-        let probe: &mut UProbe = raw
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("program `{program}` type mismatch"))?;
-        match probe.load() {
-            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-            Err(error) => return Err(error).context("uprobe load failed"),
+    probe.attach(Some(symbol), 0, path, Some(pid)).map(|_| ())
+}
+
+fn attach_ssl_with_fallback(
+    ex: (&str, &str),
+    legacy: (&str, &str),
+    attach: &mut dyn FnMut(&str, &str) -> Result<(), ProgramError>,
+) -> Result<(), ProgramError> {
+    match attach(ex.0, ex.1) {
+        Ok(()) => Ok(()),
+        Err(ProgramError::UProbeError(UProbeError::SymbolError { .. })) => {
+            attach(legacy.0, legacy.1)
         }
-        probe
-            .attach(Some(symbol), 0, path, None)
-            .with_context(|| format!("uprobe attach `{symbol}` failed"))?;
+        Err(error) => Err(error),
+    }
+}
+
+fn checked_ssl_attach_pid(pid: i32) -> anyhow::Result<i32> {
+    anyhow::ensure!(pid > 0, "refusing invalid SSL uprobe pid {pid}");
+    Ok(pid)
+}
+
+fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path, pid: i32) -> anyhow::Result<()> {
+    // _ex 与 legacy 包装符号不能同时挂：OpenSSL 包装会把一次调用变成两组完整分片。
+    // 仅当目标 libssl 确实没有 _ex 符号时回退到 legacy；加载/权限等错误不能触发回退。
+    let pid = checked_ssl_attach_pid(pid)?;
+    let mut attach = |program: &str, symbol: &str| {
+        attach_ssl_symbol(ebpf, program, symbol, path, pid)
+    };
+    for (ex, legacy) in [
+        (
+            ("legacy_ssl_write_ex", "SSL_write_ex"),
+            ("legacy_ssl_write", "SSL_write"),
+        ),
+        (
+            ("legacy_ssl_read_enter_ex", "SSL_read_ex"),
+            ("legacy_ssl_read_enter", "SSL_read"),
+        ),
+        (
+            ("legacy_ssl_read_exit", "SSL_read_ex"),
+            ("legacy_ssl_read_exit", "SSL_read"),
+        ),
+    ] {
+        attach_ssl_with_fallback(ex, legacy, &mut attach).with_context(|| {
+            format!("uprobe attach `{}` with `{}` fallback failed", ex.1, legacy.1)
+        })?;
     }
     Ok(())
 }
@@ -1743,6 +2117,7 @@ mod tests {
         CursorRereader {
             max_bytes: 1_024 * 1_024,
             ttl_ns: 500_000_000,
+            claims: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -1817,7 +2192,7 @@ mod tests {
         let appended = rereader
             .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
             .expect("fingerprint match must patch");
-        assert_eq!(appended, payload_len);
+        assert_eq!(appended, Some(payload_len));
         assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN + payload_len);
         assert!(chunk
             .partial_reasons
@@ -1888,6 +2263,7 @@ mod tests {
         let rereader = CursorRereader {
             max_bytes: 256 * 1_024,
             ttl_ns: 500_000_000,
+            claims: RefCell::new(VecDeque::new()),
         };
         let mut chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
         let cursor = cursor_for(&chunk, 700_000, 0x7f00_0000);
@@ -1901,7 +2277,7 @@ mod tests {
         let appended = rereader
             .patch(&mut chunk, &cursor, 1_000, 2_000, &reader)
             .expect("capped patch must still append");
-        assert_eq!(appended, 256 * 1_024);
+        assert_eq!(appended, Some(256 * 1_024));
         assert_eq!(chunk.data.len(), LEGACY_PLAINTEXT_LEN + 256 * 1_024);
         assert!(chunk
             .partial_reasons
@@ -1965,6 +2341,489 @@ mod tests {
             completed[0].request.captured_bytes > 0,
             "the truncated request prefix must be retained as partial evidence"
         );
+    }
+
+    fn repetitive_json_body(body_len: usize) -> String {
+        let prefix = r#"{"model":"fixture-model","messages":[{"role":"user","content":""#;
+        let suffix = r#""}]}"#;
+        let pattern = b"0123456789abcdef";
+        let mut body = String::with_capacity(body_len);
+        body.push_str(prefix);
+        body.extend(
+            (0..body_len - prefix.len() - suffix.len())
+                .map(|index| pattern[index % pattern.len()] as char),
+        );
+        body.push_str(suffix);
+        assert_eq!(body.len(), body_len);
+        body
+    }
+
+    fn assert_tls_cursor_reread_reassembles(full: Vec<u8>, expected_body: &str) {
+        let tls_ctx = 0x7f12_3456_7890_u64;
+        let rereader = cursor_test_rereader();
+        let patch_reads = std::cell::Cell::new(0usize);
+        let reader = |_pid, addr, len| {
+            patch_reads.set(patch_reads.get() + 1);
+            assert_eq!(addr, 0x7f00_0000 - LEGACY_CURSOR_TAIL_LEN as u64);
+            assert_eq!(len, full.len() - 131_072 + LEGACY_CURSOR_TAIL_LEN);
+            Some(full[131_072 - LEGACY_CURSOR_TAIL_LEN..].to_vec())
+        };
+        let mut sequencer = PlaintextSequencer::default();
+        let mut reassembler = InteractionReassembler::default();
+        let mut completed = Vec::new();
+        for index in 0..8usize {
+            let start = index * LEGACY_PLAINTEXT_LEN;
+            let end = start + LEGACY_PLAINTEXT_LEN;
+            let mut event = LegacyTlsPlaintextEvent {
+                pid: 2_531_223,
+                direction: 0,
+                len: LEGACY_PLAINTEXT_LEN as u32,
+                orig_len: (full.len() - start) as u32,
+                tls_ctx,
+                comm: [0; 16],
+                captured_at_boot_ns: 1_000 + index as u64,
+                data: [0; LEGACY_PLAINTEXT_LEN],
+            };
+            event.data.copy_from_slice(&full[start..end]);
+            let mut chunk = tls_plaintext_chunk_from_event(
+                &event,
+                index as u128 + 1,
+                &mut sequencer,
+            );
+            if index == 7 {
+                let cursor = cursor_for(
+                    &chunk,
+                    (full.len() - 131_072) as u32,
+                    0x7f00_0000,
+                );
+                assert_eq!(
+                    rereader.patch(
+                        &mut chunk,
+                        &cursor,
+                        event.captured_at_boot_ns,
+                        2_000,
+                        &reader,
+                    ),
+                    Ok(Some(full.len() - 131_072))
+                );
+                completed.extend(reassembler.push(chunk));
+
+                let mut replay_results = Vec::new();
+                for replay_index in 1..4u64 {
+                    let mut replay = tls_plaintext_chunk_from_event(
+                        &event,
+                        index as u128 + replay_index as u128 + 1,
+                        &mut sequencer,
+                    );
+                    let replay_cursor = cursor_for(
+                        &replay,
+                        (full.len() - 131_072) as u32,
+                        0x7f00_0000,
+                    );
+                    let outcome = rereader.patch(
+                        &mut replay,
+                        &replay_cursor,
+                        event.captured_at_boot_ns + replay_index * 6_000_000,
+                        2_000 + replay_index * 6_000_000,
+                        &reader,
+                    );
+                    let replay_len = replay.data.len();
+                    if outcome != Ok(None) {
+                        completed.extend(reassembler.push(replay));
+                    }
+                    replay_results.push((outcome, replay_len));
+                }
+                assert!(
+                    replay_results.iter().all(|(outcome, len)| {
+                        *outcome == Ok(None) && *len == LEGACY_PLAINTEXT_LEN
+                    }),
+                    "the same cursor must be consumed once across timestamped paths: {replay_results:?}"
+                );
+                continue;
+            }
+            completed.extend(reassembler.push(chunk));
+        }
+
+        let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        let mut response_event = LegacyTlsPlaintextEvent {
+            pid: 2_531_223,
+            direction: LEGACY_PLAINTEXT_DIRECTION_READ,
+            len: response.len() as u32,
+            orig_len: response.len() as u32,
+            tls_ctx,
+            comm: [0; 16],
+            captured_at_boot_ns: 2_000,
+            data: [0; LEGACY_PLAINTEXT_LEN],
+        };
+        response_event.data[..response.len()].copy_from_slice(response.as_bytes());
+        let response_chunk = tls_plaintext_chunk_from_event(&response_event, 9, &mut sequencer);
+        completed.extend(reassembler.push(response_chunk));
+
+        assert_eq!(patch_reads.get(), 1, "one cursor must be consumed once");
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].request.body, expected_body);
+        assert_eq!(completed[0].response.text.as_deref(), Some("ok"));
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "cursor_reread_patched"));
+    }
+
+    #[test]
+    fn tls_cursor_reread_repetitive_body_reassembles_content_length_once() {
+        let body_len = 307_200usize;
+        let head = format!(
+            "POST /r4 HTTP/1.1\r\nHost: 10.1.3.119:18443\r\nX-R4: 12345\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+        );
+        assert_eq!(head.len(), 114);
+        let body = repetitive_json_body(body_len);
+        let mut full = head.into_bytes();
+        full.extend_from_slice(body.as_bytes());
+        assert_eq!(full.len(), 307_314);
+        assert_tls_cursor_reread_reassembles(full, &body);
+    }
+
+    #[test]
+    fn tls_cursor_reread_reassembles_chunked_request_once() {
+        let body = repetitive_json_body(220_000);
+        let mut full = b"POST /v1/chat/completions HTTP/1.1\r\nHost: 10.1.3.119:18443\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in body.as_bytes().chunks(16 * 1024) {
+            full.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            full.extend_from_slice(part);
+            full.extend_from_slice(b"\r\n");
+        }
+        full.extend_from_slice(b"0\r\n\r\n");
+        assert!(full.len() > 131_072);
+        assert_tls_cursor_reread_reassembles(full, &body);
+    }
+
+    #[test]
+    fn ssl_attach_keys_dedup_repeats_without_blocking_other_processes() {
+        let first = SslAttachKey {
+            pid: 42,
+            start_time_ticks: 100,
+            dev: 7,
+            ino: 99,
+        };
+        let other_process = SslAttachKey { pid: 43, ..first };
+        let reused_process = SslAttachKey {
+            start_time_ticks: 101,
+            ..first
+        };
+        let mut manager = SslUprobeManager::default();
+        assert!(manager.attached.insert(first));
+        for _ in 0..3 {
+            assert!(!manager.attached.insert(first));
+        }
+        assert!(manager.attached.insert(other_process));
+        assert!(manager.attached.insert(reused_process));
+        assert_eq!(manager.attached.len(), 3);
+    }
+
+    #[test]
+    fn ssl_attach_state_prunes_dead_or_reused_processes() {
+        let pid = std::process::id() as i32;
+        let start_time_ticks = ssl_process_start_ticks(pid).expect("current process start");
+        let current = SslAttachKey {
+            pid,
+            start_time_ticks,
+            dev: 7,
+            ino: 99,
+        };
+        let stale = SslAttachKey {
+            start_time_ticks: start_time_ticks.wrapping_sub(1),
+            ..current
+        };
+        let mut manager = SslUprobeManager::default();
+        manager.attached.extend([current, stale]);
+        manager.failed.insert(stale);
+        manager.prune_stale();
+        assert!(manager.attached.contains(&current));
+        assert!(!manager.attached.contains(&stale));
+        assert!(!manager.failed.contains(&stale));
+    }
+
+    #[test]
+    fn ssl_attach_key_retains_unavailable_process() {
+        let key = SslAttachKey {
+            pid: 42,
+            start_time_ticks: 100,
+            dev: 7,
+            ino: 99,
+        };
+        assert!(key.matches(SslProcessState::Unavailable));
+        assert!(key.matches(SslProcessState::Present(100)));
+        assert!(!key.matches(SslProcessState::Present(101)));
+        assert!(!key.matches(SslProcessState::Exited));
+    }
+
+    #[test]
+    fn checked_ssl_attach_pid_rejects_invalid_values() {
+        assert_eq!(checked_ssl_attach_pid(1).unwrap(), 1);
+        for pid in [0, -1, i32::MIN] {
+            assert!(checked_ssl_attach_pid(pid).is_err(), "pid={pid}");
+        }
+    }
+
+    #[test]
+    fn ssl_attach_diag_counts_repeat_successes() {
+        let key = SslAttachKey {
+            pid: 42,
+            start_time_ticks: 100,
+            dev: 7,
+            ino: 99,
+        };
+        let mut manager = SslUprobeManager::default();
+        for _ in 0..3 {
+            manager.record_attach_success(key, Path::new("/tmp/libssl.so"));
+        }
+        assert_eq!(manager.attached.len(), 1);
+        assert_eq!(manager.diag_entries[&key].attach_entries, 3);
+        let invalid = SslAttachKey { pid: 0, ..key };
+        manager.record_attach_success(invalid, Path::new("/tmp/libssl.so"));
+        assert_eq!(manager.diag_entries[&invalid].attach_entries, 1);
+        assert!(invalid.pid <= 0, "summary must mark invalid pid entries");
+    }
+
+    #[test]
+    fn proc_root_alias_preserves_dev_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let direct = std::fs::metadata("/etc/hosts").expect("direct metadata");
+        let via_proc = std::fs::metadata(format!(
+            "/proc/{}/root/etc/hosts",
+            std::process::id()
+        ))
+        .expect("proc root metadata");
+        assert_eq!(
+            (direct.dev(), direct.ino()),
+            (via_proc.dev(), via_proc.ino())
+        );
+    }
+
+    fn missing_symbol_error() -> ProgramError {
+        ProgramError::UProbeError(UProbeError::SymbolError {
+            symbol: "SSL_write_ex".to_string(),
+            error: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing symbol",
+            )),
+        })
+    }
+
+    #[test]
+    fn ssl_symbol_fallback_prefers_ex_without_adding_legacy() {
+        let mut calls = Vec::new();
+        attach_ssl_with_fallback(
+            ("ex", "SSL_write_ex"),
+            ("legacy", "SSL_write"),
+            &mut |program, symbol| {
+                calls.push((program.to_string(), symbol.to_string()));
+                Ok(())
+            },
+        )
+        .expect("_ex attach succeeds");
+        assert_eq!(calls, [("ex".to_string(), "SSL_write_ex".to_string())]);
+    }
+
+    #[test]
+    fn ssl_symbol_fallback_uses_legacy_only_when_ex_is_missing() {
+        let mut calls = Vec::new();
+        attach_ssl_with_fallback(
+            ("ex", "SSL_write_ex"),
+            ("legacy", "SSL_write"),
+            &mut |program, symbol| {
+                calls.push((program.to_string(), symbol.to_string()));
+                if program == "ex" {
+                    Err(missing_symbol_error())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("legacy fallback succeeds");
+        assert_eq!(
+            calls,
+            [
+                ("ex".to_string(), "SSL_write_ex".to_string()),
+                ("legacy".to_string(), "SSL_write".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn ssl_symbol_fallback_does_not_hide_real_attach_errors() {
+        let mut calls = Vec::new();
+        let result = attach_ssl_with_fallback(
+            ("ex", "SSL_write_ex"),
+            ("legacy", "SSL_write"),
+            &mut |program, symbol| {
+                calls.push((program.to_string(), symbol.to_string()));
+                Err(ProgramError::AlreadyLoaded)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, [("ex".to_string(), "SSL_write_ex".to_string())]);
+    }
+
+    #[test]
+    fn duplicate_fragment_window_and_lru_rules() {
+        let chunk = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        let mut dedup = FragmentDedup::default();
+        assert!(!dedup.should_suppress(&chunk, 307_314, 1_000));
+        assert!(dedup.should_suppress(&chunk, 307_314, 1_000 + 5_000_000));
+        assert!(!dedup.should_suppress(&chunk, 290_930, 1_000 + 6_000_000));
+        let mut different = patterned_chunk(LEGACY_PLAINTEXT_LEN);
+        different.data[0] ^= 1;
+        assert!(!dedup.should_suppress(&different, 307_314, 1_000 + 7_000_000));
+        assert!(!dedup.should_suppress(&chunk, 307_314, 1_000 + 26_000_000));
+        assert!(dedup.should_suppress(&chunk, 307_314, 1_000 + 30_000_000));
+
+        let mut bounded = FragmentDedup::default();
+        for orig_len in 0..70 {
+            assert!(!bounded.should_suppress(&chunk, orig_len, 1_000 + orig_len as u64));
+        }
+        let connection = &bounded.connections[&(chunk.connection_id, chunk.pid)];
+        assert_eq!(connection.entries.len(), DUPLICATE_FRAGMENT_KEYS_PER_CONNECTION);
+        assert!(!connection.entries.iter().any(|entry| entry.key.orig_len == 0));
+        bounded.expire_idle(100_000_000, Duration::from_millis(25));
+        assert!(bounded.connections.is_empty());
+
+        let mut capped = FragmentDedup::default();
+        for pid in 1..=(DUPLICATE_FRAGMENT_MAX_CONNECTIONS as u32 + 10) {
+            let mut other = chunk.clone();
+            other.pid = pid;
+            capped.should_suppress(&other, 307_314, 1_000);
+        }
+        assert_eq!(capped.connections.len(), DUPLICATE_FRAGMENT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn duplicate_fragment_groups_are_suppressed_before_reassembly() {
+        let tls_ctx = 0x7f12_3456_7890_u64;
+        let body_len = 307_200usize;
+        let head = format!(
+            "POST /r4 HTTP/1.1\r\nHost: 10.1.3.119:18443\r\nX-R4: 12345\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+        );
+        assert_eq!(head.len(), 114);
+        let body = repetitive_json_body(body_len);
+        let mut full = head.into_bytes();
+        full.extend_from_slice(body.as_bytes());
+        assert_eq!(full.len(), 307_314);
+
+        let rereader = cursor_test_rereader();
+        let patch_reads = std::cell::Cell::new(0usize);
+        let reader = |_pid, addr, len| {
+            patch_reads.set(patch_reads.get() + 1);
+            assert_eq!(addr, 0x7f00_0000 - LEGACY_CURSOR_TAIL_LEN as u64);
+            assert_eq!(len, full.len() - 131_072 + LEGACY_CURSOR_TAIL_LEN);
+            Some(full[131_072 - LEGACY_CURSOR_TAIL_LEN..].to_vec())
+        };
+        let mut dedup = FragmentDedup::default();
+        let mut sequencer = PlaintextSequencer::default();
+        let mut reassembler = InteractionReassembler::default();
+        let mut completed = Vec::new();
+        for group in 0..2u64 {
+            for index in 0..8usize {
+                let start = index * LEGACY_PLAINTEXT_LEN;
+                let end = start + LEGACY_PLAINTEXT_LEN;
+                let captured_at_boot_ns = 1_000 + index as u64 + group * 5_000_000;
+                let mut event = LegacyTlsPlaintextEvent {
+                    pid: 2_531_223,
+                    direction: 0,
+                    len: LEGACY_PLAINTEXT_LEN as u32,
+                    orig_len: (full.len() - start) as u32,
+                    tls_ctx,
+                    comm: [0; 16],
+                    captured_at_boot_ns,
+                    data: [0; LEGACY_PLAINTEXT_LEN],
+                };
+                event.data.copy_from_slice(&full[start..end]);
+                let mut chunk = tls_plaintext_chunk_from_event(
+                    &event,
+                    captured_at_boot_ns as u128,
+                    &mut sequencer,
+                );
+                let duplicate = suppress_duplicate_fragment(
+                    &mut dedup,
+                    &mut sequencer,
+                    &chunk,
+                    event.orig_len,
+                    captured_at_boot_ns,
+                    tls_ctx as u32,
+                    (tls_ctx >> 32) as u32,
+                );
+                assert_eq!(duplicate, group == 1, "group={group} index={index}");
+                if duplicate {
+                    continue;
+                }
+                if index == 7 {
+                    let cursor = cursor_for(
+                        &chunk,
+                        (full.len() - 131_072) as u32,
+                        0x7f00_0000,
+                    );
+                    assert_eq!(
+                        rereader.patch(&mut chunk, &cursor, captured_at_boot_ns, 20_000_000, &reader),
+                        Ok(Some(full.len() - 131_072))
+                    );
+                }
+                completed.extend(reassembler.push(chunk));
+            }
+        }
+
+        let response_head = b"HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.9.21\r\nDate: Sun, 25 Oct 2026 18:59:16 GMT\r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(response_head.len(), 111);
+        let response_event = |data: &[u8], captured_at_boot_ns: u64| {
+            let mut event = LegacyTlsPlaintextEvent {
+                pid: 2_531_223,
+                direction: LEGACY_PLAINTEXT_DIRECTION_READ,
+                len: data.len() as u32,
+                orig_len: data.len() as u32,
+                tls_ctx,
+                comm: [0; 16],
+                captured_at_boot_ns,
+                data: [0; LEGACY_PLAINTEXT_LEN],
+            };
+            event.data[..data.len()].copy_from_slice(data);
+            event
+        };
+        let response_chunk = tls_plaintext_chunk_from_event(
+            &response_event(response_head, 30_000_000),
+            30_000_000,
+            &mut sequencer,
+        );
+        completed.extend(reassembler.push(response_chunk));
+        assert!(
+            completed.is_empty(),
+            "a header-only response must wait for its declared two-byte body"
+        );
+        let response_chunk = tls_plaintext_chunk_from_event(
+            &response_event(b"ok", 31_000_000),
+            31_000_000,
+            &mut sequencer,
+        );
+        completed.extend(reassembler.push(response_chunk));
+
+        assert_eq!(patch_reads.get(), 1, "duplicate group must not patch again");
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].request.body, body);
+        assert_eq!(completed[0].response.body, "ok");
+        assert_eq!(reassembler.metrics().sequence_gaps, 0);
+        assert!(completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "cursor_reread_patched"));
+        let evidence = reassembler.take_evidence();
+        assert!(evidence.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason == "probe_call_limit")
+        }));
     }
 
     #[test]

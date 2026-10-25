@@ -4,8 +4,8 @@
 //! The eBPF hot path only copies bytes. This module owns framing, decompression, provider-neutral
 //! message/tool extraction, request-response pairing, and explicit completeness. It intentionally
 //! receives no authorization headers in its output contract. HTTP/2 decodes a bounded HPACK subset
-//! (`:method`/`:path`/`:status`/`content-type`/`host`/`authority`) plus DATA bodies; HPACK desync
-//! surfaces as `h2_hpack_desync` while the DATA body-only lane continues.
+//! (`:method`/`:path`/`:status`/`content-type`/`content-encoding`/`host`/`authority`) plus DATA
+//! bodies; HPACK desync surfaces as `h2_hpack_desync` while the DATA body-only lane continues.
 
 use crate::event_time::system_now_unix_ns;
 use crate::h2_hpack::{HpackDecoder, Http2HeaderBlock};
@@ -3949,14 +3949,19 @@ fn duplicate_probe_write(state: &mut ConnectionState, chunk: &PlaintextChunk) ->
     }
     let digest: [u8; 32] = Sha256::digest(&chunk.data).into();
     let len = chunk.data.len() as u64;
-    let duplicate = state.last_probe_write.as_ref().is_some_and(
-        |(direction, previous_len, previous_hash, previous_at)| {
-            *direction == chunk.direction
-                && *previous_len == len
-                && *previous_hash == digest
-                && chunk.event_at_unix_ns.saturating_sub(*previous_at) < DUPLICATE_PROBE_WRITE_NS
-        },
-    );
+    // Identical 16 KiB fragments are legal in a large repetitive body. Only a self-describing
+    // request head can use the duplicate-probe heuristic; continuation fragments must always
+    // reach the incremental HTTP decoder.
+    let duplicate = state.requests.buffer.is_empty()
+        && looks_like_http_request_prefix(&chunk.data)
+        && state.last_probe_write.as_ref().is_some_and(
+            |(direction, previous_len, previous_hash, previous_at)| {
+                *direction == chunk.direction
+                    && *previous_len == len
+                    && *previous_hash == digest
+                    && chunk.event_at_unix_ns.saturating_sub(*previous_at) < DUPLICATE_PROBE_WRITE_NS
+            },
+        );
     state.last_probe_write = Some((chunk.direction, len, digest, chunk.event_at_unix_ns));
     duplicate
 }
@@ -5975,6 +5980,9 @@ fn http2_apply_headers(stream: &mut Http2StreamState, block: Http2HeaderBlock) {
     if block.content_type.is_some() {
         stream.headers.content_type = block.content_type;
     }
+    if block.content_encoding.is_some() {
+        stream.headers.content_encoding = block.content_encoding;
+    }
     if block.authority.is_some() {
         stream.headers.authority = block.authority;
     }
@@ -5993,6 +6001,9 @@ fn http2_message_from_stream(
     let mut headers = BTreeMap::new();
     if let Some(content_type) = stream.headers.content_type.clone() {
         headers.insert("content-type".to_string(), content_type);
+    }
+    if let Some(content_encoding) = stream.headers.content_encoding.clone() {
+        headers.insert("content-encoding".to_string(), content_encoding);
     }
     let host = stream
         .headers
@@ -6549,10 +6560,20 @@ fn decode_content_encoding<'a>(
         // reassembly attempt against the whole accumulated body.
         return (std::borrow::Cow::Borrowed(bytes), None);
     }
+    let preserve_compressed_on_failure = normalized == "zstd";
     let decoder: Box<dyn Read> = match normalized.as_str() {
         "gzip" | "x-gzip" => Box::new(GzDecoder::new(bytes)),
         "deflate" => Box::new(ZlibDecoder::new(bytes)),
         "raw-deflate" => Box::new(DeflateDecoder::new(bytes)),
+        "zstd" => match zstd::stream::read::Decoder::new(bytes) {
+            Ok(decoder) => Box::new(decoder),
+            Err(_) => {
+                return (
+                    std::borrow::Cow::Borrowed(bytes),
+                    Some("compressed_decode_failed".to_string()),
+                )
+            }
+        },
         _ => {
             return (
                 std::borrow::Cow::Borrowed(bytes),
@@ -6564,6 +6585,10 @@ fn decode_content_encoding<'a>(
     let mut bounded = decoder.take(max_output_bytes as u64 + 1);
     match bounded.read_to_end(&mut output) {
         Ok(_) if output.len() <= max_output_bytes => (std::borrow::Cow::Owned(output), None),
+        Ok(_) if preserve_compressed_on_failure => (
+            std::borrow::Cow::Borrowed(bytes),
+            Some("decompressed_body_limit".to_string()),
+        ),
         Ok(_) => {
             output.truncate(max_output_bytes);
             (
@@ -6571,11 +6596,16 @@ fn decode_content_encoding<'a>(
                 Some("decompressed_body_limit".to_string()),
             )
         }
+        Err(_) if preserve_compressed_on_failure => (
+            std::borrow::Cow::Borrowed(bytes),
+            Some("compressed_decode_failed".to_string()),
+        ),
         Err(_) if !output.is_empty() => {
             // DEFLATE is a streaming algorithm: a truncated input still yields a valid
             // decompressed prefix. Return it with an explicit truncation reason instead of
             // discarding everything as content_decode_error — downstream JSON salvage can then
-            // use the turns that did decompress.
+            // use the turns that did decompress. Zstd instead keeps the complete compressed
+            // bytes: a partial decoded prefix is not a safe substitute for the original payload.
             output.truncate(max_output_bytes);
             (
                 std::borrow::Cow::Owned(output),
@@ -11698,6 +11728,128 @@ Content-Type: application/json
         let completed = reassembler.push(chunk(ChunkDirection::Response, response, 2));
         assert_eq!(completed[0].response.text.as_deref(), Some("compressed"));
         assert_eq!(completed[0].response.encoding, "utf8");
+    }
+
+    #[test]
+    fn zstd_json_error_response_decodes_through_reassembly() {
+        let json = r#"{"error":{"message":"Insufficient Balance","type":"insufficient_balance"}}"#;
+        let encoded = zstd::stream::encode_all(json.as_bytes(), 3).unwrap();
+        let response = [
+            format!(
+                "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n\r\n",
+                encoded.len()
+            )
+            .into_bytes(),
+            encoded,
+        ]
+        .concat();
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(r#"{"model":"deepseek-chat","messages":[]}"#),
+            1,
+        ));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response, 2));
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let item = &completed[0];
+        assert_eq!(item.status_code, 402);
+        assert_eq!(item.response.body, json);
+        assert_eq!(item.response.encoding, "utf8");
+        assert_eq!(item.response.decoded_bytes as usize, json.len());
+        assert_eq!(item.response.sha256, sha256_hex(json.as_bytes()));
+        assert_eq!(
+            item.response
+                .structured
+                .as_ref()
+                .and_then(|value| value.pointer("/error/message"))
+                .and_then(Value::as_str),
+            Some("Insufficient Balance")
+        );
+        assert!(!item
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "compressed_decode_failed"));
+    }
+
+    #[test]
+    fn zstd_sse_response_decodes_across_reassembly_fragments() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"zstd \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stream\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let encoded = zstd::stream::encode_all(sse.as_bytes(), 3).unwrap();
+        let response = [
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: zstd\r\n\r\n"
+                .to_vec(),
+            encoded,
+        ]
+        .concat();
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(r#"{"model":"m","messages":[]}"#),
+            1,
+        ));
+        let mut completed = Vec::new();
+        for (index, part) in response.chunks(11).enumerate() {
+            completed.extend(reassembler.push(chunk(
+                ChunkDirection::Response,
+                part.to_vec(),
+                index as u128 + 2,
+            )));
+        }
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].response.text.as_deref(), Some("zstd stream"));
+        assert_eq!(completed[0].response.body, sse);
+        assert_eq!(completed[0].response.sha256, sha256_hex(sse.as_bytes()));
+        assert_eq!(completed[0].response.encoding, "utf8");
+    }
+
+    #[test]
+    fn zstd_decode_limit_preserves_complete_compressed_input() {
+        let plaintext = vec![b'x'; 64 * 1024];
+        let encoded = zstd::stream::encode_all(plaintext.as_slice(), 3).unwrap();
+        let (decoded, reason) = decode_content_encoding(&encoded, "zstd", 1024);
+        assert_eq!(decoded.as_ref(), encoded.as_slice());
+        assert_eq!(reason.as_deref(), Some("decompressed_body_limit"));
+    }
+
+    #[test]
+    fn zstd_decode_failure_preserves_compressed_body_through_reassembly() {
+        use base64::Engine as _;
+
+        let json = r#"{"error":{"message":"Insufficient Balance"}}"#;
+        let mut encoded = zstd::stream::encode_all(json.as_bytes(), 3).unwrap();
+        encoded.truncate(encoded.len() / 2);
+        let response = [
+            format!(
+                "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n\r\n",
+                encoded.len()
+            )
+            .into_bytes(),
+            encoded.clone(),
+        ]
+        .concat();
+        let mut reassembler = InteractionReassembler::default();
+        reassembler.push(chunk(
+            ChunkDirection::Request,
+            http_request(r#"{"model":"deepseek-chat","messages":[]}"#),
+            1,
+        ));
+        let completed = reassembler.push(chunk(ChunkDirection::Response, response, 2));
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let item = &completed[0];
+        assert_eq!(item.response.encoding, "base64");
+        assert_eq!(item.response.decoded_bytes as usize, encoded.len());
+        let exported = base64::engine::general_purpose::STANDARD
+            .decode(item.response.body.as_bytes())
+            .unwrap();
+        assert_eq!(exported, encoded);
+        assert!(item
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "compressed_decode_failed"));
     }
 
     #[test]

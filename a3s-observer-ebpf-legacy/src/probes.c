@@ -169,12 +169,12 @@ struct plaintext_tls_event {
 };
 _Static_assert(sizeof(struct plaintext_tls_event) == 16432, "plaintext_tls_event ABI mismatch");
 
-/* ---- 截断补读游标（R3 实验特性，仅 x86 开发通道，A3S_BPF_ARCH_X86_64 门控）----
+/* ---- 截断补读游标（R3/R4 实验特性，仅 x86 开发通道，A3S_BPF_ARCH_X86_64 门控）----
  * 单次 SSL_write/SSL_read（uprobe）或 HTTP write/read（kprobe）数据量超过发射窗口
- * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道单分片 16KB）时被截断：末片 chunk 事件在
- * header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度和已采尾部 64B 的
- * FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，先比对衔接处指纹
- * 再拼接——宁可不拼，不可错拼。
+ * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道单分片 16KB；R4 开启时 TLS 提前至 8 片）
+ * 时被截断：发射终止片在 header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度
+ * 和已采尾部 64B 的 FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，
+ * 先比对衔接处指纹再拼接——宁可不拼，不可错拼。
  * 不进 arm64/4.19 对象：该面已在 TLS_SPLIT_MAX=12 上验证冻结，验证器预算无冗余，
  * 全部游标代码、扩展 scratch 与 A3S_RUNTIME_CONFIG map 均由 A3S_BPF_ARCH_X86_64
  * 条件编译剔除，arm64 对象保持字节不变（构建校验：对比改动前后 sha256）。
@@ -194,8 +194,8 @@ struct plaintext_cursor_ext {
 _Static_assert(sizeof(struct plaintext_cursor_ext) == 32, "cursor ext ABI mismatch");
 
 #if defined(A3S_BPF_ARCH_X86_64)
-/* 扩展 scratch：事件后预留游标槽位。常规分片仍按 header+len 修剪发射；只有窗口
- * 用尽的末片把记录扩到 sizeof(event)+sizeof(ext)。 */
+/* 扩展 scratch：事件后预留游标槽位。常规分片仍按 header+len 修剪发射；只有选中的
+ * 发射终止片把记录扩到 sizeof(event)+sizeof(ext)。 */
 struct plaintext_event_with_cursor {
     struct plaintext_event event;
     struct plaintext_cursor_ext ext;
@@ -375,7 +375,7 @@ INLINE int plaintext_admitted(u32 pid) {
 }
 
 #if defined(A3S_BPF_ARCH_X86_64)
-/* R3 截断补读：以下三个 helper 只在窗口用尽的冷路径被调用。 */
+/* R3/R4 截断补读 helper：只服务 syscall 截断片或超过 128KB 的 TLS 调用。 */
 INLINE int cursor_reread_enabled(void) {
     u32 key = 0;
     const u64 *flags = bpf_map_lookup_elem(&A3S_RUNTIME_CONFIG, &key);
@@ -935,18 +935,26 @@ char LICENSE[] SEC("license") = "GPL";
 /* 与 emit_plaintext 同款的定长窗口复制（4.19 验证器只认常量长度）；差别只在事件类型
  * 与 tls_ctx 身份字段，没有 fd/代际——SSL* 指针即连接身份。 */
 /* 单次 SSL 调用只产出一个分块。大缓冲由 emit_tls_plaintext 的定界循环拆分多次调用。
- * emit_cursor（R3，仅 x86 生效）：调用方仅在窗口用尽的末片置位，本函数在该片的事件
- * 尾部追加续读游标扩展；arm64 构建恒传 0，内联后无任何游标代码。 */
-INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
-                           u64 count, u32 direction, u32 emit_cursor) {
+ * emit_cursor（R3/R4，仅 x86 生效）：调用方在发射终止片置位，本函数在该片的事件尾部
+ * 追加续读游标扩展；arm64 构建恒传 0，内联后无任何游标代码。x86 返回值表示游标是否
+ * 实际挂上，供 R4 在第 8 片读取降级时回退到完整 40 片路径。 */
+#if defined(A3S_BPF_ARCH_X86_64)
+#define TLS_CHUNK_RESULT u32
+#define TLS_CHUNK_RETURN(value) return (value)
+#else
+#define TLS_CHUNK_RESULT void
+#define TLS_CHUNK_RETURN(value) return
+#endif
+INLINE TLS_CHUNK_RESULT emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
+                                       u64 count, u32 direction, u32 emit_cursor) {
     struct plaintext_tls_event *event;
     u32 len;
     if (!buf || !count || !tls_ctx)
-        return;
+        TLS_CHUNK_RETURN(0);
     event = scratch(&PLAINTEXT_TLS_SCRATCH);
     if (!event) {
         count_drop();
-        return;
+        TLS_CHUNK_RETURN(0);
     }
     len = (u32)count;
     if (len > LEGACY_PLAINTEXT_LEN)
@@ -1004,8 +1012,8 @@ INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
         if (emit_len > LEGACY_PLAINTEXT_LEN)
             emit_len = LEGACY_PLAINTEXT_LEN;
 #if defined(A3S_BPF_ARCH_X86_64)
-        /* 窗口用尽末片且完整采满时挂续读扩展；count 是本分片起点的剩余量，
-         * count - 16KB 即窗口外未覆盖字节数。 */
+        /* R4 第 8 片或 R3 窗口末片完整采满时挂续读扩展；count 是本分片起点的剩余量，
+         * count - 16KB 即本次发射未覆盖字节数。 */
         if (emit_cursor && emit_len == LEGACY_PLAINTEXT_LEN &&
             cursor_reread_enabled()) {
             struct plaintext_tls_event_with_cursor *full = (void *)event;
@@ -1014,12 +1022,13 @@ INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
                             event->data + LEGACY_PLAINTEXT_LEN - PLAINTEXT_CURSOR_TAIL_LEN);
             output(ctx, &PLAINTEXT_TLS_EVENTS, event,
                    sizeof(*event) + sizeof(struct plaintext_cursor_ext));
-            return;
+            return 1;
         }
 #endif
         output(ctx, &PLAINTEXT_TLS_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
     }
+    TLS_CHUNK_RETURN(0);
 }
 
 /* 大缓冲拆分：之前每次 SSL 调用只复制首个 16KB 窗口，150KB 的单次 SSL_write 只采到
@@ -1030,6 +1039,10 @@ INLINE void emit_tls_chunk(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 buf,
  * arm64/4.19 仿真侧保持 12 冻结不变（该值已在目标内核验证，且 128K 指令预算更紧）。 */
 #if defined(A3S_BPF_ARCH_X86_64)
 #define TLS_SPLIT_MAX 40
+/* R4：游标开启时，大调用最多立即发 8 片，将 640KB 突发的 ring 压力降为 128KB；剩余
+ * 字节依赖 process_vm_readv 在用户缓冲区仍存活/未复用时补读。仅在大于 128KB 时启用，
+ * 小调用不增加游标竞态；第 8 片无法挂游标则继续原 40 片路径。 */
+#define TLS_CURSOR_EMIT_MAX 8
 #else
 #define TLS_SPLIT_MAX 12
 #endif
@@ -1037,22 +1050,37 @@ INLINE void emit_tls_plaintext(struct pt_regs *ctx, u32 pid, u64 tls_ctx, u64 bu
                                u64 count, u32 direction) {
     if (!buf || !count || !tls_ctx)
         return;
+#if defined(A3S_BPF_ARCH_X86_64)
+    const u32 early_cursor =
+        count > (u64)TLS_CURSOR_EMIT_MAX * LEGACY_PLAINTEXT_LEN && cursor_reread_enabled();
+    u32 early_cursor_attached = 0;
+#endif
     /* 全展开：老内核验证器不接受回跳；展开后的 break 只产生前向跳。窗口大小见 TLS_SPLIT_MAX。 */
 #pragma unroll
     for (u32 i = 0; i < TLS_SPLIT_MAX; i++) {
         const u64 offset = (u64)i * LEGACY_PLAINTEXT_LEN;
+#if defined(A3S_BPF_ARCH_X86_64)
+        /* 提前退出放在第 9 次迭代入口以保持全展开；第 8 片未挂上时继续原 40 片路径。 */
+        if (offset >= count || (i == TLS_CURSOR_EMIT_MAX && early_cursor_attached))
+#else
         if (offset >= count)
+#endif
             break;
 #if defined(A3S_BPF_ARCH_X86_64)
-        /* i == TLS_SPLIT_MAX-1 是编译期常量：非末片迭代的游标分支被死代码消除，
-         * 游标代码在对象里只出现一次。末片之外（count - offset <= 16KB）不挂游标。 */
+        /* 游标开启且 count > 128KB 时第 8 片提前收尾；否则只有原 640KB 窗口之外
+         * 仍有字节时才在第 40 片挂游标。两个条件互斥于正常提前退出口，不会重复挂。 */
         const u32 cursor =
-            (i == TLS_SPLIT_MAX - 1 && count - offset > LEGACY_PLAINTEXT_LEN) ? 1 : 0;
+            ((i == TLS_CURSOR_EMIT_MAX - 1 && early_cursor) ||
+             (i == TLS_SPLIT_MAX - 1 && count - offset > LEGACY_PLAINTEXT_LEN)) ? 1 : 0;
+        const u32 cursor_attached =
+            emit_tls_chunk(ctx, pid, tls_ctx, buf + offset, count - offset, direction, cursor);
+        if (i == TLS_CURSOR_EMIT_MAX - 1)
+            early_cursor_attached = cursor_attached;
 #else
         const u32 cursor = 0;
-#endif
         emit_tls_chunk(ctx, pid, tls_ctx, buf + offset, count - offset, direction,
                        cursor);
+#endif
     }
 }
 

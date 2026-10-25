@@ -1,7 +1,7 @@
 //! Bounded HTTP/2 HEADERS HPACK decoder for Observer Collector.
 //!
-//! Decodes only `:method`, `:path`, `:status`, `content-type`, and `host`/`authority`.
-//! Dynamic table is capped at 4 KiB. On decode failure the connection marks
+//! Decodes only `:method`, `:path`, `:status`, `content-type`, `content-encoding`, and
+//! `host`/`authority`. Dynamic table is capped at 4 KiB. On decode failure the connection marks
 //! `h2_hpack_desync` and callers continue the DATA body-only path.
 
 use std::sync::OnceLock;
@@ -17,6 +17,7 @@ pub struct Http2HeaderBlock {
     pub path: Option<String>,
     pub status: Option<String>,
     pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
     pub authority: Option<String>,
     pub host: Option<String>,
 }
@@ -182,6 +183,7 @@ fn retain_header(selected: &mut Http2HeaderBlock, name: &[u8], value: &[u8]) {
         ":path" => selected.path = Some(value.to_string()),
         ":status" => selected.status = Some(value.to_string()),
         "content-type" => selected.content_type = Some(value.to_string()),
+        "content-encoding" => selected.content_encoding = Some(value.to_string()),
         ":authority" => selected.authority = Some(value.to_string()),
         "host" => selected.host = Some(value.to_string()),
         _ => {}
@@ -538,6 +540,7 @@ mod tests {
             (":path", "/v1/responses"),
             (":status", "200"),
             ("content-type", "application/json"),
+            ("content-encoding", "zstd"),
             (":authority", "api.openai.com"),
         ]);
         let mut decoder = HpackDecoder::default();
@@ -546,6 +549,7 @@ mod tests {
         assert_eq!(block.path.as_deref(), Some("/v1/responses"));
         assert_eq!(block.status.as_deref(), Some("200"));
         assert_eq!(block.content_type.as_deref(), Some("application/json"));
+        assert_eq!(block.content_encoding.as_deref(), Some("zstd"));
         assert_eq!(block.authority.as_deref(), Some("api.openai.com"));
     }
 

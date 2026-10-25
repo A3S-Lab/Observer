@@ -23,6 +23,7 @@ serde_json = "1"
 sha2 = "0.10"
 httparse = "1.10"
 flate2 = "1"
+zstd = "0.13"
 base64 = "0.22"
 # SIMD substring search for the SSE delimiter/terminal scanning hot path. The previous naive
 # sliding-window scan measurably pinned a collector core at 100% on long streaming responses.
