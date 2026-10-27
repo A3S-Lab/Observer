@@ -176,6 +176,9 @@ pub struct ReassemblyMetrics {
     pub evidence_evictions: u64,
     pub fragment_tracker_evictions: u64,
     pub orphan_chunks: u64,
+    /// Redis RESP chatter (cache/session store lanes of a whitelisted process) dropped
+    /// at the reassembler entry; never an agent conversation, frees perf-ring capacity.
+    pub resp_chatter_dropped: u64,
     pub sequence_gaps: u64,
     pub parser_failures: u64,
     pub body_limit_drops: u64,
@@ -1744,6 +1747,35 @@ impl InteractionReassembler {
         )
     }
 
+    /// Redis RESP protocol chatter (array form `*N\r\n$N\r\n...`, inline `GET k\r\n`).
+    /// Observed as multi-million-chunk floods between a whitelisted agent process and its
+    /// Redis: infrastructure noise, never an LLM conversation, and it crowds the perf rings
+    /// that the real HTTP/LLM lane needs. Dropped at the reassembler entry with a dedicated
+    /// counter; lossless for the Agent transcript. Userland-only, no BPF change.
+    fn looks_like_resp_chatter(data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        if data[0] == b'*' && data.len() >= 5 {
+            let mut i = 1;
+            while i < data.len() && data[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > 1
+                && i + 2 < data.len()
+                && data[i] == b'\r'
+                && data[i + 1] == b'\n'
+                && matches!(data[i + 2], b'$' | b'*' | b'+' | b':' | b'-')
+            {
+                return true;
+            }
+        }
+        // Only the array form is matched. The inline verb form (`GET key\r\n`) must NOT
+        // be matched: an HTTP request line also starts with `GET ` (websocket upgrades,
+        // plain GETs). Redis client libraries emit the array form exclusively.
+        false
+    }
+
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
         self.evict_if_needed();
         let observed_key = ConnectionKey::from(&chunk);
@@ -1756,6 +1788,13 @@ impl InteractionReassembler {
         if orphan_control_frame {
             self.metrics.orphan_chunks = self.metrics.orphan_chunks.saturating_add(1);
             self.enqueue_gap_evidence(observed_key, &chunk, "orphan_control_frame", "websocket");
+            return Vec::new();
+        }
+        // Redis RESP chatter: infrastructure noise from the whitelisted process itself (its
+        // cache/session store), never an agent conversation. Dropped before any connection
+        // state exists so Redis lanes can never crowd rings or splice into LLM interactions.
+        if Self::looks_like_resp_chatter(&chunk.data) {
+            self.metrics.resp_chatter_dropped = self.metrics.resp_chatter_dropped.saturating_add(1);
             return Vec::new();
         }
         let (key, binding_gap) = self.resolve_connection_key(&chunk);
@@ -10603,9 +10642,16 @@ Content-Type: application/json
         c.socket_fd = 13;
         noise.push(c);
         noise.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
+        // RESP 数组形式（Redis 客户端库唯一线形态）如今在重组器入口直接丢弃：
+        // 不建立连接状态、不占任何车道内存、也不产出退休记录——比快车道退休更强的
+        // 保证。现场实测该形态曾以千万级 chunk 洪峰挤占 perf ring。
         assert!(
-            !noise.take_completed().is_empty() || !noise.take_evidence().is_empty(),
-            "非 HTTP 噪音连接必须在快车道退休（90s），不得占用慢车道"
+            noise.take_completed().is_empty() && noise.take_evidence().is_empty(),
+            "RESP 噪音应在入口丢弃，不得产出退休记录"
+        );
+        assert_eq!(
+            noise.metrics().resp_chatter_dropped, 1,
+            "RESP 噪音必须计入 resp_chatter_dropped"
         );
     }
 
