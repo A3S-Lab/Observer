@@ -175,9 +175,11 @@ _Static_assert(sizeof(struct plaintext_tls_event) == 16432, "plaintext_tls_event
  * 时被截断：发射终止片在 header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度
  * 和已采尾部 64B 的 FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，
  * 先比对衔接处指纹再拼接——宁可不拼，不可错拼。
- * 不进 arm64/4.19 对象：该面已在 TLS_SPLIT_MAX=12 上验证冻结，验证器预算无冗余，
- * 全部游标代码、扩展 scratch 与 A3S_RUNTIME_CONFIG map 均由 A3S_BPF_ARCH_X86_64
- * 条件编译剔除，arm64 对象保持字节不变（构建校验：对比改动前后 sha256）。
+ * arm64/4.19（compat12 起）：syscall 通道游标经 A3S_BPF_LEGACY_CURSOR 开启——现场
+ * partialReasons 主因 probe_call_limit（单次 >16KB write 被固定窗口切断），冷路径
+ * 增量约 300 指令，预算实测通过；TLS 通道游标仍仅 x86（TLS_SPLIT_MAX 发射面是
+ * 4.19 验证器预算最紧处，且该通道在仿真现场零流量）。不传新宏时预处理输出与
+ * 冻结基线字节一致（构建校验：对比 sha256）。
  * 游标信息自包含在事件扩展尾部（任务书 ABI 条款的优先方式），因此无需 BPF 侧
  * cursor LRU map：游标随事件生灭，TTL 由用户态按 captured_at_boot_ns 判定。 */
 #define PLAINTEXT_CURSOR_MAGIC 0x3153525543533341ULL /* "A3SCURS1" 小端 */
@@ -193,9 +195,10 @@ struct plaintext_cursor_ext {
 };
 _Static_assert(sizeof(struct plaintext_cursor_ext) == 32, "cursor ext ABI mismatch");
 
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* 扩展 scratch：事件后预留游标槽位。常规分片仍按 header+len 修剪发射；只有选中的
- * 发射终止片把记录扩到 sizeof(event)+sizeof(ext)。 */
+ * 发射终止片把记录扩到 sizeof(event)+sizeof(ext)。arm64 只用 syscall 变体；
+ * TLS 变体仅 x86 定义引用。 */
 struct plaintext_event_with_cursor {
     struct plaintext_event event;
     struct plaintext_cursor_ext ext;
@@ -239,6 +242,9 @@ SCRATCH_MAP(SEC_SCRATCH, struct sec_event);
 #if defined(A3S_BPF_ARCH_X86_64)
 SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event_with_cursor);
 SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event_with_cursor);
+#elif defined(A3S_BPF_LEGACY_CURSOR)
+SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event_with_cursor);
+SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
 #else
 SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event);
 SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
@@ -264,10 +270,9 @@ struct bpf_map_def SEC("maps") SSL_READ_ARGS = {
     .type = BPF_MAP_TYPE_HASH, .key_size = 8, .value_size = sizeof(struct ssl_read_args),
     .max_entries = 16384
 };
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* 运行时开关（R3）：bit0 = 截断补读。collector 仅在 A3S_OBSERVER_CURSOR_REREAD 开启时
- * 于加载后写 1；默认 0 = BPF 侧完全不产生游标扩展，行为与旧版逐字节一致。
- * arm64 对象不含此 map（游标代码整体按架构剔除）。 */
+ * 于加载后写 1；默认 0 = BPF 侧完全不产生游标扩展，行为与旧版逐字节一致。 */
 struct bpf_map_def SEC("maps") A3S_RUNTIME_CONFIG = {
     .type = BPF_MAP_TYPE_ARRAY, .key_size = 4, .value_size = 8, .max_entries = 1
 };
@@ -374,7 +379,7 @@ INLINE int plaintext_admitted(u32 pid) {
     return bpf_map_lookup_elem(&PLAINTEXT_ALLOWED, &pid) != 0;
 }
 
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* R3/R4 截断补读 helper：只服务 syscall 截断片或超过 128KB 的 TLS 调用。 */
 INLINE int cursor_reread_enabled(void) {
     u32 key = 0;
@@ -788,7 +793,7 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
         u32 emit_len = event->len;
         if (emit_len > LEGACY_PLAINTEXT_LEN)
             emit_len = LEGACY_PLAINTEXT_LEN;
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
         /* 截断补读游标（冷路径）：本 syscall 超过 16KB 窗口且完整采满时挂续读扩展。
          * len 被读失败降窗（<16KB）说明衔接处不可信，不挂游标——宁可不拼。 */
         if (count > LEGACY_PLAINTEXT_LEN && emit_len == LEGACY_PLAINTEXT_LEN &&
