@@ -1329,8 +1329,27 @@ fn attach_first(ebpf: &mut Ebpf, program: &str, symbols: &[&str], attached: &mut
             return;
         }
     };
-    if let Err(error) = probe.load() {
-        tracing::warn!(program, error = %error, "legacy probe load failed");
+    // BPF_PROG_LOAD can fail transiently on memory-fragmented hosts (JIT alloc ENOMEM
+    // surfaces as a near-empty verifier log — field-observed 2026-11-02: byte-identical
+    // legacy_http_write failed while legacy_http_sendto loaded on the next call).
+    // Retry before giving up so a busy machine cannot wedge the whole install.
+    let mut load_failed = false;
+    for attempt in 1..=3u8 {
+        match probe.load() {
+            Ok(()) => {
+                load_failed = false;
+                break;
+            }
+            Err(error) => {
+                load_failed = true;
+                tracing::warn!(program, attempt, error = %error, "legacy probe load failed");
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    if load_failed {
         return;
     }
     for symbol in symbols {
