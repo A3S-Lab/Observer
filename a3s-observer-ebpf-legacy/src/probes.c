@@ -1,5 +1,8 @@
 #define SEC(name) __attribute__((section(name), used))
 #define INLINE static __attribute__((always_inline)) inline
+/* 阻断编译器对局部值的常量/范围折叠（内核 BPF barrier_var 惯用法）。
+ * 4.19 验证器不做跨分支范围传播：尺寸 clamp 必须以目标码形态存活到调用点。 */
+#define barrier_var(var) __asm__ volatile("" : "+r"(var))
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -802,13 +805,32 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
             cursor_ext_fill(&full->ext, buf + LEGACY_PLAINTEXT_LEN,
                             count - LEGACY_PLAINTEXT_LEN,
                             event->data + LEGACY_PLAINTEXT_LEN - PLAINTEXT_CURSOR_TAIL_LEN);
-            output(ctx, &PLAINTEXT_EVENTS, event,
-                   sizeof(*event) + sizeof(struct plaintext_cursor_ext));
+            /* 4.19 verifier: the perf output size argument must carry a provable
+             * bound AT the call site — the clamp on emit_len above does not survive
+             * the extra cursor branch in cross-branch range tracking. Re-derive the
+             * bound from a local here ("R5 unbounded memory access", 2026-11-02). */
+            u32 cursor_size =
+                (u32)sizeof(*event) + (u32)sizeof(struct plaintext_cursor_ext);
+            barrier_var(cursor_size);
+            if (cursor_size > (u32)sizeof(struct plaintext_event_with_cursor))
+                cursor_size = (u32)sizeof(struct plaintext_event_with_cursor);
+            output(ctx, &PLAINTEXT_EVENTS, event, cursor_size);
             return;
         }
-#endif
+        /* Same 4.19 rule for the trimmed-path size: the cursor branch between the
+         * emit_len clamp and this use breaks range propagation on 4.19, so restore
+         * the bound with a local compare directly before the call. */
+        {
+            u32 trimmed_size = (u32)sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len;
+            barrier_var(trimmed_size);
+            if (trimmed_size > (u32)sizeof(*event))
+                trimmed_size = (u32)sizeof(*event);
+            output(ctx, &PLAINTEXT_EVENTS, event, trimmed_size);
+        }
+#else
         output(ctx, &PLAINTEXT_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
+#endif
     }
 }
 
