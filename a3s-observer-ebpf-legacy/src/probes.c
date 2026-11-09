@@ -254,6 +254,79 @@ SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
 #endif
 SCRATCH_MAP(DROPS, u64);
 
+/* compat25: kernel-side file prefilter, ported from the modern backend (a3s-observer-ebpf).
+ * Layouts MUST match a3s_observer_common::{FileFilterKey,FileFilterValue,FileFilterConfig,
+ * FileFilterSampleWindow,FileFilterStats} exactly. Userspace owns every map; the kernel only
+ * reads. Fail-open: missing/empty config or an absent rules map entry keeps historical
+ * full-capture behavior. cgroup membership is fork-inherited, so agent children of a KEEP
+ * rule stay kept with zero userspace sync in the hot path. */
+struct file_filter_key {
+    u64 cgroup_id;
+    u64 epoch;
+};                                  /* 16 bytes */
+struct file_filter_value {
+    u8 action;                      /* 1=keep 2=sample 3=drop */
+    u8 authority;                   /* 1=candidate 2=authoritative */
+    u16 flags;
+    u32 _reserved;
+    u64 epoch;
+    u64 expires_at_boot_ns;         /* 0 = no expiry */
+};                                  /* 24 bytes */
+struct file_filter_config {
+    u64 active_epoch;
+    u64 sample_window_ns;
+    u32 unknown_per_cgroup_limit;
+    u32 unknown_per_cpu_limit;
+    u8 flags;                       /* bit0 enabled, bit1 unknown-sample, bit2 unknown-drop */
+    u8 _reserved[7];
+};                                  /* 32 bytes */
+struct file_filter_sample_window {
+    u64 started_at_boot_ns;
+    u32 count;
+    u32 _reserved;
+};                                  /* 16 bytes */
+struct file_filter_stats {
+    u64 access_kept;
+    u64 access_unknown_kept;
+    u64 access_sampled;
+    u64 access_dropped;
+    u64 access_sample_suppressed;
+    u64 delete_kept;
+    u64 delete_unknown_kept;
+    u64 delete_dropped;
+    u64 rule_hits;
+    u64 rule_misses;
+    u64 stale_rules;
+    u64 access_ring_dropped;
+    u64 delete_ring_dropped;
+};                                  /* 104 bytes, field order == FileFilterStats */
+#define FILE_FILTER_CFG_ENABLED    (1U << 0)
+#define FILE_FILTER_CFG_UNKNOWN_SAMPLE (1U << 1)
+#define FILE_FILTER_CFG_UNKNOWN_DROP   (1U << 2)
+#define FILE_FILTER_ACTION_KEEP   1
+#define FILE_FILTER_ACTION_SAMPLE 2
+#define FILE_FILTER_ACTION_DROP   3
+#define FILE_FILTER_AUTHORITY_AUTHORITATIVE 2
+#define FILE_FILTER_DEFAULT_WINDOW_NS   1000000000ULL
+#define FILE_FILTER_DEFAULT_PER_CGROUP  20U
+#define FILE_FILTER_DEFAULT_PER_CPU     64U
+
+struct bpf_map_def SEC("maps") FILE_FILTER_RULES = {
+    .type = BPF_MAP_TYPE_HASH, .key_size = 16, .value_size = 24, .max_entries = 65536
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_CONFIG = {
+    .type = BPF_MAP_TYPE_ARRAY, .key_size = 4, .value_size = 32, .max_entries = 1
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_STATS = {
+    .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 104, .max_entries = 1
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_UNKNOWN_WINDOWS = {
+    .type = BPF_MAP_TYPE_LRU_HASH, .key_size = 8, .value_size = 16, .max_entries = 16384
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_GLOBAL_WINDOW = {
+    .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 16, .max_entries = 1
+};
+
 /* Identity-whitelisted TGIDs admitted to plaintext payload capture. Written by the userspace
  * collector from the forwarder's tls-agent-cgroups document; deleted on process exit. */
 struct bpf_map_def SEC("maps") PLAINTEXT_ALLOWED = {
@@ -302,6 +375,7 @@ static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)A3
 static u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
+static u64 (*bpf_get_current_cgroup_id)(void) = (void *)7;
 static long (*bpf_get_current_comm)(void *buf, u32 size) = (void *)16;
 static long (*bpf_perf_event_output)(void *ctx, void *map, u64 flags,
                                      const void *data, u64 size) = (void *)25;
@@ -316,6 +390,126 @@ static long (*bpf_probe_read_user_str)(void *dst, u32 size, const void *src) = (
 static long (*bpf_trace_printk)(const char *fmt, u32 fmt_size, ...) = (void *)6;
 static long (*bpf_probe_read_compat)(void *dst, u32 size, const void *src) = (void *)4;
 #endif
+
+/* Bounded Unknown sampler, mirroring the modern backend's sample_window_allows(). Fixed-size
+ * accesses only; the 4.19 verifier accepts plain lookups + branches. */
+INLINE int file_filter_window_allows(struct file_filter_sample_window *window, u64 now,
+                                     u64 window_ns, u32 limit) {
+    if (now - window->started_at_boot_ns >= window_ns) {
+        window->started_at_boot_ns = now;
+        window->count = 0;
+    }
+    if (window->count >= limit)
+        return 0;
+    window->count += 1;
+    return 1;
+}
+
+INLINE int file_filter_unknown_sample_allowed(u64 cgroup_id, struct file_filter_config *cfg,
+                                              u64 now) {
+    u64 window_ns = cfg->sample_window_ns ? cfg->sample_window_ns : FILE_FILTER_DEFAULT_WINDOW_NS;
+    u32 cgroup_limit = cfg->unknown_per_cgroup_limit
+        ? cfg->unknown_per_cgroup_limit : FILE_FILTER_DEFAULT_PER_CGROUP;
+    u32 cpu_limit = cfg->unknown_per_cpu_limit
+        ? cfg->unknown_per_cpu_limit : FILE_FILTER_DEFAULT_PER_CPU;
+    struct file_filter_sample_window *window =
+        bpf_map_lookup_elem(&FILE_FILTER_UNKNOWN_WINDOWS, &cgroup_id);
+    if (window) {
+        if (!file_filter_window_allows(window, now, window_ns, cgroup_limit))
+            return 0;
+    } else {
+        struct file_filter_sample_window initial = {
+            .started_at_boot_ns = now, .count = 1, ._reserved = 0
+        };
+        if (bpf_map_update_elem(&FILE_FILTER_UNKNOWN_WINDOWS, &cgroup_id, &initial, 0) != 0)
+            return 0;
+    }
+    {
+        u32 zero = 0;
+        struct file_filter_sample_window *global =
+            bpf_map_lookup_elem(&FILE_FILTER_GLOBAL_WINDOW, &zero);
+        if (!global)
+            return 1;
+        return file_filter_window_allows(global, now, window_ns, cpu_limit);
+    }
+}
+
+/* The file-event admission decision, ported from the modern backend's
+ * legacy_file_access_decision()/legacy_file_delete_decision(). Returns 1 to keep, 0 to drop. */
+INLINE int file_filter_allow(u64 cgroup_id, int is_delete) {
+    u32 zero = 0;
+    struct file_filter_config *cfg = bpf_map_lookup_elem(&FILE_FILTER_CONFIG, &zero);
+    struct file_filter_stats *stats = bpf_map_lookup_elem(&FILE_FILTER_STATS, &zero);
+    if (!cfg)
+        return 1; /* fail-open: no config installed */
+    if (!(cfg->flags & FILE_FILTER_CFG_ENABLED)) {
+        if (stats) {
+            if (is_delete) stats->delete_kept += 1; else stats->access_kept += 1;
+        }
+        return 1;
+    }
+    {
+        u64 now = bpf_ktime_get_ns();
+        struct file_filter_key key;
+        struct file_filter_value *rule;
+        int have_rule = 0;
+        key.cgroup_id = cgroup_id;
+        key.epoch = cfg->active_epoch;
+        rule = bpf_map_lookup_elem(&FILE_FILTER_RULES, &key);
+        if (rule) {
+            if (rule->epoch != cfg->active_epoch ||
+                (rule->expires_at_boot_ns != 0 && now >= rule->expires_at_boot_ns)) {
+                if (stats) stats->stale_rules += 1;
+            } else {
+                if (stats) stats->rule_hits += 1;
+                have_rule = 1;
+            }
+        } else {
+            if (stats) stats->rule_misses += 1;
+        }
+        if (have_rule) {
+            /* KEEP short-circuits; authoritative DROP drops; SAMPLE or candidate DROP falls
+             * through to the configured Unknown policy (candidate can never authorize a drop). */
+            if (rule->action == FILE_FILTER_ACTION_KEEP) {
+                if (stats) {
+                    if (is_delete) stats->delete_kept += 1; else stats->access_kept += 1;
+                }
+                return 1;
+            }
+            if (rule->action == FILE_FILTER_ACTION_DROP &&
+                rule->authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE) {
+                if (stats) {
+                    if (is_delete) stats->delete_dropped += 1; else stats->access_dropped += 1;
+                }
+                return 0;
+            }
+        }
+        if (cfg->flags & FILE_FILTER_CFG_UNKNOWN_DROP) {
+            if (stats) {
+                if (is_delete) stats->delete_dropped += 1; else stats->access_dropped += 1;
+            }
+            return 0;
+        }
+        if (!(cfg->flags & FILE_FILTER_CFG_UNKNOWN_SAMPLE)) {
+            if (stats) {
+                if (is_delete) {
+                    stats->delete_kept += 1;
+                    stats->delete_unknown_kept += 1;
+                } else {
+                    stats->access_kept += 1;
+                    stats->access_unknown_kept += 1;
+                }
+            }
+            return 1;
+        }
+        if (file_filter_unknown_sample_allowed(cgroup_id, cfg, now)) {
+            if (stats) stats->access_sampled += 1;
+            return 1;
+        }
+        if (stats) stats->access_sample_suppressed += 1;
+        return 0;
+    }
+}
 
 INLINE void count_drop(void) {
     u32 key = 0;
@@ -600,6 +794,10 @@ int legacy_connect(struct pt_regs *ctx) {
 INLINE void emit_file(struct pt_regs *ctx, u64 path, u32 flags) {
     struct file_event *event;
     if (!path)
+        return;
+    /* compat25: kernel-side admission. Dropped events never reach the scratch map or the
+     * ring; userspace attribution semantics (cgroup_id stays 0) are unchanged. */
+    if (!file_filter_allow(bpf_get_current_cgroup_id(), flags == FILE_DELETE_FLAG))
         return;
     event = scratch(&FILE_SCRATCH);
     if (!event) {

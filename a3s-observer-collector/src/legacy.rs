@@ -186,6 +186,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         plaintext_allowed = Some(map);
     }
 
+    // compat25: kernel-side file prefilter (port of the modern backend's FILE_FILTER maps).
+    // Fail-open: unset env or an object without the maps keeps the historical full capture.
+    let mut file_filter = super::legacy_file_filter::FileFilterManager::from_env(&mut ebpf)?;
+    if let Some(manager) = file_filter.as_mut() {
+        manager.initial_load();
+    }
+
     // R3 截断补读：默认关。开启时置位 BPF 运行时开关（A3S_RUNTIME_CONFIG[0] bit0），
     // 窗口用尽末片才开始携带续读游标扩展；map 缺失（arm64 冻结对象）时特性整体关闭。
     let cursor_rereader = if plaintext_http {
@@ -369,6 +376,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut ssl_attach_diag = tokio::time::interval(Duration::from_secs(30));
     ssl_attach_diag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ssl_attach_diag.tick().await;
+    let mut file_filter_tick = tokio::time::interval(Duration::from_secs(5));
+    file_filter_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    file_filter_tick.tick().await;
     let mut stats = Stats::default();
     emit_legacy_heartbeat(
         exporter.as_ref(),
@@ -377,12 +387,29 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &stats,
         0,
         Some(perf_lost.snapshot()),
+        file_filter.as_ref(),
     );
 
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
+            _ = file_filter_tick.tick(), if file_filter.is_some() => {
+                if let Some(manager) = file_filter.as_mut() {
+                    match manager.reload() {
+                        Ok(Some(entries)) => tracing::info!(
+                            epoch = manager.active_epoch(),
+                            entries,
+                            "hot-reloaded file filter snapshot"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "file filter snapshot reload failed; retaining the loaded epoch"
+                        ),
+                    }
+                }
+            }
             _ = ssl_attach_diag.tick(), if ssl_uprobes => {
                 if let Some(manager) = ssl_manager.as_ref() {
                     manager.log_attach_summary();
@@ -399,6 +426,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     &stats,
                     dropped,
                     Some(perf_lost.snapshot()),
+                    file_filter.as_ref(),
                 );
                 if suppressed_shells > 0 {
                     // Unparsed interactions with zero request/response payload are noise (idle
@@ -1989,7 +2017,19 @@ fn emit_legacy_heartbeat(
     stats: &Stats,
     dropped: u64,
     perf_lost_by_map: Option<BTreeMap<String, u64>>,
+    file_filter: Option<&super::legacy_file_filter::FileFilterManager>,
 ) {
+    // compat25: real kernel-side file prefilter metrics replace the static defaults; with no
+    // manager (feature off / old object) the heartbeat keeps its historical fail-open shape.
+    let file_filter_snapshot = match file_filter {
+        Some(manager) => super::FileFilterHeartbeatSnapshot {
+            stats: manager.aggregate_stats(),
+            enabled: manager.enabled(),
+            epoch: manager.active_epoch(),
+            unknown_policy: manager.unknown_policy(),
+        },
+        None => super::FileFilterHeartbeatSnapshot::default(),
+    };
     let event = super::collector_heartbeat(
         collector,
         interval_secs,
@@ -1997,7 +2037,7 @@ fn emit_legacy_heartbeat(
         dropped,
         exporter.output_drops(),
         perf_lost_by_map,
-        super::FileFilterHeartbeatSnapshot::default(),
+        file_filter_snapshot,
         None,
         None,
         None,
