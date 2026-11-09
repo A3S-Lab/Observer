@@ -396,6 +396,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             _ = sigterm.recv() => break,
             _ = file_filter_tick.tick(), if file_filter.is_some() => {
                 if let Some(manager) = file_filter.as_mut() {
+                    manager.log_seen_cgroups();
                     match manager.reload() {
                         Ok(Some(entries)) => tracing::info!(
                             epoch = manager.active_epoch(),

@@ -149,6 +149,8 @@ pub(super) fn parse_filter_rule_snapshot(
 /// snapshot applies, so absence of a rules file keeps full capture.
 pub(super) struct FileFilterManager {
     rules: BpfHashMap<MapData, [u8; 16], [u8; 24]>,
+    seen: Option<BpfHashMap<MapData, u64, u64>>,
+    last_seen_signature: u64,
     config: Array<MapData, [u8; 32]>,
     stats: PerCpuArray<MapData, [u8; 104]>,
     path: PathBuf,
@@ -184,6 +186,10 @@ impl FileFilterManager {
                 .take_map("FILE_FILTER_STATS")
                 .context("`FILE_FILTER_STATS` missing")?,
         )?;
+        // Diagnostic-only: absent on pre-compat27 objects.
+        let seen = ebpf
+            .take_map("FILE_FILTER_SEEN")
+            .and_then(|map| BpfHashMap::try_from(map).ok());
         let unknown_policy =
             parse_unknown_file_policy(std::env::var("A3S_OBSERVER_FILE_UNKNOWN_POLICY").ok().as_deref())
                 .map_err(anyhow::Error::msg)?;
@@ -214,6 +220,8 @@ impl FileFilterManager {
         );
         Ok(Some(Self {
             rules,
+            seen,
+            last_seen_signature: 0,
             config,
             stats,
             path: PathBuf::from(path),
@@ -309,6 +317,43 @@ impl FileFilterManager {
                 "initial file filter snapshot unavailable; retaining the configured Unknown policy"
             ),
         }
+    }
+
+    /// Log the cgroup ids the kernel actually observes (diagnostic for hybrid-hierarchy keying).
+    /// Called on the reload tick; logs at most once per changed signature.
+    pub(super) fn log_seen_cgroups(&mut self) {
+        let Some(seen) = self.seen.as_mut() else {
+            return;
+        };
+        let mut ids: Vec<(u64, u64)> = Vec::new();
+        for entry in seen.iter() {
+            match entry {
+                Ok((key, value)) => ids.push((key, value)),
+                Err(_) => break,
+            }
+            if ids.len() >= 32 {
+                break;
+            }
+        }
+        let mut signature = 0u64;
+        for (id, _) in &ids {
+            signature = signature.wrapping_mul(31).wrapping_add(*id);
+        }
+        if signature == self.last_seen_signature {
+            return;
+        }
+        self.last_seen_signature = signature;
+        ids.sort_by_key(|(id, _)| *id);
+        let preview: Vec<String> = ids
+            .iter()
+            .take(8)
+            .map(|(id, count)| format!("{id}={count}"))
+            .collect();
+        tracing::info!(
+            ids = ids.len(),
+            sample = preview.join(","),
+            "file filter kernel-observed cgroup ids (compare against rule cgroupIds)"
+        );
     }
 
     /// Reload on change; `Ok(Some(entries))` when a new epoch was applied.

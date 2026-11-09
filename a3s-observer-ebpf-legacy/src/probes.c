@@ -326,6 +326,12 @@ struct bpf_map_def SEC("maps") FILE_FILTER_UNKNOWN_WINDOWS = {
 struct bpf_map_def SEC("maps") FILE_FILTER_GLOBAL_WINDOW = {
     .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 16, .max_entries = 1
 };
+/* compat27 diagnostic: cgroup ids the kernel actually observes on file events, with counts.
+ * Userspace logs the set on change - it identifies which hierarchy bpf_get_current_cgroup_id
+ * keys by on hybrid kernels (field 2026-11-09: unified-inode rules never hit). */
+struct bpf_map_def SEC("maps") FILE_FILTER_SEEN = {
+    .type = BPF_MAP_TYPE_LRU_HASH, .key_size = 8, .value_size = 8, .max_entries = 1024
+};
 
 /* Identity-whitelisted TGIDs admitted to plaintext payload capture. Written by the userspace
  * collector from the forwarder's tls-agent-cgroups document; deleted on process exit. */
@@ -436,8 +442,19 @@ INLINE int file_filter_unknown_sample_allowed(u64 cgroup_id, struct file_filter_
 
 /* The file-event admission decision, ported from the modern backend's
  * legacy_file_access_decision()/legacy_file_delete_decision(). Returns 1 to keep, 0 to drop. */
+INLINE void file_filter_note_seen(u64 cgroup_id) {
+    u64 *seen = bpf_map_lookup_elem(&FILE_FILTER_SEEN, &cgroup_id);
+    if (seen) {
+        *seen += 1;
+    } else {
+        u64 initial = 1;
+        bpf_map_update_elem(&FILE_FILTER_SEEN, &cgroup_id, &initial, 0);
+    }
+}
+
 INLINE int file_filter_allow(u64 cgroup_id, int is_delete) {
     u32 zero = 0;
+    file_filter_note_seen(cgroup_id);
     struct file_filter_config *cfg = bpf_map_lookup_elem(&FILE_FILTER_CONFIG, &zero);
     struct file_filter_stats *stats = bpf_map_lookup_elem(&FILE_FILTER_STATS, &zero);
     if (!cfg)
