@@ -326,9 +326,10 @@ struct bpf_map_def SEC("maps") FILE_FILTER_UNKNOWN_WINDOWS = {
 struct bpf_map_def SEC("maps") FILE_FILTER_GLOBAL_WINDOW = {
     .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 16, .max_entries = 1
 };
-/* compat27 diagnostic: cgroup ids the kernel actually observes on file events, with counts.
- * Userspace logs the set on change - it identifies which hierarchy bpf_get_current_cgroup_id
- * keys by on hybrid kernels (field 2026-11-09: unified-inode rules never hit). */
+/* compat27 diagnostic: ids the kernel actually observes on file events, with counts. On the
+ * field UOS 4.19.90 backport bpf_get_current_cgroup_id returns per-call garbage, so compat28
+ * keys the file filter by TGID (battle-tested by PLAINTEXT_ALLOWED); this map now records the
+ * key space actually in use (pids), still logged on change for field verification. */
 struct bpf_map_def SEC("maps") FILE_FILTER_SEEN = {
     .type = BPF_MAP_TYPE_LRU_HASH, .key_size = 8, .value_size = 8, .max_entries = 1024
 };
@@ -381,7 +382,6 @@ static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)A3
 static u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
-static u64 (*bpf_get_current_cgroup_id)(void) = (void *)7;
 static long (*bpf_get_current_comm)(void *buf, u32 size) = (void *)16;
 static long (*bpf_perf_event_output)(void *ctx, void *map, u64 flags,
                                      const void *data, u64 size) = (void *)25;
@@ -442,19 +442,19 @@ INLINE int file_filter_unknown_sample_allowed(u64 cgroup_id, struct file_filter_
 
 /* The file-event admission decision, ported from the modern backend's
  * legacy_file_access_decision()/legacy_file_delete_decision(). Returns 1 to keep, 0 to drop. */
-INLINE void file_filter_note_seen(u64 cgroup_id) {
-    u64 *seen = bpf_map_lookup_elem(&FILE_FILTER_SEEN, &cgroup_id);
+INLINE void file_filter_note_seen(u64 key_id) {
+    u64 *seen = bpf_map_lookup_elem(&FILE_FILTER_SEEN, &key_id);
     if (seen) {
         *seen += 1;
     } else {
         u64 initial = 1;
-        bpf_map_update_elem(&FILE_FILTER_SEEN, &cgroup_id, &initial, 0);
+        bpf_map_update_elem(&FILE_FILTER_SEEN, &key_id, &initial, 0);
     }
 }
 
-INLINE int file_filter_allow(u64 cgroup_id, int is_delete) {
+INLINE int file_filter_allow(u64 key_id, int is_delete) {
     u32 zero = 0;
-    file_filter_note_seen(cgroup_id);
+    file_filter_note_seen(key_id);
     struct file_filter_config *cfg = bpf_map_lookup_elem(&FILE_FILTER_CONFIG, &zero);
     struct file_filter_stats *stats = bpf_map_lookup_elem(&FILE_FILTER_STATS, &zero);
     if (!cfg)
@@ -470,7 +470,7 @@ INLINE int file_filter_allow(u64 cgroup_id, int is_delete) {
         struct file_filter_key key;
         struct file_filter_value *rule;
         int have_rule = 0;
-        key.cgroup_id = cgroup_id;
+        key.cgroup_id = key_id;
         key.epoch = cfg->active_epoch;
         rule = bpf_map_lookup_elem(&FILE_FILTER_RULES, &key);
         if (rule) {
@@ -519,7 +519,7 @@ INLINE int file_filter_allow(u64 cgroup_id, int is_delete) {
             }
             return 1;
         }
-        if (file_filter_unknown_sample_allowed(cgroup_id, cfg, now)) {
+        if (file_filter_unknown_sample_allowed(key_id, cfg, now)) {
             if (stats) stats->access_sampled += 1;
             return 1;
         }
@@ -813,8 +813,11 @@ INLINE void emit_file(struct pt_regs *ctx, u64 path, u32 flags) {
     if (!path)
         return;
     /* compat25: kernel-side admission. Dropped events never reach the scratch map or the
-     * ring; userspace attribution semantics (cgroup_id stays 0) are unchanged. */
-    if (!file_filter_allow(bpf_get_current_cgroup_id(), flags == FILE_DELETE_FLAG))
+     * ring; userspace attribution semantics (cgroup_id stays 0) are unchanged.
+     * compat28: keyed by TGID - on the field UOS 4.19.90 backport
+     * bpf_get_current_cgroup_id returns per-call garbage (verified via FILE_FILTER_SEEN,
+     * 2026-11-09); PLAINTEXT_ALLOWED has run TGID-keyed on this same kernel for days. */
+    if (!file_filter_allow(bpf_get_current_pid_tgid() >> 32, flags == FILE_DELETE_FLAG))
         return;
     event = scratch(&FILE_SCRATCH);
     if (!event) {
