@@ -347,6 +347,7 @@ impl FileFilterManager {
 
         let previous = std::mem::replace(&mut self.installed_keys, inserted);
         self.active_epoch = snapshot.epoch;
+        self.enabled = true;
         for old_key in previous {
             let _ = self.rules.remove(&old_key);
         }
