@@ -31,6 +31,7 @@ const DEFAULT_UNKNOWN_PER_CGROUP: u32 = 20;
 const DEFAULT_UNKNOWN_PER_NODE: u32 = 1_000;
 const DEFAULT_UNKNOWN_WINDOW_MS: u64 = 1_000;
 
+#[derive(Clone)]
 pub(super) struct ParsedFileFilterSnapshot {
     epoch: u64,
     rules: Vec<(FileFilterKey, FileFilterValue)>,
@@ -158,6 +159,12 @@ pub(super) struct FileFilterManager {
     installed_keys: Vec<[u8; 16]>,
     active_epoch: u64,
     enabled: bool,
+    last_snapshot: Option<ParsedFileFilterSnapshot>,
+    last_pid_set: std::collections::HashSet<u64>,
+    next_epoch: u64,
+    unified_root: PathBuf,
+    unified_cache: Vec<(u64, PathBuf)>,
+    unified_cache_at: Option<std::time::Instant>,
     unknown_policy: UnknownFilePolicy,
     sample_window_ns: u64,
     unknown_per_cgroup_limit: u32,
@@ -229,6 +236,12 @@ impl FileFilterManager {
             installed_keys: Vec::new(),
             active_epoch: 0,
             enabled: false,
+            last_snapshot: None,
+            last_pid_set: std::collections::HashSet::new(),
+            next_epoch: 0,
+            unified_root: Self::resolve_unified_root(),
+            unified_cache: Vec::new(),
+            unified_cache_at: None,
             unknown_policy,
             sample_window_ns: window_ms.saturating_mul(1_000_000),
             unknown_per_cgroup_limit: per_cgroup,
@@ -356,22 +369,144 @@ impl FileFilterManager {
         );
     }
 
-    /// Reload on change; `Ok(Some(entries))` when a new epoch was applied.
-    pub(super) fn reload(&mut self) -> Result<Option<usize>> {
-        let Some(bytes) = self.read_changed()? else {
-            return Ok(None);
-        };
-        let parsed = parse_filter_rule_snapshot(&bytes, now_unix_ns(), now_boot_ns())?;
-        self.apply(parsed).map(Some)
+    /// compat28: the field UOS 4.19.90 backport returns per-call garbage from
+    /// bpf_get_current_cgroup_id, so the kernel filters by TGID (exactly like the
+    /// battle-tested PLAINTEXT_ALLOWED map). Rules stay cgroup-semantics in the snapshot;
+    /// here each ruled cgroup resolves to its live pids (/sys/fs/cgroup/unified/<path>/
+    /// cgroup.procs) and one map entry is emitted per pid plus the original cgroup key
+    /// (forward-compat for kernels with a working helper). Applied epochs are a local
+    /// monotonic counter so pid-set refreshes can switch generations between snapshot
+    /// publishes. New processes are covered on the next tick (<=5s) - the same window
+    /// the plaintext whitelist has always accepted.
+    fn resolve_unified_root() -> PathBuf {
+        let unified = PathBuf::from("/sys/fs/cgroup/unified");
+        if unified.join("cgroup.procs").exists() {
+            return unified;
+        }
+        PathBuf::from("/sys/fs/cgroup")
     }
 
-    fn apply(&mut self, snapshot: ParsedFileFilterSnapshot) -> Result<usize> {
-        anyhow::ensure!(
-            snapshot.epoch > self.active_epoch,
-            "filter rule epoch must increase monotonically"
-        );
-        let mut inserted = Vec::with_capacity(snapshot.rules.len());
+    fn refresh_unified_cache(&mut self) {
+        let mut cache: Vec<(u64, PathBuf)> = Vec::new();
+        let mut add_dir = |dir: &std::path::Path, cache: &mut Vec<(u64, PathBuf)>| {
+            if let Ok(metadata) = std::fs::metadata(dir) {
+                use std::os::unix::fs::MetadataExt;
+                let ino = metadata.ino();
+                if ino > 0 {
+                    cache.push((ino, dir.to_path_buf()));
+                }
+            }
+        };
+        add_dir(&self.unified_root, &mut cache);
+        if let Ok(entries) = std::fs::read_dir(&self.unified_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                add_dir(&path, &mut cache);
+                if let Ok(subs) = std::fs::read_dir(&path) {
+                    for sub in subs.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.is_dir() {
+                            add_dir(&sub_path, &mut cache);
+                        }
+                    }
+                }
+            }
+        }
+        self.unified_cache = cache;
+        self.unified_cache_at = Some(std::time::Instant::now());
+    }
+
+    fn pids_for_cgroup(&mut self, inode: u64) -> Vec<u64> {
+        let stale = match self.unified_cache_at {
+            Some(at) => at.elapsed().as_secs() > 30,
+            None => true,
+        };
+        let known = self.unified_cache.iter().any(|(ino, _)| *ino == inode);
+        if stale || !known {
+            self.refresh_unified_cache();
+        }
+        let Some(path) = self
+            .unified_cache
+            .iter()
+            .find(|(ino, _)| *ino == inode)
+            .map(|(_, path)| path.clone())
+        else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(path.join("cgroup.procs"))
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| line.trim().parse::<u64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reload on rule-file change and refresh the pid translation; `Ok(Some(entries))`
+    /// when a new generation was applied.
+    pub(super) fn reload(&mut self) -> Result<Option<usize>> {
+        let file_changed = match self.read_changed()? {
+            Some(bytes) => {
+                let parsed = parse_filter_rule_snapshot(&bytes, now_unix_ns(), now_boot_ns())?;
+                self.last_snapshot = Some(parsed);
+                true
+            }
+            None => false,
+        };
+        let Some(snapshot) = self.last_snapshot.clone() else {
+            return Ok(None);
+        };
+        let mut pid_entries: Vec<(u64, FileFilterValue)> = Vec::new();
+        let mut pid_set = std::collections::HashSet::new();
         for (key, value) in &snapshot.rules {
+            for pid in self.pids_for_cgroup(key.cgroup_id) {
+                if pid_set.insert(pid) {
+                    pid_entries.push((pid, *value));
+                }
+            }
+        }
+        if !file_changed && pid_set == self.last_pid_set {
+            return Ok(None);
+        }
+        self.last_pid_set = pid_set;
+        self.apply(snapshot, pid_entries).map(Some)
+    }
+
+    fn apply(
+        &mut self,
+        snapshot: ParsedFileFilterSnapshot,
+        pid_entries: Vec<(u64, FileFilterValue)>,
+    ) -> Result<usize> {
+        let applied_epoch = self.next_epoch.max(snapshot.epoch).max(1);
+        self.next_epoch = applied_epoch + 1;
+        let mut entries: Vec<(FileFilterKey, FileFilterValue)> = Vec::new();
+        for (key, value) in &snapshot.rules {
+            let mut translated = *value;
+            translated.epoch = applied_epoch;
+            entries.push((
+                FileFilterKey {
+                    cgroup_id: key.cgroup_id,
+                    epoch: applied_epoch,
+                },
+                translated,
+            ));
+        }
+        for (pid, value) in &pid_entries {
+            let mut translated = *value;
+            translated.epoch = applied_epoch;
+            entries.push((
+                FileFilterKey {
+                    cgroup_id: *pid,
+                    epoch: applied_epoch,
+                },
+                translated,
+            ));
+        }
+        let mut inserted = Vec::with_capacity(entries.len());
+        for (key, value) in &entries {
             let key_bytes = pod_bytes::<_, 16>(key);
             let value_bytes = pod_bytes::<_, 24>(value);
             if let Err(error) = self.rules.insert(key_bytes, value_bytes, 0) {
@@ -383,7 +518,7 @@ impl FileFilterManager {
             inserted.push(key_bytes);
         }
 
-        if let Err(error) = self.write_config(snapshot.epoch) {
+        if let Err(error) = self.write_config(applied_epoch) {
             for rollback_key in &inserted {
                 let _ = self.rules.remove(rollback_key);
             }
@@ -391,7 +526,7 @@ impl FileFilterManager {
         }
 
         let previous = std::mem::replace(&mut self.installed_keys, inserted);
-        self.active_epoch = snapshot.epoch;
+        self.active_epoch = applied_epoch;
         self.enabled = true;
         for old_key in previous {
             let _ = self.rules.remove(&old_key);
