@@ -182,6 +182,7 @@ fn process_context_serializes_mount_namespace_with_stable_identity() {
             cwd: None,
             cgroup: None,
             cgroup_id: 73,
+            ..ProcessContext::default()
         }),
         provider: None,
         event: AgentEvent::ProcessExit {

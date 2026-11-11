@@ -4,7 +4,7 @@
 //! implementation here; environment-specific ones (k8s, a3s-box, OTel) land with the
 //! probes.
 
-use crate::model::EnrichedEvent;
+use crate::model::{AgentEvent, EnrichedEvent};
 use crate::workload::WorkloadIdentity;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -72,24 +72,53 @@ pub trait ServiceClassifier: Send + Sync {
 /// point classification must fall back to IP/DNS correlation.
 pub struct SniClassifier;
 
+fn host_is_or_subdomain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn is_gemini_host(host: &str) -> bool {
+    host_is_or_subdomain(host, "generativelanguage.googleapis.com")
+        || host_is_or_subdomain(host, "aiplatform.googleapis.com")
+        // Vertex AI regional endpoints use `<location>-aiplatform.googleapis.com`.
+        || host.ends_with("-aiplatform.googleapis.com")
+        || host_is_or_subdomain(host, "cloudaicompanion.googleapis.com")
+        || host_is_or_subdomain(host, "geminicloudassist.googleapis.com")
+}
+
 impl ServiceClassifier for SniClassifier {
     fn classify(&self, sni: Option<&str>, _peer: IpAddr) -> Option<Provider> {
-        let host = sni?;
+        let normalized = sni?.trim_end_matches('.').to_ascii_lowercase();
+        let host = normalized.as_str();
         Some(match host {
-            h if h.ends_with("openai.azure.com") => Provider::AzureOpenAi,
-            h if h.ends_with("openai.com") || h.ends_with("oaiusercontent.com") => Provider::OpenAi,
-            h if h.ends_with("anthropic.com") => Provider::Anthropic,
-            h if h.ends_with("googleapis.com") => Provider::Gemini,
-            h if h.ends_with("mistral.ai") => Provider::Mistral,
-            h if h.ends_with("cohere.ai") || h.ends_with("cohere.com") => Provider::Cohere,
-            h if h.ends_with("x.ai") => Provider::XAi,
-            h if h.ends_with("deepseek.com") => Provider::DeepSeek,
-            h if h.ends_with("groq.com") => Provider::Groq,
-            h if h.ends_with("together.xyz") || h.ends_with("together.ai") => Provider::Together,
-            h if h.ends_with("perplexity.ai") => Provider::Perplexity,
-            h if h.ends_with("fireworks.ai") => Provider::Fireworks,
-            h if h.ends_with("openrouter.ai") => Provider::OpenRouter,
-            h if h.ends_with("amazonaws.com") && h.contains("bedrock") => Provider::Bedrock,
+            h if host_is_or_subdomain(h, "openai.azure.com") => Provider::AzureOpenAi,
+            h if host_is_or_subdomain(h, "openai.com")
+                || host_is_or_subdomain(h, "oaiusercontent.com") =>
+            {
+                Provider::OpenAi
+            }
+            h if host_is_or_subdomain(h, "anthropic.com") => Provider::Anthropic,
+            h if is_gemini_host(h) => Provider::Gemini,
+            h if host_is_or_subdomain(h, "mistral.ai") => Provider::Mistral,
+            h if host_is_or_subdomain(h, "cohere.ai") || host_is_or_subdomain(h, "cohere.com") => {
+                Provider::Cohere
+            }
+            h if host_is_or_subdomain(h, "x.ai") => Provider::XAi,
+            h if host_is_or_subdomain(h, "deepseek.com") => Provider::DeepSeek,
+            h if host_is_or_subdomain(h, "groq.com") => Provider::Groq,
+            h if host_is_or_subdomain(h, "together.xyz")
+                || host_is_or_subdomain(h, "together.ai") =>
+            {
+                Provider::Together
+            }
+            h if host_is_or_subdomain(h, "perplexity.ai") => Provider::Perplexity,
+            h if host_is_or_subdomain(h, "fireworks.ai") => Provider::Fireworks,
+            h if host_is_or_subdomain(h, "openrouter.ai") => Provider::OpenRouter,
+            h if host_is_or_subdomain(h, "amazonaws.com") && h.contains("bedrock") => {
+                Provider::Bedrock
+            }
             _ => return None,
         })
     }
@@ -101,6 +130,9 @@ pub trait Exporter: Send + Sync {
     /// Output lines dropped because the write queue was full (slow/stalled consumer). Cumulative.
     fn output_drops(&self) -> u64 {
         0
+    }
+    fn output_drops_by_kind(&self) -> std::collections::BTreeMap<String, u64> {
+        std::collections::BTreeMap::new()
     }
 }
 
@@ -116,27 +148,72 @@ impl Exporter for LogExporter {
 /// Exporter that writes each event as one NDJSON line to stdout — consumable by any log
 /// pipeline (vector / Loki / jq / files). OTLP is a drop-in via this same trait.
 ///
-/// A dedicated writer thread owns stdout, fed by a bounded queue, so a slow/stalled consumer can
-/// never block the caller's event loop — which would stall the 60s report + liveness heartbeat
-/// and get the collector killed. When the queue is full, lines are dropped and counted instead.
+/// Lifecycle, ToolExec and ordinary events have separate bounded channels. A writer thread owns
+/// stdout and drains them in that priority order.
 pub struct JsonExporter {
     tx: std::sync::mpsc::SyncSender<String>,
+    exec_tx: std::sync::mpsc::SyncSender<String>,
+    lifecycle_tx: std::sync::mpsc::SyncSender<String>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dropped_by_kind: std::sync::Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl JsonExporter {
     pub fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(4096);
+        Self::with_limits(4096, 65_536, 16_384)
+    }
+
+    fn with_limits(
+        ordinary_capacity: usize,
+        exec_capacity: usize,
+        lifecycle_capacity: usize,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(ordinary_capacity);
+        let (exec_tx, exec_rx) = std::sync::mpsc::sync_channel::<String>(exec_capacity);
+        let (lifecycle_tx, lifecycle_rx) =
+            std::sync::mpsc::sync_channel::<String>(lifecycle_capacity);
         std::thread::spawn(move || {
             use std::io::Write;
+            use std::sync::mpsc::TryRecvError;
             let mut out = std::io::stdout().lock();
-            while let Ok(line) = rx.recv() {
-                let _ = writeln!(out, "{line}");
+            loop {
+                match lifecycle_rx.try_recv() {
+                    Ok(line) => {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => break,
+                }
+                match exec_rx.try_recv() {
+                    Ok(line) => {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => break,
+                }
+                match rx.try_recv() {
+                    Ok(line) => {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => break,
+                }
             }
         });
         Self {
             tx,
+            exec_tx,
+            lifecycle_tx,
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_by_kind: std::sync::Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+        }
+    }
+
+    fn record_output_drop(&self, kind: &'static str) {
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut counts) = self.dropped_by_kind.lock() {
+            *counts.entry(kind.to_string()).or_insert(0) += 1;
         }
     }
 }
@@ -150,16 +227,44 @@ impl Default for JsonExporter {
 impl Exporter for JsonExporter {
     fn export(&self, event: &EnrichedEvent) {
         if let Ok(line) = serde_json::to_string(event) {
-            // Non-blocking: a full queue means the consumer is slower than collection — drop the
-            // line (counted) rather than stall the event loop on a blocking write.
-            if self.tx.try_send(line).is_err() {
-                self.dropped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if matches!(
+                event.event,
+                AgentEvent::ProcessExit { .. } | AgentEvent::CollectorHeartbeat { .. }
+            ) {
+                let _ = self.lifecycle_tx.send(line);
+                return;
+            }
+            let (kind, failed) = match &event.event {
+                AgentEvent::ToolExec { .. } => ("ToolExec", self.exec_tx.send(line).is_err()),
+                AgentEvent::Egress { .. } => ("Egress", self.tx.try_send(line).is_err()),
+                AgentEvent::Dns { .. } => ("Dns", self.tx.try_send(line).is_err()),
+                AgentEvent::FileAccess { .. } => ("FileAccess", self.tx.try_send(line).is_err()),
+                AgentEvent::FileDelete { .. } => ("FileDelete", self.tx.try_send(line).is_err()),
+                AgentEvent::LlmCall { .. } => ("LlmCall", self.tx.try_send(line).is_err()),
+                AgentEvent::LlmRequestObserved { .. } => {
+                    ("LlmRequestObserved", self.tx.try_send(line).is_err())
+                }
+                AgentEvent::LlmResponseObserved { .. } => {
+                    ("LlmResponseObserved", self.tx.try_send(line).is_err())
+                }
+                AgentEvent::SecurityAction { .. } => {
+                    ("SecurityAction", self.tx.try_send(line).is_err())
+                }
+                AgentEvent::ProcessExit { .. } | AgentEvent::CollectorHeartbeat { .. } => return,
+            };
+            if failed {
+                self.record_output_drop(kind);
             }
         }
     }
     fn output_drops(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn output_drops_by_kind(&self) -> std::collections::BTreeMap<String, u64> {
+        self.dropped_by_kind
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -339,6 +444,18 @@ mod tests {
             Some(Provider::Gemini)
         );
         assert_eq!(
+            c.classify(Some("us-central1-aiplatform.googleapis.com"), ip),
+            Some(Provider::Gemini)
+        );
+        assert_eq!(
+            c.classify(Some("cloudaicompanion.googleapis.com"), ip),
+            Some(Provider::Gemini)
+        );
+        assert_eq!(
+            c.classify(Some("GEMINICLOUDASSIST.GOOGLEAPIS.COM."), ip),
+            Some(Provider::Gemini)
+        );
+        assert_eq!(
             c.classify(Some("api.cohere.ai"), ip),
             Some(Provider::Cohere)
         );
@@ -362,6 +479,20 @@ mod tests {
         );
         assert_eq!(c.classify(None, ip), None); // no SNI → unclassified
         assert_eq!(c.classify(Some("example.com"), ip), None);
+        for non_gemini_google_api in [
+            "oauthaccountmanager.googleapis.com",
+            "content-autofill.googleapis.com",
+            "safebrowsing.googleapis.com",
+            "serviceusage.googleapis.com",
+        ] {
+            assert_eq!(
+                c.classify(Some(non_gemini_google_api), ip),
+                None,
+                "{non_gemini_google_api} must not be classified as Gemini"
+            );
+        }
+        assert_eq!(c.classify(Some("notopenai.com"), ip), None);
+        assert_eq!(c.classify(Some("evilopenrouter.ai"), ip), None);
     }
 
     #[test]
@@ -392,6 +523,67 @@ mod tests {
         let k = parse_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n");
         assert!(k.pod_uid.is_none());
         assert!(k.container_id.is_none());
+    }
+
+    #[test]
+    fn json_exporter_protects_exits_when_ordinary_queue_is_full() {
+        use crate::model::AgentEvent;
+        let ex = JsonExporter::with_limits(1, 1, 1);
+        let event = |kind| EnrichedEvent {
+            identity: Identity::default(),
+            workload: None,
+            observation: None,
+            process: None,
+            provider: None,
+            event: kind,
+        };
+        ex.export(&event(AgentEvent::FileDelete {
+            pid: 1,
+            path: "/tmp/a".into(),
+        }));
+        ex.export(&event(AgentEvent::FileDelete {
+            pid: 2,
+            path: "/tmp/b".into(),
+        }));
+        assert_eq!(ex.output_drops(), 1);
+        ex.export(&event(AgentEvent::ProcessExit {
+            pid: 1,
+            exit_code: 0,
+            signal: 0,
+        }));
+        assert_eq!(ex.output_drops(), 1);
+    }
+
+    #[test]
+    fn json_exporter_exec_backpressure_does_not_drop() {
+        use crate::model::AgentEvent;
+        let ex = JsonExporter::with_limits(0, 1, 1);
+        let exec = |pid| EnrichedEvent {
+            identity: Identity::default(),
+            workload: None,
+            observation: None,
+            process: None,
+            provider: None,
+            event: AgentEvent::ToolExec {
+                pid,
+                ppid: 1,
+                uid: 1000,
+                argv: vec!["git".into()],
+                argv_truncated: false,
+                argv_incomplete: false,
+                exec_confirmed: true,
+                argv_source: "kernel_compact".into(),
+                captured_argc: 1,
+                captured_bytes: 4,
+                observed_argc: 1,
+                observed_bytes: 4,
+                cwd: String::new(),
+            },
+        };
+        ex.export(&exec(10));
+        ex.export(&exec(11));
+        assert_eq!(ex.output_drops_by_kind().get("ToolExec"), None);
+        assert_eq!(ex.output_drops(), 0);
     }
 
     #[test]

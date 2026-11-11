@@ -22,12 +22,12 @@ are specified in [`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.
 ```
   AI agent + its tool subprocesses                  unmodified · any language
             │
-            │   execve · do_exit · connect · TLS ClientHello · DNS · openat · setuid/ptrace/bind · SSL_*
+            │   execve · do_exit · connect · TLS ClientHello · DNS · openat · setuid/ptrace/bind
   ══════════╪═══════════════════════════════════════════════  KERNEL  (eBPF + fanotify)
             ▼
    OBSERVE  (passive, always-on)            INTERVENE  (opt-in, external policy)
      exec  exit  connect  sni  dns           enforce   → cgroup/connect4: deny egress
-     security  llm-metrics  file*  ssl*      fileguard → fanotify: deny open + exec
+     security  llm-metrics  file*            fileguard → fanotify: deny open + exec
             │
             │  ring buffers
   ══════════╪═══════════════════════════════════════════════  USERSPACE
@@ -36,26 +36,27 @@ are specified in [`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.
      identity (k8s pod / proc / comm)  ·  correlate (pid,fd)→peer  ·  export NDJSON
             │
             ▼
-   OTel Collector  →  your backend            * opt-in: A3S_OBSERVER_FILES / _SSL
+   OTel Collector  →  your backend            * file capture is an independent opt-in
 ```
 
 ## Observe — who / what / where
 
-One event answers **who** (process or k8s pod) / **what** (tool, file, LLM provider + bytes /
-latency / TTFT, or plaintext) / **where** (peer IP / hostname).
+One event answers **who** (process or k8s pod) / **what** (tool, file, LLM provider +
+connection-level bytes / latency / TTFT) / **where** (peer IP / hostname). Production
+Interaction collection is source-level metadata-only.
 
 | signal | kernel hook | event |
 |---|---|---|
-| `exec` | `sys_enter_execve` + `sched_process_exec` | `ToolExec` — bounded argv fragments, successful-exec confirmation, `/proc` supplementation + cwd, comm, uid |
-| `exit` | `do_exit` kprobe | `ProcessExit` — outcome: **exit code + signal** (clean / SIGSEGV crash / SIGKILL-OOM), one per process |
+| `exec` | `sys_enter_execve` + `sched_process_exec` | `ToolExec` — bounded argv fragments, successful-exec confirmation, committed comm, `start_boottime` generation and separately sourced creation/observed parents |
+| `exit` | `do_exit` kprobe | `ProcessExit` — outcome: **exit code + signal** (clean / SIGSEGV crash / SIGKILL-OOM), one per process, with the same generation identity |
 | `connect` | `sys_enter_connect` | `Egress` — peer IP:port |
 | `sni` | TLS ClientHello (plaintext `server_name`) | LLM **provider** + endpoint |
 | `dns` | `sendto` / `sendmsg` / `sendmmsg` to :53 | `Dns` — resolved hostname |
 | llm metrics | per-socket `read`/`recv` + `close` | `LlmCall` — req/resp wire bytes, latency, TTFT |
 | `file`\* | `sys_enter_openat` (write opens) | `FileAccess` — files written (`A3S_OBSERVER_FILES=1`) |
 | `unlink`\* | `sys_enter_unlinkat` | `FileDelete` — files deleted (`A3S_OBSERVER_FILES=1`) |
-| `ssl`\* | OpenSSL `SSL_write` / `SSL_read` uprobes | `SslContent` — request/response plaintext (`A3S_OBSERVER_SSL=1`) |
-| `llm-api`\* | parsed from `SslContent` | `LlmApi` — **model** + token usage (`A3S_OBSERVER_SSL=1`) |
+| `ssl` (isolated fixture only) | allow-listed OpenSSL `SSL_write*` uprobes | bounded outbound request fragments sent only to the in-process fixture reassembler; never attached in production metadata mode and never exported as ordinary NDJSON |
+| `llm-api` (isolated fixture only) | HTTP/1.1 reassembly + fixture Provider parser | `LlmRequestObserved` / nested `UserInstructionObserved` in a newly-created `0600` fixture artifact; not a production capability claim |
 | `security` | `setuid` / `ptrace` / `bind` syscalls | `SecurityAction` — privilege escalation (→root) / process injection / opened a listening port (rare + in-kernel-filtered) |
 | collector heartbeat | userspace timer | `CollectorHeartbeat` — collector id, node/pod, attached probes, feature flags, per-window counts, ring drops, output drops |
 
@@ -71,16 +72,17 @@ agent action and should not be fed into security policy decisions.
 {"identity":{"agent":"python3","task":"1841","session":null},"provider":"Anthropic",
  "event":{"LlmCall":{"pid":1841,"sni":"api.anthropic.com","peer":"160.79.104.10",
  "req_bytes":284,"resp_bytes":3832,"latency":{"secs":1,"nanos":210000000},
- "ttft":{"secs":0,"nanos":410000000}}}}
+ "ttft":{"secs":0,"nanos":410000000},"capture_mode":"metadata",
+ "capture_completeness":"unavailable","parse_status":"not_attempted",
+ "raw_retention_state":"not_retained","presentation_state":"metadata_only",
+ "timing_scope":"connection","latency_availability":"available",
+ "ttft_availability":"available"}}}
 {"identity":{"agent":"python3","task":"1903","session":null},"provider":null,
  "event":{"ToolExec":{"pid":1903,"ppid":1841,
  "argv":["git","clone","https://github.com/acme/repo"],"argv_truncated":false,
  "argv_incomplete":false,"exec_confirmed":true,"argv_source":"kernel_fragments",
  "captured_argc":3,"captured_bytes":36,"observed_argc":3,"observed_bytes":36,
  "cwd":"/home/agent/work"}}}
-{"identity":{"agent":"python3","task":"1841","session":null},"provider":null,
- "event":{"SslContent":{"pid":1841,"is_read":false,
- "content":"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n..."}}}
 ```
 
 `ToolExec.argv` is reconstructed in the collector from bounded 128-byte kernel records. The
@@ -221,11 +223,14 @@ let cage = ProviderPolicy::new([Provider::Anthropic]).deny_unclassified(true);
 
 - **Zero-instrumentation, language-agnostic** — observe or guard any agent (Python/Node/Go/Rust)
   without touching its code, including its tool subprocesses.
-- **Kernel hooks only in the always-on core, no uprobes** — so the core gives **no LLM
-  prompt/completion content**. That content is available via an **opt-in** OpenSSL uprobe
-  extension (`A3S_OBSERVER_SSL=1`) — OpenSSL only (Python/Node/curl …, not Go `crypto/tls`),
-  kept out of the universal core because a uprobe binds to a library symbol. (ECH will
-  eventually hide SNI → fall back to IP/DNS.)
+- **Kernel hooks only in the always-on core, no payload uprobes** — production gives **no LLM
+  prompt/completion content**. `A3S_OBSERVER_SSL` is ignored and cannot enable plaintext capture.
+  Experimental OpenSSL and native-stdin paths exist only for isolated Phase -1 fixtures and
+  require all of: `fixture_payload` mode, `isolated_test` environment, the explicit plaintext
+  confirmation, a non-zero target-PID allowlist, a new absolute `0600` output path, and an
+  explicit Provider host allowlist. Raw fragments never enter the ordinary event exporter. These
+  paths are not supported production features. (ECH will eventually hide SNI → fall back to
+  IP/DNS.)
 - **a3s-box** — a box is a separate guest kernel, so host-side eBPF sees box **egress** (it
   flows through the host net path) but not in-guest exec/file — those need an in-guest collector
   (phase 2).
@@ -245,8 +250,108 @@ A3S_OBSERVER_JSON=1 sudo -E ./target/release/a3s-observer-collector   # NDJSON
 ```
 
 Linux only; needs root (CAP_BPF + CAP_PERFMON). Env knobs: `A3S_OBSERVER_JSON` (NDJSON),
-`A3S_OBSERVER_FILES` (file writes — high-volume), `A3S_OBSERVER_SSL` (OpenSSL content),
+`A3S_OBSERVER_FILES` (file writes — high-volume),
+`A3S_OBSERVER_INTERACTION_CAPTURE_MODE=metadata|off|runtime_payload` (production default:
+`metadata`), and
 `A3S_OBSERVER_HEARTBEAT` (liveness file path).
+
+`runtime_payload` is an opt-in local/controlled path implemented by AnySentry Observer. It requires
+`A3S_OBSERVER_ENVIRONMENT=local_development|controlled_capture`, the exact confirmation value,
+and a Provider allowlist. By default it discovers native Codex ELF files from running processes
+and common host NVM/npm/VS Code installations, verifies supported Rustls signatures, and attaches
+by exact device/inode. `A3S_OBSERVER_RUNTIME_BINARY` is an optional diagnostic override rather than
+a required setting; exact target PIDs remain available as a narrower troubleshooting scope.
+Start Observer before Codex when possible so a compressed WebSocket is observed from its handshake.
+For kimi CLI processes, the kimi/OpenSSL lane additionally reassembles the response direction
+(`SSL_read`) and emits a paired `LlmResponseObserved` event with aggregated assistant text, tool
+calls, finish reason, and token usage. Both events are intended for AnySentry's encrypted
+Interaction lane; they do not depend on AgentSight or an AgentSight database.
+
+The separate Fixture plaintext path is test-only. The reproducible Python/OpenSSL Fixture creates a local TLS
+endpoint, targets one exact PID, validates HTTP/1.1 user-message extraction, engages `SIGUSR2`,
+scans ordinary output for plaintext leakage, and removes its sensitive temporary directory:
+
+```bash
+cargo build --release -p a3s-observer-collector
+sudo python3 scripts/verify-interaction-fixture.py \
+  --collector target/release/a3s-observer-collector \
+  --libssl /usr/lib/x86_64-linux-gnu/libssl.so.3
+```
+
+On a workstation where the account has Docker access but not passwordless sudo, run the same
+isolated test in a disposable privileged container:
+
+```bash
+docker run --rm --privileged --pid=host --network=host \
+  -v /sys:/sys \
+  -v "$PWD:/work:ro" -w /work python:3.12-slim \
+  python3 scripts/verify-interaction-fixture.py \
+    --collector target/release/a3s-observer-collector \
+    --libssl /usr/lib/x86_64-linux-gnu/libssl.so.3
+```
+
+This command is evidence for the exact Python/OpenSSL fingerprint only. It neither enables
+production content capture nor establishes Node, Bun, Go, Rustls, HTTP/2, or WebSocket support.
+The experimental request-only ABI emits variable-size fragments of at most 31 KiB and fragments a
+single OpenSSL call up to a 16 MiB absolute ceiling; beyond the ceiling the captured prefix is
+still emitted and the call is marked truncated, so it cannot yield a `complete` request. The real
+Fixture verifies small, 276 KiB, and near-1-MiB requests.
+
+The independent native-stdio Fixture verifies a bounded Runtime input/output path without
+attaching OpenSSL probes. It targets only fd 0/1 of exact PIDs, waits for stdin EOF before
+producing `AgentInputObserved`, uses process exit as the one-shot stdout boundary for
+`AgentOutputObserved`, exercises multi-call reassembly, engages `SIGUSR2`, checks the `0600`
+artifact, and scans ordinary Observer output for leakage:
+
+```bash
+docker run --rm --privileged --pid=host --network=host \
+  -v /sys:/sys \
+  -v "$PWD:/work:ro" -w /work python:3.12-slim \
+  python3 scripts/verify-native-stdin-fixture.py \
+    --collector target/release/a3s-observer-collector
+```
+
+The real Codex verifier starts the installed native Codex binary in a stopped wrapper, attaches
+the exact-PID eBPF Fixture, resumes it with one synthetic stdin prompt, requires a successful
+`OK` response, captures that stdout response, and returns only hash/length evidence:
+
+```bash
+python3 scripts/verify-codex-native-stdin-fixture.py \
+  --collector target/release/a3s-observer-collector
+```
+
+This proves only one-shot `codex exec -` stdin/stdout-boundary capture for the tested binary. It
+observes the instruction supplied to the Agent and the bytes the Agent writes to stdout, not the
+transformed request sent to the LLM. The verifier supplies one explicit source Turn ID so the two
+records can be projected as one complete Turn by AnySentry. Interactive TUI, PTY, app-server,
+multiple prompts on one stdin stream, Agent-to-LLM request bodies, and general Turn/action
+correlation remain unsupported. Production still does not attach either native-stdio payload
+tracepoint.
+
+The declared-load verifier compares the isolated Fixture with the production-equivalent
+`metadata` Observer in an A/B/A sequence. It uses the faster of the before/after metadata P95
+values as the conservative comparison, retains only instruction length and SHA-256 in the
+disposable `0600` artifact, checks every Ground Truth hash, and sends requests after `SIGUSR2`:
+
+```bash
+docker run --rm --privileged --pid=host --network=host \
+  -v /sys:/sys \
+  -v "$PWD:/work:ro" -w /work python:3.12-slim \
+  python3 scripts/verify-interaction-fixture-load.py \
+    --duration-seconds 120 --baseline-seconds 120 \
+    --requests-per-second 100 --concurrency 32
+
+# Frozen contract: 900 s metadata + 900 s Fixture + 900 s metadata.
+docker run --rm --privileged --pid=host --network=host \
+  -v /sys:/sys \
+  -v "$PWD:/work:ro" -w /work python:3.12-slim \
+  python3 scripts/verify-interaction-fixture-load.py --contract
+```
+
+The current shared-workstation A/B/A result does **not** pass the 2% P95/TTFT budget, and its two
+metadata baselines are themselves non-stationary. The 900-second contract must therefore be rerun
+on a dedicated quiet benchmark node before this Runtime can be marked supported. Production
+remains source-level `metadata-only`.
 
 Opt-in enforcement — run against an agent's cgroup and/or a deny-list file:
 

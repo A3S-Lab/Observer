@@ -6,6 +6,26 @@ All notable changes to a3s-observer will be documented in this file.
 
 ### Added
 
+- kimi-code response-direction plaintext lane for `runtime_payload`: the kimi attach now also
+  binds `ssl_read_enter`/`ssl_read_exit` at the symtab-resolved `SSL_read` offset, and kimi
+  `SSL_read` fragments (gated to `runtime_probe_state.kimi_pids` only — other runtimes' reads
+  stay rejected) are
+  reassembled per connection, decoded as HTTP/1.1 (chunked / optional gzip), and incrementally
+  parsed as OpenAI-style SSE. Aggregated assistant text, tool calls (with incremental
+  `function.arguments` concatenation), `finish_reason`, and token usage produce a new sensitive
+  `AgentEvent::LlmResponseObserved` event, finalized on `data: [DONE]`, process exit, or the
+  reassembly timeout (idle/abort lanes emit bounded `partial` events). Requests and responses
+  pair on the same connection in order; unpaired reads are dropped. Per-connection and
+  aggregated-content byte caps mark oversize streams `capture_completeness=truncated`, all
+  plaintext buffers zeroize on drop, and the `SIGUSR2` kill switch clears the response pipeline
+  alongside the request pipeline.
+- kimi-code TLS plaintext lane for `runtime_payload`: automatic discovery of the kimi CLI
+  (`~/.kimi-code/bin/kimi`, `/usr/local/bin/kimi`, and running `kimi` processes), ELF symbol
+  table resolution of the statically linked `SSL_write`/`SSL_read` entry points, and
+  request-direction `ssl_write_enter`/`ssl_write_exit` uprobe attachment by file offset. A
+  dedicated `KIMI_OPENSSL_EXACT_BINARY_ALL` in-kernel gate scopes capture to the exact attached
+  inode, and kimi fragments are labeled `capture_method=ebpf_openssl`. Moonshot provider hosts
+  must be present in `A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS` for requests to be attributed.
 - A provider-neutral workload attribution contract: `WorkloadIdentity` requires stable workload,
   deployment, immutable revision, logical replica, provider-unit, and node IDs. Each
   `WorkloadIdentityValue` is bounded to 128 ASCII bytes and rejects whitespace, control
@@ -22,6 +42,86 @@ All notable changes to a3s-observer will be documented in this file.
 This contract is the first slice of workload metrics support. Multi-replica Linux collection,
 resource/restart/availability measurements, lifecycle fixtures, and OTLP/Prometheus metric parity
 are not included yet.
+
+### Fixed
+
+- Fragment pump jump table is now kept alive for the collector's lifetime, fixing a total loss
+  of every `SSL_write` larger than 124 KiB (4 fragments). The canary build populated
+  `SSL_FRAGMENT_PUMPS` and then dropped the `ProgramArray` handle; with the handle closed the
+  jump-table entry no longer resolved at runtime (observed empty via bpftool on kernel 6.17), so
+  every `bpf_tail_call` fell through and the pump program never executed — each oversized call
+  was silently counted as one `ssl_dropped` and no fragment was ever emitted. Production symptom:
+  the first few small requests captured, then llm=0 for 45 minutes while assistant traffic
+  continued. The collector now stores the populated table for its whole lifetime, logs the
+  post-populate entry count, and exports it as `jump_table_entries` in the 60s report. The tail
+  call itself is also hoisted out of bpf2bpf subprograms into each probe main function
+  (`EMIT_SSL_PUMP_PENDING` protocol), eliminating the subprogram-tail-call failure class
+  entirely. New per-CPU `SSL_PUMP_STATS` counters (stashed/entries/hops/rechain/output/probe-read
+  failures, fast-path calls, ceiling clamps, markers) are exported in the 60s report alongside
+  per-branch payload discard breakdown (`ssl_record_parse_failed`, `discard_empty_payload`,
+  `discard_op_not_allowed`, `discard_native_gate`).
+- kimi-code request lane no longer drops requests that outgrow the capture ceiling; oversized
+  `SSL_write` calls are now fragmented instead of discarded. Production regression showed the
+  4 MiB cap still losing every late-session request (189/232 requests over ceiling, tail writes
+  estimated at 8-15 MiB): the eBPF now fragments any call up to a 16 MiB absolute ceiling through
+  the ordinary fragment path (same `call_sequence`/`fragment_index`/`fragment_offset` semantics).
+  Fragmentation runs in a dedicated tail-call-only program (`ssl_fragment_pump`, never attached):
+  the kernel verifier simulates `bpf_loop` iteration-by-iteration and its 1M-processed-insn
+  budget only tolerates ~130 iterations per program, so each hop emits 128 fragments (4 MiB) and
+  re-chains via `bpf_tail_call` until the call is fully emitted. Only the tail beyond the ceiling
+  is marked truncated — the captured prefix is still emitted
+  and the call is counted once under `calls_oversized` (a per-call suppression set keeps hundreds
+  of prefix fragments from multiplying warnings). The SSL ring grows to 32 MiB (shared across
+  CPUs; one worst-case burst is ~16.9 MiB in 529 records, so the ring holds a full burst plus
+  concurrent response traffic), and the default
+  `A3S_OBSERVER_PAYLOAD_MAX_REASSEMBLY_BYTES`/`A3S_OBSERVER_PAYLOAD_MAX_DECOMPRESSED_BYTES` rise
+  to 16 MiB (env bounds widened to 64 MiB).
+- kimi-code request lane no longer stalls permanently once a conversation grows past one MiB.
+  Agent CLIs resend the full conversation history — including resent `reasoning_content` blocks,
+  which token usage does not reflect — on every turn, so a single `SSL_write` eventually exceeds
+  the old 1 MiB `SSL_MAX_CAPTURE_LEN`. The eBPF then emitted a header-only truncated record and
+  userspace dropped the call as `tls_call_truncated`; because the history only grows, every
+  subsequent request failed the same way (production: 173/173 requests lost over 66 minutes,
+  responses parsed but unpaired). `SSL_MAX_CAPTURE_LEN` and the default
+  `A3S_OBSERVER_PAYLOAD_MAX_REASSEMBLY_BYTES` are now 4 MiB, the SSL ring is sized at 8 MiB (2×
+  the per-call ceiling) so one max-size burst cannot overflow it, and oversize drops are counted
+  under a dedicated `calls_oversized` Loss Ledger field (with `original_len` on the loss warning
+  and fixture loss record) so this class of silent stall is visible as it starts.
+- kimi-code response lane no longer drops whole responses on HTTP/1.1 keep-alive reuse. kimi
+  (undici) pools TLS connections, so response N+1 follows response N on the same `ssl_pointer`;
+  previously the connection state was deleted at SSE `[DONE]`, and when the trailing chunked
+  terminator (`0\r\n\r\n`) arrived coalesced with the next response's headers in a later
+  `SSL_read`, the fresh connection failed with `http_response_status_line_invalid` on every
+  subsequent read — silently losing the entire pipelined response and its pending request.
+  Connections now persist across responses with a byte backlog, the chunked terminator is
+  drained independently of `[DONE]` finalization, 1xx interim responses (`100 Continue`) are
+  skipped, and a headerless parse failure with a pending request emits an explicit
+  `parse_status=failed`, `capture_completeness=partial` observation (counted under the new
+  `responses_failed` Loss Ledger field, alongside `interim_responses_skipped`) instead of
+  vanishing.
+- `remember_ssl_call` no longer takes an `Option<usize>` argument: depending on inlining
+  decisions, LLVM can pass the `None` payload register as `undef`, which the kernel verifier
+  rejects (`R4 !read_ok`) when `ssl_write_enter` is loaded. The written-length argument index is
+  now a scalar `usize` where 0 means "no output-length pointer", so no undefined register can
+  cross the function boundary on any toolchain.
+
+### Security
+
+- Production interaction observation is now source-level `metadata-only`.
+  `A3S_OBSERVER_SSL` is ignored and the ordinary event model can no longer carry `SslContent` or
+  `LlmApi` plaintext. Dedicated OpenSSL and native-stdin payload paths exist only as isolated
+  Phase -1 Runtime Fixtures: they require an explicit test environment and confirmation, an exact
+  non-zero PID allowlist, a Provider-host allowlist, and a newly created `0600` artifact. Fixture
+  fragments never enter ordinary NDJSON or logs, and `SIGUSR2` disables the eBPF read path before
+  clearing queued plaintext. The outbound-request-only OpenSSL schema-4 ABI uses bounded
+  variable-size records of at most 31 KiB, reassembles at most 1 MiB per successful write, and
+  records larger calls as incomplete. The native-stdin path attaches only `read(2)` entry/exit
+  tracepoints, accepts only fd 0 of allowlisted PIDs, and emits only after EOF. OpenSSL attachment
+  can be disabled independently, preventing irrelevant TLS probes for static Rustls runtimes.
+  The build tracks the shared eBPF ABI crate so a constant-only ABI change cannot silently reuse
+  stale bytecode. Correctness, loss, leakage, `0600`, and Kill Switch checks pass for the exact
+  Python/OpenSSL Fixture and for a real `codex-cli 0.147.0` `codex exec -` stdin Fixture. The
+  OpenSSL 2% P95/TTFT declared-load Gate remains failed, and neither path is enabled in production.
 
 ## [0.11.0] — SecurityAction: privesc / injection / open-port
 

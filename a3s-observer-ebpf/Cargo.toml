@@ -14,3 +14,5 @@ a3s-observer-common = { path = "../a3s-observer-common" }
 [[bin]]
 name = "probes"
 path = "src/main.rs"
+test = false
+bench = false

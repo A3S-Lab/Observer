@@ -33,8 +33,10 @@ spec:
             privileged: true
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
+            - { name: A3S_OBSERVER_INTERACTION_CAPTURE_MODE, value: "metadata" }
             # - { name: A3S_OBSERVER_FILES, value: "1" }   # opt in to file-write capture
-            # - { name: A3S_OBSERVER_SSL, value: "1" }     # opt in to OpenSSL content (uprobe)
+            # Payload capture is not a production option. Phase -1 fixture mode additionally
+            # requires isolated_test, explicit confirmation, and a target-PID allowlist.
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
           resources:
