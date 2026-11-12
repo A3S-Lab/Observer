@@ -55,6 +55,29 @@ fn now_boot_ns() -> u64 {
     seconds.saturating_mul(1_000_000_000)
 }
 
+/// Stable fingerprint of the effective rule set (cgroup rules + pid translation).
+/// compat30: the forwarder rewrites the snapshot on every TTL refresh (~10s); applying
+/// an identical set again would churn 49 map inserts and bump the epoch for nothing.
+/// Pure function - unit tested in isolation below.
+pub(super) fn rules_fingerprint(
+    rules: &[(FileFilterKey, FileFilterValue)],
+    pids: &std::collections::BTreeSet<u64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (key, value) in rules {
+        key.cgroup_id.hash(&mut hasher);
+        value.action.hash(&mut hasher);
+        value.authority.hash(&mut hasher);
+        value.expires_at_boot_ns.hash(&mut hasher);
+    }
+    pids.len().hash(&mut hasher);
+    for pid in pids {
+        pid.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub(super) fn parse_filter_rule_snapshot(
     bytes: &[u8],
     now_unix_ns: u128,
@@ -161,6 +184,7 @@ pub(super) struct FileFilterManager {
     enabled: bool,
     last_snapshot: Option<ParsedFileFilterSnapshot>,
     last_pid_set: std::collections::HashSet<u64>,
+    last_applied_fingerprint: u64,
     next_epoch: u64,
     unified_root: PathBuf,
     unified_cache: Vec<(u64, PathBuf)>,
@@ -238,6 +262,7 @@ impl FileFilterManager {
             enabled: false,
             last_snapshot: None,
             last_pid_set: std::collections::HashSet::new(),
+            last_applied_fingerprint: 0,
             next_epoch: 0,
             unified_root: Self::resolve_unified_root(),
             unified_cache: Vec::new(),
@@ -471,8 +496,16 @@ impl FileFilterManager {
         if !file_changed && pid_set == self.last_pid_set {
             return Ok(None);
         }
+        let pid_tree: std::collections::BTreeSet<u64> = pid_set.iter().copied().collect();
+        let fingerprint = rules_fingerprint(&snapshot.rules, &pid_tree);
+        if !file_changed && fingerprint == self.last_applied_fingerprint {
+            self.last_pid_set = pid_set;
+            return Ok(None);
+        }
         self.last_pid_set = pid_set;
-        self.apply(snapshot, pid_entries).map(Some)
+        let applied = self.apply(snapshot, pid_entries)?;
+        self.last_applied_fingerprint = fingerprint;
+        Ok(Some(applied))
     }
 
     fn apply(
@@ -624,6 +657,32 @@ mod tests {
     fn unknown_schema_is_rejected() {
         let bytes = b"{\"schemaVersion\":\"something.else.v1\",\"epoch\":1,\"entries\":[]}";
         assert!(parse_filter_rule_snapshot(bytes, 0, 0).is_err());
+    }
+
+    #[test]
+    fn fingerprint_stable_for_identical_sets() {
+        let rules = vec![(
+            FileFilterKey { cgroup_id: 7, epoch: 1 },
+            FileFilterValue { action: 1, authority: 2, flags: 0, _reserved: 0, epoch: 1, expires_at_boot_ns: 99 },
+        )];
+        let pids: std::collections::BTreeSet<u64> = [11u64, 22, 33].into_iter().collect();
+        let a = rules_fingerprint(&rules, &pids);
+        let b = rules_fingerprint(&rules, &pids);
+        assert_eq!(a, b, "identical input must fingerprint identically");
+    }
+
+    #[test]
+    fn fingerprint_changes_with_pid_or_action() {
+        let rules = vec![(
+            FileFilterKey { cgroup_id: 7, epoch: 1 },
+            FileFilterValue { action: 1, authority: 2, flags: 0, _reserved: 0, epoch: 1, expires_at_boot_ns: 99 },
+        )];
+        let base: std::collections::BTreeSet<u64> = [11u64].into_iter().collect();
+        let more: std::collections::BTreeSet<u64> = [11u64, 12].into_iter().collect();
+        assert_ne!(rules_fingerprint(&rules, &base), rules_fingerprint(&rules, &more));
+        let mut changed = rules.clone();
+        changed[0].1.action = 3;
+        assert_ne!(rules_fingerprint(&rules, &base), rules_fingerprint(&changed, &base));
     }
 
     #[test]
