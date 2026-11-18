@@ -2403,6 +2403,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plaintext_split_write_reassembles_without_cursor_reread() {
+        let body = repetitive_json_body(40_000);
+        let head = format!(
+            "POST /ctct-guard/v1/chat/completions HTTP/1.1\r\nHost: guard\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len(),
+        );
+        let mut full = head.into_bytes();
+        full.extend_from_slice(body.as_bytes());
+
+        let mut sequencer = PlaintextSequencer::default();
+        let mut reassembler = InteractionReassembler::default();
+        let mut completed = Vec::new();
+        for (index, part) in full.chunks(LEGACY_PLAINTEXT_LEN).enumerate() {
+            let start = index * LEGACY_PLAINTEXT_LEN;
+            let mut event = plaintext_event(0, part.len() as u32, (full.len() - start) as u32);
+            event.data[..part.len()].copy_from_slice(part);
+            let chunk = plaintext_chunk_from_event(&event, index as u128 + 1, &mut sequencer);
+            completed.extend(reassembler.push(chunk));
+        }
+
+        let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(), response_body,
+        );
+        let mut response_event = plaintext_event(
+            LEGACY_PLAINTEXT_DIRECTION_READ,
+            response.len() as u32,
+            response.len() as u32,
+        );
+        response_event.data[..response.len()].copy_from_slice(response.as_bytes());
+        let response_chunk = plaintext_chunk_from_event(
+            &response_event,
+            full.chunks(LEGACY_PLAINTEXT_LEN).len() as u128 + 1,
+            &mut sequencer,
+        );
+        completed.extend(reassembler.push(response_chunk));
+
+        assert_eq!(completed.len(), 1, "split request must complete on response: {completed:?}");
+        assert_eq!(completed[0].request.body, body);
+        assert_eq!(completed[0].response.text.as_deref(), Some("ok"));
+        assert!(!completed[0]
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "reassembly_idle_expire_incomplete"));
+    }
+
     fn repetitive_json_body(body_len: usize) -> String {
         let prefix = r#"{"model":"fixture-model","messages":[{"role":"user","content":""#;
         let suffix = r#""}]}"#;

@@ -899,8 +899,8 @@ int legacy_bind(struct pt_regs *ctx) {
  * valid-byte count for userspace; the perf record is trimmed to len so short socket calls do not
  * consume a 16 KiB ring slot. If the full window crosses an unmapped page, retry with a small
  * fixed window before dropping the payload. */
-INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
-                           u32 direction) {
+INLINE void emit_plaintext_slice(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
+                                 u32 direction, u32 allow_cursor) {
     struct plaintext_event *event;
     u32 len;
     if (!buf || !count)
@@ -1017,8 +1017,8 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
 #if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
         /* 截断补读游标（冷路径）：本 syscall 超过 16KB 窗口且完整采满时挂续读扩展。
          * len 被读失败降窗（<16KB）说明衔接处不可信，不挂游标——宁可不拼。 */
-        if (count > LEGACY_PLAINTEXT_LEN && emit_len == LEGACY_PLAINTEXT_LEN &&
-            cursor_reread_enabled()) {
+        if (allow_cursor && count > LEGACY_PLAINTEXT_LEN &&
+            emit_len == LEGACY_PLAINTEXT_LEN && cursor_reread_enabled()) {
             struct plaintext_event_with_cursor *full = (void *)event;
             cursor_ext_fill(&full->ext, buf + LEGACY_PLAINTEXT_LEN,
                             count - LEGACY_PLAINTEXT_LEN,
@@ -1049,6 +1049,24 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
         output(ctx, &PLAINTEXT_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
 #endif
+    }
+}
+
+/* 普通明文与 TLS 大调用采用相同的立即分片策略：前 12 片（192KiB）在目标缓冲区
+ * 仍位于本次 syscall 时顺序复制，避免用户态补读与缓冲区复用竞争。最后一片之后仍有
+ * 剩余时才挂安全游标；中间片不得挂游标，否则会把已立即复制的字节再次追加。 */
+#define PLAINTEXT_SPLIT_MAX 12
+INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
+                           u32 direction) {
+#pragma unroll
+    for (u32 i = 0; i < PLAINTEXT_SPLIT_MAX; i++) {
+        const u64 offset = (u64)i * LEGACY_PLAINTEXT_LEN;
+        if (offset >= count)
+            break;
+        const u32 allow_cursor =
+            i == PLAINTEXT_SPLIT_MAX - 1 && count - offset > LEGACY_PLAINTEXT_LEN;
+        emit_plaintext_slice(ctx, pid, fd, buf + offset, count - offset,
+                             direction, allow_cursor);
     }
 }
 
