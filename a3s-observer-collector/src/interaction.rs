@@ -991,6 +991,9 @@ impl WebSocketFrameDecoder {
         if data.is_empty() {
             return Vec::new();
         }
+        let push_started = Instant::now();
+        let input_bytes = data.len();
+        let buffered_before = self.buffer.len();
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -1161,6 +1164,18 @@ impl WebSocketFrameDecoder {
                 }
             }
         }
+        let total = push_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                input_bytes,
+                buffered_before,
+                buffered_after = self.buffer.len(),
+                messages = messages.len(),
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow websocket push"
+            );
+        }
         messages
     }
 
@@ -1284,30 +1299,54 @@ impl WebSocketFrameDecoder {
     }
 
     fn try_resync_to_complete_plausible_event(&mut self) -> bool {
-        let expect_masked = self.kind == StreamKind::Request;
-        let search_limit = self
-            .buffer
-            .len()
-            .min(self.max_bytes.saturating_add(64))
-            .max(2);
-        for offset in 1..search_limit {
-            let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
-            else {
-                continue;
-            };
-            if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) || !frame.fin {
-                continue;
+        let started = Instant::now();
+        let buffer_bytes = self.buffer.len();
+        let mut offsets_tested = 0usize;
+        let mut frames_tested = 0usize;
+        let result = (|| {
+            let expect_masked = self.kind == StreamKind::Request;
+            let search_limit = self
+                .buffer
+                .len()
+                .min(self.max_bytes.saturating_add(64))
+                .max(2);
+            for offset in 1..search_limit {
+                offsets_tested += 1;
+                let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
+                else {
+                    continue;
+                };
+                frames_tested += 1;
+                if frame.masked != expect_masked
+                    || !matches!(frame.opcode, 0x1 | 0x2)
+                    || !frame.fin
+                {
+                    continue;
+                }
+                if !self.frame_payload_plausible_json(&frame) {
+                    continue;
+                }
+                self.buffer.drain(..offset);
+                self.fragmented = None;
+                self.last_decode_error = None;
+                self.inflater.reset(false);
+                return true;
             }
-            if !self.frame_payload_plausible_json(&frame) {
-                continue;
-            }
-            self.buffer.drain(..offset);
-            self.fragmented = None;
-            self.last_decode_error = None;
-            self.inflater.reset(false);
-            return true;
+            false
+        })();
+        let total = started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                buffer_bytes,
+                offsets_tested,
+                frames_tested,
+                found = result,
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow websocket resync"
+            );
         }
-        false
+        result
     }
 
     /// Mid-flight recover must not jump to a header-shaped offset that is only incomplete: those
@@ -1689,6 +1728,7 @@ struct ReassemblyPushProfile {
     resolve_us: u64,
     transport_evidence_us: u64,
     protocol_us: u64,
+    protocol: &'static str,
 }
 
 impl ReassemblyPushProfile {
@@ -1703,6 +1743,7 @@ impl ReassemblyPushProfile {
             resolve_us: 0,
             transport_evidence_us: 0,
             protocol_us: 0,
+            protocol: "entry",
         }
     }
 }
@@ -1728,6 +1769,7 @@ impl Drop for ReassemblyPushProfile {
             resolve_us = self.resolve_us,
             transport_evidence_us = self.transport_evidence_us,
             protocol_us = self.protocol_us,
+            protocol = self.protocol,
             other_us = total_us.saturating_sub(accounted),
             total_us,
             "legacy plaintext slow reassembly breakdown"
@@ -2077,6 +2119,19 @@ impl InteractionReassembler {
                 || (!chunk.data.is_empty() && b"HTTP/".starts_with(&chunk.data))
                 || !state.responses.buffer.is_empty());
         let protocol_started = Instant::now();
+        profile.protocol = if state.http2.active
+            || chunk.data.starts_with(b"PRI * HTTP/2.0")
+            || looks_like_http2_frame_prefix(&chunk.data)
+        {
+            "http2"
+        } else if state.websocket.active && !websocket_upgrade_response {
+            "websocket"
+        } else {
+            match chunk.direction {
+                ChunkDirection::Request => "http1_request",
+                ChunkDirection::Response => "http1_response",
+            }
+        };
         let completed = if state.http2.active
             || chunk.data.starts_with(b"PRI * HTTP/2.0")
             || looks_like_http2_frame_prefix(&chunk.data)
