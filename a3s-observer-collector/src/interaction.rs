@@ -765,6 +765,9 @@ impl HttpStreamDecoder {
         if data.is_empty() {
             return Vec::new();
         }
+        let push_started = Instant::now();
+        let input_bytes = data.len();
+        let buffered_before = self.buffer.len();
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -855,6 +858,18 @@ impl HttpStreamDecoder {
             self.chunked_scan = SseTerminalScanState::default();
             self.json_scan = JsonCompletionScanState::default();
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
+        }
+        let total = push_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                input_bytes,
+                buffered_before,
+                buffered_after = self.buffer.len(),
+                messages = messages.len(),
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow http stream push"
+            );
         }
         messages
     }
@@ -6449,6 +6464,61 @@ fn json_body_may_be_complete(bytes: &[u8], scan: &mut JsonCompletionScanState) -
     scan.complete
 }
 
+struct HttpDecodeProfile {
+    kind: StreamKind,
+    input_bytes: usize,
+    body_bytes: usize,
+    started: Instant,
+    stage: &'static str,
+    head_us: u64,
+    chunked_us: u64,
+    decompress_us: u64,
+    sse_us: u64,
+    json_scan_us: u64,
+    json_parse_us: u64,
+}
+
+impl HttpDecodeProfile {
+    fn new(kind: StreamKind, input_bytes: usize) -> Self {
+        Self {
+            kind,
+            input_bytes,
+            body_bytes: 0,
+            started: Instant::now(),
+            stage: "parse_head",
+            head_us: 0,
+            chunked_us: 0,
+            decompress_us: 0,
+            sse_us: 0,
+            json_scan_us: 0,
+            json_parse_us: 0,
+        }
+    }
+}
+
+impl Drop for HttpDecodeProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total < Duration::from_millis(100) {
+            return;
+        }
+        tracing::warn!(
+            kind = ?self.kind,
+            input_bytes = self.input_bytes,
+            body_bytes = self.body_bytes,
+            stage = self.stage,
+            head_us = self.head_us,
+            chunked_us = self.chunked_us,
+            decompress_us = self.decompress_us,
+            sse_us = self.sse_us,
+            json_scan_us = self.json_scan_us,
+            json_parse_us = self.json_parse_us,
+            total_us = total.as_micros() as u64,
+            "legacy plaintext slow http decode"
+        );
+    }
+}
+
 fn decode_http_message(
     kind: StreamKind,
     bytes: &[u8],
@@ -6457,6 +6527,7 @@ fn decode_http_message(
     chunked_scan: &mut SseTerminalScanState,
     json_scan: &mut JsonCompletionScanState,
 ) -> Result<Option<DecodedHttpMessage>, String> {
+    let mut profile = HttpDecodeProfile::new(kind, bytes.len());
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -6464,10 +6535,15 @@ fn decode_http_message(
         return Err("unsupported_http2".to_string());
     }
 
-    let Some((header_len, start_line, headers, status_code)) = parse_http_head(kind, bytes)? else {
+    let head_started = Instant::now();
+    let parsed_head = parse_http_head(kind, bytes);
+    profile.head_us = head_started.elapsed().as_micros() as u64;
+    let Some((header_len, start_line, headers, status_code)) = parsed_head? else {
+        profile.stage = "head_pending";
         return Ok(None);
     };
 
+    profile.body_bytes = bytes.len().saturating_sub(header_len);
     let body_bytes = &bytes[header_len..];
     let transfer_encoding = headers
         .get("transfer-encoding")
@@ -6491,9 +6567,12 @@ fn decode_http_message(
         .split(',')
         .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
     {
-        let Some((decoded, consumed)) =
-            decode_chunked(body_bytes, max_body_bytes, sse_response, chunked_scan)?
-        else {
+        profile.stage = "chunked";
+        let chunked_started = Instant::now();
+        let chunked = decode_chunked(body_bytes, max_body_bytes, sse_response, chunked_scan);
+        profile.chunked_us = chunked_started.elapsed().as_micros() as u64;
+        let Some((decoded, consumed)) = chunked? else {
+            profile.stage = "chunked_pending";
             return Ok(None);
         };
         (decoded, consumed)
@@ -6502,6 +6581,7 @@ fn decode_http_message(
             return Err("declared_body_limit".to_string());
         }
         if body_bytes.len() < length {
+            profile.stage = "content_length_pending";
             return Ok(None);
         }
         (body_bytes[..length].to_vec(), length)
@@ -6519,6 +6599,8 @@ fn decode_http_message(
         // directly in `body_bytes` can never prove completion. Decode only into a bounded
         // temporary framing view; the returned message still retains the exact compressed bytes
         // as its canonical body/hash. An incomplete compressed stream simply remains pending.
+        profile.stage = "content_encoding";
+        let encoding_started = Instant::now();
         let (framing_body, framing_reason) = decode_content_encoding(
             body_bytes,
             headers
@@ -6527,10 +6609,17 @@ fn decode_http_message(
                 .unwrap_or_default(),
             max_body_bytes,
         );
+        profile.decompress_us = encoding_started.elapsed().as_micros() as u64;
         if framing_reason.is_some() {
+            profile.stage = "content_encoding_pending";
             return Ok(None);
         }
-        let Some(_end) = sse_terminal_offset_incremental(framing_body.as_ref(), sse_scan) else {
+        profile.stage = "sse_terminal";
+        let sse_started = Instant::now();
+        let terminal = sse_terminal_offset_incremental(framing_body.as_ref(), sse_scan);
+        profile.sse_us = sse_started.elapsed().as_micros() as u64;
+        let Some(_end) = terminal else {
+            profile.stage = "sse_terminal_pending";
             return Ok(None);
         };
         // No explicit HTTP framing is available here. Once the decoded stream has a terminal
@@ -6542,9 +6631,23 @@ fn decode_http_message(
             .split(';')
             .next()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-        && json_body_may_be_complete(body_bytes, json_scan)
-        && serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok()
     {
+        profile.stage = "json_scan";
+        let scan_started = Instant::now();
+        let may_be_complete = json_body_may_be_complete(body_bytes, json_scan);
+        profile.json_scan_us = scan_started.elapsed().as_micros() as u64;
+        if !may_be_complete {
+            profile.stage = "json_pending";
+            return Ok(None);
+        }
+        profile.stage = "json_parse";
+        let parse_started = Instant::now();
+        let valid = serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok();
+        profile.json_parse_us = parse_started.elapsed().as_micros() as u64;
+        if !valid {
+            profile.stage = "json_invalid";
+            return Ok(None);
+        }
         // A bounded, self-describing JSON response can delimit itself even when an HTTP/1.1
         // peer omits both Content-Length and chunked framing. Incomplete JSON remains buffered;
         // a complete value is safe to consume without waiting for a socket close event.
@@ -6552,6 +6655,7 @@ fn decode_http_message(
     } else {
         // HTTP/1.x response bodies without framing end on connection close. A TLS fragment cannot
         // prove that boundary, so wait for a close/timeout-aware path instead of guessing.
+        profile.stage = "unframed_pending";
         return Ok(None);
     };
 
@@ -6559,6 +6663,7 @@ fn decode_http_message(
         extend_unique(&mut partial_reasons, ["reassembly_body_limit".to_string()]);
     }
 
+    profile.stage = "complete";
     Ok(Some(DecodedHttpMessage {
         consumed: header_len + body_consumed,
         start_line,
