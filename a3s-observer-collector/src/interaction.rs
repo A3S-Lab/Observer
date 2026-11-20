@@ -623,6 +623,17 @@ impl HttpMessage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct JsonCompletionScanState {
+    offset: usize,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    started: bool,
+    scalar: bool,
+    complete: bool,
+}
+
 #[derive(Debug)]
 struct HttpStreamDecoder {
     kind: StreamKind,
@@ -638,6 +649,9 @@ struct HttpStreamDecoder {
     /// Separate cursors for the de-chunked body inside `decode_chunked`: the de-chunked bytes
     /// and the raw framing bytes are different sequences and must not share resume offsets.
     chunked_scan: SseTerminalScanState,
+    /// Incremental structural scan for unframed JSON responses. Full serde parsing is deferred
+    /// until an object/array root closes instead of reparsing every accumulated prefix.
+    json_scan: JsonCompletionScanState,
 }
 
 impl HttpStreamDecoder {
@@ -652,6 +666,7 @@ impl HttpStreamDecoder {
             last_decode_error: None,
             sse_scan: SseTerminalScanState::default(),
             chunked_scan: SseTerminalScanState::default(),
+            json_scan: JsonCompletionScanState::default(),
         }
     }
 
@@ -726,6 +741,7 @@ impl HttpStreamDecoder {
         self.last_decode_error = None;
         self.sse_scan = SseTerminalScanState::default();
         self.chunked_scan = SseTerminalScanState::default();
+        self.json_scan = JsonCompletionScanState::default();
         Some(HttpMessage {
             start_line,
             headers,
@@ -775,6 +791,7 @@ impl HttpStreamDecoder {
                     // the terminal search for whatever pending message remains.
                     self.sse_scan = SseTerminalScanState::default();
                     self.chunked_scan = SseTerminalScanState::default();
+                    self.json_scan = JsonCompletionScanState::default();
                     self.buffer_started_at_unix_ns =
                         (!self.buffer.is_empty()).then_some(event_at_unix_ns);
                     if self.buffer.is_empty() {
@@ -788,10 +805,17 @@ impl HttpStreamDecoder {
                 buffer,
                 sse_scan,
                 chunked_scan,
+                json_scan,
                 ..
             } = self;
-            let decoded = match decode_http_message(kind, buffer, max_bytes, sse_scan, chunked_scan)
-            {
+            let decoded = match decode_http_message(
+                kind,
+                buffer,
+                max_bytes,
+                sse_scan,
+                chunked_scan,
+                json_scan,
+            ) {
                 Ok(Some(decoded)) => decoded,
                 Ok(None) => break,
                 Err(reason) => {
@@ -829,6 +853,7 @@ impl HttpStreamDecoder {
             // bytes remain start a new pending message from offset zero.
             self.sse_scan = SseTerminalScanState::default();
             self.chunked_scan = SseTerminalScanState::default();
+            self.json_scan = JsonCompletionScanState::default();
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
         }
         messages
@@ -853,6 +878,7 @@ impl HttpStreamDecoder {
         self.last_decode_error = None;
         self.sse_scan = SseTerminalScanState::default();
         self.chunked_scan = SseTerminalScanState::default();
+        self.json_scan = JsonCompletionScanState::default();
         std::mem::take(&mut self.buffer)
     }
 }
@@ -5077,12 +5103,14 @@ fn chunk_identity_probe(
     // One-shot probe over a single chunk: a fresh scan state gives full-body search semantics.
     let mut probe_sse_scan = SseTerminalScanState::default();
     let mut probe_chunked_scan = SseTerminalScanState::default();
+    let mut probe_json_scan = JsonCompletionScanState::default();
     let decoded = decode_http_message(
         kind,
         &chunk.data,
         max_body_bytes,
         &mut probe_sse_scan,
         &mut probe_chunked_scan,
+        &mut probe_json_scan,
     )
     .ok()
     .flatten()?;
@@ -6365,12 +6393,69 @@ fn parse_http_head(kind: StreamKind, bytes: &[u8]) -> Result<Option<HttpHead>, S
     }
 }
 
+fn json_body_may_be_complete(bytes: &[u8], scan: &mut JsonCompletionScanState) -> bool {
+    if scan.complete || scan.scalar {
+        return true;
+    }
+    if scan.offset > bytes.len() {
+        *scan = JsonCompletionScanState::default();
+    }
+    let mut cursor = scan.offset;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if !scan.started {
+            if byte.is_ascii_whitespace() {
+                cursor += 1;
+                continue;
+            }
+            scan.started = true;
+            if !matches!(byte, b'{' | b'[') {
+                // Scalars need the original prefix parser: appending can turn `tru` into `true`
+                // or extend a number, so there is no safe lexical completion shortcut.
+                scan.scalar = true;
+                scan.offset = bytes.len();
+                return true;
+            }
+            scan.depth = 1;
+            cursor += 1;
+            continue;
+        }
+        if scan.in_string {
+            if scan.escaped {
+                scan.escaped = false;
+            } else if byte == b'\\' {
+                scan.escaped = true;
+            } else if byte == b'"' {
+                scan.in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => scan.in_string = true,
+                b'{' | b'[' => scan.depth = scan.depth.saturating_add(1),
+                b'}' | b']' => {
+                    scan.depth = scan.depth.saturating_sub(1);
+                    if scan.depth == 0 {
+                        scan.complete = true;
+                        scan.offset = cursor + 1;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor += 1;
+    }
+    scan.offset = cursor;
+    scan.complete
+}
+
 fn decode_http_message(
     kind: StreamKind,
     bytes: &[u8],
     max_body_bytes: usize,
     sse_scan: &mut SseTerminalScanState,
     chunked_scan: &mut SseTerminalScanState,
+    json_scan: &mut JsonCompletionScanState,
 ) -> Result<Option<DecodedHttpMessage>, String> {
     if bytes.is_empty() {
         return Ok(None);
@@ -6457,6 +6542,7 @@ fn decode_http_message(
             .split(';')
             .next()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        && json_body_may_be_complete(body_bytes, json_scan)
         && serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok()
     {
         // A bounded, self-describing JSON response can delimit itself even when an HTTP/1.1
@@ -9730,6 +9816,59 @@ mod tests {
                 cursors_before_error
             );
         }
+    }
+
+    #[test]
+    fn json_completion_scan_never_rejects_valid_json_prefixes() {
+        let bodies: &[&[u8]] = &[
+            br#"{"items":[{"text":"braces } ] and quote \" and slash \\","nested":{"x":[1,2]}}]}"#,
+            br#"[{"text":"["},{"text":"}]"},true,null]"#,
+            br#" {"x":"escaped \\\" quote"} "#,
+            b" true ",
+        ];
+        for body in bodies {
+            let mut scan = JsonCompletionScanState::default();
+            for end in 1..=body.len() {
+                let prefix = &body[..end];
+                let may_be_complete = json_body_may_be_complete(prefix, &mut scan);
+                if serde_json::from_slice::<Value>(prefix).is_ok() {
+                    assert!(
+                        may_be_complete,
+                        "valid prefix was rejected at byte {end} of {body:?}"
+                    );
+                }
+                if !scan.complete && !scan.scalar {
+                    assert_eq!(scan.offset, end, "scan must resume after new bytes");
+                }
+            }
+            assert!(json_body_may_be_complete(body, &mut scan));
+        }
+    }
+
+    #[test]
+    fn unframed_large_json_completes_once_after_incremental_prefix_scans() {
+        let body = serde_json::to_string(&serde_json::json!({
+            "id": "resp-bench",
+            "items": (0..16384).map(|index| serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "text": "abcdefghijklmnopqrstuvwxyz0123456789"
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let header = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n";
+        let wire = [header.as_slice(), body.as_bytes()].concat();
+        let mut decoder = HttpStreamDecoder::new(StreamKind::Response, 8 * 1024 * 1024);
+        let split = wire.len() - 1;
+        for part in wire[..split].chunks(4096) {
+            assert!(decoder.push(part, 100, &[]).is_empty());
+        }
+        assert!(!decoder.json_scan.complete);
+        assert_eq!(decoder.json_scan.offset, split - header.len());
+        let completed = decoder.push(&wire[split..], 110, &[]);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].body, body.as_bytes());
+        assert_eq!(decoder.json_scan, JsonCompletionScanState::default());
     }
 
     #[test]
