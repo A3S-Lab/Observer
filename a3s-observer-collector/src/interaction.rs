@@ -1679,6 +1679,62 @@ impl ConnectionState {
     }
 }
 
+struct ReassemblyPushProfile {
+    pid: u32,
+    direction: ChunkDirection,
+    input_bytes: usize,
+    connections: usize,
+    started: Instant,
+    evict_us: u64,
+    resolve_us: u64,
+    transport_evidence_us: u64,
+    protocol_us: u64,
+}
+
+impl ReassemblyPushProfile {
+    fn new(chunk: &PlaintextChunk, connections: usize) -> Self {
+        Self {
+            pid: chunk.pid,
+            direction: chunk.direction,
+            input_bytes: chunk.data.len(),
+            connections,
+            started: Instant::now(),
+            evict_us: 0,
+            resolve_us: 0,
+            transport_evidence_us: 0,
+            protocol_us: 0,
+        }
+    }
+}
+
+impl Drop for ReassemblyPushProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total < Duration::from_millis(100) {
+            return;
+        }
+        let total_us = total.as_micros() as u64;
+        let accounted = self
+            .evict_us
+            .saturating_add(self.resolve_us)
+            .saturating_add(self.transport_evidence_us)
+            .saturating_add(self.protocol_us);
+        tracing::warn!(
+            pid = self.pid,
+            direction = ?self.direction,
+            input_bytes = self.input_bytes,
+            connections = self.connections,
+            evict_us = self.evict_us,
+            resolve_us = self.resolve_us,
+            transport_evidence_us = self.transport_evidence_us,
+            protocol_us = self.protocol_us,
+            other_us = total_us.saturating_sub(accounted),
+            total_us,
+            "legacy plaintext slow reassembly breakdown"
+        );
+    }
+}
+
 /// Single-writer, bounded reassembler. The Collector owns one instance and feeds reordered
 /// plaintext fragments into it, so no lock is needed on the protocol path.
 #[derive(Debug)]
@@ -1818,7 +1874,10 @@ impl InteractionReassembler {
     }
 
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
+        let mut profile = ReassemblyPushProfile::new(&chunk, self.connections.len());
+        let evict_started = Instant::now();
         self.evict_if_needed();
+        profile.evict_us = evict_started.elapsed().as_micros() as u64;
         let observed_key = ConnectionKey::from(&chunk);
         let orphan_control_frame = is_websocket_control_frame(&chunk.data)
             && !self.connections.contains_key(&observed_key)
@@ -1838,7 +1897,9 @@ impl InteractionReassembler {
             self.metrics.resp_chatter_dropped = self.metrics.resp_chatter_dropped.saturating_add(1);
             return Vec::new();
         }
+        let resolve_started = Instant::now();
         let (key, binding_gap) = self.resolve_connection_key(&chunk);
+        profile.resolve_us = resolve_started.elapsed().as_micros() as u64;
         if let Some(reason) = binding_gap.as_ref() {
             if *reason == "ambiguous_stream_binding" {
                 self.metrics.ambiguous_stream_bindings =
@@ -1935,7 +1996,10 @@ impl InteractionReassembler {
                 ["websocket_handshake_recovered".to_string()],
             );
         }
-        if let Some(evidence) = plaintext_transport_evidence(key, state, &chunk) {
+        let transport_started = Instant::now();
+        let transport_evidence = plaintext_transport_evidence(key, state, &chunk);
+        profile.transport_evidence_us = transport_started.elapsed().as_micros() as u64;
+        if let Some(evidence) = transport_evidence {
             if self.pending_evidence.len() >= self.max_connections {
                 self.pending_evidence.pop_front();
                 self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
@@ -2012,6 +2076,7 @@ impl InteractionReassembler {
             && (chunk.data.starts_with(b"HTTP/")
                 || (!chunk.data.is_empty() && b"HTTP/".starts_with(&chunk.data))
                 || !state.responses.buffer.is_empty());
+        let protocol_started = Instant::now();
         let completed = if state.http2.active
             || chunk.data.starts_with(b"PRI * HTTP/2.0")
             || looks_like_http2_frame_prefix(&chunk.data)
@@ -2359,6 +2424,7 @@ impl InteractionReassembler {
                 }
             }
         };
+        profile.protocol_us = protocol_started.elapsed().as_micros() as u64;
         let pending_request_limit_hit = state.pending_request_limit_hit;
         state.pending_request_limit_hit = false;
         if pending_request_limit_hit {
@@ -5215,6 +5281,28 @@ fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
     }
 }
 
+struct InteractionBuildProfile {
+    pid: u32,
+    request_bytes: usize,
+    response_bytes: usize,
+    started: Instant,
+}
+
+impl Drop for InteractionBuildProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                pid = self.pid,
+                request_bytes = self.request_bytes,
+                response_bytes = self.response_bytes,
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow interaction build"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_interaction(
     key: ConnectionKey,
@@ -5228,6 +5316,12 @@ fn build_interaction(
     socket_cookie: u64,
     fd_generation: u32,
 ) -> Option<CompletedInteraction> {
+    let _profile = InteractionBuildProfile {
+        pid: key.pid,
+        request_bytes: request.body.len(),
+        response_bytes: response.body.len(),
+        started: Instant::now(),
+    };
     let (method, path) = request_line(&request.start_line)?;
     let endpoint = request.endpoint();
     let status_code = response_status(&response.start_line).unwrap_or_default();
