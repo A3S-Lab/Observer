@@ -39,7 +39,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -75,7 +75,6 @@ static PLAINTEXT_INTERACTION_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_WORKER_PENDING: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_WORKER_PROCESSED: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_WORKER_COMPLETED: AtomicU64 = AtomicU64::new(0);
-static PLAINTEXT_WORKER_OUTPUT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 // R3 截断补读计数器：拼接成功/字节数与四类拒绝，60s 心跳周期随 report tick 输出。
 static CURSOR_PATCHED: AtomicU64 = AtomicU64::new(0);
@@ -255,7 +254,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let ring_pages = perf_ring_pages();
     let (tx, mut rx) = mpsc::channel(4096);
     let (plaintext_tx, plaintext_rx) = mpsc::channel(16_384);
-    let (completed_tx, mut completed_rx) = mpsc::channel(1_024);
+    let plaintext_stats = Arc::new(Mutex::new(Stats::default()));
     let perf_lost = Arc::new(PerfLostCounters::default());
     spawn_perf(
         &mut ebpf,
@@ -318,10 +317,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let drops: PerCpuArray<_, u64> =
         PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
 
-    let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
-        Box::new(JsonExporter::new())
+    let exporter: Arc<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
+        Arc::new(JsonExporter::new())
     } else {
-        Box::new(LogExporter)
+        Arc::new(LogExporter)
     };
     let resolver = KubeResolver;
     let mut collector = CollectorMeta::from_env(
@@ -358,17 +357,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .enabled_features
             .push("cursor-reread".to_string());
     }
-    let classifier = SniClassifier;
-    let mut plaintext_scope =
+
+        let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
     if plaintext_http {
         tokio::spawn(run_plaintext_worker(
             plaintext_rx,
-            completed_tx,
+            exporter.clone(),
             cursor_rereader,
+            plaintext_stats.clone(),
         ));
     }
-    let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
     plaintext_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     plaintext_tick.tick().await;
@@ -428,11 +427,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
                 let dropped = map_drops + perf_lost.total();
                 if plaintext_http {
+                    merge_plaintext_stats(&mut stats, &plaintext_stats);
                     tracing::info!(
                         pending = PLAINTEXT_WORKER_PENDING.load(Ordering::Relaxed),
                         processed = PLAINTEXT_WORKER_PROCESSED.load(Ordering::Relaxed),
                         completed = PLAINTEXT_WORKER_COMPLETED.load(Ordering::Relaxed),
-                        output_failures = PLAINTEXT_WORKER_OUTPUT_FAILURES.load(Ordering::Relaxed),
                         "legacy plaintext worker cumulative stats"
                     );
                 }
@@ -445,16 +444,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     Some(perf_lost.snapshot()),
                     file_filter.as_ref(),
                 );
-                if suppressed_shells > 0 {
-                    // Unparsed interactions with zero request/response payload are noise (idle
-                    // expiries, non-HTTP streams). They are counted here instead of occupying
-                    // interaction rows the conversation view cannot render anyway.
-                    tracing::info!(
-                        suppressed = suppressed_shells,
-                        "legacy plaintext empty-shell interactions demoted to metrics"
-                    );
-                    suppressed_shells = 0;
-                }
                 {
                     // R3 截断补读 60s 窗口统计：拼接成功/字节与四类拒绝（默认关时恒零不输出）。
                     let patched = CURSOR_PATCHED.swap(0, Ordering::Relaxed);
@@ -520,17 +509,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         manager.ensure_attached(&mut ebpf, &pids);
                     }
                 }
-            }
-            Some(output) = completed_rx.recv(), if plaintext_http => {
-                emit_plaintext_interactions(
-                    exporter.as_ref(),
-                    &mut stats,
-                    &resolver,
-                    &classifier,
-                    output.comm,
-                    output.completed,
-                    &mut suppressed_shells,
-                );
             }
             raw = rx.recv() => {
                 let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
@@ -1164,6 +1142,29 @@ fn cursor_patch_and_log(
     }
 }
 
+fn merge_plaintext_stats(target: &mut Stats, shared: &Arc<Mutex<Stats>>) {
+    let source = {
+        let mut guard = shared.lock().unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    macro_rules! merge_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(target.$field = target.$field.saturating_add(source.$field);)+
+        };
+    }
+    merge_fields!(
+        exec, exec_truncated, exec_incomplete, exec_reassembly_timeout,
+        exit, egress, dns, file, file_access, file_delete, llm, ssl, sec,
+        agent_identity_drops,
+    );
+    for (target, source) in target.pipeline.iter_mut().zip(source.pipeline.iter()) {
+        target.logical_events = target.logical_events.saturating_add(source.logical_events);
+        target.queue_admitted = target.queue_admitted.saturating_add(source.queue_admitted);
+        target.queue_dropped = target.queue_dropped.saturating_add(source.queue_dropped);
+    }
+    target.agents.extend(source.agents);
+}
+
 #[derive(Debug)]
 struct CompletedPlaintextBatch {
     completed: Vec<super::interaction::CompletedInteraction>,
@@ -1306,18 +1307,25 @@ fn process_plaintext_worker_event(
 
 async fn run_plaintext_worker(
     mut rx: mpsc::Receiver<RawEvent>,
-    completed_tx: mpsc::Sender<CompletedPlaintextBatch>,
+    exporter: Arc<dyn Exporter>,
     cursor_rereader: Option<CursorRereader>,
+    shared_stats: Arc<Mutex<Stats>>,
 ) {
     let mut reassembler = InteractionReassembler::with_idle_lanes(
         InteractionReassembler::reassembly_idle_timeout(),
         InteractionReassembler::inflight_idle_timeout(),
     );
+    let resolver = KubeResolver;
+    let classifier = SniClassifier;
     let mut sequencer = PlaintextSequencer::default();
     let mut fragment_dedup = FragmentDedup::default();
+    let mut suppressed_shells = 0u64;
     let mut idle_tick = tokio::time::interval(Duration::from_secs(2));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     idle_tick.tick().await;
+    let mut report_tick = tokio::time::interval(Duration::from_secs(60));
+    report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    report_tick.tick().await;
     loop {
         tokio::select! {
             raw = rx.recv() => {
@@ -1339,10 +1347,16 @@ async fn run_plaintext_worker(
                         cursor_rereader.as_ref(),
                     );
                     if let Some(output) = output {
-                        if completed_tx.send(output).await.is_err() {
-                            PLAINTEXT_WORKER_OUTPUT_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
+                        let mut stats = shared_stats.lock().unwrap_or_else(|error| error.into_inner());
+                        emit_plaintext_interactions(
+                            exporter.as_ref(),
+                            &mut stats,
+                            &resolver,
+                            &classifier,
+                            output.comm,
+                            output.completed,
+                            &mut suppressed_shells,
+                        );
                     }
                 }
             }
@@ -1359,10 +1373,25 @@ async fn run_plaintext_worker(
                         completed,
                         comm: [0u8; 16],
                     };
-                    if completed_tx.send(output).await.is_err() {
-                        PLAINTEXT_WORKER_OUTPUT_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+                    let mut stats = shared_stats.lock().unwrap_or_else(|error| error.into_inner());
+                    emit_plaintext_interactions(
+                        exporter.as_ref(),
+                        &mut stats,
+                        &resolver,
+                        &classifier,
+                        output.comm,
+                        output.completed,
+                        &mut suppressed_shells,
+                    );
+                }
+            }
+            _ = report_tick.tick() => {
+                if suppressed_shells > 0 {
+                    tracing::info!(
+                        suppressed = suppressed_shells,
+                        "legacy plaintext empty-shell interactions demoted to metrics"
+                    );
+                    suppressed_shells = 0;
                 }
             }
         }
@@ -2164,6 +2193,14 @@ fn legacy_enriched(
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<EnrichedEvent>>>);
+    impl Exporter for Sink {
+        fn export(&self, event: &EnrichedEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
     fn plaintext_event(direction: u32, len: u32, orig_len: u32) -> LegacyPlaintextEvent {
         let mut event = LegacyPlaintextEvent {
             pid: 4242,
@@ -2553,8 +2590,15 @@ mod tests {
         let mut full = head.into_bytes();
         full.extend_from_slice(body.as_bytes());
         let (tx, rx) = mpsc::channel(32);
-        let (completed_tx, mut completed_rx) = mpsc::channel(8);
-        tokio::spawn(run_plaintext_worker(rx, completed_tx, None));
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let exporter: Arc<dyn Exporter> = Arc::new(sink.clone());
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let worker = tokio::spawn(run_plaintext_worker(
+            rx,
+            exporter,
+            None,
+            stats,
+        ));
         for (index, part) in full.chunks(LEGACY_PLAINTEXT_LEN).enumerate() {
             let start = index * LEGACY_PLAINTEXT_LEN;
             let mut event = plaintext_event(0, part.len() as u32, (full.len() - start) as u32);
@@ -2573,21 +2617,30 @@ mod tests {
         );
         response_event.data[..response.len()].copy_from_slice(response.as_bytes());
         tx.send(RawEvent::Plaintext(Box::new(response_event), None)).await.unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), worker)
             .await
             .expect("worker output timeout")
-            .expect("worker channel closed");
-        assert_eq!(output.completed.len(), 1);
-        assert_eq!(output.completed[0].path, "/ctct-guard/v1/chat/completions");
-        assert_eq!(output.completed[0].parse_state, "parsed");
-        drop(tx);
+            .expect("worker task failed");
+        let events = sink.0.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::LlmInteraction(_)
+        )));
     }
 
     #[tokio::test]
     async fn plaintext_worker_keeps_interleaved_connections_isolated_across_batches() {
         let (tx, rx) = mpsc::channel(4_096);
-        let (completed_tx, mut completed_rx) = mpsc::channel(1_024);
-        tokio::spawn(run_plaintext_worker(rx, completed_tx, None));
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let exporter: Arc<dyn Exporter> = Arc::new(sink.clone());
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let worker = tokio::spawn(run_plaintext_worker(
+            rx,
+            exporter,
+            None,
+            stats,
+        ));
         let connections = 32u32;
         let per_connection = 25u32;
         for turn in 0..per_connection {
@@ -2624,17 +2677,35 @@ mod tests {
             }
         }
         drop(tx);
-        let mut outputs = Vec::new();
-        for _ in 0..connections * per_connection {
-            let output = tokio::time::timeout(Duration::from_secs(5), completed_rx.recv())
-                .await
-                .expect("worker output timeout")
-                .expect("worker channel closed");
-            outputs.extend(output.completed);
-        }
-        assert_eq!(outputs.len(), (connections * per_connection) as usize);
-        assert!(outputs.iter().all(|item| item.parse_state == "parsed"));
-        assert!(outputs.iter().all(|item| item.path == "/ctct-guard/v1/chat/completions"));
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("worker output timeout")
+            .expect("worker task failed");
+        let events = sink.0.lock().unwrap();
+        let outputs = events.iter().filter(|event| matches!(
+            &event.event,
+            AgentEvent::LlmInteraction(_)
+        )).count();
+        assert_eq!(outputs, (connections * per_connection) as usize);
+    }
+
+    #[test]
+    fn plaintext_stats_merge_preserves_counts_and_drains_worker_window() {
+        let shared = Arc::new(Mutex::new(Stats {
+            llm: 3,
+            ..Stats::default()
+        }));
+        shared.lock().unwrap().agents.insert("agent-a".to_string());
+        let mut target = Stats {
+            llm: 2,
+            ..Stats::default()
+        };
+        merge_plaintext_stats(&mut target, &shared);
+        assert_eq!(target.llm, 5);
+        assert!(target.agents.contains("agent-a"));
+        let drained = shared.lock().unwrap();
+        assert_eq!(drained.llm, 0);
+        assert!(drained.agents.is_empty());
     }
 
     #[test]
