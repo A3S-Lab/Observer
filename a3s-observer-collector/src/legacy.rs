@@ -72,6 +72,10 @@ enum RawEvent {
 static PLAINTEXT_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_TLS_CHUNK_SEEN: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_INTERACTION_SEEN: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_WORKER_PENDING: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_WORKER_PROCESSED: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_WORKER_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PLAINTEXT_WORKER_OUTPUT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 // R3 截断补读计数器：拼接成功/字节数与四类拒绝，60s 心跳周期随 report tick 输出。
 static CURSOR_PATCHED: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +167,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         for (program, symbols) in [
             ("legacy_http_write", [sys_sym!("write")].as_slice()),
             ("legacy_http_sendto", [sys_sym!("sendto")].as_slice()),
+            ("legacy_http_writev", [sys_sym!("writev")].as_slice()),
+            ("legacy_http_sendmsg", [sys_sym!("sendmsg")].as_slice()),
             ("legacy_http_read_enter", [sys_sym!("read")].as_slice()),
             (
                 "legacy_http_recvfrom_enter",
@@ -248,6 +254,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let ring_pages = perf_ring_pages();
     let (tx, mut rx) = mpsc::channel(4096);
+    let (plaintext_tx, plaintext_rx) = mpsc::channel(16_384);
+    let (completed_tx, mut completed_rx) = mpsc::channel(1_024);
     let perf_lost = Arc::new(PerfLostCounters::default());
     spawn_perf(
         &mut ebpf,
@@ -285,7 +293,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         spawn_plaintext_perf(
             &mut ebpf,
             "PLAINTEXT_EVENTS",
-            tx.clone(),
+            plaintext_tx.clone(),
             perf_lost.clone(),
             ring_pages,
         )?;
@@ -294,7 +302,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         spawn_tls_plaintext_perf(
             &mut ebpf,
             "PLAINTEXT_TLS_EVENTS",
-            tx.clone(),
+            plaintext_tx.clone(),
             perf_lost.clone(),
             ring_pages,
         )?;
@@ -353,14 +361,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let classifier = SniClassifier;
     let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
-    let mut interactions = plaintext_http.then(|| {
-        InteractionReassembler::with_idle_lanes(
-            InteractionReassembler::reassembly_idle_timeout(),
-            InteractionReassembler::inflight_idle_timeout(),
-        )
-    });
-    let mut sequencer = PlaintextSequencer::default();
-    let mut fragment_dedup = FragmentDedup::default();
+    if plaintext_http {
+        tokio::spawn(run_plaintext_worker(
+            plaintext_rx,
+            completed_tx,
+            cursor_rereader,
+        ));
+    }
     let mut suppressed_shells = 0u64;
     let mut plaintext_tick = tokio::time::interval(Duration::from_secs(2));
     plaintext_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -420,6 +427,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let _ = std::fs::write(&heartbeat_path, b"ok");
                 let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
                 let dropped = map_drops + perf_lost.total();
+                if plaintext_http {
+                    tracing::info!(
+                        pending = PLAINTEXT_WORKER_PENDING.load(Ordering::Relaxed),
+                        processed = PLAINTEXT_WORKER_PROCESSED.load(Ordering::Relaxed),
+                        completed = PLAINTEXT_WORKER_COMPLETED.load(Ordering::Relaxed),
+                        output_failures = PLAINTEXT_WORKER_OUTPUT_FAILURES.load(Ordering::Relaxed),
+                        "legacy plaintext worker cumulative stats"
+                    );
+                }
                 emit_legacy_heartbeat(
                     exporter.as_ref(),
                     &collector,
@@ -504,156 +520,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         manager.ensure_attached(&mut ebpf, &pids);
                     }
                 }
-                if let Some(reassembler) = interactions.as_mut() {
-                    fragment_dedup.expire_idle(
-                        boot_now_ns(),
-                        InteractionReassembler::reassembly_idle_timeout(),
-                    );
-                    reassembler.expire_idle(Instant::now());
-                    let retired = reassembler.take_completed();
-                    emit_plaintext_interactions(
-                        exporter.as_ref(),
-                        &mut stats,
-                        &resolver,
-                        &classifier,
-                        [0u8; 16],
-                        retired,
-                        &mut suppressed_shells,
-                    );
-                }
+            }
+            Some(output) = completed_rx.recv(), if plaintext_http => {
+                emit_plaintext_interactions(
+                    exporter.as_ref(),
+                    &mut stats,
+                    &resolver,
+                    &classifier,
+                    output.comm,
+                    output.completed,
+                    &mut suppressed_shells,
+                );
             }
             raw = rx.recv() => {
                 let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
                 match raw {
-                    RawEvent::Plaintext(ev, cursor) => {
-                        let seen = PLAINTEXT_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-                        if seen <= 50 || seen.is_multiple_of(500) {
-                            let take = (ev.len as usize).min(32).min(ev.data.len());
-                            let preview: String = ev.data[..take]
-                                .iter()
-                                .map(|b| {
-                                    if b.is_ascii_graphic() || *b == b' ' {
-                                        *b as char
-                                    } else {
-                                        '.'
-                                    }
-                                })
-                                .collect();
-                            tracing::info!(
-                                seen,
-                                pid = ev.pid,
-                                fd = ev.fd,
-                                direction = ev.direction,
-                                len = ev.len,
-                                orig_len = ev.orig_len,
-                                read_rc1 = ev._pad & 0xffff,
-                                read_rc2 = (ev._pad >> 16) & 0xffff,
-                                preview = %preview,
-                                "legacy plaintext chunk received"
-                            );
-                        }
-                        if let Some(reassembler) = interactions.as_mut() {
-                            let mut chunk = plaintext_chunk_from_event(
-                                &ev,
-                                safe_unix_now_ns(),
-                                &mut sequencer,
-                            );
-                            let duplicate = suppress_duplicate_fragment(
-                                &mut fragment_dedup,
-                                &mut sequencer,
-                                &chunk,
-                                ev.orig_len,
-                                ev.captured_at_boot_ns,
-                                ev.fd,
-                                ev.fd_generation,
-                            );
-                            let completed = if duplicate {
-                                Vec::new()
-                            } else if cursor_patch_and_log(
-                                cursor_rereader.as_ref(),
-                                cursor,
-                                &mut chunk,
-                                ev.captured_at_boot_ns,
-                            ) {
-                                reassembler.push(chunk)
-                            } else {
-                                Vec::new()
-                            };
-                            emit_plaintext_interactions(
-                                exporter.as_ref(),
-                                &mut stats,
-                                &resolver,
-                                &classifier,
-                                ev.comm,
-                                completed,
-                                &mut suppressed_shells,
-                            );
-                        }
-                    }
-                    RawEvent::PlaintextTls(ev, cursor) => {
-                        let seen = PLAINTEXT_TLS_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-                        if seen <= 50 || seen.is_multiple_of(500) {
-                            let take = (ev.len as usize).min(32).min(ev.data.len());
-                            let preview: String = ev.data[..take]
-                                .iter()
-                                .map(|b| {
-                                    if b.is_ascii_graphic() || *b == b' ' {
-                                        *b as char
-                                    } else {
-                                        '.'
-                                    }
-                                })
-                                .collect();
-                            tracing::info!(
-                                seen,
-                                pid = ev.pid,
-                                tls_ctx = ev.tls_ctx,
-                                connection_id = ev.tls_ctx ^ 0x5353_6c73_0000_0000,
-                                captured_at_boot_ns = ev.captured_at_boot_ns,
-                                direction = ev.direction,
-                                len = ev.len,
-                                orig_len = ev.orig_len,
-                                preview = %preview,
-                                "legacy tls plaintext chunk received"
-                            );
-                        }
-                        if let Some(reassembler) = interactions.as_mut() {
-                            let mut chunk = tls_plaintext_chunk_from_event(
-                                &ev,
-                                safe_unix_now_ns(),
-                                &mut sequencer,
-                            );
-                            let duplicate = suppress_duplicate_fragment(
-                                &mut fragment_dedup,
-                                &mut sequencer,
-                                &chunk,
-                                ev.orig_len,
-                                ev.captured_at_boot_ns,
-                                ev.tls_ctx as u32,
-                                (ev.tls_ctx >> 32) as u32,
-                            );
-                            let completed = if duplicate {
-                                Vec::new()
-                            } else if cursor_patch_and_log(
-                                cursor_rereader.as_ref(),
-                                cursor,
-                                &mut chunk,
-                                ev.captured_at_boot_ns,
-                            ) {
-                                reassembler.push(chunk)
-                            } else {
-                                Vec::new()
-                            };
-                            emit_plaintext_interactions(
-                                exporter.as_ref(),
-                                &mut stats,
-                                &resolver,
-                                &classifier,
-                                ev.comm,
-                                completed,
-                                &mut suppressed_shells,
-                            );
-                        }
+                    RawEvent::Plaintext(..) | RawEvent::PlaintextTls(..) => {
+                        anyhow::bail!("plaintext event bypassed its dedicated worker")
                     }
                     other => handle_raw(exporter.as_ref(), &resolver, &mut stats, other),
                 }
@@ -752,7 +635,7 @@ impl CursorRereader {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(500)
-            .clamp(1, 10_000);
+            .clamp(1, 30_000);
         Some(Self {
             max_bytes: max_kb * 1_024,
             ttl_ns: ttl_ms * 1_000_000,
@@ -1281,6 +1164,211 @@ fn cursor_patch_and_log(
     }
 }
 
+#[derive(Debug)]
+struct CompletedPlaintextBatch {
+    completed: Vec<super::interaction::CompletedInteraction>,
+    comm: [u8; 16],
+}
+
+fn process_plaintext_worker_event(
+    raw: RawEvent,
+    reassembler: &mut InteractionReassembler,
+    sequencer: &mut PlaintextSequencer,
+    fragment_dedup: &mut FragmentDedup,
+    cursor_rereader: Option<&CursorRereader>,
+) -> Option<CompletedPlaintextBatch> {
+    let _ = PLAINTEXT_WORKER_PENDING.try_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |value| Some(value.saturating_sub(1)),
+    );
+    PLAINTEXT_WORKER_PROCESSED.fetch_add(1, Ordering::Relaxed);
+    let (completed, comm) = match raw {
+        RawEvent::Plaintext(ev, cursor) => {
+            let seen = PLAINTEXT_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen <= 50 || seen.is_multiple_of(500) {
+                let take = (ev.len as usize).min(32).min(ev.data.len());
+                let preview: String = ev.data[..take]
+                    .iter()
+                    .map(|b| {
+                        if b.is_ascii_graphic() || *b == b' ' {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                tracing::info!(
+                    seen,
+                    pid = ev.pid,
+                    fd = ev.fd,
+                    direction = ev.direction,
+                    len = ev.len,
+                    orig_len = ev.orig_len,
+                    read_rc1 = ev._pad & 0xffff,
+                    read_rc2 = (ev._pad >> 16) & 0xffff,
+                    preview = %preview,
+                    "legacy plaintext chunk received"
+                );
+            }
+            let mut chunk = plaintext_chunk_from_event(
+                &ev,
+                safe_unix_now_ns(),
+                sequencer,
+            );
+            let duplicate = suppress_duplicate_fragment(
+                fragment_dedup,
+                sequencer,
+                &chunk,
+                ev.orig_len,
+                ev.captured_at_boot_ns,
+                ev.fd,
+                ev.fd_generation,
+            );
+            let completed = if duplicate {
+                Vec::new()
+            } else if cursor_patch_and_log(
+                cursor_rereader,
+                cursor,
+                &mut chunk,
+                ev.captured_at_boot_ns,
+            ) {
+                reassembler.push(chunk)
+            } else {
+                Vec::new()
+            };
+            (completed, ev.comm)
+        }
+        RawEvent::PlaintextTls(ev, cursor) => {
+            let seen = PLAINTEXT_TLS_CHUNK_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen <= 50 || seen.is_multiple_of(500) {
+                let take = (ev.len as usize).min(32).min(ev.data.len());
+                let preview: String = ev.data[..take]
+                    .iter()
+                    .map(|b| {
+                        if b.is_ascii_graphic() || *b == b' ' {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                tracing::info!(
+                    seen,
+                    pid = ev.pid,
+                    tls_ctx = ev.tls_ctx,
+                    connection_id = ev.tls_ctx ^ 0x5353_6c73_0000_0000,
+                    captured_at_boot_ns = ev.captured_at_boot_ns,
+                    direction = ev.direction,
+                    len = ev.len,
+                    orig_len = ev.orig_len,
+                    preview = %preview,
+                    "legacy tls plaintext chunk received"
+                );
+            }
+            let mut chunk = tls_plaintext_chunk_from_event(
+                &ev,
+                safe_unix_now_ns(),
+                sequencer,
+            );
+            let duplicate = suppress_duplicate_fragment(
+                fragment_dedup,
+                sequencer,
+                &chunk,
+                ev.orig_len,
+                ev.captured_at_boot_ns,
+                ev.tls_ctx as u32,
+                (ev.tls_ctx >> 32) as u32,
+            );
+            let completed = if duplicate {
+                Vec::new()
+            } else if cursor_patch_and_log(
+                cursor_rereader,
+                cursor,
+                &mut chunk,
+                ev.captured_at_boot_ns,
+            ) {
+                reassembler.push(chunk)
+            } else {
+                Vec::new()
+            };
+            (completed, ev.comm)
+        }
+        _ => return None,
+    };
+    if completed.is_empty() {
+        None
+    } else {
+        PLAINTEXT_WORKER_COMPLETED.fetch_add(completed.len() as u64, Ordering::Relaxed);
+        Some(CompletedPlaintextBatch { completed, comm })
+    }
+}
+
+async fn run_plaintext_worker(
+    mut rx: mpsc::Receiver<RawEvent>,
+    completed_tx: mpsc::Sender<CompletedPlaintextBatch>,
+    cursor_rereader: Option<CursorRereader>,
+) {
+    let mut reassembler = InteractionReassembler::with_idle_lanes(
+        InteractionReassembler::reassembly_idle_timeout(),
+        InteractionReassembler::inflight_idle_timeout(),
+    );
+    let mut sequencer = PlaintextSequencer::default();
+    let mut fragment_dedup = FragmentDedup::default();
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(2));
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    idle_tick.tick().await;
+    loop {
+        tokio::select! {
+            raw = rx.recv() => {
+                let Some(raw) = raw else { break; };
+                let mut batch = Vec::with_capacity(256);
+                batch.push(raw);
+                for _ in 1..256 {
+                    match rx.try_recv() {
+                        Ok(raw) => batch.push(raw),
+                        Err(_) => break,
+                    }
+                }
+                for raw in batch {
+                    let output = process_plaintext_worker_event(
+                        raw,
+                        &mut reassembler,
+                        &mut sequencer,
+                        &mut fragment_dedup,
+                        cursor_rereader.as_ref(),
+                    );
+                    if let Some(output) = output {
+                        if completed_tx.send(output).await.is_err() {
+                            PLAINTEXT_WORKER_OUTPUT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            }
+            _ = idle_tick.tick() => {
+                fragment_dedup.expire_idle(
+                    boot_now_ns(),
+                    InteractionReassembler::reassembly_idle_timeout(),
+                );
+                reassembler.expire_idle(Instant::now());
+                let completed = reassembler.take_completed();
+                if !completed.is_empty() {
+                    PLAINTEXT_WORKER_COMPLETED.fetch_add(completed.len() as u64, Ordering::Relaxed);
+                    let output = CompletedPlaintextBatch {
+                        completed,
+                        comm: [0u8; 16],
+                    };
+                    if completed_tx.send(output).await.is_err() {
+                        PLAINTEXT_WORKER_OUTPUT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn emit_plaintext_interactions(
     exporter: &dyn Exporter,
     stats: &mut Stats,
@@ -1725,11 +1813,13 @@ fn spawn_plaintext_perf(
                             size_of::<LegacyPlaintextEvent>() - LEGACY_PLAINTEXT_LEN,
                             event.len as usize,
                         );
+                        PLAINTEXT_WORKER_PENDING.fetch_add(1, Ordering::Relaxed);
                         if tx
                             .send(RawEvent::Plaintext(Box::new(event), cursor))
                             .await
                             .is_err()
                         {
+                            PLAINTEXT_WORKER_PENDING.fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                     }
@@ -1808,11 +1898,13 @@ fn spawn_tls_plaintext_perf(
                             size_of::<LegacyTlsPlaintextEvent>() - LEGACY_PLAINTEXT_LEN,
                             event.len as usize,
                         );
+                        PLAINTEXT_WORKER_PENDING.fetch_add(1, Ordering::Relaxed);
                         if tx
                             .send(RawEvent::PlaintextTls(Box::new(event), cursor))
                             .await
                             .is_err()
                         {
+                            PLAINTEXT_WORKER_PENDING.fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                     }
@@ -2449,6 +2541,110 @@ mod tests {
             .partial_reasons
             .iter()
             .any(|reason| reason == "reassembly_idle_expire_incomplete"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_worker_preserves_order_and_returns_completed_interaction() {
+        let body = repetitive_json_body(20_000);
+        let head = format!(
+            "POST /ctct-guard/v1/chat/completions HTTP/1.1\r\nHost: guard\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len(),
+        );
+        let mut full = head.into_bytes();
+        full.extend_from_slice(body.as_bytes());
+        let (tx, rx) = mpsc::channel(32);
+        let (completed_tx, mut completed_rx) = mpsc::channel(8);
+        tokio::spawn(run_plaintext_worker(rx, completed_tx, None));
+        for (index, part) in full.chunks(LEGACY_PLAINTEXT_LEN).enumerate() {
+            let start = index * LEGACY_PLAINTEXT_LEN;
+            let mut event = plaintext_event(0, part.len() as u32, (full.len() - start) as u32);
+            event.data[..part.len()].copy_from_slice(part);
+            tx.send(RawEvent::Plaintext(Box::new(event), None)).await.unwrap();
+        }
+        let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(), response_body,
+        );
+        let mut response_event = plaintext_event(
+            LEGACY_PLAINTEXT_DIRECTION_READ,
+            response.len() as u32,
+            response.len() as u32,
+        );
+        response_event.data[..response.len()].copy_from_slice(response.as_bytes());
+        tx.send(RawEvent::Plaintext(Box::new(response_event), None)).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("worker output timeout")
+            .expect("worker channel closed");
+        assert_eq!(output.completed.len(), 1);
+        assert_eq!(output.completed[0].path, "/ctct-guard/v1/chat/completions");
+        assert_eq!(output.completed[0].parse_state, "parsed");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn plaintext_worker_keeps_interleaved_connections_isolated_across_batches() {
+        let (tx, rx) = mpsc::channel(4_096);
+        let (completed_tx, mut completed_rx) = mpsc::channel(1_024);
+        tokio::spawn(run_plaintext_worker(rx, completed_tx, None));
+        let connections = 32u32;
+        let per_connection = 25u32;
+        for turn in 0..per_connection {
+            for connection in 0..connections {
+                let body = format!(
+                    r#"{{"model":"fixture-model","messages":[{{"role":"user","content":"connection-{connection}-turn-{turn}"}}]}}"#
+                );
+                let request = format!(
+                    "POST /ctct-guard/v1/chat/completions HTTP/1.1\r\nHost: guard\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let mut request_event = plaintext_event(0, request.len() as u32, request.len() as u32);
+                request_event.pid = 10_000 + connection;
+                request_event.fd = 100 + connection;
+                request_event.data[..request.len()].copy_from_slice(request.as_bytes());
+                tx.send(RawEvent::Plaintext(Box::new(request_event), None)).await.unwrap();
+
+                let response_body = format!(
+                    r#"{{"choices":[{{"message":{{"content":"answer-{connection}-{turn}"}}}}]}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(), response_body,
+                );
+                let mut response_event = plaintext_event(
+                    LEGACY_PLAINTEXT_DIRECTION_READ,
+                    response.len() as u32,
+                    response.len() as u32,
+                );
+                response_event.pid = 10_000 + connection;
+                response_event.fd = 100 + connection;
+                response_event.data[..response.len()].copy_from_slice(response.as_bytes());
+                tx.send(RawEvent::Plaintext(Box::new(response_event), None)).await.unwrap();
+            }
+        }
+        drop(tx);
+        let mut outputs = Vec::new();
+        for _ in 0..connections * per_connection {
+            let output = tokio::time::timeout(Duration::from_secs(5), completed_rx.recv())
+                .await
+                .expect("worker output timeout")
+                .expect("worker channel closed");
+            outputs.extend(output.completed);
+        }
+        assert_eq!(outputs.len(), (connections * per_connection) as usize);
+        assert!(outputs.iter().all(|item| item.parse_state == "parsed"));
+        assert!(outputs.iter().all(|item| item.path == "/ctct-guard/v1/chat/completions"));
+    }
+
+    #[test]
+    fn cursor_reread_ttl_accepts_configured_thirty_seconds() {
+        std::env::set_var("A3S_OBSERVER_CURSOR_REREAD", "1");
+        std::env::set_var("A3S_OBSERVER_CURSOR_REREAD_TTL_MS", "30000");
+        let rereader = CursorRereader::from_env().expect("cursor reread enabled");
+        assert_eq!(rereader.ttl_ns, 30_000_000_000);
+        std::env::remove_var("A3S_OBSERVER_CURSOR_REREAD");
+        std::env::remove_var("A3S_OBSERVER_CURSOR_REREAD_TTL_MS");
     }
 
     fn repetitive_json_body(body_len: usize) -> String {

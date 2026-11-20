@@ -174,7 +174,7 @@ _Static_assert(sizeof(struct plaintext_tls_event) == 16432, "plaintext_tls_event
 
 /* ---- 截断补读游标（R3/R4 实验特性，仅 x86 开发通道，A3S_BPF_ARCH_X86_64 门控）----
  * 单次 SSL_write/SSL_read（uprobe）或 HTTP write/read（kprobe）数据量超过发射窗口
- * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道单分片 16KB；R4 开启时 TLS 提前至 8 片）
+ * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道 PLAINTEXT_SPLIT_MAX×16KB；R4 开启时 TLS 提前至 8 片）
  * 时被截断：发射终止片在 header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度
  * 和已采尾部 64B 的 FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，
  * 先比对衔接处指纹再拼接——宁可不拼，不可错拼。
@@ -1078,6 +1078,62 @@ INLINE void plaintext_write(struct pt_regs *ctx) {
                    syscall_arg(ctx, 2), LEGACY_PLAINTEXT_DIRECTION_WRITE);
 }
 
+struct legacy_iovec {
+    u64 base;
+    u64 len;
+};
+
+struct legacy_msghdr {
+    u64 name;
+    u32 name_len;
+    u32 _pad;
+    u64 iov;
+    u64 iov_len;
+};
+
+/* 每个 syscall 最多读取四个 iovec，避免在老内核上展开出无界指令面。若应用把
+ * 请求拆到更多 iovec，Content-Length/流式终止条件不足时会保持 partial 并在退休时显式
+ * 形成缺口，不把缺失部分伪造成完整请求。 */
+#define PLAINTEXT_IOV_MAX 4
+INLINE void plaintext_iov_one(struct pt_regs *ctx, u32 pid, u32 fd, u64 iov,
+                              u64 index) {
+    struct legacy_iovec item;
+    if (bpf_probe_read_user(&item, sizeof(item),
+                            (const void *)(iov + index * sizeof(item))) < 0)
+        return;
+    if (!item.base || !item.len)
+        return;
+    emit_plaintext(ctx, pid, fd, item.base, item.len,
+                   LEGACY_PLAINTEXT_DIRECTION_WRITE);
+}
+
+INLINE void plaintext_iov(struct pt_regs *ctx, u32 fd, u64 iov, u64 iov_len) {
+    const u32 pid = (u32)(bpf_get_current_pid_tgid() >> 32);
+    if (!plaintext_admitted(pid))
+        return;
+    if (iov_len > 0)
+        plaintext_iov_one(ctx, pid, fd, iov, 0);
+    if (iov_len > 1)
+        plaintext_iov_one(ctx, pid, fd, iov, 1);
+    if (iov_len > 2)
+        plaintext_iov_one(ctx, pid, fd, iov, 2);
+    if (iov_len > 3)
+        plaintext_iov_one(ctx, pid, fd, iov, 3);
+}
+
+INLINE void plaintext_writev(struct pt_regs *ctx) {
+    plaintext_iov(ctx, (u32)syscall_arg(ctx, 0), syscall_arg(ctx, 1),
+                  syscall_arg(ctx, 2));
+}
+
+INLINE void plaintext_sendmsg(struct pt_regs *ctx) {
+    struct legacy_msghdr msg;
+    if (bpf_probe_read_user(&msg, sizeof(msg),
+                            (const void *)syscall_arg(ctx, 1)) < 0)
+        return;
+    plaintext_iov(ctx, (u32)syscall_arg(ctx, 0), msg.iov, msg.iov_len);
+}
+
 INLINE void plaintext_read_enter(struct pt_regs *ctx) {
     const u64 id = bpf_get_current_pid_tgid();
     struct read_args args;
@@ -1118,6 +1174,18 @@ int legacy_http_write(struct pt_regs *ctx) {
 SEC("kprobe")
 int legacy_http_sendto(struct pt_regs *ctx) {
     plaintext_write(ctx);
+    return 0;
+}
+
+SEC("kprobe")
+int legacy_http_writev(struct pt_regs *ctx) {
+    plaintext_writev(ctx);
+    return 0;
+}
+
+SEC("kprobe")
+int legacy_http_sendmsg(struct pt_regs *ctx) {
+    plaintext_sendmsg(ctx);
     return 0;
 }
 
