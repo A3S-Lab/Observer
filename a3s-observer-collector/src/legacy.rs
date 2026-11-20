@@ -1171,6 +1171,32 @@ struct CompletedPlaintextBatch {
     comm: [u8; 16],
 }
 
+fn log_plaintext_slow_stage(
+    kind: &'static str,
+    pid: u32,
+    payload_bytes: usize,
+    orig_len: u32,
+    dedup: Duration,
+    cursor: Duration,
+    reassembly: Duration,
+    total: Duration,
+) {
+    if total < Duration::from_millis(100) {
+        return;
+    }
+    tracing::warn!(
+        kind,
+        pid,
+        payload_bytes,
+        orig_len,
+        dedup_us = dedup.as_micros() as u64,
+        cursor_us = cursor.as_micros() as u64,
+        reassembly_us = reassembly.as_micros() as u64,
+        total_us = total.as_micros() as u64,
+        "legacy plaintext slow worker stage"
+    );
+}
+
 fn process_plaintext_worker_event(
     raw: RawEvent,
     reassembler: &mut InteractionReassembler,
@@ -1212,11 +1238,13 @@ fn process_plaintext_worker_event(
                     "legacy plaintext chunk received"
                 );
             }
+            let total_started = Instant::now();
             let mut chunk = plaintext_chunk_from_event(
                 &ev,
                 safe_unix_now_ns(),
                 sequencer,
             );
+            let dedup_started = Instant::now();
             let duplicate = suppress_duplicate_fragment(
                 fragment_dedup,
                 sequencer,
@@ -1226,18 +1254,49 @@ fn process_plaintext_worker_event(
                 ev.fd,
                 ev.fd_generation,
             );
+            let dedup_elapsed = dedup_started.elapsed();
+            let mut payload_bytes = chunk.data.len();
+            let mut cursor_elapsed = Duration::ZERO;
+            let mut reassembly_elapsed = Duration::ZERO;
             let completed = if duplicate {
                 Vec::new()
-            } else if cursor_patch_and_log(
-                cursor_rereader,
-                cursor,
-                &mut chunk,
-                ev.captured_at_boot_ns,
-            ) {
-                reassembler.push(chunk)
             } else {
-                Vec::new()
+                let cursor_started = Instant::now();
+                let admitted = cursor_patch_and_log(
+                    cursor_rereader,
+                    cursor,
+                    &mut chunk,
+                    ev.captured_at_boot_ns,
+                );
+                cursor_elapsed = cursor_started.elapsed();
+                if admitted {
+                    payload_bytes = chunk.data.len();
+                    if payload_bytes >= 256 * 1024 {
+                        tracing::warn!(
+                            pid = ev.pid,
+                            connection_id = chunk.connection_id,
+                            payload_bytes,
+                            "legacy plaintext large reassembly start"
+                        );
+                    }
+                    let reassembly_started = Instant::now();
+                    let completed = reassembler.push(chunk);
+                    reassembly_elapsed = reassembly_started.elapsed();
+                    completed
+                } else {
+                    Vec::new()
+                }
             };
+            log_plaintext_slow_stage(
+                "tcp",
+                ev.pid,
+                payload_bytes,
+                ev.orig_len,
+                dedup_elapsed,
+                cursor_elapsed,
+                reassembly_elapsed,
+                total_started.elapsed(),
+            );
             (completed, ev.comm)
         }
         RawEvent::PlaintextTls(ev, cursor) => {
@@ -1267,11 +1326,13 @@ fn process_plaintext_worker_event(
                     "legacy tls plaintext chunk received"
                 );
             }
+            let total_started = Instant::now();
             let mut chunk = tls_plaintext_chunk_from_event(
                 &ev,
                 safe_unix_now_ns(),
                 sequencer,
             );
+            let dedup_started = Instant::now();
             let duplicate = suppress_duplicate_fragment(
                 fragment_dedup,
                 sequencer,
@@ -1281,18 +1342,49 @@ fn process_plaintext_worker_event(
                 ev.tls_ctx as u32,
                 (ev.tls_ctx >> 32) as u32,
             );
+            let dedup_elapsed = dedup_started.elapsed();
+            let mut payload_bytes = chunk.data.len();
+            let mut cursor_elapsed = Duration::ZERO;
+            let mut reassembly_elapsed = Duration::ZERO;
             let completed = if duplicate {
                 Vec::new()
-            } else if cursor_patch_and_log(
-                cursor_rereader,
-                cursor,
-                &mut chunk,
-                ev.captured_at_boot_ns,
-            ) {
-                reassembler.push(chunk)
             } else {
-                Vec::new()
+                let cursor_started = Instant::now();
+                let admitted = cursor_patch_and_log(
+                    cursor_rereader,
+                    cursor,
+                    &mut chunk,
+                    ev.captured_at_boot_ns,
+                );
+                cursor_elapsed = cursor_started.elapsed();
+                if admitted {
+                    payload_bytes = chunk.data.len();
+                    if payload_bytes >= 256 * 1024 {
+                        tracing::warn!(
+                            pid = ev.pid,
+                            connection_id = chunk.connection_id,
+                            payload_bytes,
+                            "legacy tls plaintext large reassembly start"
+                        );
+                    }
+                    let reassembly_started = Instant::now();
+                    let completed = reassembler.push(chunk);
+                    reassembly_elapsed = reassembly_started.elapsed();
+                    completed
+                } else {
+                    Vec::new()
+                }
             };
+            log_plaintext_slow_stage(
+                "tls",
+                ev.pid,
+                payload_bytes,
+                ev.orig_len,
+                dedup_elapsed,
+                cursor_elapsed,
+                reassembly_elapsed,
+                total_started.elapsed(),
+            );
             (completed, ev.comm)
         }
         _ => return None,
@@ -1347,7 +1439,11 @@ async fn run_plaintext_worker(
                         cursor_rereader.as_ref(),
                     );
                     if let Some(output) = output {
+                        let batch_len = output.completed.len();
+                        let lock_started = Instant::now();
                         let mut stats = shared_stats.lock().unwrap_or_else(|error| error.into_inner());
+                        let lock_elapsed = lock_started.elapsed();
+                        let export_started = Instant::now();
                         emit_plaintext_interactions(
                             exporter.as_ref(),
                             &mut stats,
@@ -1357,6 +1453,16 @@ async fn run_plaintext_worker(
                             output.completed,
                             &mut suppressed_shells,
                         );
+                        let export_elapsed = export_started.elapsed();
+                        drop(stats);
+                        if lock_elapsed + export_elapsed >= Duration::from_millis(100) {
+                            tracing::warn!(
+                                batch_len,
+                                lock_us = lock_elapsed.as_micros() as u64,
+                                export_us = export_elapsed.as_micros() as u64,
+                                "legacy plaintext slow export stage"
+                            );
+                        }
                     }
                 }
             }
