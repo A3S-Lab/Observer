@@ -957,6 +957,7 @@ struct WebSocketFrameDecoder {
     profile_inflate_us: u64,
     profile_resync_calls: u64,
     profile_resync_us: u64,
+    full_resync_scan_attempted: bool,
 }
 
 impl WebSocketFrameDecoder {
@@ -981,6 +982,7 @@ impl WebSocketFrameDecoder {
             profile_inflate_us: 0,
             profile_resync_calls: 0,
             profile_resync_us: 0,
+            full_resync_scan_attempted: false,
         }
     }
 
@@ -1018,6 +1020,7 @@ impl WebSocketFrameDecoder {
         self.profile_inflate_us = 0;
         self.profile_resync_calls = 0;
         self.profile_resync_us = 0;
+        self.full_resync_scan_attempted = false;
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -1407,13 +1410,18 @@ impl WebSocketFrameDecoder {
     /// false positives discard real frames and then stall on a forged length. Prefer a complete
     /// plausible event; otherwise advance one byte at a time.
     fn try_midstream_resync(&mut self) -> bool {
-        if self.buffer.len() > 64 && self.try_resync_to_complete_plausible_event() {
-            extend_unique(
-                &mut self.partial_reasons,
-                ["websocket_midstream_resync".to_string()],
-            );
-            return true;
+        if self.buffer.len() > 64 && !self.full_resync_scan_attempted {
+            self.full_resync_scan_attempted = true;
+            if self.try_resync_to_complete_plausible_event() {
+                extend_unique(
+                    &mut self.partial_reasons,
+                    ["websocket_midstream_resync".to_string()],
+                );
+                return true;
+            }
         }
+        // A failed full scan remains valid while this push only shrinks the buffer. Rescanning
+        // after every one-byte drain cannot reveal a newly complete frame; only the next push can.
         if self.buffer.len() > 1 {
             self.buffer.drain(..1);
             self.fragmented = None;
@@ -13246,6 +13254,16 @@ Content-Type: application/json
             .partial_reasons
             .iter()
             .any(|reason| reason == "websocket_midstream_resync"));
+    }
+
+    #[test]
+    fn websocket_midstream_resync_scans_at_most_once_per_push() {
+        let mut decoder = WebSocketFrameDecoder::new(StreamKind::Request, 64 * 1024);
+        decoder.allow_midstream_resync = true;
+        let noise = vec![0xff; 512];
+        assert!(decoder.push(&noise, 100, &[]).is_empty());
+        assert!(decoder.profile_iterations > 64);
+        assert_eq!(decoder.profile_resync_calls, 1);
     }
 
     #[test]
