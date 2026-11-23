@@ -949,6 +949,14 @@ struct WebSocketFrameDecoder {
     allow_midstream_resync: bool,
     inflater: Decompress,
     last_decode_error: Option<String>,
+    profile_iterations: u64,
+    profile_frames: u64,
+    profile_candidate_calls: u64,
+    profile_candidate_us: u64,
+    profile_inflate_calls: u64,
+    profile_inflate_us: u64,
+    profile_resync_calls: u64,
+    profile_resync_us: u64,
 }
 
 impl WebSocketFrameDecoder {
@@ -965,6 +973,14 @@ impl WebSocketFrameDecoder {
             allow_midstream_resync: false,
             inflater: Decompress::new(false),
             last_decode_error: None,
+            profile_iterations: 0,
+            profile_frames: 0,
+            profile_candidate_calls: 0,
+            profile_candidate_us: 0,
+            profile_inflate_calls: 0,
+            profile_inflate_us: 0,
+            profile_resync_calls: 0,
+            profile_resync_us: 0,
         }
     }
 
@@ -994,6 +1010,14 @@ impl WebSocketFrameDecoder {
         let push_started = Instant::now();
         let input_bytes = data.len();
         let buffered_before = self.buffer.len();
+        self.profile_iterations = 0;
+        self.profile_frames = 0;
+        self.profile_candidate_calls = 0;
+        self.profile_candidate_us = 0;
+        self.profile_inflate_calls = 0;
+        self.profile_inflate_us = 0;
+        self.profile_resync_calls = 0;
+        self.profile_resync_us = 0;
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -1009,8 +1033,10 @@ impl WebSocketFrameDecoder {
 
         let mut messages = Vec::new();
         loop {
+            self.profile_iterations = self.profile_iterations.saturating_add(1);
             let frame = match decode_websocket_frame(&self.buffer, self.max_bytes) {
                 Ok(Some(frame)) => {
+                    self.profile_frames = self.profile_frames.saturating_add(1);
                     // Misaligned mid-flight bytes often forge syntactically valid frames. When
                     // recovery enabled resync, only commit data frames whose payload looks like
                     // JSON (Responses / chat events); otherwise skip toward the next header
@@ -1172,6 +1198,14 @@ impl WebSocketFrameDecoder {
                 buffered_before,
                 buffered_after = self.buffer.len(),
                 messages = messages.len(),
+                iterations = self.profile_iterations,
+                frames = self.profile_frames,
+                candidate_calls = self.profile_candidate_calls,
+                candidate_us = self.profile_candidate_us,
+                inflate_calls = self.profile_inflate_calls,
+                inflate_us = self.profile_inflate_us,
+                resync_calls = self.profile_resync_calls,
+                resync_us = self.profile_resync_us,
                 total_us = total.as_micros() as u64,
                 "legacy plaintext slow websocket push"
             );
@@ -1213,6 +1247,8 @@ impl WebSocketFrameDecoder {
     }
 
     fn inflate_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let started = Instant::now();
+        let result = (|| {
         if self.no_context_takeover {
             self.inflater.reset(false);
         }
@@ -1261,41 +1297,55 @@ impl WebSocketFrameDecoder {
             self.inflater.reset(false);
         }
         Ok(output)
+        })();
+        self.profile_inflate_calls = self.profile_inflate_calls.saturating_add(1);
+        self.profile_inflate_us = self
+            .profile_inflate_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        result
     }
 
     fn frame_payload_plausible_json(&mut self, frame: &DecodedWebSocketFrame) -> bool {
-        let payload = if frame.compressed {
-            if !self.compression_enabled {
-                if !self.allow_midstream_resync {
-                    return false;
+        let started = Instant::now();
+        let result = (|| {
+            let payload = if frame.compressed {
+                if !self.compression_enabled {
+                    if !self.allow_midstream_resync {
+                        return false;
+                    }
+                    // Late RSV1 after recover without an early compression hint.
+                    self.compression_enabled = true;
+                    self.no_context_takeover = true;
                 }
-                // Late RSV1 after recover without an early compression hint.
-                self.compression_enabled = true;
-                self.no_context_takeover = true;
+                match self.inflate_message(&frame.payload) {
+                    Ok(payload) => {
+                        // Inflate is only a probe here; reset so finish_message can inflate again.
+                        self.inflater.reset(false);
+                        payload
+                    }
+                    Err(reason) => {
+                        self.last_decode_error = Some(reason);
+                        return false;
+                    }
+                }
+            } else {
+                frame.payload.clone()
+            };
+            // Fragment starts only need a JSON prefix; FIN frames must look like the protocol we
+            // actually reassemble, or midstream false positives keep desynchronizing the decoder.
+            if !frame.fin {
+                return payload_looks_like_json_prefix(&payload);
             }
-            match self.inflate_message(&frame.payload) {
-                Ok(payload) => {
-                    // Inflate is only a probe here; reset so finish_message can inflate again.
-                    self.inflater.reset(false);
-                    payload
-                }
-                Err(reason) => {
-                    self.last_decode_error = Some(reason);
-                    return false;
-                }
+            match self.kind {
+                StreamKind::Response => payload_looks_like_responses_event(&payload),
+                StreamKind::Request => payload_looks_like_llm_request_event(&payload),
             }
-        } else {
-            frame.payload.clone()
-        };
-        // Fragment starts only need a JSON prefix; FIN frames must look like the protocol we
-        // actually reassemble, or midstream false positives keep desynchronizing the decoder.
-        if !frame.fin {
-            return payload_looks_like_json_prefix(&payload);
-        }
-        match self.kind {
-            StreamKind::Response => payload_looks_like_responses_event(&payload),
-            StreamKind::Request => payload_looks_like_llm_request_event(&payload),
-        }
+        })();
+        self.profile_candidate_calls = self.profile_candidate_calls.saturating_add(1);
+        self.profile_candidate_us = self
+            .profile_candidate_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        result
     }
 
     fn try_resync_to_complete_plausible_event(&mut self) -> bool {
@@ -1335,6 +1385,10 @@ impl WebSocketFrameDecoder {
             false
         })();
         let total = started.elapsed();
+        self.profile_resync_calls = self.profile_resync_calls.saturating_add(1);
+        self.profile_resync_us = self
+            .profile_resync_us
+            .saturating_add(total.as_micros() as u64);
         if total >= Duration::from_millis(100) {
             tracing::warn!(
                 kind = ?self.kind,
