@@ -176,6 +176,9 @@ pub struct ReassemblyMetrics {
     pub evidence_evictions: u64,
     pub fragment_tracker_evictions: u64,
     pub orphan_chunks: u64,
+    /// Redis RESP chatter (cache/session store lanes of a whitelisted process) dropped
+    /// at the reassembler entry; never an agent conversation, frees perf-ring capacity.
+    pub resp_chatter_dropped: u64,
     pub sequence_gaps: u64,
     pub parser_failures: u64,
     pub body_limit_drops: u64,
@@ -620,6 +623,17 @@ impl HttpMessage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct JsonCompletionScanState {
+    offset: usize,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    started: bool,
+    scalar: bool,
+    complete: bool,
+}
+
 #[derive(Debug)]
 struct HttpStreamDecoder {
     kind: StreamKind,
@@ -635,6 +649,9 @@ struct HttpStreamDecoder {
     /// Separate cursors for the de-chunked body inside `decode_chunked`: the de-chunked bytes
     /// and the raw framing bytes are different sequences and must not share resume offsets.
     chunked_scan: SseTerminalScanState,
+    /// Incremental structural scan for unframed JSON responses. Full serde parsing is deferred
+    /// until an object/array root closes instead of reparsing every accumulated prefix.
+    json_scan: JsonCompletionScanState,
 }
 
 impl HttpStreamDecoder {
@@ -649,6 +666,7 @@ impl HttpStreamDecoder {
             last_decode_error: None,
             sse_scan: SseTerminalScanState::default(),
             chunked_scan: SseTerminalScanState::default(),
+            json_scan: JsonCompletionScanState::default(),
         }
     }
 
@@ -723,6 +741,7 @@ impl HttpStreamDecoder {
         self.last_decode_error = None;
         self.sse_scan = SseTerminalScanState::default();
         self.chunked_scan = SseTerminalScanState::default();
+        self.json_scan = JsonCompletionScanState::default();
         Some(HttpMessage {
             start_line,
             headers,
@@ -746,6 +765,9 @@ impl HttpStreamDecoder {
         if data.is_empty() {
             return Vec::new();
         }
+        let push_started = Instant::now();
+        let input_bytes = data.len();
+        let buffered_before = self.buffer.len();
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -772,6 +794,7 @@ impl HttpStreamDecoder {
                     // the terminal search for whatever pending message remains.
                     self.sse_scan = SseTerminalScanState::default();
                     self.chunked_scan = SseTerminalScanState::default();
+                    self.json_scan = JsonCompletionScanState::default();
                     self.buffer_started_at_unix_ns =
                         (!self.buffer.is_empty()).then_some(event_at_unix_ns);
                     if self.buffer.is_empty() {
@@ -785,10 +808,17 @@ impl HttpStreamDecoder {
                 buffer,
                 sse_scan,
                 chunked_scan,
+                json_scan,
                 ..
             } = self;
-            let decoded = match decode_http_message(kind, buffer, max_bytes, sse_scan, chunked_scan)
-            {
+            let decoded = match decode_http_message(
+                kind,
+                buffer,
+                max_bytes,
+                sse_scan,
+                chunked_scan,
+                json_scan,
+            ) {
                 Ok(Some(decoded)) => decoded,
                 Ok(None) => break,
                 Err(reason) => {
@@ -826,7 +856,20 @@ impl HttpStreamDecoder {
             // bytes remain start a new pending message from offset zero.
             self.sse_scan = SseTerminalScanState::default();
             self.chunked_scan = SseTerminalScanState::default();
+            self.json_scan = JsonCompletionScanState::default();
             self.buffer_started_at_unix_ns = (!self.buffer.is_empty()).then_some(event_at_unix_ns);
+        }
+        let total = push_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                input_bytes,
+                buffered_before,
+                buffered_after = self.buffer.len(),
+                messages = messages.len(),
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow http stream push"
+            );
         }
         messages
     }
@@ -850,6 +893,7 @@ impl HttpStreamDecoder {
         self.last_decode_error = None;
         self.sse_scan = SseTerminalScanState::default();
         self.chunked_scan = SseTerminalScanState::default();
+        self.json_scan = JsonCompletionScanState::default();
         std::mem::take(&mut self.buffer)
     }
 }
@@ -905,6 +949,15 @@ struct WebSocketFrameDecoder {
     allow_midstream_resync: bool,
     inflater: Decompress,
     last_decode_error: Option<String>,
+    profile_iterations: u64,
+    profile_frames: u64,
+    profile_candidate_calls: u64,
+    profile_candidate_us: u64,
+    profile_inflate_calls: u64,
+    profile_inflate_us: u64,
+    profile_resync_calls: u64,
+    profile_resync_us: u64,
+    full_resync_scan_attempted: bool,
 }
 
 impl WebSocketFrameDecoder {
@@ -921,6 +974,15 @@ impl WebSocketFrameDecoder {
             allow_midstream_resync: false,
             inflater: Decompress::new(false),
             last_decode_error: None,
+            profile_iterations: 0,
+            profile_frames: 0,
+            profile_candidate_calls: 0,
+            profile_candidate_us: 0,
+            profile_inflate_calls: 0,
+            profile_inflate_us: 0,
+            profile_resync_calls: 0,
+            profile_resync_us: 0,
+            full_resync_scan_attempted: false,
         }
     }
 
@@ -947,6 +1009,18 @@ impl WebSocketFrameDecoder {
         if data.is_empty() {
             return Vec::new();
         }
+        let push_started = Instant::now();
+        let input_bytes = data.len();
+        let buffered_before = self.buffer.len();
+        self.profile_iterations = 0;
+        self.profile_frames = 0;
+        self.profile_candidate_calls = 0;
+        self.profile_candidate_us = 0;
+        self.profile_inflate_calls = 0;
+        self.profile_inflate_us = 0;
+        self.profile_resync_calls = 0;
+        self.profile_resync_us = 0;
+        self.full_resync_scan_attempted = false;
         if self.buffer.is_empty() {
             self.buffer_started_at_unix_ns = Some(event_at_unix_ns);
         }
@@ -962,8 +1036,10 @@ impl WebSocketFrameDecoder {
 
         let mut messages = Vec::new();
         loop {
+            self.profile_iterations = self.profile_iterations.saturating_add(1);
             let frame = match decode_websocket_frame(&self.buffer, self.max_bytes) {
                 Ok(Some(frame)) => {
+                    self.profile_frames = self.profile_frames.saturating_add(1);
                     // Misaligned mid-flight bytes often forge syntactically valid frames. When
                     // recovery enabled resync, only commit data frames whose payload looks like
                     // JSON (Responses / chat events); otherwise skip toward the next header
@@ -1117,6 +1193,26 @@ impl WebSocketFrameDecoder {
                 }
             }
         }
+        let total = push_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                input_bytes,
+                buffered_before,
+                buffered_after = self.buffer.len(),
+                messages = messages.len(),
+                iterations = self.profile_iterations,
+                frames = self.profile_frames,
+                candidate_calls = self.profile_candidate_calls,
+                candidate_us = self.profile_candidate_us,
+                inflate_calls = self.profile_inflate_calls,
+                inflate_us = self.profile_inflate_us,
+                resync_calls = self.profile_resync_calls,
+                resync_us = self.profile_resync_us,
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow websocket push"
+            );
+        }
         messages
     }
 
@@ -1154,129 +1250,177 @@ impl WebSocketFrameDecoder {
     }
 
     fn inflate_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        if self.no_context_takeover {
-            self.inflater.reset(false);
-        }
-        let mut input = Vec::with_capacity(payload.len().saturating_add(4));
-        input.extend_from_slice(payload);
-        input.extend_from_slice(WEBSOCKET_DEFLATE_TAIL);
-        let initial_capacity = input
-            .len()
-            .saturating_mul(4)
-            .clamp(4 * 1024, self.max_bytes);
-        let mut output = Vec::with_capacity(initial_capacity);
-        let mut cursor = 0usize;
-        loop {
-            if output.len() == output.capacity() {
-                if output.len() >= self.max_bytes {
-                    self.inflater.reset(false);
-                    return Err("websocket_decompressed_limit".to_string());
+        let started = Instant::now();
+        let result = (|| {
+            if self.no_context_takeover {
+                self.inflater.reset(false);
+            }
+            let mut input = Vec::with_capacity(payload.len().saturating_add(4));
+            input.extend_from_slice(payload);
+            input.extend_from_slice(WEBSOCKET_DEFLATE_TAIL);
+            let initial_capacity = input
+                .len()
+                .saturating_mul(4)
+                .clamp(4 * 1024, self.max_bytes);
+            let mut output = Vec::with_capacity(initial_capacity);
+            let mut cursor = 0usize;
+            loop {
+                if output.len() == output.capacity() {
+                    if output.len() >= self.max_bytes {
+                        self.inflater.reset(false);
+                        return Err("websocket_decompressed_limit".to_string());
+                    }
+                    let additional = output
+                        .capacity()
+                        .max(4 * 1024)
+                        .min(self.max_bytes - output.len());
+                    output.reserve_exact(additional);
                 }
-                let additional = output
-                    .capacity()
-                    .max(4 * 1024)
-                    .min(self.max_bytes - output.len());
-                output.reserve_exact(additional);
-            }
-            let before_in = self.inflater.total_in();
-            let before_out = self.inflater.total_out();
-            let status = self
-                .inflater
-                .decompress_vec(&input[cursor..], &mut output, FlushDecompress::Sync)
-                .map_err(|_| "websocket_deflate_decode_failed".to_string())?;
-            let consumed = (self.inflater.total_in() - before_in) as usize;
-            let produced = (self.inflater.total_out() - before_out) as usize;
-            cursor = cursor.saturating_add(consumed);
-            if cursor == input.len() && status != Status::BufError {
-                break;
-            }
-            if consumed == 0 && produced == 0 {
-                if cursor == input.len() {
+                let before_in = self.inflater.total_in();
+                let before_out = self.inflater.total_out();
+                let status = self
+                    .inflater
+                    .decompress_vec(&input[cursor..], &mut output, FlushDecompress::Sync)
+                    .map_err(|_| "websocket_deflate_decode_failed".to_string())?;
+                let consumed = (self.inflater.total_in() - before_in) as usize;
+                let produced = (self.inflater.total_out() - before_out) as usize;
+                cursor = cursor.saturating_add(consumed);
+                if cursor == input.len() && status != Status::BufError {
                     break;
                 }
-                self.inflater.reset(false);
-                return Err("websocket_deflate_stalled".to_string());
+                if consumed == 0 && produced == 0 {
+                    if cursor == input.len() {
+                        break;
+                    }
+                    self.inflater.reset(false);
+                    return Err("websocket_deflate_stalled".to_string());
+                }
             }
-        }
-        if self.no_context_takeover {
-            self.inflater.reset(false);
-        }
-        Ok(output)
+            if self.no_context_takeover {
+                self.inflater.reset(false);
+            }
+            Ok(output)
+        })();
+        self.profile_inflate_calls = self.profile_inflate_calls.saturating_add(1);
+        self.profile_inflate_us = self
+            .profile_inflate_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        result
     }
 
     fn frame_payload_plausible_json(&mut self, frame: &DecodedWebSocketFrame) -> bool {
-        let payload = if frame.compressed {
-            if !self.compression_enabled {
-                if !self.allow_midstream_resync {
-                    return false;
+        let started = Instant::now();
+        let result = (|| {
+            let payload = if frame.compressed {
+                if !self.compression_enabled {
+                    if !self.allow_midstream_resync {
+                        return false;
+                    }
+                    // Late RSV1 after recover without an early compression hint.
+                    self.compression_enabled = true;
+                    self.no_context_takeover = true;
                 }
-                // Late RSV1 after recover without an early compression hint.
-                self.compression_enabled = true;
-                self.no_context_takeover = true;
+                match self.inflate_message(&frame.payload) {
+                    Ok(payload) => {
+                        // Inflate is only a probe here; reset so finish_message can inflate again.
+                        self.inflater.reset(false);
+                        payload
+                    }
+                    Err(reason) => {
+                        self.last_decode_error = Some(reason);
+                        return false;
+                    }
+                }
+            } else {
+                frame.payload.clone()
+            };
+            // Fragment starts only need a JSON prefix; FIN frames must look like the protocol we
+            // actually reassemble, or midstream false positives keep desynchronizing the decoder.
+            if !frame.fin {
+                return payload_looks_like_json_prefix(&payload);
             }
-            match self.inflate_message(&frame.payload) {
-                Ok(payload) => {
-                    // Inflate is only a probe here; reset so finish_message can inflate again.
-                    self.inflater.reset(false);
-                    payload
-                }
-                Err(reason) => {
-                    self.last_decode_error = Some(reason);
-                    return false;
-                }
+            match self.kind {
+                StreamKind::Response => payload_looks_like_responses_event(&payload),
+                StreamKind::Request => payload_looks_like_llm_request_event(&payload),
             }
-        } else {
-            frame.payload.clone()
-        };
-        // Fragment starts only need a JSON prefix; FIN frames must look like the protocol we
-        // actually reassemble, or midstream false positives keep desynchronizing the decoder.
-        if !frame.fin {
-            return payload_looks_like_json_prefix(&payload);
-        }
-        match self.kind {
-            StreamKind::Response => payload_looks_like_responses_event(&payload),
-            StreamKind::Request => payload_looks_like_llm_request_event(&payload),
-        }
+        })();
+        self.profile_candidate_calls = self.profile_candidate_calls.saturating_add(1);
+        self.profile_candidate_us = self
+            .profile_candidate_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        result
     }
 
     fn try_resync_to_complete_plausible_event(&mut self) -> bool {
-        let expect_masked = self.kind == StreamKind::Request;
-        let search_limit = self
-            .buffer
-            .len()
-            .min(self.max_bytes.saturating_add(64))
-            .max(2);
-        for offset in 1..search_limit {
-            let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
-            else {
-                continue;
-            };
-            if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) || !frame.fin {
-                continue;
+        let started = Instant::now();
+        let buffer_bytes = self.buffer.len();
+        let mut offsets_tested = 0usize;
+        let mut frames_tested = 0usize;
+        let result = (|| {
+            let expect_masked = self.kind == StreamKind::Request;
+            let search_limit = self
+                .buffer
+                .len()
+                .min(self.max_bytes.saturating_add(64))
+                .max(2);
+            for offset in 1..search_limit {
+                offsets_tested += 1;
+                let Ok(Some(frame)) =
+                    decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
+                else {
+                    continue;
+                };
+                frames_tested += 1;
+                if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) || !frame.fin
+                {
+                    continue;
+                }
+                if !self.frame_payload_plausible_json(&frame) {
+                    continue;
+                }
+                self.buffer.drain(..offset);
+                self.fragmented = None;
+                self.last_decode_error = None;
+                self.inflater.reset(false);
+                return true;
             }
-            if !self.frame_payload_plausible_json(&frame) {
-                continue;
-            }
-            self.buffer.drain(..offset);
-            self.fragmented = None;
-            self.last_decode_error = None;
-            self.inflater.reset(false);
-            return true;
+            false
+        })();
+        let total = started.elapsed();
+        self.profile_resync_calls = self.profile_resync_calls.saturating_add(1);
+        self.profile_resync_us = self
+            .profile_resync_us
+            .saturating_add(total.as_micros() as u64);
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                kind = ?self.kind,
+                buffer_bytes,
+                offsets_tested,
+                frames_tested,
+                found = result,
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow websocket resync"
+            );
         }
-        false
+        result
     }
 
     /// Mid-flight recover must not jump to a header-shaped offset that is only incomplete: those
     /// false positives discard real frames and then stall on a forged length. Prefer a complete
     /// plausible event; otherwise advance one byte at a time.
     fn try_midstream_resync(&mut self) -> bool {
-        if self.buffer.len() > 64 && self.try_resync_to_complete_plausible_event() {
-            extend_unique(
-                &mut self.partial_reasons,
-                ["websocket_midstream_resync".to_string()],
-            );
-            return true;
+        if self.buffer.len() > 64 && !self.full_resync_scan_attempted {
+            self.full_resync_scan_attempted = true;
+            if self.try_resync_to_complete_plausible_event() {
+                extend_unique(
+                    &mut self.partial_reasons,
+                    ["websocket_midstream_resync".to_string()],
+                );
+                return true;
+            }
         }
+        // A failed full scan remains valid while this push only shrinks the buffer. Rescanning
+        // after every one-byte drain cannot reveal a newly complete frame; only the next push can.
         if self.buffer.len() > 1 {
             self.buffer.drain(..1);
             self.fragmented = None;
@@ -1635,6 +1779,65 @@ impl ConnectionState {
     }
 }
 
+struct ReassemblyPushProfile {
+    pid: u32,
+    direction: ChunkDirection,
+    input_bytes: usize,
+    connections: usize,
+    started: Instant,
+    evict_us: u64,
+    resolve_us: u64,
+    transport_evidence_us: u64,
+    protocol_us: u64,
+    protocol: &'static str,
+}
+
+impl ReassemblyPushProfile {
+    fn new(chunk: &PlaintextChunk, connections: usize) -> Self {
+        Self {
+            pid: chunk.pid,
+            direction: chunk.direction,
+            input_bytes: chunk.data.len(),
+            connections,
+            started: Instant::now(),
+            evict_us: 0,
+            resolve_us: 0,
+            transport_evidence_us: 0,
+            protocol_us: 0,
+            protocol: "entry",
+        }
+    }
+}
+
+impl Drop for ReassemblyPushProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total < Duration::from_millis(100) {
+            return;
+        }
+        let total_us = total.as_micros() as u64;
+        let accounted = self
+            .evict_us
+            .saturating_add(self.resolve_us)
+            .saturating_add(self.transport_evidence_us)
+            .saturating_add(self.protocol_us);
+        tracing::warn!(
+            pid = self.pid,
+            direction = ?self.direction,
+            input_bytes = self.input_bytes,
+            connections = self.connections,
+            evict_us = self.evict_us,
+            resolve_us = self.resolve_us,
+            transport_evidence_us = self.transport_evidence_us,
+            protocol_us = self.protocol_us,
+            protocol = self.protocol,
+            other_us = total_us.saturating_sub(accounted),
+            total_us,
+            "legacy plaintext slow reassembly breakdown"
+        );
+    }
+}
+
 /// Single-writer, bounded reassembler. The Collector owns one instance and feeds reordered
 /// plaintext fragments into it, so no lock is needed on the protocol path.
 #[derive(Debug)]
@@ -1744,8 +1947,40 @@ impl InteractionReassembler {
         )
     }
 
+    /// Redis RESP protocol chatter (array form `*N\r\n$N\r\n...`, inline `GET k\r\n`).
+    /// Observed as multi-million-chunk floods between a whitelisted agent process and its
+    /// Redis: infrastructure noise, never an LLM conversation, and it crowds the perf rings
+    /// that the real HTTP/LLM lane needs. Dropped at the reassembler entry with a dedicated
+    /// counter; lossless for the Agent transcript. Userland-only, no BPF change.
+    fn looks_like_resp_chatter(data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        if data[0] == b'*' && data.len() >= 5 {
+            let mut i = 1;
+            while i < data.len() && data[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > 1
+                && i + 2 < data.len()
+                && data[i] == b'\r'
+                && data[i + 1] == b'\n'
+                && matches!(data[i + 2], b'$' | b'*' | b'+' | b':' | b'-')
+            {
+                return true;
+            }
+        }
+        // Only the array form is matched. The inline verb form (`GET key\r\n`) must NOT
+        // be matched: an HTTP request line also starts with `GET ` (websocket upgrades,
+        // plain GETs). Redis client libraries emit the array form exclusively.
+        false
+    }
+
     pub fn push(&mut self, mut chunk: PlaintextChunk) -> Vec<CompletedInteraction> {
+        let mut profile = ReassemblyPushProfile::new(&chunk, self.connections.len());
+        let evict_started = Instant::now();
         self.evict_if_needed();
+        profile.evict_us = evict_started.elapsed().as_micros() as u64;
         let observed_key = ConnectionKey::from(&chunk);
         let orphan_control_frame = is_websocket_control_frame(&chunk.data)
             && !self.connections.contains_key(&observed_key)
@@ -1758,7 +1993,16 @@ impl InteractionReassembler {
             self.enqueue_gap_evidence(observed_key, &chunk, "orphan_control_frame", "websocket");
             return Vec::new();
         }
+        // Redis RESP chatter: infrastructure noise from the whitelisted process itself (its
+        // cache/session store), never an agent conversation. Dropped before any connection
+        // state exists so Redis lanes can never crowd rings or splice into LLM interactions.
+        if Self::looks_like_resp_chatter(&chunk.data) {
+            self.metrics.resp_chatter_dropped = self.metrics.resp_chatter_dropped.saturating_add(1);
+            return Vec::new();
+        }
+        let resolve_started = Instant::now();
         let (key, binding_gap) = self.resolve_connection_key(&chunk);
+        profile.resolve_us = resolve_started.elapsed().as_micros() as u64;
         if let Some(reason) = binding_gap.as_ref() {
             if *reason == "ambiguous_stream_binding" {
                 self.metrics.ambiguous_stream_bindings =
@@ -1855,7 +2099,10 @@ impl InteractionReassembler {
                 ["websocket_handshake_recovered".to_string()],
             );
         }
-        if let Some(evidence) = plaintext_transport_evidence(key, state, &chunk) {
+        let transport_started = Instant::now();
+        let transport_evidence = plaintext_transport_evidence(key, state, &chunk);
+        profile.transport_evidence_us = transport_started.elapsed().as_micros() as u64;
+        if let Some(evidence) = transport_evidence {
             if self.pending_evidence.len() >= self.max_connections {
                 self.pending_evidence.pop_front();
                 self.metrics.evidence_evictions = self.metrics.evidence_evictions.saturating_add(1);
@@ -1932,6 +2179,20 @@ impl InteractionReassembler {
             && (chunk.data.starts_with(b"HTTP/")
                 || (!chunk.data.is_empty() && b"HTTP/".starts_with(&chunk.data))
                 || !state.responses.buffer.is_empty());
+        let protocol_started = Instant::now();
+        profile.protocol = if state.http2.active
+            || chunk.data.starts_with(b"PRI * HTTP/2.0")
+            || looks_like_http2_frame_prefix(&chunk.data)
+        {
+            "http2"
+        } else if state.websocket.active && !websocket_upgrade_response {
+            "websocket"
+        } else {
+            match chunk.direction {
+                ChunkDirection::Request => "http1_request",
+                ChunkDirection::Response => "http1_response",
+            }
+        };
         let completed = if state.http2.active
             || chunk.data.starts_with(b"PRI * HTTP/2.0")
             || looks_like_http2_frame_prefix(&chunk.data)
@@ -2279,6 +2540,7 @@ impl InteractionReassembler {
                 }
             }
         };
+        profile.protocol_us = protocol_started.elapsed().as_micros() as u64;
         let pending_request_limit_hit = state.pending_request_limit_hit;
         state.pending_request_limit_hit = false;
         if pending_request_limit_hit {
@@ -3310,6 +3572,28 @@ impl InteractionReassembler {
         self.retain_live_connection_aliases();
     }
 
+    /// Redacted printable preview of buffered wire bytes for gap evidence: enough to
+    /// recognize a protocol shape (HTTP/1.1 start line, h2 preface, binary framing)
+    /// without carrying credentials or payloads into storage.
+    fn redacted_wire_sample(bytes: &[u8], max: usize) -> Option<String> {
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(
+            bytes
+                .iter()
+                .take(max)
+                .map(|b| {
+                    if (0x20..0x7f).contains(b) {
+                        *b as char
+                    } else {
+                        '·'
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn retire_incomplete_connection(
         &mut self,
         key: ConnectionKey,
@@ -3317,11 +3601,14 @@ impl InteractionReassembler {
         reason: &'static str,
     ) {
         let pending_requests = state.pending_requests.len();
-        // Capture the buffer sizes before flushing: the retire path may drain them into a
-        // partial interaction, and the coverage-gap evidence must still describe the truncated
-        // bytes that were observed (both channels are intentional, not duplicates in intent).
+        // Capture the buffer sizes and a redacted wire preview before flushing: the retire
+        // path may drain them into a partial interaction, and the coverage-gap evidence must
+        // still describe the truncated bytes that were observed (both channels are
+        // intentional, not duplicates in intent).
         let request_buffer_bytes = state.requests.buffered_bytes();
         let response_buffer_bytes = state.responses.buffered_bytes();
+        let wire_sample = Self::redacted_wire_sample(&state.requests.buffer, 64)
+            .or_else(|| Self::redacted_wire_sample(&state.responses.buffer, 64));
         self.flush_pending_requests_as_partial(key, &mut state, reason);
         if pending_requests > 0 || request_buffer_bytes > 0 || response_buffer_bytes > 0 {
             tracing::warn!(
@@ -3385,7 +3672,7 @@ impl InteractionReassembler {
                     + response_buffer_bytes
                     + state.pending_request_bytes) as u64,
                 encoding: "metadata_only".to_string(),
-                redacted_sample: None,
+                redacted_sample: wire_sample,
                 sample_sha256: sha256_hex(fingerprint.as_bytes()),
                 reasons: vec![
                     reason.to_string(),
@@ -3959,7 +4246,8 @@ fn duplicate_probe_write(state: &mut ConnectionState, chunk: &PlaintextChunk) ->
                 *direction == chunk.direction
                     && *previous_len == len
                     && *previous_hash == digest
-                    && chunk.event_at_unix_ns.saturating_sub(*previous_at) < DUPLICATE_PROBE_WRITE_NS
+                    && chunk.event_at_unix_ns.saturating_sub(*previous_at)
+                        < DUPLICATE_PROBE_WRITE_NS
             },
         );
     state.last_probe_write = Some((chunk.direction, len, digest, chunk.event_at_unix_ns));
@@ -5019,12 +5307,14 @@ fn chunk_identity_probe(
     // One-shot probe over a single chunk: a fresh scan state gives full-body search semantics.
     let mut probe_sse_scan = SseTerminalScanState::default();
     let mut probe_chunked_scan = SseTerminalScanState::default();
+    let mut probe_json_scan = JsonCompletionScanState::default();
     let decoded = decode_http_message(
         kind,
         &chunk.data,
         max_body_bytes,
         &mut probe_sse_scan,
         &mut probe_chunked_scan,
+        &mut probe_json_scan,
     )
     .ok()
     .flatten()?;
@@ -5114,6 +5404,28 @@ fn observe_socket_bind(state: &mut ConnectionState, chunk: &PlaintextChunk) {
     }
 }
 
+struct InteractionBuildProfile {
+    pid: u32,
+    request_bytes: usize,
+    response_bytes: usize,
+    started: Instant,
+}
+
+impl Drop for InteractionBuildProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total >= Duration::from_millis(100) {
+            tracing::warn!(
+                pid = self.pid,
+                request_bytes = self.request_bytes,
+                response_bytes = self.response_bytes,
+                total_us = total.as_micros() as u64,
+                "legacy plaintext slow interaction build"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_interaction(
     key: ConnectionKey,
@@ -5127,6 +5439,12 @@ fn build_interaction(
     socket_cookie: u64,
     fd_generation: u32,
 ) -> Option<CompletedInteraction> {
+    let _profile = InteractionBuildProfile {
+        pid: key.pid,
+        request_bytes: request.body.len(),
+        response_bytes: response.body.len(),
+        started: Instant::now(),
+    };
     let (method, path) = request_line(&request.start_line)?;
     let endpoint = request.endpoint();
     let status_code = response_status(&response.start_line).unwrap_or_default();
@@ -6307,13 +6625,126 @@ fn parse_http_head(kind: StreamKind, bytes: &[u8]) -> Result<Option<HttpHead>, S
     }
 }
 
+fn json_body_may_be_complete(bytes: &[u8], scan: &mut JsonCompletionScanState) -> bool {
+    if scan.complete || scan.scalar {
+        return true;
+    }
+    if scan.offset > bytes.len() {
+        *scan = JsonCompletionScanState::default();
+    }
+    let mut cursor = scan.offset;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if !scan.started {
+            if byte.is_ascii_whitespace() {
+                cursor += 1;
+                continue;
+            }
+            scan.started = true;
+            if !matches!(byte, b'{' | b'[') {
+                // Scalars need the original prefix parser: appending can turn `tru` into `true`
+                // or extend a number, so there is no safe lexical completion shortcut.
+                scan.scalar = true;
+                scan.offset = bytes.len();
+                return true;
+            }
+            scan.depth = 1;
+            cursor += 1;
+            continue;
+        }
+        if scan.in_string {
+            if scan.escaped {
+                scan.escaped = false;
+            } else if byte == b'\\' {
+                scan.escaped = true;
+            } else if byte == b'"' {
+                scan.in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => scan.in_string = true,
+                b'{' | b'[' => scan.depth = scan.depth.saturating_add(1),
+                b'}' | b']' => {
+                    scan.depth = scan.depth.saturating_sub(1);
+                    if scan.depth == 0 {
+                        scan.complete = true;
+                        scan.offset = cursor + 1;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor += 1;
+    }
+    scan.offset = cursor;
+    scan.complete
+}
+
+struct HttpDecodeProfile {
+    kind: StreamKind,
+    input_bytes: usize,
+    body_bytes: usize,
+    started: Instant,
+    stage: &'static str,
+    head_us: u64,
+    chunked_us: u64,
+    decompress_us: u64,
+    sse_us: u64,
+    json_scan_us: u64,
+    json_parse_us: u64,
+}
+
+impl HttpDecodeProfile {
+    fn new(kind: StreamKind, input_bytes: usize) -> Self {
+        Self {
+            kind,
+            input_bytes,
+            body_bytes: 0,
+            started: Instant::now(),
+            stage: "parse_head",
+            head_us: 0,
+            chunked_us: 0,
+            decompress_us: 0,
+            sse_us: 0,
+            json_scan_us: 0,
+            json_parse_us: 0,
+        }
+    }
+}
+
+impl Drop for HttpDecodeProfile {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total < Duration::from_millis(100) {
+            return;
+        }
+        tracing::warn!(
+            kind = ?self.kind,
+            input_bytes = self.input_bytes,
+            body_bytes = self.body_bytes,
+            stage = self.stage,
+            head_us = self.head_us,
+            chunked_us = self.chunked_us,
+            decompress_us = self.decompress_us,
+            sse_us = self.sse_us,
+            json_scan_us = self.json_scan_us,
+            json_parse_us = self.json_parse_us,
+            total_us = total.as_micros() as u64,
+            "legacy plaintext slow http decode"
+        );
+    }
+}
+
 fn decode_http_message(
     kind: StreamKind,
     bytes: &[u8],
     max_body_bytes: usize,
     sse_scan: &mut SseTerminalScanState,
     chunked_scan: &mut SseTerminalScanState,
+    json_scan: &mut JsonCompletionScanState,
 ) -> Result<Option<DecodedHttpMessage>, String> {
+    let mut profile = HttpDecodeProfile::new(kind, bytes.len());
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -6321,10 +6752,15 @@ fn decode_http_message(
         return Err("unsupported_http2".to_string());
     }
 
-    let Some((header_len, start_line, headers, status_code)) = parse_http_head(kind, bytes)? else {
+    let head_started = Instant::now();
+    let parsed_head = parse_http_head(kind, bytes);
+    profile.head_us = head_started.elapsed().as_micros() as u64;
+    let Some((header_len, start_line, headers, status_code)) = parsed_head? else {
+        profile.stage = "head_pending";
         return Ok(None);
     };
 
+    profile.body_bytes = bytes.len().saturating_sub(header_len);
     let body_bytes = &bytes[header_len..];
     let transfer_encoding = headers
         .get("transfer-encoding")
@@ -6348,9 +6784,12 @@ fn decode_http_message(
         .split(',')
         .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
     {
-        let Some((decoded, consumed)) =
-            decode_chunked(body_bytes, max_body_bytes, sse_response, chunked_scan)?
-        else {
+        profile.stage = "chunked";
+        let chunked_started = Instant::now();
+        let chunked = decode_chunked(body_bytes, max_body_bytes, sse_response, chunked_scan);
+        profile.chunked_us = chunked_started.elapsed().as_micros() as u64;
+        let Some((decoded, consumed)) = chunked? else {
+            profile.stage = "chunked_pending";
             return Ok(None);
         };
         (decoded, consumed)
@@ -6359,6 +6798,7 @@ fn decode_http_message(
             return Err("declared_body_limit".to_string());
         }
         if body_bytes.len() < length {
+            profile.stage = "content_length_pending";
             return Ok(None);
         }
         (body_bytes[..length].to_vec(), length)
@@ -6376,6 +6816,8 @@ fn decode_http_message(
         // directly in `body_bytes` can never prove completion. Decode only into a bounded
         // temporary framing view; the returned message still retains the exact compressed bytes
         // as its canonical body/hash. An incomplete compressed stream simply remains pending.
+        profile.stage = "content_encoding";
+        let encoding_started = Instant::now();
         let (framing_body, framing_reason) = decode_content_encoding(
             body_bytes,
             headers
@@ -6384,10 +6826,17 @@ fn decode_http_message(
                 .unwrap_or_default(),
             max_body_bytes,
         );
+        profile.decompress_us = encoding_started.elapsed().as_micros() as u64;
         if framing_reason.is_some() {
+            profile.stage = "content_encoding_pending";
             return Ok(None);
         }
-        let Some(_end) = sse_terminal_offset_incremental(framing_body.as_ref(), sse_scan) else {
+        profile.stage = "sse_terminal";
+        let sse_started = Instant::now();
+        let terminal = sse_terminal_offset_incremental(framing_body.as_ref(), sse_scan);
+        profile.sse_us = sse_started.elapsed().as_micros() as u64;
+        let Some(_end) = terminal else {
+            profile.stage = "sse_terminal_pending";
             return Ok(None);
         };
         // No explicit HTTP framing is available here. Once the decoded stream has a terminal
@@ -6399,8 +6848,23 @@ fn decode_http_message(
             .split(';')
             .next()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-        && serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok()
     {
+        profile.stage = "json_scan";
+        let scan_started = Instant::now();
+        let may_be_complete = json_body_may_be_complete(body_bytes, json_scan);
+        profile.json_scan_us = scan_started.elapsed().as_micros() as u64;
+        if !may_be_complete {
+            profile.stage = "json_pending";
+            return Ok(None);
+        }
+        profile.stage = "json_parse";
+        let parse_started = Instant::now();
+        let valid = serde_json::from_slice::<serde_json::Value>(body_bytes).is_ok();
+        profile.json_parse_us = parse_started.elapsed().as_micros() as u64;
+        if !valid {
+            profile.stage = "json_invalid";
+            return Ok(None);
+        }
         // A bounded, self-describing JSON response can delimit itself even when an HTTP/1.1
         // peer omits both Content-Length and chunked framing. Incomplete JSON remains buffered;
         // a complete value is safe to consume without waiting for a socket close event.
@@ -6408,6 +6872,7 @@ fn decode_http_message(
     } else {
         // HTTP/1.x response bodies without framing end on connection close. A TLS fragment cannot
         // prove that boundary, so wait for a close/timeout-aware path instead of guessing.
+        profile.stage = "unframed_pending";
         return Ok(None);
     };
 
@@ -6415,6 +6880,7 @@ fn decode_http_message(
         extend_unique(&mut partial_reasons, ["reassembly_body_limit".to_string()]);
     }
 
+    profile.stage = "complete";
     Ok(Some(DecodedHttpMessage {
         consumed: header_len + body_consumed,
         start_line,
@@ -9675,6 +10141,59 @@ mod tests {
     }
 
     #[test]
+    fn json_completion_scan_never_rejects_valid_json_prefixes() {
+        let bodies: &[&[u8]] = &[
+            br#"{"items":[{"text":"braces } ] and quote \" and slash \\","nested":{"x":[1,2]}}]}"#,
+            br#"[{"text":"["},{"text":"}]"},true,null]"#,
+            br#" {"x":"escaped \\\" quote"} "#,
+            b" true ",
+        ];
+        for body in bodies {
+            let mut scan = JsonCompletionScanState::default();
+            for end in 1..=body.len() {
+                let prefix = &body[..end];
+                let may_be_complete = json_body_may_be_complete(prefix, &mut scan);
+                if serde_json::from_slice::<Value>(prefix).is_ok() {
+                    assert!(
+                        may_be_complete,
+                        "valid prefix was rejected at byte {end} of {body:?}"
+                    );
+                }
+                if !scan.complete && !scan.scalar {
+                    assert_eq!(scan.offset, end, "scan must resume after new bytes");
+                }
+            }
+            assert!(json_body_may_be_complete(body, &mut scan));
+        }
+    }
+
+    #[test]
+    fn unframed_large_json_completes_once_after_incremental_prefix_scans() {
+        let body = serde_json::to_string(&serde_json::json!({
+            "id": "resp-bench",
+            "items": (0..16384).map(|index| serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "text": "abcdefghijklmnopqrstuvwxyz0123456789"
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let header = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n";
+        let wire = [header.as_slice(), body.as_bytes()].concat();
+        let mut decoder = HttpStreamDecoder::new(StreamKind::Response, 8 * 1024 * 1024);
+        let split = wire.len() - 1;
+        for part in wire[..split].chunks(4096) {
+            assert!(decoder.push(part, 100, &[]).is_empty());
+        }
+        assert!(!decoder.json_scan.complete);
+        assert_eq!(decoder.json_scan.offset, split - header.len());
+        let completed = decoder.push(&wire[split..], 110, &[]);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].body, body.as_bytes());
+        assert_eq!(decoder.json_scan, JsonCompletionScanState::default());
+    }
+
+    #[test]
     fn rustls_body_only_sse_split_prefix_and_cr_delimiter_preserve_raw_body() {
         let request_body =
             r#"{"model":"fixture-model","input":[{"role":"user","content":"split-sse"}]}"#;
@@ -10584,9 +11103,17 @@ Content-Type: application/json
         c.socket_fd = 13;
         noise.push(c);
         noise.expire_idle(std::time::Instant::now() + std::time::Duration::from_secs(91));
+        // RESP 数组形式（Redis 客户端库唯一线形态）如今在重组器入口直接丢弃：
+        // 不建立连接状态、不占任何车道内存、也不产出退休记录——比快车道退休更强的
+        // 保证。现场实测该形态曾以千万级 chunk 洪峰挤占 perf ring。
         assert!(
-            !noise.take_completed().is_empty() || !noise.take_evidence().is_empty(),
-            "非 HTTP 噪音连接必须在快车道退休（90s），不得占用慢车道"
+            noise.take_completed().is_empty() && noise.take_evidence().is_empty(),
+            "RESP 噪音应在入口丢弃，不得产出退休记录"
+        );
+        assert_eq!(
+            noise.metrics().resp_chatter_dropped,
+            1,
+            "RESP 噪音必须计入 resp_chatter_dropped"
         );
     }
 
@@ -12734,6 +13261,16 @@ Content-Type: application/json
             .partial_reasons
             .iter()
             .any(|reason| reason == "websocket_midstream_resync"));
+    }
+
+    #[test]
+    fn websocket_midstream_resync_scans_at_most_once_per_push() {
+        let mut decoder = WebSocketFrameDecoder::new(StreamKind::Request, 64 * 1024);
+        decoder.allow_midstream_resync = true;
+        let noise = vec![0xff; 512];
+        assert!(decoder.push(&noise, 100, &[]).is_empty());
+        assert!(decoder.profile_iterations > 64);
+        assert_eq!(decoder.profile_resync_calls, 1);
     }
 
     #[test]

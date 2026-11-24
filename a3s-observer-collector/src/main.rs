@@ -1691,6 +1691,8 @@ impl ExecAssembler {
 
 #[cfg(feature = "legacy-kernel-4-19")]
 mod legacy;
+#[cfg(feature = "legacy-kernel-4-19")]
+mod legacy_file_filter;
 
 #[cfg(not(feature = "legacy-kernel-4-19"))]
 #[tokio::main]

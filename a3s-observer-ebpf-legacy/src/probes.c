@@ -1,5 +1,8 @@
 #define SEC(name) __attribute__((section(name), used))
 #define INLINE static __attribute__((always_inline)) inline
+/* 阻断编译器对局部值的常量/范围折叠（内核 BPF barrier_var 惯用法）。
+ * 4.19 验证器不做跨分支范围传播：尺寸 clamp 必须以目标码形态存活到调用点。 */
+#define barrier_var(var) __asm__ volatile("" : "+r"(var))
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -171,13 +174,15 @@ _Static_assert(sizeof(struct plaintext_tls_event) == 16432, "plaintext_tls_event
 
 /* ---- 截断补读游标（R3/R4 实验特性，仅 x86 开发通道，A3S_BPF_ARCH_X86_64 门控）----
  * 单次 SSL_write/SSL_read（uprobe）或 HTTP write/read（kprobe）数据量超过发射窗口
- * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道单分片 16KB；R4 开启时 TLS 提前至 8 片）
+ * （TLS 通道 TLS_SPLIT_MAX×16KB，syscall 通道 PLAINTEXT_SPLIT_MAX×16KB；R4 开启时 TLS 提前至 8 片）
  * 时被截断：发射终止片在 header+len 之后追加一个定长扩展尾部，携带续读地址、剩余长度
  * 和已采尾部 64B 的 FNV-1a 指纹。用户态 collector 用 process_vm_readv 补读剩余部分，
  * 先比对衔接处指纹再拼接——宁可不拼，不可错拼。
- * 不进 arm64/4.19 对象：该面已在 TLS_SPLIT_MAX=12 上验证冻结，验证器预算无冗余，
- * 全部游标代码、扩展 scratch 与 A3S_RUNTIME_CONFIG map 均由 A3S_BPF_ARCH_X86_64
- * 条件编译剔除，arm64 对象保持字节不变（构建校验：对比改动前后 sha256）。
+ * arm64/4.19（compat12 起）：syscall 通道游标经 A3S_BPF_LEGACY_CURSOR 开启——现场
+ * partialReasons 主因 probe_call_limit（单次 >16KB write 被固定窗口切断），冷路径
+ * 增量约 300 指令，预算实测通过；TLS 通道游标仍仅 x86（TLS_SPLIT_MAX 发射面是
+ * 4.19 验证器预算最紧处，且该通道在仿真现场零流量）。不传新宏时预处理输出与
+ * 冻结基线字节一致（构建校验：对比 sha256）。
  * 游标信息自包含在事件扩展尾部（任务书 ABI 条款的优先方式），因此无需 BPF 侧
  * cursor LRU map：游标随事件生灭，TTL 由用户态按 captured_at_boot_ns 判定。 */
 #define PLAINTEXT_CURSOR_MAGIC 0x3153525543533341ULL /* "A3SCURS1" 小端 */
@@ -193,9 +198,10 @@ struct plaintext_cursor_ext {
 };
 _Static_assert(sizeof(struct plaintext_cursor_ext) == 32, "cursor ext ABI mismatch");
 
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* 扩展 scratch：事件后预留游标槽位。常规分片仍按 header+len 修剪发射；只有选中的
- * 发射终止片把记录扩到 sizeof(event)+sizeof(ext)。 */
+ * 发射终止片把记录扩到 sizeof(event)+sizeof(ext)。arm64 只用 syscall 变体；
+ * TLS 变体仅 x86 定义引用。 */
 struct plaintext_event_with_cursor {
     struct plaintext_event event;
     struct plaintext_cursor_ext ext;
@@ -239,11 +245,94 @@ SCRATCH_MAP(SEC_SCRATCH, struct sec_event);
 #if defined(A3S_BPF_ARCH_X86_64)
 SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event_with_cursor);
 SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event_with_cursor);
+#elif defined(A3S_BPF_LEGACY_CURSOR)
+SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event_with_cursor);
+SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
 #else
 SCRATCH_MAP(PLAINTEXT_SCRATCH, struct plaintext_event);
 SCRATCH_MAP(PLAINTEXT_TLS_SCRATCH, struct plaintext_tls_event);
 #endif
 SCRATCH_MAP(DROPS, u64);
+
+/* compat25: kernel-side file prefilter, ported from the modern backend (a3s-observer-ebpf).
+ * Layouts MUST match a3s_observer_common::{FileFilterKey,FileFilterValue,FileFilterConfig,
+ * FileFilterSampleWindow,FileFilterStats} exactly. Userspace owns every map; the kernel only
+ * reads. Fail-open: missing/empty config or an absent rules map entry keeps historical
+ * full-capture behavior. cgroup membership is fork-inherited, so agent children of a KEEP
+ * rule stay kept with zero userspace sync in the hot path. */
+struct file_filter_key {
+    u64 cgroup_id;
+    u64 epoch;
+};                                  /* 16 bytes */
+struct file_filter_value {
+    u8 action;                      /* 1=keep 2=sample 3=drop */
+    u8 authority;                   /* 1=candidate 2=authoritative */
+    u16 flags;
+    u32 _reserved;
+    u64 epoch;
+    u64 expires_at_boot_ns;         /* 0 = no expiry */
+};                                  /* 24 bytes */
+struct file_filter_config {
+    u64 active_epoch;
+    u64 sample_window_ns;
+    u32 unknown_per_cgroup_limit;
+    u32 unknown_per_cpu_limit;
+    u8 flags;                       /* bit0 enabled, bit1 unknown-sample, bit2 unknown-drop */
+    u8 _reserved[7];
+};                                  /* 32 bytes */
+struct file_filter_sample_window {
+    u64 started_at_boot_ns;
+    u32 count;
+    u32 _reserved;
+};                                  /* 16 bytes */
+struct file_filter_stats {
+    u64 access_kept;
+    u64 access_unknown_kept;
+    u64 access_sampled;
+    u64 access_dropped;
+    u64 access_sample_suppressed;
+    u64 delete_kept;
+    u64 delete_unknown_kept;
+    u64 delete_dropped;
+    u64 rule_hits;
+    u64 rule_misses;
+    u64 stale_rules;
+    u64 access_ring_dropped;
+    u64 delete_ring_dropped;
+};                                  /* 104 bytes, field order == FileFilterStats */
+#define FILE_FILTER_CFG_ENABLED    (1U << 0)
+#define FILE_FILTER_CFG_UNKNOWN_SAMPLE (1U << 1)
+#define FILE_FILTER_CFG_UNKNOWN_DROP   (1U << 2)
+#define FILE_FILTER_ACTION_KEEP   1
+#define FILE_FILTER_ACTION_SAMPLE 2
+#define FILE_FILTER_ACTION_DROP   3
+#define FILE_FILTER_AUTHORITY_AUTHORITATIVE 2
+#define FILE_FILTER_DEFAULT_WINDOW_NS   1000000000ULL
+#define FILE_FILTER_DEFAULT_PER_CGROUP  20U
+#define FILE_FILTER_DEFAULT_PER_CPU     64U
+
+struct bpf_map_def SEC("maps") FILE_FILTER_RULES = {
+    .type = BPF_MAP_TYPE_HASH, .key_size = 16, .value_size = 24, .max_entries = 65536
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_CONFIG = {
+    .type = BPF_MAP_TYPE_ARRAY, .key_size = 4, .value_size = 32, .max_entries = 1
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_STATS = {
+    .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 104, .max_entries = 1
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_UNKNOWN_WINDOWS = {
+    .type = BPF_MAP_TYPE_LRU_HASH, .key_size = 8, .value_size = 16, .max_entries = 16384
+};
+struct bpf_map_def SEC("maps") FILE_FILTER_GLOBAL_WINDOW = {
+    .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, .value_size = 16, .max_entries = 1
+};
+/* compat27 diagnostic: ids the kernel actually observes on file events, with counts. On the
+ * field UOS 4.19.90 backport bpf_get_current_cgroup_id returns per-call garbage, so compat28
+ * keys the file filter by TGID (battle-tested by PLAINTEXT_ALLOWED); this map now records the
+ * key space actually in use (pids), still logged on change for field verification. */
+struct bpf_map_def SEC("maps") FILE_FILTER_SEEN = {
+    .type = BPF_MAP_TYPE_LRU_HASH, .key_size = 8, .value_size = 8, .max_entries = 1024
+};
 
 /* Identity-whitelisted TGIDs admitted to plaintext payload capture. Written by the userspace
  * collector from the forwarder's tls-agent-cgroups document; deleted on process exit. */
@@ -264,10 +353,9 @@ struct bpf_map_def SEC("maps") SSL_READ_ARGS = {
     .type = BPF_MAP_TYPE_HASH, .key_size = 8, .value_size = sizeof(struct ssl_read_args),
     .max_entries = 16384
 };
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* 运行时开关（R3）：bit0 = 截断补读。collector 仅在 A3S_OBSERVER_CURSOR_REREAD 开启时
- * 于加载后写 1；默认 0 = BPF 侧完全不产生游标扩展，行为与旧版逐字节一致。
- * arm64 对象不含此 map（游标代码整体按架构剔除）。 */
+ * 于加载后写 1；默认 0 = BPF 侧完全不产生游标扩展，行为与旧版逐字节一致。 */
 struct bpf_map_def SEC("maps") A3S_RUNTIME_CONFIG = {
     .type = BPF_MAP_TYPE_ARRAY, .key_size = 4, .value_size = 8, .max_entries = 1
 };
@@ -308,6 +396,137 @@ static long (*bpf_probe_read_user_str)(void *dst, u32 size, const void *src) = (
 static long (*bpf_trace_printk)(const char *fmt, u32 fmt_size, ...) = (void *)6;
 static long (*bpf_probe_read_compat)(void *dst, u32 size, const void *src) = (void *)4;
 #endif
+
+/* Bounded Unknown sampler, mirroring the modern backend's sample_window_allows(). Fixed-size
+ * accesses only; the 4.19 verifier accepts plain lookups + branches. */
+INLINE int file_filter_window_allows(struct file_filter_sample_window *window, u64 now,
+                                     u64 window_ns, u32 limit) {
+    if (now - window->started_at_boot_ns >= window_ns) {
+        window->started_at_boot_ns = now;
+        window->count = 0;
+    }
+    if (window->count >= limit)
+        return 0;
+    window->count += 1;
+    return 1;
+}
+
+INLINE int file_filter_unknown_sample_allowed(u64 cgroup_id, struct file_filter_config *cfg,
+                                              u64 now) {
+    u64 window_ns = cfg->sample_window_ns ? cfg->sample_window_ns : FILE_FILTER_DEFAULT_WINDOW_NS;
+    u32 cgroup_limit = cfg->unknown_per_cgroup_limit
+        ? cfg->unknown_per_cgroup_limit : FILE_FILTER_DEFAULT_PER_CGROUP;
+    u32 cpu_limit = cfg->unknown_per_cpu_limit
+        ? cfg->unknown_per_cpu_limit : FILE_FILTER_DEFAULT_PER_CPU;
+    struct file_filter_sample_window *window =
+        bpf_map_lookup_elem(&FILE_FILTER_UNKNOWN_WINDOWS, &cgroup_id);
+    if (window) {
+        if (!file_filter_window_allows(window, now, window_ns, cgroup_limit))
+            return 0;
+    } else {
+        struct file_filter_sample_window initial = {
+            .started_at_boot_ns = now, .count = 1, ._reserved = 0
+        };
+        if (bpf_map_update_elem(&FILE_FILTER_UNKNOWN_WINDOWS, &cgroup_id, &initial, 0) != 0)
+            return 0;
+    }
+    {
+        u32 zero = 0;
+        struct file_filter_sample_window *global =
+            bpf_map_lookup_elem(&FILE_FILTER_GLOBAL_WINDOW, &zero);
+        if (!global)
+            return 1;
+        return file_filter_window_allows(global, now, window_ns, cpu_limit);
+    }
+}
+
+/* The file-event admission decision, ported from the modern backend's
+ * legacy_file_access_decision()/legacy_file_delete_decision(). Returns 1 to keep, 0 to drop. */
+INLINE void file_filter_note_seen(u64 key_id) {
+    u64 *seen = bpf_map_lookup_elem(&FILE_FILTER_SEEN, &key_id);
+    if (seen) {
+        *seen += 1;
+    } else {
+        u64 initial = 1;
+        bpf_map_update_elem(&FILE_FILTER_SEEN, &key_id, &initial, 0);
+    }
+}
+
+INLINE int file_filter_allow(u64 key_id, int is_delete) {
+    u32 zero = 0;
+    file_filter_note_seen(key_id);
+    struct file_filter_config *cfg = bpf_map_lookup_elem(&FILE_FILTER_CONFIG, &zero);
+    struct file_filter_stats *stats = bpf_map_lookup_elem(&FILE_FILTER_STATS, &zero);
+    if (!cfg)
+        return 1; /* fail-open: no config installed */
+    if (!(cfg->flags & FILE_FILTER_CFG_ENABLED)) {
+        if (stats) {
+            if (is_delete) stats->delete_kept += 1; else stats->access_kept += 1;
+        }
+        return 1;
+    }
+    {
+        u64 now = bpf_ktime_get_ns();
+        struct file_filter_key key;
+        struct file_filter_value *rule;
+        int have_rule = 0;
+        key.cgroup_id = key_id;
+        key.epoch = cfg->active_epoch;
+        rule = bpf_map_lookup_elem(&FILE_FILTER_RULES, &key);
+        if (rule) {
+            if (rule->epoch != cfg->active_epoch ||
+                (rule->expires_at_boot_ns != 0 && now >= rule->expires_at_boot_ns)) {
+                if (stats) stats->stale_rules += 1;
+            } else {
+                if (stats) stats->rule_hits += 1;
+                have_rule = 1;
+            }
+        } else {
+            if (stats) stats->rule_misses += 1;
+        }
+        if (have_rule) {
+            /* KEEP short-circuits; authoritative DROP drops; SAMPLE or candidate DROP falls
+             * through to the configured Unknown policy (candidate can never authorize a drop). */
+            if (rule->action == FILE_FILTER_ACTION_KEEP) {
+                if (stats) {
+                    if (is_delete) stats->delete_kept += 1; else stats->access_kept += 1;
+                }
+                return 1;
+            }
+            if (rule->action == FILE_FILTER_ACTION_DROP &&
+                rule->authority == FILE_FILTER_AUTHORITY_AUTHORITATIVE) {
+                if (stats) {
+                    if (is_delete) stats->delete_dropped += 1; else stats->access_dropped += 1;
+                }
+                return 0;
+            }
+        }
+        if (cfg->flags & FILE_FILTER_CFG_UNKNOWN_DROP) {
+            if (stats) {
+                if (is_delete) stats->delete_dropped += 1; else stats->access_dropped += 1;
+            }
+            return 0;
+        }
+        if (!(cfg->flags & FILE_FILTER_CFG_UNKNOWN_SAMPLE)) {
+            if (stats) {
+                if (is_delete) {
+                    stats->delete_kept += 1;
+                    stats->delete_unknown_kept += 1;
+                } else {
+                    stats->access_kept += 1;
+                    stats->access_unknown_kept += 1;
+                }
+            }
+            return 1;
+        }
+        if (file_filter_unknown_sample_allowed(key_id, cfg, now)) {
+            if (stats) stats->access_sampled += 1;
+            return 1;
+        }
+        if (stats) stats->access_sample_suppressed += 1;
+        return 0;
+    }
+}
 
 INLINE void count_drop(void) {
     u32 key = 0;
@@ -374,7 +593,7 @@ INLINE int plaintext_admitted(u32 pid) {
     return bpf_map_lookup_elem(&PLAINTEXT_ALLOWED, &pid) != 0;
 }
 
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
 /* R3/R4 截断补读 helper：只服务 syscall 截断片或超过 128KB 的 TLS 调用。 */
 INLINE int cursor_reread_enabled(void) {
     u32 key = 0;
@@ -593,6 +812,13 @@ INLINE void emit_file(struct pt_regs *ctx, u64 path, u32 flags) {
     struct file_event *event;
     if (!path)
         return;
+    /* compat25: kernel-side admission. Dropped events never reach the scratch map or the
+     * ring; userspace attribution semantics (cgroup_id stays 0) are unchanged.
+     * compat28: keyed by TGID - on the field UOS 4.19.90 backport
+     * bpf_get_current_cgroup_id returns per-call garbage (verified via FILE_FILTER_SEEN,
+     * 2026-11-09); PLAINTEXT_ALLOWED has run TGID-keyed on this same kernel for days. */
+    if (!file_filter_allow(bpf_get_current_pid_tgid() >> 32, flags == FILE_DELETE_FLAG))
+        return;
     event = scratch(&FILE_SCRATCH);
     if (!event) {
         count_drop();
@@ -673,8 +899,8 @@ int legacy_bind(struct pt_regs *ctx) {
  * valid-byte count for userspace; the perf record is trimmed to len so short socket calls do not
  * consume a 16 KiB ring slot. If the full window crosses an unmapped page, retry with a small
  * fixed window before dropping the payload. */
-INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
-                           u32 direction) {
+INLINE void emit_plaintext_slice(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
+                                 u32 direction, u32 allow_cursor) {
     struct plaintext_event *event;
     u32 len;
     if (!buf || !count)
@@ -788,22 +1014,59 @@ INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 co
         u32 emit_len = event->len;
         if (emit_len > LEGACY_PLAINTEXT_LEN)
             emit_len = LEGACY_PLAINTEXT_LEN;
-#if defined(A3S_BPF_ARCH_X86_64)
+#if defined(A3S_BPF_ARCH_X86_64) || defined(A3S_BPF_LEGACY_CURSOR)
         /* 截断补读游标（冷路径）：本 syscall 超过 16KB 窗口且完整采满时挂续读扩展。
          * len 被读失败降窗（<16KB）说明衔接处不可信，不挂游标——宁可不拼。 */
-        if (count > LEGACY_PLAINTEXT_LEN && emit_len == LEGACY_PLAINTEXT_LEN &&
-            cursor_reread_enabled()) {
+        if (allow_cursor && count > LEGACY_PLAINTEXT_LEN &&
+            emit_len == LEGACY_PLAINTEXT_LEN && cursor_reread_enabled()) {
             struct plaintext_event_with_cursor *full = (void *)event;
             cursor_ext_fill(&full->ext, buf + LEGACY_PLAINTEXT_LEN,
                             count - LEGACY_PLAINTEXT_LEN,
                             event->data + LEGACY_PLAINTEXT_LEN - PLAINTEXT_CURSOR_TAIL_LEN);
-            output(ctx, &PLAINTEXT_EVENTS, event,
-                   sizeof(*event) + sizeof(struct plaintext_cursor_ext));
+            /* 4.19 verifier: the perf output size argument must carry a provable
+             * bound AT the call site — the clamp on emit_len above does not survive
+             * the extra cursor branch in cross-branch range tracking. Re-derive the
+             * bound from a local here ("R5 unbounded memory access", 2026-11-02). */
+            u32 cursor_size =
+                (u32)sizeof(*event) + (u32)sizeof(struct plaintext_cursor_ext);
+            barrier_var(cursor_size);
+            if (cursor_size > (u32)sizeof(struct plaintext_event_with_cursor))
+                cursor_size = (u32)sizeof(struct plaintext_event_with_cursor);
+            output(ctx, &PLAINTEXT_EVENTS, event, cursor_size);
             return;
         }
-#endif
+        /* Same 4.19 rule for the trimmed-path size: the cursor branch between the
+         * emit_len clamp and this use breaks range propagation on 4.19, so restore
+         * the bound with a local compare directly before the call. */
+        {
+            u32 trimmed_size = (u32)sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len;
+            barrier_var(trimmed_size);
+            if (trimmed_size > (u32)sizeof(*event))
+                trimmed_size = (u32)sizeof(*event);
+            output(ctx, &PLAINTEXT_EVENTS, event, trimmed_size);
+        }
+#else
         output(ctx, &PLAINTEXT_EVENTS, event,
                sizeof(*event) - LEGACY_PLAINTEXT_LEN + emit_len);
+#endif
+    }
+}
+
+/* 普通明文与 TLS 大调用采用相同的立即分片策略：前 12 片（192KiB）在目标缓冲区
+ * 仍位于本次 syscall 时顺序复制，避免用户态补读与缓冲区复用竞争。最后一片之后仍有
+ * 剩余时才挂安全游标；中间片不得挂游标，否则会把已立即复制的字节再次追加。 */
+#define PLAINTEXT_SPLIT_MAX 12
+INLINE void emit_plaintext(struct pt_regs *ctx, u32 pid, u32 fd, u64 buf, u64 count,
+                           u32 direction) {
+#pragma unroll
+    for (u32 i = 0; i < PLAINTEXT_SPLIT_MAX; i++) {
+        const u64 offset = (u64)i * LEGACY_PLAINTEXT_LEN;
+        if (offset >= count)
+            break;
+        const u32 allow_cursor =
+            i == PLAINTEXT_SPLIT_MAX - 1 && count - offset > LEGACY_PLAINTEXT_LEN;
+        emit_plaintext_slice(ctx, pid, fd, buf + offset, count - offset,
+                             direction, allow_cursor);
     }
 }
 
@@ -813,6 +1076,62 @@ INLINE void plaintext_write(struct pt_regs *ctx) {
         return;
     emit_plaintext(ctx, pid, (u32)syscall_arg(ctx, 0), syscall_arg(ctx, 1),
                    syscall_arg(ctx, 2), LEGACY_PLAINTEXT_DIRECTION_WRITE);
+}
+
+struct legacy_iovec {
+    u64 base;
+    u64 len;
+};
+
+struct legacy_msghdr {
+    u64 name;
+    u32 name_len;
+    u32 _pad;
+    u64 iov;
+    u64 iov_len;
+};
+
+/* 每个 syscall 最多读取四个 iovec，避免在老内核上展开出无界指令面。若应用把
+ * 请求拆到更多 iovec，Content-Length/流式终止条件不足时会保持 partial 并在退休时显式
+ * 形成缺口，不把缺失部分伪造成完整请求。 */
+#define PLAINTEXT_IOV_MAX 4
+INLINE void plaintext_iov_one(struct pt_regs *ctx, u32 pid, u32 fd, u64 iov,
+                              u64 index) {
+    struct legacy_iovec item;
+    if (bpf_probe_read_user(&item, sizeof(item),
+                            (const void *)(iov + index * sizeof(item))) < 0)
+        return;
+    if (!item.base || !item.len)
+        return;
+    emit_plaintext(ctx, pid, fd, item.base, item.len,
+                   LEGACY_PLAINTEXT_DIRECTION_WRITE);
+}
+
+INLINE void plaintext_iov(struct pt_regs *ctx, u32 fd, u64 iov, u64 iov_len) {
+    const u32 pid = (u32)(bpf_get_current_pid_tgid() >> 32);
+    if (!plaintext_admitted(pid))
+        return;
+    if (iov_len > 0)
+        plaintext_iov_one(ctx, pid, fd, iov, 0);
+    if (iov_len > 1)
+        plaintext_iov_one(ctx, pid, fd, iov, 1);
+    if (iov_len > 2)
+        plaintext_iov_one(ctx, pid, fd, iov, 2);
+    if (iov_len > 3)
+        plaintext_iov_one(ctx, pid, fd, iov, 3);
+}
+
+INLINE void plaintext_writev(struct pt_regs *ctx) {
+    plaintext_iov(ctx, (u32)syscall_arg(ctx, 0), syscall_arg(ctx, 1),
+                  syscall_arg(ctx, 2));
+}
+
+INLINE void plaintext_sendmsg(struct pt_regs *ctx) {
+    struct legacy_msghdr msg;
+    if (bpf_probe_read_user(&msg, sizeof(msg),
+                            (const void *)syscall_arg(ctx, 1)) < 0)
+        return;
+    plaintext_iov(ctx, (u32)syscall_arg(ctx, 0), msg.iov, msg.iov_len);
 }
 
 INLINE void plaintext_read_enter(struct pt_regs *ctx) {
@@ -855,6 +1174,18 @@ int legacy_http_write(struct pt_regs *ctx) {
 SEC("kprobe")
 int legacy_http_sendto(struct pt_regs *ctx) {
     plaintext_write(ctx);
+    return 0;
+}
+
+SEC("kprobe")
+int legacy_http_writev(struct pt_regs *ctx) {
+    plaintext_writev(ctx);
+    return 0;
+}
+
+SEC("kprobe")
+int legacy_http_sendmsg(struct pt_regs *ctx) {
+    plaintext_sendmsg(ctx);
     return 0;
 }
 
