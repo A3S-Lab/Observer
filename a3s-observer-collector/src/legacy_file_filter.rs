@@ -16,13 +16,15 @@ use a3s_observer_common::{
     FILE_FILTER_AUTHORITY_CANDIDATE, FILE_FILTER_CONFIG_ENABLED, FILE_FILTER_CONFIG_UNKNOWN_DROP,
     FILE_FILTER_CONFIG_UNKNOWN_SAMPLE,
 };
-use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray};
 use anyhow::{Context, Result};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use super::{bounded_env_u64, env_any, json_string, parse_rfc3339_unix_nanos, pod_bytes,
-            pod_from_bytes, parse_unknown_file_policy, UnknownFilePolicy};
+use super::{
+    bounded_env_u64, env_any, json_string, parse_rfc3339_unix_nanos, parse_unknown_file_policy,
+    pod_bytes, pod_from_bytes, UnknownFilePolicy,
+};
 
 const FILTER_RULE_SNAPSHOT_SCHEMA: &str = "anysentry.filter_rule_snapshot.v1";
 const FILTER_RULE_SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -203,27 +205,27 @@ impl FileFilterManager {
             return Ok(None);
         };
         let rules = BpfHashMap::try_from(
-            ebpf
-                .take_map("FILE_FILTER_RULES")
+            ebpf.take_map("FILE_FILTER_RULES")
                 .context("`FILE_FILTER_RULES` missing")?,
         )?;
         let config = Array::try_from(
-            ebpf
-                .take_map("FILE_FILTER_CONFIG")
+            ebpf.take_map("FILE_FILTER_CONFIG")
                 .context("`FILE_FILTER_CONFIG` missing")?,
         )?;
         let stats = PerCpuArray::try_from(
-            ebpf
-                .take_map("FILE_FILTER_STATS")
+            ebpf.take_map("FILE_FILTER_STATS")
                 .context("`FILE_FILTER_STATS` missing")?,
         )?;
         // Diagnostic-only: absent on pre-compat27 objects.
         let seen = ebpf
             .take_map("FILE_FILTER_SEEN")
             .and_then(|map| BpfHashMap::try_from(map).ok());
-        let unknown_policy =
-            parse_unknown_file_policy(std::env::var("A3S_OBSERVER_FILE_UNKNOWN_POLICY").ok().as_deref())
-                .map_err(anyhow::Error::msg)?;
+        let unknown_policy = parse_unknown_file_policy(
+            std::env::var("A3S_OBSERVER_FILE_UNKNOWN_POLICY")
+                .ok()
+                .as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
         let per_cgroup = bounded_env_u64(
             "A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP",
             DEFAULT_UNKNOWN_PER_CGROUP as u64,
@@ -298,8 +300,7 @@ impl FileFilterManager {
                 .access_unknown_kept
                 .saturating_add(item.access_unknown_kept);
             aggregate.access_sampled = aggregate.access_sampled.saturating_add(item.access_sampled);
-            aggregate.access_dropped =
-                aggregate.access_dropped.saturating_add(item.access_dropped);
+            aggregate.access_dropped = aggregate.access_dropped.saturating_add(item.access_dropped);
             aggregate.access_sample_suppressed = aggregate
                 .access_sample_suppressed
                 .saturating_add(item.access_sample_suppressed);
@@ -307,8 +308,7 @@ impl FileFilterManager {
             aggregate.delete_unknown_kept = aggregate
                 .delete_unknown_kept
                 .saturating_add(item.delete_unknown_kept);
-            aggregate.delete_dropped =
-                aggregate.delete_dropped.saturating_add(item.delete_dropped);
+            aggregate.delete_dropped = aggregate.delete_dropped.saturating_add(item.delete_dropped);
             aggregate.rule_hits = aggregate.rule_hits.saturating_add(item.rule_hits);
             aggregate.rule_misses = aggregate.rule_misses.saturating_add(item.rule_misses);
             aggregate.stale_rules = aggregate.stale_rules.saturating_add(item.stale_rules);
@@ -662,8 +662,18 @@ mod tests {
     #[test]
     fn fingerprint_stable_for_identical_sets() {
         let rules = vec![(
-            FileFilterKey { cgroup_id: 7, epoch: 1 },
-            FileFilterValue { action: 1, authority: 2, flags: 0, _reserved: 0, epoch: 1, expires_at_boot_ns: 99 },
+            FileFilterKey {
+                cgroup_id: 7,
+                epoch: 1,
+            },
+            FileFilterValue {
+                action: 1,
+                authority: 2,
+                flags: 0,
+                _reserved: 0,
+                epoch: 1,
+                expires_at_boot_ns: 99,
+            },
         )];
         let pids: std::collections::BTreeSet<u64> = [11u64, 22, 33].into_iter().collect();
         let a = rules_fingerprint(&rules, &pids);
@@ -674,15 +684,31 @@ mod tests {
     #[test]
     fn fingerprint_changes_with_pid_or_action() {
         let rules = vec![(
-            FileFilterKey { cgroup_id: 7, epoch: 1 },
-            FileFilterValue { action: 1, authority: 2, flags: 0, _reserved: 0, epoch: 1, expires_at_boot_ns: 99 },
+            FileFilterKey {
+                cgroup_id: 7,
+                epoch: 1,
+            },
+            FileFilterValue {
+                action: 1,
+                authority: 2,
+                flags: 0,
+                _reserved: 0,
+                epoch: 1,
+                expires_at_boot_ns: 99,
+            },
         )];
         let base: std::collections::BTreeSet<u64> = [11u64].into_iter().collect();
         let more: std::collections::BTreeSet<u64> = [11u64, 12].into_iter().collect();
-        assert_ne!(rules_fingerprint(&rules, &base), rules_fingerprint(&rules, &more));
+        assert_ne!(
+            rules_fingerprint(&rules, &base),
+            rules_fingerprint(&rules, &more)
+        );
         let mut changed = rules.clone();
         changed[0].1.action = 3;
-        assert_ne!(rules_fingerprint(&rules, &base), rules_fingerprint(&changed, &base));
+        assert_ne!(
+            rules_fingerprint(&rules, &base),
+            rules_fingerprint(&changed, &base)
+        );
     }
 
     #[test]

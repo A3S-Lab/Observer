@@ -1252,54 +1252,54 @@ impl WebSocketFrameDecoder {
     fn inflate_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let started = Instant::now();
         let result = (|| {
-        if self.no_context_takeover {
-            self.inflater.reset(false);
-        }
-        let mut input = Vec::with_capacity(payload.len().saturating_add(4));
-        input.extend_from_slice(payload);
-        input.extend_from_slice(WEBSOCKET_DEFLATE_TAIL);
-        let initial_capacity = input
-            .len()
-            .saturating_mul(4)
-            .clamp(4 * 1024, self.max_bytes);
-        let mut output = Vec::with_capacity(initial_capacity);
-        let mut cursor = 0usize;
-        loop {
-            if output.len() == output.capacity() {
-                if output.len() >= self.max_bytes {
-                    self.inflater.reset(false);
-                    return Err("websocket_decompressed_limit".to_string());
+            if self.no_context_takeover {
+                self.inflater.reset(false);
+            }
+            let mut input = Vec::with_capacity(payload.len().saturating_add(4));
+            input.extend_from_slice(payload);
+            input.extend_from_slice(WEBSOCKET_DEFLATE_TAIL);
+            let initial_capacity = input
+                .len()
+                .saturating_mul(4)
+                .clamp(4 * 1024, self.max_bytes);
+            let mut output = Vec::with_capacity(initial_capacity);
+            let mut cursor = 0usize;
+            loop {
+                if output.len() == output.capacity() {
+                    if output.len() >= self.max_bytes {
+                        self.inflater.reset(false);
+                        return Err("websocket_decompressed_limit".to_string());
+                    }
+                    let additional = output
+                        .capacity()
+                        .max(4 * 1024)
+                        .min(self.max_bytes - output.len());
+                    output.reserve_exact(additional);
                 }
-                let additional = output
-                    .capacity()
-                    .max(4 * 1024)
-                    .min(self.max_bytes - output.len());
-                output.reserve_exact(additional);
-            }
-            let before_in = self.inflater.total_in();
-            let before_out = self.inflater.total_out();
-            let status = self
-                .inflater
-                .decompress_vec(&input[cursor..], &mut output, FlushDecompress::Sync)
-                .map_err(|_| "websocket_deflate_decode_failed".to_string())?;
-            let consumed = (self.inflater.total_in() - before_in) as usize;
-            let produced = (self.inflater.total_out() - before_out) as usize;
-            cursor = cursor.saturating_add(consumed);
-            if cursor == input.len() && status != Status::BufError {
-                break;
-            }
-            if consumed == 0 && produced == 0 {
-                if cursor == input.len() {
+                let before_in = self.inflater.total_in();
+                let before_out = self.inflater.total_out();
+                let status = self
+                    .inflater
+                    .decompress_vec(&input[cursor..], &mut output, FlushDecompress::Sync)
+                    .map_err(|_| "websocket_deflate_decode_failed".to_string())?;
+                let consumed = (self.inflater.total_in() - before_in) as usize;
+                let produced = (self.inflater.total_out() - before_out) as usize;
+                cursor = cursor.saturating_add(consumed);
+                if cursor == input.len() && status != Status::BufError {
                     break;
                 }
-                self.inflater.reset(false);
-                return Err("websocket_deflate_stalled".to_string());
+                if consumed == 0 && produced == 0 {
+                    if cursor == input.len() {
+                        break;
+                    }
+                    self.inflater.reset(false);
+                    return Err("websocket_deflate_stalled".to_string());
+                }
             }
-        }
-        if self.no_context_takeover {
-            self.inflater.reset(false);
-        }
-        Ok(output)
+            if self.no_context_takeover {
+                self.inflater.reset(false);
+            }
+            Ok(output)
         })();
         self.profile_inflate_calls = self.profile_inflate_calls.saturating_add(1);
         self.profile_inflate_us = self
@@ -1365,14 +1365,13 @@ impl WebSocketFrameDecoder {
                 .max(2);
             for offset in 1..search_limit {
                 offsets_tested += 1;
-                let Ok(Some(frame)) = decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
+                let Ok(Some(frame)) =
+                    decode_websocket_frame(&self.buffer[offset..], self.max_bytes)
                 else {
                     continue;
                 };
                 frames_tested += 1;
-                if frame.masked != expect_masked
-                    || !matches!(frame.opcode, 0x1 | 0x2)
-                    || !frame.fin
+                if frame.masked != expect_masked || !matches!(frame.opcode, 0x1 | 0x2) || !frame.fin
                 {
                     continue;
                 }
@@ -3584,7 +3583,13 @@ impl InteractionReassembler {
             bytes
                 .iter()
                 .take(max)
-                .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '·' })
+                .map(|b| {
+                    if (0x20..0x7f).contains(b) {
+                        *b as char
+                    } else {
+                        '·'
+                    }
+                })
                 .collect(),
         )
     }
@@ -4241,7 +4246,8 @@ fn duplicate_probe_write(state: &mut ConnectionState, chunk: &PlaintextChunk) ->
                 *direction == chunk.direction
                     && *previous_len == len
                     && *previous_hash == digest
-                    && chunk.event_at_unix_ns.saturating_sub(*previous_at) < DUPLICATE_PROBE_WRITE_NS
+                    && chunk.event_at_unix_ns.saturating_sub(*previous_at)
+                        < DUPLICATE_PROBE_WRITE_NS
             },
         );
     state.last_probe_write = Some((chunk.direction, len, digest, chunk.event_at_unix_ns));
@@ -11105,7 +11111,8 @@ Content-Type: application/json
             "RESP 噪音应在入口丢弃，不得产出退休记录"
         );
         assert_eq!(
-            noise.metrics().resp_chatter_dropped, 1,
+            noise.metrics().resp_chatter_dropped,
+            1,
             "RESP 噪音必须计入 resp_chatter_dropped"
         );
     }

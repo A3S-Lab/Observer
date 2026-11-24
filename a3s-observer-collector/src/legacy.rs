@@ -17,15 +17,17 @@ use a3s_observer::{
     IdentityResolver, JsonExporter, KubeResolver, LogExporter, RawObservation, SniClassifier,
 };
 use a3s_observer_common::{
-    classic_tls_sock_connection_id, fnv1a64, ConnectEvent, ExitEvent, FileEvent,
-    LegacyCursorExt, LegacyExecEvent, LegacyPlaintextEvent, LegacyTlsPlaintextEvent, SecEvent,
+    classic_tls_sock_connection_id, fnv1a64, ConnectEvent, ExitEvent, FileEvent, LegacyCursorExt,
+    LegacyExecEvent, LegacyPlaintextEvent, LegacyTlsPlaintextEvent, SecEvent,
     A3S_CONFIG_FLAG_CURSOR_REREAD, ARGV_SLOTS, FILE_DELETE_FLAG, LEGACY_ARG_LEN,
     LEGACY_CURSOR_EXT_MAGIC, LEGACY_CURSOR_TAIL_LEN, LEGACY_PLAINTEXT_DIRECTION_READ,
     LEGACY_PLAINTEXT_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
 };
 use anyhow::Context as _;
 use aya::{
-    maps::{perf::AsyncPerfEventArray, Array as BpfArray, HashMap as BpfHashMap, MapData, PerCpuArray},
+    maps::{
+        perf::AsyncPerfEventArray, Array as BpfArray, HashMap as BpfHashMap, MapData, PerCpuArray,
+    },
     programs::{KProbe, ProgramError, UProbe, UProbeError},
     util::online_cpus,
     Ebpf,
@@ -50,9 +52,13 @@ use tokio::sync::mpsc;
 macro_rules! sys_sym {
     ($name:literal) => {{
         #[cfg(target_arch = "aarch64")]
-        { concat!("__arm64_sys_", $name) }
+        {
+            concat!("__arm64_sys_", $name)
+        }
         #[cfg(not(target_arch = "aarch64"))]
-        { concat!("__x64_sys_", $name) }
+        {
+            concat!("__x64_sys_", $name)
+        }
     }};
 }
 
@@ -132,12 +138,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &[sys_sym!("ptrace")],
         &mut attached,
     );
-    attach_first(
-        &mut ebpf,
-        "legacy_bind",
-        &[sys_sym!("bind")],
-        &mut attached,
-    );
+    attach_first(&mut ebpf, "legacy_bind", &[sys_sym!("bind")], &mut attached);
     if files {
         attach_first(
             &mut ebpf,
@@ -225,10 +226,30 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     // Dev-machine x86_64 diagnosis (A3S_BPF_DIAG build only): unconditional connect-boundary
     // trace_printk probe. Absent from the frozen arm64 object; attach is a no-op then.
     if std::env::var_os("A3S_OBSERVER_DIAG").is_some() {
-        attach_first(&mut ebpf, "legacy_diag_connect", &[sys_sym!("connect")], &mut attached);
-        attach_first(&mut ebpf, "legacy_diag_sysconnect", &["__sys_connect"], &mut attached);
-        attach_first(&mut ebpf, "legacy_diag_ksysread", &["ksys_read"], &mut attached);
-        attach_first(&mut ebpf, "legacy_diag_ksysread_ret", &["ksys_read"], &mut attached);
+        attach_first(
+            &mut ebpf,
+            "legacy_diag_connect",
+            &[sys_sym!("connect")],
+            &mut attached,
+        );
+        attach_first(
+            &mut ebpf,
+            "legacy_diag_sysconnect",
+            &["__sys_connect"],
+            &mut attached,
+        );
+        attach_first(
+            &mut ebpf,
+            "legacy_diag_ksysread",
+            &["ksys_read"],
+            &mut attached,
+        );
+        attach_first(
+            &mut ebpf,
+            "legacy_diag_ksysread_ret",
+            &["ksys_read"],
+            &mut attached,
+        );
     }
 
     let effective_probes = attached
@@ -353,12 +374,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .push("openssl-uprobe".to_string());
     }
     if cursor_rereader.is_some() {
-        collector
-            .enabled_features
-            .push("cursor-reread".to_string());
+        collector.enabled_features.push("cursor-reread".to_string());
     }
 
-        let mut plaintext_scope =
+    let mut plaintext_scope =
         plaintext_http.then(|| TlsAgentScopeReloader::new(plaintext_scope_path()));
     if plaintext_http {
         tokio::spawn(run_plaintext_worker(
@@ -683,7 +702,9 @@ impl CursorRereader {
         }
         let payload = &read[tail_len..];
         chunk.data.extend_from_slice(payload);
-        chunk.partial_reasons.push("cursor_reread_patched".to_string());
+        chunk
+            .partial_reasons
+            .push("cursor_reread_patched".to_string());
         if payload.len() < cursor.remaining as usize {
             chunk
                 .partial_reasons
@@ -776,7 +797,10 @@ impl PerfLostCounters {
             .iter()
             .enumerate()
             .map(|(index, (_, key))| {
-                ((*key).to_string(), self.by_map[index].load(Ordering::Relaxed))
+                (
+                    (*key).to_string(),
+                    self.by_map[index].load(Ordering::Relaxed),
+                )
             })
             .collect()
     }
@@ -860,14 +884,19 @@ struct PlaintextSequencer {
 
 impl PlaintextSequencer {
     fn next(&mut self, pid: u32, fd: u32, generation: u32, is_read: bool) -> u64 {
-        if self.counters.len() >= 4_096 && !self.counters.contains_key(&(pid, fd, generation, is_read)) {
+        if self.counters.len() >= 4_096
+            && !self.counters.contains_key(&(pid, fd, generation, is_read))
+        {
             // Bounded state: evict one arbitrary baseline. A fresh key restarts at 1, which the
             // reassembler treats as a new baseline (no gap), never as a fabricated continuity.
             if let Some(oldest) = self.counters.keys().next().copied() {
                 self.counters.remove(&oldest);
             }
         }
-        let slot = self.counters.entry((pid, fd, generation, is_read)).or_insert(0);
+        let slot = self
+            .counters
+            .entry((pid, fd, generation, is_read))
+            .or_insert(0);
         *slot = slot.wrapping_add(1);
         *slot
     }
@@ -936,14 +965,10 @@ impl FragmentDedup {
         }
         let connection = self.connections.entry(connection_key).or_default();
         connection.last_seen_boot_ns = connection.last_seen_boot_ns.max(captured_at_boot_ns);
-        if let Some(index) = connection
-            .entries
-            .iter()
-            .position(|entry| entry.key == key)
-        {
+        if let Some(index) = connection.entries.iter().position(|entry| entry.key == key) {
             let first_seen_boot_ns = connection.entries[index].first_seen_boot_ns;
-            let duplicate =
-                captured_at_boot_ns.saturating_sub(first_seen_boot_ns) <= DUPLICATE_FRAGMENT_WINDOW_NS;
+            let duplicate = captured_at_boot_ns.saturating_sub(first_seen_boot_ns)
+                <= DUPLICATE_FRAGMENT_WINDOW_NS;
             connection.entries.remove(index);
             connection.entries.push_back(FragmentEntry {
                 key,
@@ -1153,8 +1178,19 @@ fn merge_plaintext_stats(target: &mut Stats, shared: &Arc<Mutex<Stats>>) {
         };
     }
     merge_fields!(
-        exec, exec_truncated, exec_incomplete, exec_reassembly_timeout,
-        exit, egress, dns, file, file_access, file_delete, llm, ssl, sec,
+        exec,
+        exec_truncated,
+        exec_incomplete,
+        exec_reassembly_timeout,
+        exit,
+        egress,
+        dns,
+        file,
+        file_access,
+        file_delete,
+        llm,
+        ssl,
+        sec,
         agent_identity_drops,
     );
     for (target, source) in target.pipeline.iter_mut().zip(source.pipeline.iter()) {
@@ -1204,11 +1240,9 @@ fn process_plaintext_worker_event(
     fragment_dedup: &mut FragmentDedup,
     cursor_rereader: Option<&CursorRereader>,
 ) -> Option<CompletedPlaintextBatch> {
-    let _ = PLAINTEXT_WORKER_PENDING.try_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |value| Some(value.saturating_sub(1)),
-    );
+    let _ = PLAINTEXT_WORKER_PENDING.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
     PLAINTEXT_WORKER_PROCESSED.fetch_add(1, Ordering::Relaxed);
     let (completed, comm) = match raw {
         RawEvent::Plaintext(ev, cursor) => {
@@ -1239,11 +1273,7 @@ fn process_plaintext_worker_event(
                 );
             }
             let total_started = Instant::now();
-            let mut chunk = plaintext_chunk_from_event(
-                &ev,
-                safe_unix_now_ns(),
-                sequencer,
-            );
+            let mut chunk = plaintext_chunk_from_event(&ev, safe_unix_now_ns(), sequencer);
             let dedup_started = Instant::now();
             let duplicate = suppress_duplicate_fragment(
                 fragment_dedup,
@@ -1327,11 +1357,7 @@ fn process_plaintext_worker_event(
                 );
             }
             let total_started = Instant::now();
-            let mut chunk = tls_plaintext_chunk_from_event(
-                &ev,
-                safe_unix_now_ns(),
-                sequencer,
-            );
+            let mut chunk = tls_plaintext_chunk_from_event(&ev, safe_unix_now_ns(), sequencer);
             let dedup_started = Instant::now();
             let duplicate = suppress_duplicate_fragment(
                 fragment_dedup,
@@ -1636,9 +1662,7 @@ enum SslProcessState {
 impl SslAttachKey {
     fn matches(self, state: SslProcessState) -> bool {
         match state {
-            SslProcessState::Present(start_time_ticks) => {
-                start_time_ticks == self.start_time_ticks
-            }
+            SslProcessState::Present(start_time_ticks) => start_time_ticks == self.start_time_ticks,
             SslProcessState::Exited => false,
             // 瞬时 proc 读取/解析失败不是退出证据；保留现有链接和台账，避免重复挂接。
             SslProcessState::Unavailable => true,
@@ -1686,17 +1710,19 @@ struct SslUprobeManager {
 impl SslUprobeManager {
     fn record_attach_success(&mut self, key: SslAttachKey, path: &Path) {
         self.attached.insert(key);
-        if self.diag_entries.len() >= SSL_ATTACH_DIAG_LIMIT
-            && !self.diag_entries.contains_key(&key)
+        if self.diag_entries.len() >= SSL_ATTACH_DIAG_LIMIT && !self.diag_entries.contains_key(&key)
         {
             if let Some(oldest) = self.diag_entries.keys().next().copied() {
                 self.diag_entries.remove(&oldest);
             }
         }
-        let entry = self.diag_entries.entry(key).or_insert_with(|| SslDiagEntry {
-            path: path.to_path_buf(),
-            attach_entries: 0,
-        });
+        let entry = self
+            .diag_entries
+            .entry(key)
+            .or_insert_with(|| SslDiagEntry {
+                path: path.to_path_buf(),
+                attach_entries: 0,
+            });
         entry.path = path.to_path_buf();
         entry.attach_entries += 1;
     }
@@ -1757,7 +1783,11 @@ impl SslUprobeManager {
                     continue;
                 }
                 if ssl_lines == 1 && self.logged_ssl_pids.insert(*pid) {
-                    tracing::info!(pid = *pid, path, "legacy openssl uprobe scan: libssl mapped");
+                    tracing::info!(
+                        pid = *pid,
+                        path,
+                        "legacy openssl uprobe scan: libssl mapped"
+                    );
                 }
                 let host_path = PathBuf::from(format!("/proc/{pid}/root{path}"));
                 let Ok(metadata) = std::fs::metadata(&host_path) else {
@@ -1845,9 +1875,8 @@ fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path, pid: i32) -> anyhow::Result<
     // _ex 与 legacy 包装符号不能同时挂：OpenSSL 包装会把一次调用变成两组完整分片。
     // 仅当目标 libssl 确实没有 _ex 符号时回退到 legacy；加载/权限等错误不能触发回退。
     let pid = checked_ssl_attach_pid(pid)?;
-    let mut attach = |program: &str, symbol: &str| {
-        attach_ssl_symbol(ebpf, program, symbol, path, pid)
-    };
+    let mut attach =
+        |program: &str, symbol: &str| attach_ssl_symbol(ebpf, program, symbol, path, pid);
     for (ex, legacy) in [
         (
             ("legacy_ssl_write_ex", "SSL_write_ex"),
@@ -1863,7 +1892,10 @@ fn attach_ssl_uprobes(ebpf: &mut Ebpf, path: &Path, pid: i32) -> anyhow::Result<
         ),
     ] {
         attach_ssl_with_fallback(ex, legacy, &mut attach).with_context(|| {
-            format!("uprobe attach `{}` with `{}` fallback failed", ex.1, legacy.1)
+            format!(
+                "uprobe attach `{}` with `{}` fallback failed",
+                ex.1, legacy.1
+            )
         })?;
     }
     Ok(())
@@ -2089,11 +2121,7 @@ fn read_value<T: Copy>(bytes: &[u8]) -> Option<T> {
 /// R3 游标扩展尾部：record 布局为 header + len + [ext]。旧解析只读到 header+len，
 /// 多余尾部天然忽略（宽容性已由 trimmed-record 约定保证）；新解析仅在 record 足够长
 /// 且 magic 匹配时采纳，其余字段的合法性由 CursorRereader::patch 复核。
-fn cursor_ext_from_record(
-    bytes: &[u8],
-    header_len: usize,
-    len: usize,
-) -> Option<LegacyCursorExt> {
+fn cursor_ext_from_record(bytes: &[u8], header_len: usize, len: usize) -> Option<LegacyCursorExt> {
     let start = header_len.checked_add(len)?;
     let ext = bytes.get(start..start + size_of::<LegacyCursorExt>())?;
     let cursor = LegacyCursorExt {
@@ -2589,13 +2617,13 @@ mod tests {
         // 该测试钉住存量行为：交互不在响应到达时完成（请求不完整），而是在 idle 边界以
         // partial 退休导出——验收脚本必须等过 idle 边界再判"零事件"。
         let body_len = 32_768usize;
-        let head = format!("POST /r3test HTTP/1.1\r\nHost: x\r\nContent-Length: {body_len}\r\n\r\n");
+        let head =
+            format!("POST /r3test HTTP/1.1\r\nHost: x\r\nContent-Length: {body_len}\r\n\r\n");
         let mut full = head.into_bytes();
         full.extend(std::iter::repeat(b'x').take(body_len));
         let total = full.len();
 
-        let mut request_event =
-            plaintext_event(0, LEGACY_PLAINTEXT_LEN as u32, total as u32);
+        let mut request_event = plaintext_event(0, LEGACY_PLAINTEXT_LEN as u32, total as u32);
         request_event.data[..LEGACY_PLAINTEXT_LEN].copy_from_slice(&full[..LEGACY_PLAINTEXT_LEN]);
         let response_wire = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let mut response_event = plaintext_event(
@@ -2627,7 +2655,11 @@ mod tests {
         );
         reassembler.expire_idle(Instant::now() + Duration::from_secs(91));
         let completed = reassembler.take_completed();
-        assert_eq!(completed.len(), 1, "idle boundary must retire the partial: {completed:?}");
+        assert_eq!(
+            completed.len(),
+            1,
+            "idle boundary must retire the partial: {completed:?}"
+        );
         assert!(completed[0]
             .partial_reasons
             .iter()
@@ -2662,7 +2694,8 @@ mod tests {
         let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            response_body.len(), response_body,
+            response_body.len(),
+            response_body,
         );
         let mut response_event = plaintext_event(
             LEGACY_PLAINTEXT_DIRECTION_READ,
@@ -2677,7 +2710,11 @@ mod tests {
         );
         completed.extend(reassembler.push(response_chunk));
 
-        assert_eq!(completed.len(), 1, "split request must complete on response: {completed:?}");
+        assert_eq!(
+            completed.len(),
+            1,
+            "split request must complete on response: {completed:?}"
+        );
         assert_eq!(completed[0].request.body, body);
         assert_eq!(completed[0].response.text.as_deref(), Some("ok"));
         assert!(!completed[0]
@@ -2699,22 +2736,20 @@ mod tests {
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
         let exporter: Arc<dyn Exporter> = Arc::new(sink.clone());
         let stats = Arc::new(Mutex::new(Stats::default()));
-        let worker = tokio::spawn(run_plaintext_worker(
-            rx,
-            exporter,
-            None,
-            stats,
-        ));
+        let worker = tokio::spawn(run_plaintext_worker(rx, exporter, None, stats));
         for (index, part) in full.chunks(LEGACY_PLAINTEXT_LEN).enumerate() {
             let start = index * LEGACY_PLAINTEXT_LEN;
             let mut event = plaintext_event(0, part.len() as u32, (full.len() - start) as u32);
             event.data[..part.len()].copy_from_slice(part);
-            tx.send(RawEvent::Plaintext(Box::new(event), None)).await.unwrap();
+            tx.send(RawEvent::Plaintext(Box::new(event), None))
+                .await
+                .unwrap();
         }
         let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            response_body.len(), response_body,
+            response_body.len(),
+            response_body,
         );
         let mut response_event = plaintext_event(
             LEGACY_PLAINTEXT_DIRECTION_READ,
@@ -2722,17 +2757,18 @@ mod tests {
             response.len() as u32,
         );
         response_event.data[..response.len()].copy_from_slice(response.as_bytes());
-        tx.send(RawEvent::Plaintext(Box::new(response_event), None)).await.unwrap();
+        tx.send(RawEvent::Plaintext(Box::new(response_event), None))
+            .await
+            .unwrap();
         drop(tx);
         tokio::time::timeout(Duration::from_secs(2), worker)
             .await
             .expect("worker output timeout")
             .expect("worker task failed");
         let events = sink.0.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.event,
-            AgentEvent::LlmInteraction(_)
-        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(&event.event, AgentEvent::LlmInteraction(_))));
     }
 
     #[tokio::test]
@@ -2741,12 +2777,7 @@ mod tests {
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
         let exporter: Arc<dyn Exporter> = Arc::new(sink.clone());
         let stats = Arc::new(Mutex::new(Stats::default()));
-        let worker = tokio::spawn(run_plaintext_worker(
-            rx,
-            exporter,
-            None,
-            stats,
-        ));
+        let worker = tokio::spawn(run_plaintext_worker(rx, exporter, None, stats));
         let connections = 32u32;
         let per_connection = 25u32;
         for turn in 0..per_connection {
@@ -2758,11 +2789,14 @@ mod tests {
                     "POST /ctct-guard/v1/chat/completions HTTP/1.1\r\nHost: guard\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(), body,
                 );
-                let mut request_event = plaintext_event(0, request.len() as u32, request.len() as u32);
+                let mut request_event =
+                    plaintext_event(0, request.len() as u32, request.len() as u32);
                 request_event.pid = 10_000 + connection;
                 request_event.fd = 100 + connection;
                 request_event.data[..request.len()].copy_from_slice(request.as_bytes());
-                tx.send(RawEvent::Plaintext(Box::new(request_event), None)).await.unwrap();
+                tx.send(RawEvent::Plaintext(Box::new(request_event), None))
+                    .await
+                    .unwrap();
 
                 let response_body = format!(
                     r#"{{"choices":[{{"message":{{"content":"answer-{connection}-{turn}"}}}}]}}"#
@@ -2779,7 +2813,9 @@ mod tests {
                 response_event.pid = 10_000 + connection;
                 response_event.fd = 100 + connection;
                 response_event.data[..response.len()].copy_from_slice(response.as_bytes());
-                tx.send(RawEvent::Plaintext(Box::new(response_event), None)).await.unwrap();
+                tx.send(RawEvent::Plaintext(Box::new(response_event), None))
+                    .await
+                    .unwrap();
             }
         }
         drop(tx);
@@ -2788,10 +2824,10 @@ mod tests {
             .expect("worker output timeout")
             .expect("worker task failed");
         let events = sink.0.lock().unwrap();
-        let outputs = events.iter().filter(|event| matches!(
-            &event.event,
-            AgentEvent::LlmInteraction(_)
-        )).count();
+        let outputs = events
+            .iter()
+            .filter(|event| matches!(&event.event, AgentEvent::LlmInteraction(_)))
+            .count();
         assert_eq!(outputs, (connections * per_connection) as usize);
     }
 
@@ -2866,17 +2902,10 @@ mod tests {
                 data: [0; LEGACY_PLAINTEXT_LEN],
             };
             event.data.copy_from_slice(&full[start..end]);
-            let mut chunk = tls_plaintext_chunk_from_event(
-                &event,
-                index as u128 + 1,
-                &mut sequencer,
-            );
+            let mut chunk =
+                tls_plaintext_chunk_from_event(&event, index as u128 + 1, &mut sequencer);
             if index == 7 {
-                let cursor = cursor_for(
-                    &chunk,
-                    (full.len() - 131_072) as u32,
-                    0x7f00_0000,
-                );
+                let cursor = cursor_for(&chunk, (full.len() - 131_072) as u32, 0x7f00_0000);
                 assert_eq!(
                     rereader.patch(
                         &mut chunk,
@@ -2896,11 +2925,8 @@ mod tests {
                         index as u128 + replay_index as u128 + 1,
                         &mut sequencer,
                     );
-                    let replay_cursor = cursor_for(
-                        &replay,
-                        (full.len() - 131_072) as u32,
-                        0x7f00_0000,
-                    );
+                    let replay_cursor =
+                        cursor_for(&replay, (full.len() - 131_072) as u32, 0x7f00_0000);
                     let outcome = rereader.patch(
                         &mut replay,
                         &replay_cursor,
@@ -3075,11 +3101,8 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let direct = std::fs::metadata("/etc/hosts").expect("direct metadata");
-        let via_proc = std::fs::metadata(format!(
-            "/proc/{}/root/etc/hosts",
-            std::process::id()
-        ))
-        .expect("proc root metadata");
+        let via_proc = std::fs::metadata(format!("/proc/{}/root/etc/hosts", std::process::id()))
+            .expect("proc root metadata");
         assert_eq!(
             (direct.dev(), direct.ino()),
             (via_proc.dev(), via_proc.ino())
@@ -3169,8 +3192,14 @@ mod tests {
             assert!(!bounded.should_suppress(&chunk, orig_len, 1_000 + orig_len as u64));
         }
         let connection = &bounded.connections[&(chunk.connection_id, chunk.pid)];
-        assert_eq!(connection.entries.len(), DUPLICATE_FRAGMENT_KEYS_PER_CONNECTION);
-        assert!(!connection.entries.iter().any(|entry| entry.key.orig_len == 0));
+        assert_eq!(
+            connection.entries.len(),
+            DUPLICATE_FRAGMENT_KEYS_PER_CONNECTION
+        );
+        assert!(!connection
+            .entries
+            .iter()
+            .any(|entry| entry.key.orig_len == 0));
         bounded.expire_idle(100_000_000, Duration::from_millis(25));
         assert!(bounded.connections.is_empty());
 
@@ -3243,13 +3272,15 @@ mod tests {
                     continue;
                 }
                 if index == 7 {
-                    let cursor = cursor_for(
-                        &chunk,
-                        (full.len() - 131_072) as u32,
-                        0x7f00_0000,
-                    );
+                    let cursor = cursor_for(&chunk, (full.len() - 131_072) as u32, 0x7f00_0000);
                     assert_eq!(
-                        rereader.patch(&mut chunk, &cursor, captured_at_boot_ns, 20_000_000, &reader),
+                        rereader.patch(
+                            &mut chunk,
+                            &cursor,
+                            captured_at_boot_ns,
+                            20_000_000,
+                            &reader
+                        ),
                         Ok(Some(full.len() - 131_072))
                     );
                 }
@@ -3356,7 +3387,12 @@ mod tests {
         }
         std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
         for (value, expected) in [
-            (Some("256"), (256 * 1024_usize).div_ceil(host_page_size()).clamp(8, 1_024)),
+            (
+                Some("256"),
+                (256 * 1024_usize)
+                    .div_ceil(host_page_size())
+                    .clamp(8, 1_024),
+            ),
             // Sub-page byte targets clamp up to the minimum page budget.
             (Some("1"), 8),
             // Huge byte targets clamp down to the maximum page budget.
@@ -3372,7 +3408,9 @@ mod tests {
         std::env::set_var("A3S_OBSERVER_PERF_RING_KB", "256");
         assert_eq!(
             perf_ring_pages(),
-            (256 * 1024_usize).div_ceil(host_page_size()).clamp(8, 1_024)
+            (256 * 1024_usize)
+                .div_ceil(host_page_size())
+                .clamp(8, 1_024)
         );
         std::env::remove_var("A3S_OBSERVER_PERF_RING_PAGES");
         std::env::remove_var("A3S_OBSERVER_PERF_RING_KB");
